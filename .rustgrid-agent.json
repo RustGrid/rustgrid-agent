@@ -2,9 +2,9 @@
   "project_key": "RG",
   "repo": {
     "owner": "RustGrid",
-    "name": "agent-runner-CLI"
+    "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
   "quality_gate_command": "cargo test",
-  "codex_command": "codex exec --full-auto -"
+  "codex_command": "codex exec --full-auto --json -"
 }

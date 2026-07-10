@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::BTreeSet,
     path::Path,
     sync::{
@@ -34,6 +34,8 @@ struct Reporter<'a> {
     api: &'a RustGridClient,
     run_id: &'a str,
     row_version: Cell<i64>,
+    ticket_id: &'a str,
+    ticket_row_version: Cell<i64>,
 }
 
 impl Reporter<'_> {
@@ -58,15 +60,45 @@ impl Reporter<'_> {
         Ok(())
     }
 
+    fn set_ticket_status(&self, status: &str) -> Result<()> {
+        let version =
+            self.api
+                .update_ticket_status(self.ticket_id, self.ticket_row_version.get(), status)?;
+        self.ticket_row_version.set(version);
+        println!("[   status] Ticket is now {status}");
+        Ok(())
+    }
+
+    fn feedback(&self, message: &str) -> Result<()> {
+        println!("[ feedback] {message}");
+        self.api.create_comment(
+            self.ticket_id,
+            &format!("🤖 **RustGrid Agent update**\n\n{message}"),
+        )
+    }
+
     fn fail(&self, error: &anyhow::Error) -> Result<()> {
         let message = format!("{error:#}");
         let step_result = self.step("run_failed", "failed", &message, None);
+        let comment_result = self.api.create_comment(
+            self.ticket_id,
+            &format!(
+                "⛔ **RustGrid Agent blocked**\n\n{message}\n\nHuman intervention is required before the agent can continue."
+            ),
+        );
+        let ticket_result = self.set_ticket_status("blocked");
         let update_result = self.update_run("failed", Some(&message));
         if let Err(report_error) = step_result {
             eprintln!("[warning] {report_error:#}");
         }
         if let Err(report_error) = update_result {
             eprintln!("[warning] could not mark RustGrid run failed: {report_error:#}");
+        }
+        if let Err(report_error) = comment_result {
+            eprintln!("[warning] could not append blocked ticket comment: {report_error:#}");
+        }
+        if let Err(report_error) = ticket_result {
+            eprintln!("[warning] could not mark ticket blocked: {report_error:#}");
         }
         Ok(())
     }
@@ -135,37 +167,43 @@ fn execute_claimed(
         api,
         run_id: &run.id,
         row_version: Cell::new(run.row_version),
+        ticket_id: &ticket.id,
+        ticket_row_version: Cell::new(ticket.row_version),
     };
 
-    reporter.step(
-        "ticket_fetched",
-        "completed",
-        &format!("Fetched ticket {}", ticket.key),
-        Some(json!({"ticket_id": ticket.id})),
-    )?;
-    reporter.step(
-        "ticket_claimed",
-        "completed",
-        &format!("Claimed ticket {}", ticket.key),
-        Some(json!({"worker_id": worker.id})),
-    )?;
-    reporter.step(
-        "run_created",
-        "completed",
-        &format!("Created and claimed agent run {}", run.id),
-        None,
-    )?;
+    let result = (|| {
+        reporter.set_ticket_status("in_progress")?;
+        reporter.step(
+            "ticket_fetched",
+            "completed",
+            &format!("Fetched ticket {}", ticket.key),
+            Some(json!({"ticket_id": ticket.id})),
+        )?;
+        reporter.step(
+            "ticket_claimed",
+            "completed",
+            &format!("Claimed ticket {}", ticket.key),
+            Some(json!({"worker_id": worker.id})),
+        )?;
+        reporter.step(
+            "run_created",
+            "completed",
+            &format!("Created and claimed agent run {}", run.id),
+            None,
+        )?;
+        execute(
+            context,
+            api,
+            run,
+            ticket,
+            &reporter,
+            repo,
+            baseline,
+            generated_prompt,
+        )
+    })();
 
-    match execute(
-        context,
-        api,
-        run,
-        ticket,
-        &reporter,
-        repo,
-        baseline,
-        generated_prompt,
-    ) {
+    match result {
         Ok(summary) => Ok(summary),
         Err(error) => {
             reporter.fail(&error)?;
@@ -227,8 +265,24 @@ fn execute(
     )?;
 
     reporter.step("codex", "running", "Running Codex locally", None)?;
-    let codex_status =
-        command::streaming(&context.codex_command, &repo.root, Some(&generated_prompt))?;
+    let blocked_action = RefCell::new(None);
+    let codex_status = command::streaming_lines(
+        &context.codex_command,
+        &repo.root,
+        Some(&generated_prompt),
+        |line| {
+            if let Some(message) = feedback_from_output_line(line) {
+                if let Some(action) = blocked_action_from_feedback(&message) {
+                    blocked_action.replace(Some(action));
+                }
+                reporter.feedback(&message)?;
+            }
+            Ok(())
+        },
+    )?;
+    if let Some(action) = blocked_action.into_inner() {
+        bail!("human intervention required: {action}");
+    }
     if !codex_status.success() {
         bail!("Codex exited with {codex_status}");
     }
@@ -332,6 +386,7 @@ fn execute(
         "Agent run completed successfully",
         None,
     )?;
+    reporter.set_ticket_status("done")?;
     reporter.update_run("succeeded", Some(&pr.html_url))?;
 
     let summary = RunSummary {
@@ -455,6 +510,48 @@ fn print_output(stdout: &str, stderr: &str) {
     }
 }
 
+fn feedback_from_output_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Some(trimmed.to_owned());
+    };
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("item.completed") => {
+            let item = event.get("item")?;
+            (item.get("type")?.as_str()? == "agent_message")
+                .then(|| item.get("text")?.as_str().map(str::to_owned))?
+        }
+        Some("error") => event
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(|message| format!("Codex error: {message}")),
+        _ => None,
+    }
+}
+
+fn blocked_action_from_feedback(message: &str) -> Option<String> {
+    if !message
+        .to_ascii_uppercase()
+        .contains("RUSTGRID_AGENT_STATUS: BLOCKED")
+    {
+        return None;
+    }
+    message
+        .lines()
+        .find_map(|line| {
+            let (label, value) = line.split_once(':')?;
+            label
+                .trim()
+                .eq_ignore_ascii_case("HUMAN_ACTION_REQUIRED")
+                .then(|| value.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some("Codex reported that human intervention is required".to_owned()))
+}
+
 fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &str) -> String {
     format!(
         "Implements RustGrid ticket **{}**.\n\n{}\n\n### Verification\n\n- `{}`\n\nRustGrid agent run: `{}`\n",
@@ -482,4 +579,30 @@ fn short_sha(sha: &str) -> &str {
 }
 fn presence(value: Option<&str>) -> &'static str {
     if value.is_some() { "set" } else { "missing" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_only_agent_feedback_from_codex_jsonl() {
+        let message = r#"{"type":"item.completed","item":{"id":"1","type":"agent_message","text":"Implemented the parser."}}"#;
+        assert_eq!(
+            feedback_from_output_line(message).as_deref(),
+            Some("Implemented the parser.")
+        );
+        let command = r#"{"type":"item.completed","item":{"id":"2","type":"command_execution","command":"cargo test"}}"#;
+        assert_eq!(feedback_from_output_line(command), None);
+    }
+
+    #[test]
+    fn extracts_explicit_human_action_from_blocked_feedback() {
+        let message = "I need a production credential.\nRUSTGRID_AGENT_STATUS: BLOCKED\nHUMAN_ACTION_REQUIRED: Add the signing key.";
+        assert_eq!(
+            blocked_action_from_feedback(message).as_deref(),
+            Some("Add the signing key.")
+        );
+        assert_eq!(blocked_action_from_feedback("Still working"), None);
+    }
 }
