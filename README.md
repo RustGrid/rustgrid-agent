@@ -34,6 +34,16 @@ export GITHUB_TOKEN=github_pat_...
 export CODEX_COMMAND='codex exec --full-auto -' # optional
 ```
 
+The RustGrid API key needs these permissions:
+
+- `tickets:read` and `comments:read`
+- `agents:workers:register` and `agents:workers:heartbeat`
+- `agents:runs:claim` and `agents:runs:update`
+- `agents:steps:create`
+- `agents:links:create`
+- `agents:quality_gates:read` and `agents:quality_gates:create`
+- `projects:read` when `watch` resolves a configured `project_key`
+
 `GITHUB_TOKEN` needs permission to push branches and create pull requests. HTTPS pushes receive it through child-process-only Git configuration; SSH remotes continue to use normal SSH configuration. The token is never placed in Git command arguments or remote URLs.
 
 ## Commands
@@ -41,14 +51,14 @@ export CODEX_COMMAND='codex exec --full-auto -' # optional
 ```sh
 rustgrid-agent register
 rustgrid-agent status
-rustgrid-agent run RG-123
+rustgrid-agent run <ticket-uuid>
 rustgrid-agent watch
 ```
 
 Useful options:
 
 ```sh
-rustgrid-agent run RG-123 --allow-dirty
+rustgrid-agent run <ticket-uuid> --allow-dirty
 rustgrid-agent watch --interval 30
 rustgrid-agent watch --once
 rustgrid-agent --config path/to/config.json status
@@ -84,21 +94,21 @@ The runner leaves the agent branch and worktree in place after a failure so the 
 
 ## RustGrid agent API contract
 
-The public RustGrid base API is `/api/v1`. Agent endpoints are isolated in `src/api.rs` because the authenticated agent API can evolve independently. This version uses:
+The RustGrid base API is `/api/v1`. The endpoint and payload mappings in `src/api.rs` match the RustGrid backend contract. This version uses:
 
 | Action | Method and path |
 | --- | --- |
 | Register worker | `POST /agent-workers/register` |
 | Heartbeat | `POST /agent-workers/{id}/heartbeat` |
-| Fetch ticket context | `GET /tickets/{id}?include=comments,custom_fields,quality_gate_failures` |
-| Claim ticket | `POST /tickets/{id}/claim` |
-| Next queued ticket | `GET /agent-tickets/next` |
-| Create/update run | `POST /agent-runs`, `PATCH /agent-runs/{id}` |
+| Fetch ticket context | `GET /tickets/{id}`, `/tickets/{id}/comments`, `/tickets/{id}/quality-gate-results` |
+| Claim ticket and create run | `POST /tickets/{id}/agent-runs/claim` |
+| Claim next queued ticket | `POST /agent-runs/claim-next` |
+| Update run | `PATCH /agent-runs/{id}` with `If-Match` |
 | Append step | `POST /agent-runs/{id}/steps` |
-| Report gate | `POST /agent-runs/{id}/quality-gates` |
-| Attach PR | `POST /agent-runs/{id}/attachments` |
+| Report gate | `POST /tickets/{id}/quality-gate-results` |
+| Attach PR | `POST /tickets/{id}/external-links` |
 
-Responses may be direct objects or wrapped in `data`, `ticket`, `worker`, `run`, or `agent_run`. Create/claim requests use idempotency keys. All API requests use bearer authentication.
+Create/claim requests use idempotency keys. Run updates use the backend's versioned ETag format. All API requests use bearer authentication.
 
 ## Development
 

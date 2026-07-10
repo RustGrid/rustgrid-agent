@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::{
-    Method,
+    Method, StatusCode,
     blocking::{Client, RequestBuilder},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -11,8 +11,6 @@ use uuid::Uuid;
 
 use crate::config::AppContext;
 
-// Agent endpoints are intentionally centralized here while the authenticated RustGrid
-// agent API is evolving. The configured base URL should include `/api/v1`.
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
 
@@ -21,24 +19,19 @@ pub struct RustGridClient {
     http: Client,
     base_url: String,
     api_key: String,
-    project_field: &'static str,
-    project_value: String,
     session_id: Uuid,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Worker {
-    #[serde(alias = "worker_id")]
     pub id: String,
-    #[serde(default)]
-    pub status: Option<String>,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Ticket {
-    #[serde(alias = "ticket_id")]
     pub id: String,
-    #[serde(alias = "ticket_key", alias = "key")]
+    #[serde(alias = "ticket_key", alias = "key", alias = "project_key")]
     pub key: String,
     pub title: String,
     #[serde(default)]
@@ -55,7 +48,7 @@ pub struct Ticket {
 pub struct Comment {
     #[serde(default, alias = "body", alias = "text")]
     pub content: String,
-    #[serde(default, alias = "author_name")]
+    #[serde(default, alias = "author_name", alias = "author_id")]
     pub author: Option<Value>,
 }
 
@@ -69,22 +62,27 @@ pub struct QualityGateFailure {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AgentRun {
-    #[serde(alias = "run_id")]
     pub id: String,
+    pub ticket_id: String,
+    pub row_version: i64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct StepPayload<'a> {
-    pub name: &'a str,
-    pub status: &'a str,
-    pub message: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Value>,
+#[derive(Debug, Deserialize)]
+struct Page<T> {
+    items: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QualityGateRecord {
+    status: String,
+    #[serde(default)]
+    checks: Value,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 impl RustGridClient {
     pub fn new(context: &AppContext) -> Result<Self> {
-        let (project_field, project_value) = context.project_value();
         Ok(Self {
             http: Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -92,26 +90,24 @@ impl RustGridClient {
                 .build()?,
             base_url: context.api_url.trim_end_matches('/').to_owned(),
             api_key: context.require_api_key()?.to_owned(),
-            project_field,
-            project_value: project_value.to_owned(),
             session_id: Uuid::new_v4(),
         })
     }
 
     pub fn register(&self) -> Result<Worker> {
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "local-worker".into());
-        let mut payload = json!({
-            "name": hostname,
-            "capabilities": ["codex", "git", "github_pull_requests"],
-            "version": env!("CARGO_PKG_VERSION")
-        });
-        payload[self.project_field] = json!(self.project_value);
         self.send_json(
             Method::POST,
             &format!("{WORKERS}/register"),
-            Some(payload),
-            Some(&format!("register-worker-{}", self.project_value)),
-            &["worker", "data"],
+            Some(json!({
+                "name": hostname,
+                "kind": "codex",
+                "capabilities": ["codex", "git", "github"],
+                "status": "online"
+            })),
+            Some(&format!("rustgrid-agent-worker-{hostname}")),
+            &[],
+            None,
         )
     }
 
@@ -119,99 +115,198 @@ impl RustGridClient {
         self.send_empty(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
-            Some(json!({})),
+            Some(json!({"status": "online"})),
             None,
         )
     }
 
     pub fn fetch_ticket(&self, ticket_id: &str) -> Result<Ticket> {
-        self.send_json(
+        let mut ticket: Ticket = self.send_json(
             Method::GET,
-            &format!("tickets/{ticket_id}?include=comments,custom_fields,quality_gate_failures"),
+            &format!("tickets/{ticket_id}"),
             None,
             None,
-            &["ticket", "data"],
-        )
+            &[],
+            None,
+        )?;
+        let comments: Page<Comment> = self.send_json(
+            Method::GET,
+            &format!("tickets/{ticket_id}/comments?page=1&size=100"),
+            None,
+            None,
+            &[],
+            None,
+        )?;
+        let gates: Page<QualityGateRecord> = self.send_json(
+            Method::GET,
+            &format!("tickets/{ticket_id}/quality-gate-results?page=1&size=100"),
+            None,
+            None,
+            &[],
+            None,
+        )?;
+        ticket.comments = comments.items;
+        ticket.previous_quality_gate_failures = gates
+            .items
+            .into_iter()
+            .filter(|gate| gate.status == "failed")
+            .map(|gate| QualityGateFailure {
+                command: None,
+                message: gate.summary.unwrap_or_else(|| gate.checks.to_string()),
+            })
+            .collect();
+        Ok(ticket)
     }
 
-    pub fn next_ticket(&self, worker_id: &str) -> Result<Option<Ticket>> {
-        let path = format!(
-            "agent-tickets/next?{}={}&worker_id={}",
-            self.project_field,
-            url_encode(&self.project_value),
-            url_encode(worker_id)
-        );
-        let value = self.send_value(Method::GET, &path, None, None)?;
-        if value.is_null() || value.get("ticket").is_some_and(Value::is_null) {
-            return Ok(None);
+    pub fn resolve_project_id(&self, context: &AppContext) -> Result<String> {
+        if let Some(id) = context.config.project_id.clone() {
+            return Ok(id);
         }
-        deserialize_envelope(value, &["ticket", "data"]).map(Some)
+        #[derive(Deserialize)]
+        struct Project {
+            id: String,
+        }
+        let key = context.config.project_key.as_deref().expect("validated");
+        let project: Project = self.send_json(
+            Method::GET,
+            &format!("projects/key/{}", url_encode(key)),
+            None,
+            None,
+            &[],
+            None,
+        )?;
+        Ok(project.id)
     }
 
-    pub fn claim_ticket(&self, ticket_id: &str, worker_id: &str) -> Result<()> {
-        self.send_empty(
-            Method::POST,
-            &format!("tickets/{ticket_id}/claim"),
-            Some(json!({"worker_id": worker_id})),
-            Some(&format!("claim-{ticket_id}-{worker_id}")),
-        )
-    }
-
-    pub fn create_run(&self, ticket: &Ticket, worker_id: &str) -> Result<AgentRun> {
-        let mut payload =
-            json!({"ticket_id": ticket.id, "worker_id": worker_id, "status": "running"});
-        payload[self.project_field] = json!(self.project_value);
+    pub fn claim_ticket(&self, ticket_id: &str, worker_id: &str, prompt: &str) -> Result<AgentRun> {
         self.send_json(
             Method::POST,
-            RUNS,
-            Some(payload),
+            &format!("tickets/{ticket_id}/agent-runs/claim"),
+            Some(json!({
+                "worker_id": worker_id,
+                "input_prompt": prompt,
+                "metadata": {"runner": "rustgrid-agent"},
+                "lease_seconds": 3600
+            })),
             Some(&format!(
-                "run-{}-{worker_id}-{}",
-                ticket.id, self.session_id
+                "claim-{ticket_id}-{worker_id}-{}",
+                self.session_id
             )),
-            &["agent_run", "run", "data"],
+            &[],
+            None,
         )
     }
 
-    pub fn append_step(&self, run_id: &str, step: &StepPayload<'_>) -> Result<()> {
-        let value = serde_json::to_value(step)?;
+    pub fn claim_next(&self, worker_id: &str, project_id: &str) -> Result<Option<AgentRun>> {
+        let path = format!("{RUNS}/claim-next");
+        let body = json!({
+            "worker_id": worker_id,
+            "project_id": project_id,
+            "input_prompt": "Claimed by rustgrid-agent; detailed ticket prompt is generated locally.",
+            "metadata": {"runner": "rustgrid-agent"},
+            "lease_seconds": 3600,
+            "statuses": ["backlog", "todo"]
+        });
+        match self.send_value(
+            Method::POST,
+            &path,
+            Some(body),
+            Some(&format!("claim-next-{}", Uuid::new_v4())),
+            None,
+        ) {
+            Ok(value) => deserialize_envelope(value, &[]).map(Some),
+            Err(HttpFailure {
+                status: StatusCode::NOT_FOUND,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn append_step(
+        &self,
+        run_id: &str,
+        name: &str,
+        status: &str,
+        message: &str,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let step_key = format!(
+            "{}-{}",
+            name.replace('_', "-"),
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
         self.send_empty(
             Method::POST,
             &format!("{RUNS}/{run_id}/steps"),
-            Some(value),
-            None,
+            Some(json!({
+                "step_key": step_key,
+                "title": truncate(message, 300),
+                "status": status,
+                "summary": truncate(message, 5000),
+                "metadata": metadata.unwrap_or_else(|| json!({}))
+            })),
+            Some(&format!("step-{run_id}-{step_key}")),
         )
     }
 
-    pub fn update_run(&self, run_id: &str, status: &str, message: Option<&str>) -> Result<()> {
-        self.send_empty(
+    pub fn update_run(
+        &self,
+        run_id: &str,
+        row_version: i64,
+        status: &str,
+        message: Option<&str>,
+    ) -> Result<AgentRun> {
+        let message = message.map(|value| truncate(value, 20_000));
+        let mut body = json!({"status": status});
+        if status == "failed" {
+            body["error_message"] = json!(message.as_deref());
+        } else {
+            body["output_summary"] = json!(message.as_deref());
+        }
+        self.send_json(
             Method::PATCH,
             &format!("{RUNS}/{run_id}"),
-            Some(json!({"status": status, "message": message})),
+            Some(body),
             None,
+            &[],
+            Some(&format!("\"agent-runs:{run_id}:{row_version}\"")),
         )
     }
 
     pub fn report_quality_gate(
         &self,
+        ticket_id: &str,
         run_id: &str,
         command: &str,
         passed: bool,
         output: &str,
     ) -> Result<()> {
-        self.send_empty(Method::POST, &format!("{RUNS}/{run_id}/quality-gates"), Some(json!({
-            "command": command, "status": if passed { "passed" } else { "failed" }, "output": truncate(output, 16_000)
-        })), None)
-    }
-
-    pub fn attach_pr(&self, run_id: &str, url: &str, number: u64) -> Result<()> {
         self.send_empty(
             Method::POST,
-            &format!("{RUNS}/{run_id}/attachments"),
+            &format!("tickets/{ticket_id}/quality-gate-results"),
             Some(json!({
-                "type": "github_pull_request", "url": url, "pull_request_number": number
+                "run_id": run_id,
+                "status": if passed { "passed" } else { "failed" },
+                "checks": [{"name": command, "status": if passed { "passed" } else { "failed" }, "summary": truncate(output, 16000)}],
+                "summary": truncate(if passed { "Local quality gate passed" } else { output }, 5000)
             })),
-            None,
+            Some(&format!("gate-{run_id}")),
+        )
+    }
+
+    pub fn attach_pr(&self, ticket_id: &str, run_id: &str, url: &str, number: u64) -> Result<()> {
+        self.send_empty(
+            Method::POST,
+            &format!("tickets/{ticket_id}/external-links"),
+            Some(json!({
+                "kind": "github_pr",
+                "label": format!("GitHub PR #{number}"),
+                "url": url,
+                "external_id": number.to_string(),
+                "metadata": {"agent_run_id": run_id}
+            })),
+            Some(&format!("pr-link-{run_id}")),
         )
     }
 
@@ -228,7 +323,8 @@ impl RustGridClient {
         path: &str,
         body: Option<Value>,
         idempotency: Option<&str>,
-    ) -> Result<Value> {
+        if_match: Option<&str>,
+    ) -> std::result::Result<Value, HttpFailure> {
         let mut request = self.request(method, path);
         if let Some(body) = body {
             request = request.json(&body);
@@ -236,9 +332,12 @@ impl RustGridClient {
         if let Some(key) = idempotency {
             request = request.header("Idempotency-Key", key);
         }
+        if let Some(etag) = if_match {
+            request = request.header("If-Match", etag);
+        }
         let response = request
             .send()
-            .with_context(|| format!("RustGrid request failed: {path}"))?;
+            .map_err(|error| HttpFailure::transport(path, error))?;
         let status = response.status();
         let request_id = response
             .headers()
@@ -247,21 +346,24 @@ impl RustGridClient {
             .map(str::to_owned);
         let text = response
             .text()
-            .context("could not read RustGrid response")?;
+            .map_err(|error| HttpFailure::transport(path, error))?;
         if !status.is_success() {
-            bail!(
-                "RustGrid {path} returned {status}{}: {}",
-                request_id
-                    .map(|id| format!(" (request {id})"))
-                    .unwrap_or_default(),
-                truncate(&text, 2_000)
-            );
+            return Err(HttpFailure {
+                status,
+                path: path.to_owned(),
+                request_id,
+                body: truncate(&text, 2000),
+            });
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text)
-            .with_context(|| format!("RustGrid {path} returned invalid JSON"))
+        serde_json::from_str(&text).map_err(|error| HttpFailure {
+            status,
+            path: path.to_owned(),
+            request_id,
+            body: format!("invalid JSON response: {error}"),
+        })
     }
 
     fn send_json<T: DeserializeOwned>(
@@ -271,8 +373,12 @@ impl RustGridClient {
         body: Option<Value>,
         idempotency: Option<&str>,
         keys: &[&str],
+        if_match: Option<&str>,
     ) -> Result<T> {
-        deserialize_envelope(self.send_value(method, path, body, idempotency)?, keys)
+        deserialize_envelope(
+            self.send_value(method, path, body, idempotency, if_match)?,
+            keys,
+        )
     }
 
     fn send_empty(
@@ -282,9 +388,48 @@ impl RustGridClient {
         body: Option<Value>,
         idempotency: Option<&str>,
     ) -> Result<()> {
-        self.send_value(method, path, body, idempotency).map(|_| ())
+        self.send_value(method, path, body, idempotency, None)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }
+
+#[derive(Debug)]
+struct HttpFailure {
+    status: StatusCode,
+    path: String,
+    request_id: Option<String>,
+    body: String,
+}
+
+impl HttpFailure {
+    fn transport(path: &str, error: reqwest::Error) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            path: path.to_owned(),
+            request_id: None,
+            body: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RustGrid {} returned {}{}: {}",
+            self.path,
+            self.status,
+            self.request_id
+                .as_ref()
+                .map(|id| format!(" (request {id})"))
+                .unwrap_or_default(),
+            self.body
+        )
+    }
+}
+
+impl std::error::Error for HttpFailure {}
 
 fn deserialize_envelope<T: DeserializeOwned>(mut value: Value, keys: &[&str]) -> Result<T> {
     for key in keys {

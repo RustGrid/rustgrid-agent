@@ -1,4 +1,6 @@
 use std::{
+    cell::Cell,
+    collections::BTreeSet,
     path::Path,
     sync::{
         Arc,
@@ -12,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::{
-    api::{AgentRun, RustGridClient, StepPayload, Ticket, Worker},
+    api::{AgentRun, RustGridClient, Ticket, Worker},
     command,
     config::AppContext,
     git::{Repo, branch_name},
@@ -31,6 +33,7 @@ pub struct RunSummary {
 struct Reporter<'a> {
     api: &'a RustGridClient,
     run_id: &'a str,
+    row_version: Cell<i64>,
 }
 
 impl Reporter<'_> {
@@ -43,22 +46,22 @@ impl Reporter<'_> {
     ) -> Result<()> {
         println!("[{status:>9}] {message}");
         self.api
-            .append_step(
-                self.run_id,
-                &StepPayload {
-                    name,
-                    status,
-                    message,
-                    metadata,
-                },
-            )
+            .append_step(self.run_id, name, status, message, metadata)
             .with_context(|| format!("could not report step {name} to RustGrid"))
+    }
+
+    fn update_run(&self, status: &str, message: Option<&str>) -> Result<()> {
+        let run = self
+            .api
+            .update_run(self.run_id, self.row_version.get(), status, message)?;
+        self.row_version.set(run.row_version);
+        Ok(())
     }
 
     fn fail(&self, error: &anyhow::Error) -> Result<()> {
         let message = format!("{error:#}");
         let step_result = self.step("run_failed", "failed", &message, None);
-        let update_result = self.api.update_run(self.run_id, "failed", Some(&message));
+        let update_result = self.update_run("failed", Some(&message));
         if let Err(report_error) = step_result {
             eprintln!("[warning] {report_error:#}");
         }
@@ -75,13 +78,8 @@ pub fn register(context: &AppContext) -> Result<()> {
     let worker = api.register()?;
     api.heartbeat(&worker.id)?;
     println!(
-        "[ complete] Worker {} is registered and healthy{}",
-        worker.id,
-        worker
-            .status
-            .as_deref()
-            .map(|s| format!(" ({s})"))
-            .unwrap_or_default()
+        "[ complete] Worker {} is registered and healthy ({})",
+        worker.id, worker.status
     );
     Ok(())
 }
@@ -103,14 +101,40 @@ fn run_ticket_with_worker(
 ) -> Result<RunSummary> {
     println!("[ starting] Fetching ticket {ticket_id}");
     let ticket = api.fetch_ticket(ticket_id)?;
-    api.claim_ticket(&ticket.id, &worker.id)
-        .with_context(|| format!("could not claim ticket {}", ticket.key))?;
+    let repo = Repo::discover()?;
+    let baseline = repo.ensure_safe(allow_dirty)?;
+    let generated_prompt =
+        prompt::build(&ticket, &repo.root, &context.config.quality_gate_command)?;
     let run = api
-        .create_run(&ticket, &worker.id)
-        .with_context(|| format!("could not create agent run for {}", ticket.key))?;
+        .claim_ticket(&ticket.id, &worker.id, &generated_prompt)
+        .with_context(|| format!("could not claim ticket {}", ticket.key))?;
+    execute_claimed(
+        context,
+        api,
+        worker,
+        &run,
+        &ticket,
+        repo,
+        baseline,
+        generated_prompt,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_claimed(
+    context: &AppContext,
+    api: &RustGridClient,
+    worker: &Worker,
+    run: &AgentRun,
+    ticket: &Ticket,
+    repo: Repo,
+    baseline: BTreeSet<String>,
+    generated_prompt: String,
+) -> Result<RunSummary> {
     let reporter = Reporter {
         api,
         run_id: &run.id,
+        row_version: Cell::new(run.row_version),
     };
 
     reporter.step(
@@ -128,11 +152,20 @@ fn run_ticket_with_worker(
     reporter.step(
         "run_created",
         "completed",
-        &format!("Created agent run {}", run.id),
+        &format!("Created and claimed agent run {}", run.id),
         None,
     )?;
 
-    match execute(context, api, &run, &ticket, &reporter, allow_dirty) {
+    match execute(
+        context,
+        api,
+        run,
+        ticket,
+        &reporter,
+        repo,
+        baseline,
+        generated_prompt,
+    ) {
         Ok(summary) => Ok(summary),
         Err(error) => {
             reporter.fail(&error)?;
@@ -141,16 +174,17 @@ fn run_ticket_with_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute(
     context: &AppContext,
     api: &RustGridClient,
     run: &AgentRun,
     ticket: &Ticket,
     reporter: &Reporter<'_>,
-    allow_dirty: bool,
+    repo: Repo,
+    baseline: BTreeSet<String>,
+    generated_prompt: String,
 ) -> Result<RunSummary> {
-    let repo = Repo::discover()?;
-    let baseline = repo.ensure_safe(allow_dirty)?;
     if !baseline.is_empty() {
         reporter.step(
             "working_tree_checked",
@@ -185,7 +219,6 @@ fn execute(
         None,
     )?;
 
-    let generated_prompt = prompt::build(ticket, &repo.root, &context.config.quality_gate_command)?;
     reporter.step(
         "prompt_built",
         "completed",
@@ -215,6 +248,7 @@ fn execute(
     let gate_output = combine_output(&gate.stdout, &gate.stderr);
     let passed = gate.status.success();
     api.report_quality_gate(
+        &ticket.id,
         &run.id,
         &context.config.quality_gate_command,
         passed,
@@ -285,7 +319,7 @@ fn execute(
         Some(json!({"url": pr.html_url})),
     )?;
 
-    api.attach_pr(&run.id, &pr.html_url, pr.number)?;
+    api.attach_pr(&ticket.id, &run.id, &pr.html_url, pr.number)?;
     reporter.step(
         "rustgrid_attachment",
         "completed",
@@ -298,7 +332,7 @@ fn execute(
         "Agent run completed successfully",
         None,
     )?;
-    api.update_run(&run.id, "completed", Some(&pr.html_url))?;
+    reporter.update_run("succeeded", Some(&pr.html_url))?;
 
     let summary = RunSummary {
         ticket_key: ticket.key.clone(),
@@ -318,6 +352,7 @@ pub fn watch(
 ) -> Result<()> {
     let api = RustGridClient::new(context)?;
     let worker = api.register()?;
+    let project_id = api.resolve_project_id(context)?;
     println!("[ watching] Worker {} is polling RustGrid", worker.id);
     let running = Arc::new(AtomicBool::new(true));
     let signal = Arc::clone(&running);
@@ -326,12 +361,24 @@ pub fn watch(
 
     while running.load(Ordering::SeqCst) {
         api.heartbeat(&worker.id)?;
-        match api.next_ticket(&worker.id)? {
-            Some(ticket) => {
+        let repo = Repo::discover()?;
+        let baseline = repo.ensure_safe(allow_dirty)?;
+        match api.claim_next(&worker.id, &project_id)? {
+            Some(run) => {
+                let ticket = api.fetch_ticket(&run.ticket_id)?;
                 println!("[  claimed] Queue returned {}", ticket.key);
-                if let Err(error) =
-                    run_ticket_with_worker(context, &api, &worker, &ticket.id, allow_dirty)
-                {
+                let generated_prompt =
+                    prompt::build(&ticket, &repo.root, &context.config.quality_gate_command)?;
+                if let Err(error) = execute_claimed(
+                    context,
+                    &api,
+                    &worker,
+                    &run,
+                    &ticket,
+                    repo,
+                    baseline,
+                    generated_prompt,
+                ) {
                     eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
                 }
             }
