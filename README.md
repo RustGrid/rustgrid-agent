@@ -2,7 +2,7 @@
 
 `rustgrid-agent` turns queued RustGrid tickets into ready-to-review GitHub pull requests. It claims a ticket, gives the ticket and repository instructions to Codex, runs the repository's quality gate, commits the generated changes, opens a pull request, and records every major action in RustGrid.
 
-> The Homebrew formula is named `rustgrid-cli`; the executable it installs is named `rustgrid-agent`.
+The Cargo package, executable, GitHub repository, and Homebrew formula all use the name `rustgrid-agent`.
 
 ## What it does
 
@@ -33,17 +33,17 @@ The agent must be run from inside the Git repository it will modify. Its configu
 
 ### Homebrew
 
-Once `rustgrid-cli` has been accepted into Homebrew/core, install it with:
+Once `rustgrid-agent` has been accepted into Homebrew/core, install it with:
 
 ```sh
-brew install rustgrid-cli
+brew install rustgrid-agent
 rustgrid-agent --version
 ```
 
 Until then, a public RustGrid tap can provide it with:
 
 ```sh
-brew install RustGrid/tap/rustgrid-cli
+brew install RustGrid/tap/rustgrid-agent
 rustgrid-agent --version
 ```
 
@@ -54,8 +54,8 @@ Use the fully qualified tap name until the formula is available from Homebrew/co
 Clone this repository and install the binary with Cargo:
 
 ```sh
-git clone https://github.com/RustGrid/agent-runner-CLI.git
-cd agent-runner-CLI
+git clone https://github.com/RustGrid/rustgrid-agent.git
+cd rustgrid-agent
 cargo install --locked --path .
 rustgrid-agent --version
 ```
@@ -73,7 +73,7 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
   "project_key": "RG",
   "repo": {
     "owner": "RustGrid",
-    "name": "agent-runner-CLI"
+    "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
   "quality_gate_command": "cargo test",
@@ -250,7 +250,7 @@ Common checks:
 
 ## Publishing with Homebrew
 
-This section is for RustGrid maintainers. Homebrew distribution needs a versioned public release plus a formula. A tap can be published immediately under the RustGrid organization; the unqualified command `brew install rustgrid-cli` on a new machine requires acceptance into the central `Homebrew/homebrew-core` repository.
+This section is for RustGrid maintainers. Homebrew distribution needs a versioned public release plus a formula. A tap can be published immediately under the RustGrid organization; the unqualified command `brew install rustgrid-agent` on a new machine requires acceptance into the central `Homebrew/homebrew-core` repository.
 
 ### 1. Create a release artifact
 
@@ -269,18 +269,18 @@ This section is for RustGrid maintainers. Homebrew distribution needs a versione
 The release URL will have this form:
 
 ```text
-https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate
+https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate
 ```
 
 ### 2. Create the formula
 
-Create `Formula/rustgrid-cli.rb` in a public `RustGrid/homebrew-tap` repository:
+Create `Formula/rustgrid-agent.rb` in a public `RustGrid/homebrew-tap` repository:
 
 ```ruby
-class RustgridCli < Formula
+class RustgridAgent < Formula
   desc "Run Codex against RustGrid tickets and publish GitHub pull requests"
-  homepage "https://github.com/RustGrid/agent-runner-CLI"
-  url "https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate"
+  homepage "https://github.com/RustGrid/rustgrid-agent"
+  url "https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate"
   sha256 "REPLACE_WITH_RELEASE_ARCHIVE_SHA256"
   license "MIT"
 
@@ -296,32 +296,32 @@ class RustgridCli < Formula
 end
 ```
 
-Replace both `X.Y.Z` values and the checksum. The formula is named `rustgrid-cli` because that is the requested Homebrew package name, while Cargo installs the existing `rustgrid-agent` executable.
+Replace both `X.Y.Z` values and the checksum. The formula and installed executable are both named `rustgrid-agent`.
 
 Validate the formula in a clean Homebrew environment:
 
 ```sh
-brew audit --strict --online RustGrid/tap/rustgrid-cli
-brew install --build-from-source RustGrid/tap/rustgrid-cli
-brew test RustGrid/tap/rustgrid-cli
+brew audit --strict --online RustGrid/tap/rustgrid-agent
+brew install --build-from-source RustGrid/tap/rustgrid-agent
+brew test RustGrid/tap/rustgrid-agent
 rustgrid-agent --version
-brew uninstall rustgrid-cli
+brew uninstall rustgrid-agent
 ```
 
 Commit and push the formula to the default branch of the public tap. Users can then run:
 
 ```sh
-brew install RustGrid/tap/rustgrid-cli
+brew install RustGrid/tap/rustgrid-agent
 ```
 
-### 3. Enable `brew install rustgrid-cli`
+### 3. Enable `brew install rustgrid-agent`
 
-For installation without a tap qualifier, submit `Formula/r/rustgrid-cli.rb` as a pull request to `Homebrew/homebrew-core`. Use the same stable release URL and checksum, follow the current [Homebrew formula requirements](https://docs.brew.sh/Acceptable-Formulae), and run the audit, install, and test checks requested by Homebrew's contribution guide. Core requires a stable, tagged, open-source project that builds on supported macOS and Linux versions; it also applies notability and third-party-use criteria. A public tap remains the supported route until the project qualifies.
+For installation without a tap qualifier, submit `Formula/r/rustgrid-agent.rb` as a pull request to `Homebrew/homebrew-core`. Use the same stable release URL and checksum, follow the current [Homebrew formula requirements](https://docs.brew.sh/Acceptable-Formulae), and run the audit, install, and test checks requested by Homebrew's contribution guide. Core requires a stable, tagged, open-source project that builds on supported macOS and Linux versions; it also applies notability and third-party-use criteria. A public tap remains the supported route until the project qualifies.
 
 Homebrew/core inclusion is reviewed by Homebrew maintainers and is not guaranteed. Until it is accepted, document the tap-qualified command. Once accepted, a new user can install with exactly:
 
 ```sh
-brew install rustgrid-cli
+brew install rustgrid-agent
 ```
 
 ### 4. Publish future versions
