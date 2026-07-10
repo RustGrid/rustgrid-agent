@@ -1,0 +1,25 @@
+[package]
+name = "rustgrid-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Run Codex against RustGrid tickets and publish the result as a GitHub pull request"
+license = "MIT"
+repository = "https://github.com/RustGrid/agent-runner-CLI"
+
+[[bin]]
+name = "rustgrid-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shlex = "1.3"
+uuid = { version = "1.11", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.14"

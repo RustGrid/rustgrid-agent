@@ -1,0 +1,438 @@
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result, bail};
+use serde_json::json;
+
+use crate::{
+    api::{AgentRun, RustGridClient, StepPayload, Ticket, Worker},
+    command,
+    config::AppContext,
+    git::{Repo, branch_name},
+    github::GitHubClient,
+    prompt,
+};
+
+#[derive(Debug)]
+pub struct RunSummary {
+    pub ticket_key: String,
+    pub branch: String,
+    pub commit: String,
+    pub pull_request_url: String,
+}
+
+struct Reporter<'a> {
+    api: &'a RustGridClient,
+    run_id: &'a str,
+}
+
+impl Reporter<'_> {
+    fn step(
+        &self,
+        name: &str,
+        status: &str,
+        message: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        println!("[{status:>9}] {message}");
+        self.api
+            .append_step(
+                self.run_id,
+                &StepPayload {
+                    name,
+                    status,
+                    message,
+                    metadata,
+                },
+            )
+            .with_context(|| format!("could not report step {name} to RustGrid"))
+    }
+
+    fn fail(&self, error: &anyhow::Error) -> Result<()> {
+        let message = format!("{error:#}");
+        let step_result = self.step("run_failed", "failed", &message, None);
+        let update_result = self.api.update_run(self.run_id, "failed", Some(&message));
+        if let Err(report_error) = step_result {
+            eprintln!("[warning] {report_error:#}");
+        }
+        if let Err(report_error) = update_result {
+            eprintln!("[warning] could not mark RustGrid run failed: {report_error:#}");
+        }
+        Ok(())
+    }
+}
+
+pub fn register(context: &AppContext) -> Result<()> {
+    println!("[ starting] Registering RustGrid worker");
+    let api = RustGridClient::new(context)?;
+    let worker = api.register()?;
+    api.heartbeat(&worker.id)?;
+    println!(
+        "[ complete] Worker {} is registered and healthy{}",
+        worker.id,
+        worker
+            .status
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+pub fn run_ticket(context: &AppContext, ticket_id: &str, allow_dirty: bool) -> Result<RunSummary> {
+    let api = RustGridClient::new(context)?;
+    println!("[ starting] Registering worker");
+    let worker = api.register()?;
+    api.heartbeat(&worker.id)?;
+    run_ticket_with_worker(context, &api, &worker, ticket_id, allow_dirty)
+}
+
+fn run_ticket_with_worker(
+    context: &AppContext,
+    api: &RustGridClient,
+    worker: &Worker,
+    ticket_id: &str,
+    allow_dirty: bool,
+) -> Result<RunSummary> {
+    println!("[ starting] Fetching ticket {ticket_id}");
+    let ticket = api.fetch_ticket(ticket_id)?;
+    api.claim_ticket(&ticket.id, &worker.id)
+        .with_context(|| format!("could not claim ticket {}", ticket.key))?;
+    let run = api
+        .create_run(&ticket, &worker.id)
+        .with_context(|| format!("could not create agent run for {}", ticket.key))?;
+    let reporter = Reporter {
+        api,
+        run_id: &run.id,
+    };
+
+    reporter.step(
+        "ticket_fetched",
+        "completed",
+        &format!("Fetched ticket {}", ticket.key),
+        Some(json!({"ticket_id": ticket.id})),
+    )?;
+    reporter.step(
+        "ticket_claimed",
+        "completed",
+        &format!("Claimed ticket {}", ticket.key),
+        Some(json!({"worker_id": worker.id})),
+    )?;
+    reporter.step(
+        "run_created",
+        "completed",
+        &format!("Created agent run {}", run.id),
+        None,
+    )?;
+
+    match execute(context, api, &run, &ticket, &reporter, allow_dirty) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            reporter.fail(&error)?;
+            Err(error)
+        }
+    }
+}
+
+fn execute(
+    context: &AppContext,
+    api: &RustGridClient,
+    run: &AgentRun,
+    ticket: &Ticket,
+    reporter: &Reporter<'_>,
+    allow_dirty: bool,
+) -> Result<RunSummary> {
+    let repo = Repo::discover()?;
+    let baseline = repo.ensure_safe(allow_dirty)?;
+    if !baseline.is_empty() {
+        reporter.step(
+            "working_tree_checked",
+            "completed",
+            &format!(
+                "Dirty tree allowed; excluding {} pre-existing path(s) from the commit",
+                baseline.len()
+            ),
+            Some(json!({"excluded_paths": baseline})),
+        )?;
+    } else {
+        reporter.step(
+            "working_tree_checked",
+            "completed",
+            "Git working tree is clean",
+            None,
+        )?;
+    }
+
+    let branch = branch_name(&ticket.key, &ticket.title);
+    reporter.step(
+        "branch_create",
+        "running",
+        &format!("Creating branch {branch}"),
+        Some(json!({"base": context.config.default_base_branch})),
+    )?;
+    repo.create_branch(&branch, &context.config.default_base_branch)?;
+    reporter.step(
+        "branch_create",
+        "completed",
+        &format!("Created branch {branch}"),
+        None,
+    )?;
+
+    let generated_prompt = prompt::build(ticket, &repo.root, &context.config.quality_gate_command)?;
+    reporter.step(
+        "prompt_built",
+        "completed",
+        "Built Codex prompt from ticket and repository context",
+        Some(json!({"characters": generated_prompt.len()})),
+    )?;
+
+    reporter.step("codex", "running", "Running Codex locally", None)?;
+    let codex_status =
+        command::streaming(&context.codex_command, &repo.root, Some(&generated_prompt))?;
+    if !codex_status.success() {
+        bail!("Codex exited with {codex_status}");
+    }
+    reporter.step("codex", "completed", "Codex finished successfully", None)?;
+
+    reporter.step(
+        "quality_gate",
+        "running",
+        &format!(
+            "Running quality gate: {}",
+            context.config.quality_gate_command
+        ),
+        None,
+    )?;
+    let gate = run_captured(&context.config.quality_gate_command, &repo.root)?;
+    print_output(&gate.stdout, &gate.stderr);
+    let gate_output = combine_output(&gate.stdout, &gate.stderr);
+    let passed = gate.status.success();
+    api.report_quality_gate(
+        &run.id,
+        &context.config.quality_gate_command,
+        passed,
+        &gate_output,
+    )?;
+    reporter.step(
+        "quality_gate",
+        if passed { "completed" } else { "failed" },
+        if passed {
+            "Quality gate passed"
+        } else {
+            "Quality gate failed"
+        },
+        Some(json!({"exit_code": gate.status.code()})),
+    )?;
+    if !passed {
+        bail!("quality gate failed with {}", gate.status);
+    }
+
+    let paths = repo.new_agent_paths(&baseline)?;
+    if paths.is_empty() {
+        bail!("Codex produced no committable changes");
+    }
+    reporter.step(
+        "changes_detected",
+        "completed",
+        &format!("Found {} agent-created changed path(s)", paths.len()),
+        Some(json!({"paths": paths})),
+    )?;
+
+    reporter.step("commit", "running", "Committing agent changes", None)?;
+    let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
+    reporter.step(
+        "commit",
+        "completed",
+        &format!("Created commit {}", short_sha(&commit)),
+        Some(json!({"commit": commit})),
+    )?;
+
+    reporter.step("push", "running", &format!("Pushing branch {branch}"), None)?;
+    let github_token = context.require_github_token()?;
+    repo.push(&branch, github_token)?;
+    reporter.step(
+        "push",
+        "completed",
+        &format!("Pushed branch {branch}"),
+        None,
+    )?;
+
+    reporter.step(
+        "pull_request",
+        "running",
+        "Opening GitHub pull request",
+        None,
+    )?;
+    let github = GitHubClient::new(github_token)?;
+    let pr = github.create_pull_request(
+        &context.config.repo,
+        &format!("{}: {}", ticket.key, ticket.title),
+        &pull_request_body(ticket, &run.id, &context.config.quality_gate_command),
+        &branch,
+        &context.config.default_base_branch,
+    )?;
+    reporter.step(
+        "pull_request",
+        "completed",
+        &format!("Opened pull request #{}", pr.number),
+        Some(json!({"url": pr.html_url})),
+    )?;
+
+    api.attach_pr(&run.id, &pr.html_url, pr.number)?;
+    reporter.step(
+        "rustgrid_attachment",
+        "completed",
+        "Attached pull request to RustGrid",
+        Some(json!({"url": pr.html_url})),
+    )?;
+    reporter.step(
+        "run_complete",
+        "completed",
+        "Agent run completed successfully",
+        None,
+    )?;
+    api.update_run(&run.id, "completed", Some(&pr.html_url))?;
+
+    let summary = RunSummary {
+        ticket_key: ticket.key.clone(),
+        branch,
+        commit,
+        pull_request_url: pr.html_url,
+    };
+    print_summary(&summary, &context.config.quality_gate_command);
+    Ok(summary)
+}
+
+pub fn watch(
+    context: &AppContext,
+    allow_dirty: bool,
+    interval: Duration,
+    once: bool,
+) -> Result<()> {
+    let api = RustGridClient::new(context)?;
+    let worker = api.register()?;
+    println!("[ watching] Worker {} is polling RustGrid", worker.id);
+    let running = Arc::new(AtomicBool::new(true));
+    let signal = Arc::clone(&running);
+    ctrlc::set_handler(move || signal.store(false, Ordering::SeqCst))
+        .context("could not install Ctrl-C handler")?;
+
+    while running.load(Ordering::SeqCst) {
+        api.heartbeat(&worker.id)?;
+        match api.next_ticket(&worker.id)? {
+            Some(ticket) => {
+                println!("[  claimed] Queue returned {}", ticket.key);
+                if let Err(error) =
+                    run_ticket_with_worker(context, &api, &worker, &ticket.id, allow_dirty)
+                {
+                    eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
+                }
+            }
+            None => println!("[     idle] No tickets available"),
+        }
+        if once {
+            break;
+        }
+        thread::sleep(interval);
+    }
+    println!("[  stopped] Watcher stopped");
+    Ok(())
+}
+
+pub fn status(context: &AppContext) -> Result<()> {
+    let repo = Repo::discover()?;
+    let dirty = repo.dirty_paths()?;
+    let parsed_codex = command::parse(&context.codex_command)?;
+    let parsed_gate = command::parse(&context.config.quality_gate_command)?;
+    let (project_kind, project) = context.project_value();
+    println!("RustGrid agent status\n");
+    println!("  Config:       {}", context.config_path.display());
+    println!("  RustGrid API: {}", context.api_url);
+    println!("  Project:      {project_kind}={project}");
+    println!(
+        "  Repository:   {}/{} ({})",
+        context.config.repo.owner,
+        context.config.repo.name,
+        repo.root.display()
+    );
+    println!("  Base branch:  {}", context.config.default_base_branch);
+    println!("  Codex:        {}", parsed_codex.join(" "));
+    println!("  Quality gate: {}", parsed_gate.join(" "));
+    println!("  API key:      {}", presence(context.api_key.as_deref()));
+    println!(
+        "  GitHub token: {}",
+        presence(context.github_token.as_deref())
+    );
+    println!(
+        "  Working tree: {}",
+        if dirty.is_empty() {
+            "clean".into()
+        } else {
+            format!("dirty ({} path(s))", dirty.len())
+        }
+    );
+    if context.api_key.is_none() || context.github_token.is_none() {
+        bail!("status checks failed: required credentials are missing");
+    }
+    Ok(())
+}
+
+fn run_captured(command_text: &str, cwd: &Path) -> Result<command::CommandOutput> {
+    let parts = command::parse(command_text)?;
+    println!("  $ {}", parts.join(" "));
+    command::capture(&parts[0], &parts[1..], cwd)
+}
+
+fn combine_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_owned(),
+        (true, false) => stderr.to_owned(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn print_output(stdout: &str, stderr: &str) {
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+}
+
+fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &str) -> String {
+    format!(
+        "Implements RustGrid ticket **{}**.\n\n{}\n\n### Verification\n\n- `{}`\n\nRustGrid agent run: `{}`\n",
+        ticket.key,
+        ticket
+            .description
+            .as_deref()
+            .unwrap_or("No description provided."),
+        quality_gate,
+        run_id
+    )
+}
+
+fn print_summary(summary: &RunSummary, gate: &str) {
+    println!("\nRun complete\n");
+    println!("  Ticket:       {}", summary.ticket_key);
+    println!("  Branch:       {}", summary.branch);
+    println!("  Commit:       {}", summary.commit);
+    println!("  Quality gate: passed ({gate})");
+    println!("  Pull request: {}", summary.pull_request_url);
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..sha.len().min(12)).unwrap_or(sha)
+}
+fn presence(value: Option<&str>) -> &'static str {
+    if value.is_some() { "set" } else { "missing" }
+}
