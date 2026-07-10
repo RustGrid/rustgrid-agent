@@ -53,7 +53,7 @@ impl AppContext {
         let codex_command = env::var("CODEX_COMMAND")
             .ok()
             .or_else(|| config.codex_command.clone())
-            .unwrap_or_else(|| "codex exec --full-auto -".into());
+            .unwrap_or_else(|| "codex exec --full-auto --json -".into());
 
         Ok(Self {
             config,

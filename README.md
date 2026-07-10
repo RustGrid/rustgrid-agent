@@ -2,7 +2,7 @@
 
 `rustgrid-agent` turns queued RustGrid tickets into ready-to-review GitHub pull requests. It claims a ticket, gives the ticket and repository instructions to Codex, runs the repository's quality gate, commits the generated changes, opens a pull request, and records every major action in RustGrid.
 
-> The Homebrew formula is named `rustgrid-cli`; the executable it installs is named `rustgrid-agent`.
+The Cargo package, executable, GitHub repository, and Homebrew formula all use the name `rustgrid-agent`.
 
 ## What it does
 
@@ -12,10 +12,10 @@ For each ticket, the agent:
 2. Fetches and claims the ticket and creates an agent run.
 3. Checks the local Git repository and creates an `agent/<ticket-key>-<slug>` branch.
 4. Builds a Codex prompt from the ticket title, description, comments, custom fields, previous quality-gate failures, and root `AGENTS.md` and `README.md` files.
-5. Runs Codex locally and streams its output to the terminal.
+5. Marks the ticket `in_progress`, runs Codex locally, and publishes each Codex agent update as one ticket comment.
 6. Runs the configured quality gate without shell evaluation.
 7. Commits only agent-created paths, pushes the branch, and opens a GitHub pull request.
-8. Attaches the pull request to the ticket and completes the RustGrid run.
+8. Attaches the pull request, marks the ticket `done`, and completes the RustGrid run. Terminal failures and explicit requests for human intervention mark the ticket `blocked`.
 
 ## Requirements
 
@@ -33,17 +33,17 @@ The agent must be run from inside the Git repository it will modify. Its configu
 
 ### Homebrew
 
-Once `rustgrid-cli` has been accepted into Homebrew/core, install it with:
+Once `rustgrid-agent` has been accepted into Homebrew/core, install it with:
 
 ```sh
-brew install rustgrid-cli
+brew install rustgrid-agent
 rustgrid-agent --version
 ```
 
 Until then, a public RustGrid tap can provide it with:
 
 ```sh
-brew install RustGrid/tap/rustgrid-cli
+brew install RustGrid/tap/rustgrid-agent
 rustgrid-agent --version
 ```
 
@@ -54,8 +54,8 @@ Use the fully qualified tap name until the formula is available from Homebrew/co
 Clone this repository and install the binary with Cargo:
 
 ```sh
-git clone https://github.com/RustGrid/agent-runner-CLI.git
-cd agent-runner-CLI
+git clone https://github.com/RustGrid/rustgrid-agent.git
+cd rustgrid-agent
 cargo install --locked --path .
 rustgrid-agent --version
 ```
@@ -73,11 +73,11 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
   "project_key": "RG",
   "repo": {
     "owner": "RustGrid",
-    "name": "agent-runner-CLI"
+    "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
   "quality_gate_command": "cargo test",
-  "codex_command": "codex exec --full-auto -"
+  "codex_command": "codex exec --full-auto --json -"
 }
 ```
 
@@ -146,14 +146,14 @@ rustgrid-agent --config path/to/agent.json status
 | `repo.name` | Yes | GitHub repository name. |
 | `default_base_branch` | No | Local branch from which agent branches are created and the base used for pull requests. Defaults to `main`. |
 | `quality_gate_command` | Yes | Command run after Codex finishes, for example `cargo test` or `npm test`. |
-| `codex_command` | No | Command that accepts the generated prompt on stdin. Defaults to `codex exec --full-auto -`. |
+| `codex_command` | No | Command that accepts the generated prompt on stdin. Defaults to `codex exec --full-auto --json -`. The runner adds `--json` automatically when the executable is `codex`. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
 `CODEX_COMMAND` overrides `codex_command`, which is useful for local experiments without changing the committed configuration:
 
 ```sh
-export CODEX_COMMAND='codex exec --full-auto -'
+export CODEX_COMMAND='codex exec --full-auto --json -'
 ```
 
 ## Credentials
@@ -167,7 +167,7 @@ export CODEX_COMMAND='codex exec --full-auto -'
 
 The RustGrid API key needs these permissions:
 
-- `tickets:read` and `comments:read`
+- `tickets:read`, `tickets:update`, `comments:read`, and `comments:create`
 - `agents:workers:register` and `agents:workers:heartbeat`
 - `agents:runs:claim` and `agents:runs:update`
 - `agents:steps:create`
@@ -223,7 +223,11 @@ Run only one watcher per working copy. Each successful ticket changes the curren
 
 ## Run lifecycle and recovery
 
-A successful run creates a branch, commit, pull request, RustGrid external link, and auditable sequence of run steps. Quality-gate output sent to RustGrid is capped at 16 KB.
+A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `done` only after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
+
+Codex is instructed to emit concise progress updates. With Codex JSONL output, each completed `agent_message` becomes exactly one comment; reasoning summaries and command execution events are ignored. Compatible custom commands may emit plain text, where each non-empty output line becomes one comment.
+
+When Codex cannot proceed without a decision, credential, permission, or external-system change, it emits `RUSTGRID_AGENT_STATUS: BLOCKED` and a specific `HUMAN_ACTION_REQUIRED`. The runner stops safely, adds a blocked comment, marks the ticket `blocked`, and fails the agent run. Other terminal automation failures use the same blocked handoff because a human must resolve the failed run before it can continue.
 
 If Codex, the quality gate, Git push, or pull-request creation fails, the agent reports the error to RustGrid when a run exists and exits without resetting or deleting the work. The generated branch and worktree remain available for inspection. Resolve the underlying problem before retrying. If the same generated branch already exists, rename or remove it only after preserving any useful work; the agent will not overwrite it.
 
@@ -250,7 +254,7 @@ Common checks:
 
 ## Publishing with Homebrew
 
-This section is for RustGrid maintainers. Homebrew distribution needs a versioned public release plus a formula. A tap can be published immediately under the RustGrid organization; the unqualified command `brew install rustgrid-cli` on a new machine requires acceptance into the central `Homebrew/homebrew-core` repository.
+This section is for RustGrid maintainers. Homebrew distribution needs a versioned public release plus a formula. A tap can be published immediately under the RustGrid organization; the unqualified command `brew install rustgrid-agent` on a new machine requires acceptance into the central `Homebrew/homebrew-core` repository.
 
 ### 1. Create a release artifact
 
@@ -266,7 +270,7 @@ The [release workflow](.github/workflows/release.yml) rejects tags that do not m
 The release URL will have this form:
 
 ```text
-https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate
+https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate
 ```
 
 ### 2. Create the formula
@@ -274,10 +278,10 @@ https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-a
 Download `rustgrid-cli.rb` from the GitHub release and add it as `Formula/rustgrid-cli.rb` in a public `RustGrid/homebrew-tap` repository. The generated formula has this shape:
 
 ```ruby
-class RustgridCli < Formula
+class RustgridAgent < Formula
   desc "Run Codex against RustGrid tickets and publish GitHub pull requests"
-  homepage "https://github.com/RustGrid/agent-runner-CLI"
-  url "https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate"
+  homepage "https://github.com/RustGrid/rustgrid-agent"
+  url "https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate"
   sha256 "REPLACE_WITH_RELEASE_ARCHIVE_SHA256"
   license "MIT"
 
@@ -298,27 +302,27 @@ The release workflow replaces both `X.Y.Z` values and the checksum. The formula 
 Validate the formula in a clean Homebrew environment:
 
 ```sh
-brew audit --strict --online RustGrid/tap/rustgrid-cli
-brew install --build-from-source RustGrid/tap/rustgrid-cli
-brew test RustGrid/tap/rustgrid-cli
+brew audit --strict --online RustGrid/tap/rustgrid-agent
+brew install --build-from-source RustGrid/tap/rustgrid-agent
+brew test RustGrid/tap/rustgrid-agent
 rustgrid-agent --version
-brew uninstall rustgrid-cli
+brew uninstall rustgrid-agent
 ```
 
 Commit and push the formula to the default branch of the public tap. Users can then run:
 
 ```sh
-brew install RustGrid/tap/rustgrid-cli
+brew install RustGrid/tap/rustgrid-agent
 ```
 
-### 3. Enable `brew install rustgrid-cli`
+### 3. Enable `brew install rustgrid-agent`
 
-For installation without a tap qualifier, submit `Formula/r/rustgrid-cli.rb` as a pull request to `Homebrew/homebrew-core`. Use the same stable release URL and checksum, follow the current [Homebrew formula requirements](https://docs.brew.sh/Acceptable-Formulae), and run the audit, install, and test checks requested by Homebrew's contribution guide. Core requires a stable, tagged, open-source project that builds on supported macOS and Linux versions; it also applies notability and third-party-use criteria. A public tap remains the supported route until the project qualifies.
+For installation without a tap qualifier, submit `Formula/r/rustgrid-agent.rb` as a pull request to `Homebrew/homebrew-core`. Use the same stable release URL and checksum, follow the current [Homebrew formula requirements](https://docs.brew.sh/Acceptable-Formulae), and run the audit, install, and test checks requested by Homebrew's contribution guide. Core requires a stable, tagged, open-source project that builds on supported macOS and Linux versions; it also applies notability and third-party-use criteria. A public tap remains the supported route until the project qualifies.
 
 Homebrew/core inclusion is reviewed by Homebrew maintainers and is not guaranteed. Until it is accepted, document the tap-qualified command. Once accepted, a new user can install with exactly:
 
 ```sh
-brew install rustgrid-cli
+brew install rustgrid-agent
 ```
 
 ### 4. Publish future versions
@@ -341,6 +345,8 @@ The RustGrid base API is `/api/v1`. The endpoint and payload mappings in `src/ap
 | Register worker | `POST /agent-workers/register` |
 | Heartbeat | `POST /agent-workers/{id}/heartbeat` |
 | Fetch ticket context | `GET /tickets/{id}`, `/tickets/{id}/comments`, `/tickets/{id}/quality-gate-results` |
+| Publish agent feedback | `POST /tickets/{id}/comments` |
+| Update ticket progress | `PATCH /tickets/{id}` with `If-Match` |
 | Claim ticket and create run | `POST /tickets/{id}/agent-runs/claim` |
 | Claim next queued ticket | `POST /agent-runs/claim-next` |
 | Update run | `PATCH /agent-runs/{id}` with `If-Match` |

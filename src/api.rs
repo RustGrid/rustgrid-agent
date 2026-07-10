@@ -42,6 +42,8 @@ pub struct Ticket {
     pub custom_fields: Value,
     #[serde(default)]
     pub previous_quality_gate_failures: Vec<QualityGateFailure>,
+    #[serde(skip)]
+    pub row_version: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,13 +123,19 @@ impl RustGridClient {
     }
 
     pub fn fetch_ticket(&self, ticket_id: &str) -> Result<Ticket> {
-        let mut ticket: Ticket = self.send_json(
+        let (ticket_value, etag) = self.send_value_with_etag(
             Method::GET,
             &format!("tickets/{ticket_id}"),
             None,
             None,
-            &[],
             None,
+        )?;
+        let mut ticket: Ticket = deserialize_envelope(ticket_value, &[])?;
+        ticket.row_version = parse_etag_row_version(
+            etag.as_deref()
+                .context("ticket response did not include an ETag")?,
+            "tickets",
+            &ticket.id,
         )?;
         let comments: Page<Comment> = self.send_json(
             Method::GET,
@@ -156,6 +164,39 @@ impl RustGridClient {
             })
             .collect();
         Ok(ticket)
+    }
+
+    pub fn create_comment(&self, ticket_id: &str, body: &str) -> Result<()> {
+        self.send_empty(
+            Method::POST,
+            &format!("tickets/{ticket_id}/comments"),
+            Some(json!({"body": truncate(body, 5000)})),
+            Some(&format!("agent-comment-{}", Uuid::new_v4())),
+        )
+    }
+
+    pub fn update_ticket_status(
+        &self,
+        ticket_id: &str,
+        row_version: i64,
+        status: &str,
+    ) -> Result<i64> {
+        let (_, etag) = self.send_value_with_etag(
+            Method::PATCH,
+            &format!("tickets/{ticket_id}"),
+            Some(json!({"status": status})),
+            Some(&format!(
+                "ticket-status-{ticket_id}-{status}-{}",
+                Uuid::new_v4()
+            )),
+            Some(&format!("\"tickets:{ticket_id}:{row_version}\"")),
+        )?;
+        parse_etag_row_version(
+            etag.as_deref()
+                .context("ticket update did not include an ETag")?,
+            "tickets",
+            ticket_id,
+        )
     }
 
     pub fn resolve_project_id(&self, context: &AppContext) -> Result<String> {
@@ -325,6 +366,18 @@ impl RustGridClient {
         idempotency: Option<&str>,
         if_match: Option<&str>,
     ) -> std::result::Result<Value, HttpFailure> {
+        self.send_value_with_etag(method, path, body, idempotency, if_match)
+            .map(|(value, _)| value)
+    }
+
+    fn send_value_with_etag(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        idempotency: Option<&str>,
+        if_match: Option<&str>,
+    ) -> std::result::Result<(Value, Option<String>), HttpFailure> {
         let mut request = self.request(method, path);
         if let Some(body) = body {
             request = request.json(&body);
@@ -344,6 +397,11 @@ impl RustGridClient {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = response
             .text()
             .map_err(|error| HttpFailure::transport(path, error))?;
@@ -356,14 +414,15 @@ impl RustGridClient {
             });
         }
         if text.trim().is_empty() {
-            return Ok(Value::Null);
+            return Ok((Value::Null, etag));
         }
-        serde_json::from_str(&text).map_err(|error| HttpFailure {
+        let value = serde_json::from_str(&text).map_err(|error| HttpFailure {
             status,
             path: path.to_owned(),
             request_id,
             body: format!("invalid JSON response: {error}"),
-        })
+        })?;
+        Ok((value, etag))
     }
 
     fn send_json<T: DeserializeOwned>(
@@ -462,4 +521,29 @@ fn url_encode(value: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+fn parse_etag_row_version(etag: &str, prefix: &str, id: &str) -> Result<i64> {
+    let value = etag.trim().trim_matches('"');
+    let expected_prefix = format!("{prefix}:{id}:");
+    let version = value
+        .strip_prefix(&expected_prefix)
+        .with_context(|| format!("unexpected ETag {etag}"))?;
+    version
+        .parse::<i64>()
+        .with_context(|| format!("invalid row version in ETag {etag}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ticket_etag_versions() {
+        assert_eq!(
+            parse_etag_row_version("\"tickets:abc:7\"", "tickets", "abc").unwrap(),
+            7
+        );
+        assert!(parse_etag_row_version("\"agent-runs:abc:7\"", "tickets", "abc").is_err());
+    }
 }

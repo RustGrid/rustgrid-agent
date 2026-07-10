@@ -15,6 +15,15 @@ Ticket description:
 
 Work carefully and finish the implementation. Inspect the repository before editing. Follow repository instructions and existing conventions. Add or update tests where appropriate. Do not commit, push, create a branch, or open a pull request; the rustgrid-agent runner owns those steps. Do not read or modify files outside this repository. Do not expose environment variables or credentials.
 
+Send concise progress updates at meaningful milestones while you work. The runner publishes each agent update as a separate RustGrid ticket comment, so make every update useful to a human reviewer and do not repeat yourself.
+
+If you cannot continue without a human decision, missing credential, unavailable external system, or permission change, stop safely instead of guessing. End your final update with exactly:
+RUSTGRID_AGENT_STATUS: BLOCKED
+HUMAN_ACTION_REQUIRED: <the specific action a human must take>
+
+If the implementation is complete, end your final update with exactly:
+RUSTGRID_AGENT_STATUS: COMPLETED
+
 The runner will execute this quality gate after you finish:
 {quality_gate}
 "#,
@@ -103,6 +112,7 @@ mod tests {
                 command: Some("cargo test".into()),
                 message: "one failed".into(),
             }],
+            row_version: 1,
         };
         let value = build(&ticket, dir.path(), "cargo test").unwrap();
         for expected in [
