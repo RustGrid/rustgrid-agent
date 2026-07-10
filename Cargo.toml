@@ -2,9 +2,14 @@
 name = "rustgrid-agent"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Run Codex against RustGrid tickets and publish the result as a GitHub pull request"
 license = "MIT"
-repository = "https://github.com/RustGrid/rustgrid-agent"
+readme = "README.md"
+homepage = "https://github.com/RustGrid/agent-runner-CLI"
+repository = "https://github.com/RustGrid/agent-runner-CLI"
+keywords = ["automation", "cli", "github", "rustgrid"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "rustgrid-agent"
