@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Package and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.85 --profile minimal --component clippy,rustfmt
+
+      - name: Use Rust toolchain
+        run: rustup default 1.85
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be a semantic version prefixed with v: ${tag}" >&2
+            exit 1
+          fi
+
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+          )"
+          if [[ "${tag}" != "v${version}" ]]; then
+            echo "Tag ${tag} does not match Cargo package version ${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run release checks
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --locked
+
+      - name: Package source archive
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          archive="target/package/rustgrid-agent-${VERSION}.crate"
+          checksum="$(sha256sum "${archive}" | awk '{print $1}')"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate Homebrew formula
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s/@VERSION@/${VERSION}/g" \
+            -e "s/@SHA256@/${CHECKSUM}/g" \
+            packaging/homebrew/rustgrid-cli.rb.in \
+            > target/package/rustgrid-cli.rb
+          if grep -Eq '@(VERSION|SHA256)@' target/package/rustgrid-cli.rb; then
+            echo "Homebrew formula still contains an unresolved placeholder" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${ARCHIVE}" \
+            "target/package/rustgrid-cli.rb#Homebrew formula" \
+            --verify-tag \
+            --generate-notes \
+            --title "rustgrid-agent ${GITHUB_REF_NAME}"

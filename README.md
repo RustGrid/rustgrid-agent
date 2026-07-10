@@ -256,15 +256,12 @@ This section is for RustGrid maintainers. Homebrew distribution needs a versione
 
 1. Choose a semantic version and update `version` in `Cargo.toml` and the root package entry in `Cargo.lock`.
 2. Run the development checks listed below.
-3. Commit the release change, create a `vX.Y.Z` tag, and publish a GitHub release from that tag.
-4. Attach an immutable source archive to the release. A Cargo package is suitable:
+3. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
 
-   ```sh
-   cargo package --locked
-   shasum -a 256 target/package/rustgrid-agent-X.Y.Z.crate
-   ```
+The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-cli.rb.in`](packaging/homebrew/rustgrid-cli.rb.in); and creates the GitHub release. The release contains both of these assets:
 
-5. Upload `target/package/rustgrid-agent-X.Y.Z.crate` to the `vX.Y.Z` GitHub release and retain the SHA-256 value for the formula.
+- `rustgrid-agent-X.Y.Z.crate`, the immutable source archive
+- `rustgrid-cli.rb`, the formula with the release URL and checksum filled in
 
 The release URL will have this form:
 
@@ -274,7 +271,7 @@ https://github.com/RustGrid/agent-runner-CLI/releases/download/vX.Y.Z/rustgrid-a
 
 ### 2. Create the formula
 
-Create `Formula/rustgrid-cli.rb` in a public `RustGrid/homebrew-tap` repository:
+Download `rustgrid-cli.rb` from the GitHub release and add it as `Formula/rustgrid-cli.rb` in a public `RustGrid/homebrew-tap` repository. The generated formula has this shape:
 
 ```ruby
 class RustgridCli < Formula
@@ -296,7 +293,7 @@ class RustgridCli < Formula
 end
 ```
 
-Replace both `X.Y.Z` values and the checksum. The formula is named `rustgrid-cli` because that is the requested Homebrew package name, while Cargo installs the existing `rustgrid-agent` executable.
+The release workflow replaces both `X.Y.Z` values and the checksum. The formula is named `rustgrid-cli` because that is the requested Homebrew package name, while Cargo installs the existing `rustgrid-agent` executable.
 
 Validate the formula in a clean Homebrew environment:
 
@@ -328,10 +325,10 @@ brew install rustgrid-cli
 
 For every release:
 
-1. Publish a new immutable artifact and checksum.
-2. Update the formula's `url` and `sha256`.
+1. Update the Cargo version and push its matching version tag.
+2. Download the generated formula from the new GitHub release.
 3. Run `brew audit`, install from source, and `brew test`.
-4. Submit the update to the tap or Homebrew/core, depending on where the formula lives.
+4. Submit the formula update to the tap or Homebrew/core, depending on where the formula lives.
 
 Do not replace an asset for an existing version: its checksum would change and break reproducible installs.
 
