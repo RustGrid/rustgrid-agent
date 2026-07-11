@@ -2,6 +2,8 @@ pub mod api;
 pub mod command;
 pub mod config;
 pub mod coordinator;
+mod execution;
+mod finalization;
 pub mod git;
 pub mod github;
 pub mod health;

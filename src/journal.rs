@@ -214,4 +214,16 @@ mod tests {
             RecoveryPlan::ResumeFromPullRequest { .. }
         ));
     }
+
+    #[test]
+    fn restores_the_persisted_run_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        journal.checkpoint(RunPhase::Publishing, 7).unwrap();
+
+        let restored = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        assert_eq!(restored.phase, RunPhase::Publishing);
+        assert_eq!(restored.last_sequence, 7);
+    }
 }

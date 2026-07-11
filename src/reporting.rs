@@ -71,13 +71,14 @@ impl<'a> Reporter<'a> {
     ) -> Self {
         let progress_sequence = journal.progress_sequence;
         let sequence = journal.last_sequence;
+        let phase = journal.phase;
         Self {
             api,
             run_id,
             row_version,
             ticket_id,
             ticket_row_version: Cell::new(ticket_row_version),
-            phase: Cell::new(RunPhase::Claimed),
+            phase: Cell::new(phase),
             sequence: Cell::new(sequence),
             journal: RefCell::new(journal),
             progress_sequence: Cell::new(progress_sequence),
