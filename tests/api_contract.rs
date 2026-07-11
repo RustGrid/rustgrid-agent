@@ -31,6 +31,8 @@ fn context(base_url: String) -> AppContext {
             command_timeout_seconds: 1800,
             run_timeout_seconds: 7200,
             failed_workspace_retention_hours: 72,
+            max_command_output_bytes: 8 * 1024 * 1024,
+            max_workspace_bytes: 5 * 1024 * 1024 * 1024,
         },
         config_path: PathBuf::from("test.json"),
         api_url: base_url,

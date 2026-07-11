@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::api::{RustGridClient, is_lease_lost};
+use crate::{
+    api::{RustGridClient, is_lease_lost},
+    shutdown,
+};
 
 pub struct RunSupervisor {
     stop: Arc<AtomicBool>,
@@ -52,6 +55,10 @@ impl RunSupervisor {
                     .max(heartbeat_interval.as_secs()),
             );
             while !thread_stop.load(Ordering::SeqCst) {
+                if shutdown::requested() {
+                    execution_running.store(false, Ordering::SeqCst);
+                    break;
+                }
                 if run_started.elapsed() >= run_timeout {
                     thread_timed_out.store(true, Ordering::SeqCst);
                     execution_running.store(false, Ordering::SeqCst);

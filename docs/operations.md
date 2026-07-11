@@ -17,6 +17,8 @@ RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and
 interrupted workspaces are retained until `failed_workspace_retention_hours`.
+Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
+container disk quota for enforcement while commands are actively writing.
 
 ## Health and alerts
 
@@ -28,6 +30,7 @@ Alert when any of these conditions occur:
 - progress event publishing repeatedly requires reconciliation;
 - retained workspace disk usage exceeds 80%;
 - token issuance returns 403, 409, or 502;
+- GitHub rate limits repeatedly exhaust all bounded retries;
 - the process restarts more than three times in ten minutes.
 
 ## Recovery
@@ -40,6 +43,10 @@ the journal manually while the worker is running.
 Lease loss is fail-closed: local execution is cancelled and no terminal ticket
 or run update is attempted. The control plane decides whether to requeue or
 reassign the run.
+
+SIGINT and SIGTERM request a drain, stop new claims, and terminate the complete
+Unix child process group. Captured output is bounded by
+`max_command_output_bytes`; the recovery journal retains the terminal diagnostic.
 
 ## Upgrade and rollback
 

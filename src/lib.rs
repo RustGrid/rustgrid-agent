@@ -8,6 +8,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod prompt;
 pub mod runner;
+pub mod shutdown;
 pub mod supervisor;
 pub mod token;
 pub mod workspace;

@@ -22,6 +22,8 @@ pub struct RunJournal {
     pub pull_request_number: Option<u64>,
     #[serde(default)]
     pub progress_sequence: u64,
+    #[serde(default)]
+    pub last_error: Option<String>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -51,6 +53,7 @@ impl RunJournal {
             pull_request_url: None,
             pull_request_number: None,
             progress_sequence: 0,
+            last_error: None,
             path,
         };
         journal.persist()?;
@@ -81,6 +84,11 @@ impl RunJournal {
 
     pub fn record_progress_sequence(&mut self, sequence: u64) -> Result<()> {
         self.progress_sequence = sequence;
+        self.persist()
+    }
+
+    pub fn record_error(&mut self, error: &str) -> Result<()> {
+        self.last_error = Some(error.to_owned());
         self.persist()
     }
 

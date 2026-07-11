@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use reqwest::{
+    StatusCode,
+    blocking::{Client, RequestBuilder, Response},
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -53,15 +56,15 @@ impl GitHubClient {
             "https://api.github.com/repos/{}/{}/pulls",
             repo.owner, repo.name
         );
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .json(&json!({"title": title, "body": body, "head": head, "base": base}))
-            .send()
-            .context("GitHub pull request request failed")?;
+        let payload = json!({"title": title, "body": body, "head": head, "base": base});
+        let response = self.send_with_retry("create pull request", || {
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+        })?;
         let status = response.status();
         let text = response.text().context("could not read GitHub response")?;
         if !status.is_success() {
@@ -85,14 +88,13 @@ impl GitHubClient {
             repo.name,
             url_encode(&head)
         );
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .context("GitHub pull request lookup failed")?;
+        let response = self.send_with_retry("look up pull request", || {
+            self.http
+                .get(&url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        })?;
         let status = response.status();
         let text = response.text().context("could not read GitHub response")?;
         if !status.is_success() {
@@ -113,14 +115,13 @@ impl GitHubClient {
             repo.name,
             url_encode(reference)
         );
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .context("GitHub check-runs request failed")?;
+        let response = self.send_with_retry("list check runs", || {
+            self.http
+                .get(&url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        })?;
         let status = response.status();
         let text = response
             .text()
@@ -135,6 +136,64 @@ impl GitHubClient {
             serde_json::from_str(&text).context("GitHub returned invalid check-run results")?;
         Ok(response.check_runs)
     }
+
+    fn send_with_retry<F>(&self, operation: &str, mut build: F) -> Result<Response>
+    where
+        F: FnMut() -> RequestBuilder,
+    {
+        for attempt in 0..3u32 {
+            let response = match build().send() {
+                Ok(response) => response,
+                Err(error) if attempt < 2 => {
+                    eprintln!(
+                        "[warning] retrying GitHub {operation} after transport error: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(300 * (1u64 << attempt)));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("GitHub {operation} failed"));
+                }
+            };
+            let status = response.status();
+            if attempt < 2 && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            {
+                let delay = github_retry_delay(&response, attempt);
+                eprintln!(
+                    "[warning] GitHub {operation} returned {status}; retrying in {}s",
+                    delay.as_secs()
+                );
+                std::thread::sleep(delay);
+                continue;
+            }
+            return Ok(response);
+        }
+        unreachable!("GitHub retry loop always returns")
+    }
+}
+
+fn github_retry_delay(response: &Response, attempt: u32) -> Duration {
+    if let Some(seconds) = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.min(60));
+    }
+    if let Some(reset) = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        return Duration::from_secs(reset.saturating_sub(now).clamp(1, 60));
+    }
+    Duration::from_millis(300 * (1u64 << attempt))
 }
 
 fn url_encode(value: &str) -> String {

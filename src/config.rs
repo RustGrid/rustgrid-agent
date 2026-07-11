@@ -31,6 +31,10 @@ pub struct Config {
     pub run_timeout_seconds: u64,
     #[serde(default = "default_failed_workspace_retention_hours")]
     pub failed_workspace_retention_hours: u64,
+    #[serde(default = "default_max_command_output_bytes")]
+    pub max_command_output_bytes: u64,
+    #[serde(default = "default_max_workspace_bytes")]
+    pub max_workspace_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -72,6 +76,14 @@ fn default_run_timeout_seconds() -> u64 {
 
 fn default_failed_workspace_retention_hours() -> u64 {
     72
+}
+
+fn default_max_command_output_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_max_workspace_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
 }
 
 impl AppContext {
@@ -157,6 +169,12 @@ impl Config {
         if self.failed_workspace_retention_hours > 24 * 30 {
             bail!("failed_workspace_retention_hours cannot exceed 720");
         }
+        if self.max_command_output_bytes < 64 * 1024 {
+            bail!("max_command_output_bytes must be at least 65536");
+        }
+        if self.max_workspace_bytes < 64 * 1024 * 1024 {
+            bail!("max_workspace_bytes must be at least 67108864");
+        }
         Ok(())
     }
 }
@@ -187,6 +205,8 @@ mod tests {
             command_timeout_seconds: 1800,
             run_timeout_seconds: 7200,
             failed_workspace_retention_hours: 72,
+            max_command_output_bytes: 8 * 1024 * 1024,
+            max_workspace_bytes: 5 * 1024 * 1024 * 1024,
         };
         assert!(
             config

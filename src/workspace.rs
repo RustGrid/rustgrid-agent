@@ -89,6 +89,14 @@ impl RunWorkspace {
             .with_context(|| format!("could not remove workspace {}", self.root.display()))
     }
 
+    pub fn enforce_size_limit(&self, max_bytes: u64) -> Result<u64> {
+        let size = directory_size(&self.root)?;
+        if size > max_bytes {
+            bail!("run workspace uses {size} bytes, exceeding limit {max_bytes}");
+        }
+        Ok(size)
+    }
+
     pub fn sweep_stale(workspace_root: &Path, retention: Duration) -> Result<usize> {
         if !workspace_root.exists() {
             return Ok(0);
@@ -114,6 +122,20 @@ impl RunWorkspace {
         }
         Ok(removed)
     }
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -182,5 +204,6 @@ mod tests {
         assert!(first.repo.root.join("README.md").is_file());
         let second = RunWorkspace::prepare(&root, "run-1", &manifest, "token").unwrap();
         assert!(second.resumed());
+        assert!(second.enforce_size_limit(1).is_err());
     }
 }

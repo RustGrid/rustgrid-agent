@@ -41,6 +41,7 @@ enum Commands {
 }
 
 fn run() -> Result<()> {
+    rustgrid_agent::shutdown::install()?;
     let cli = Cli::parse();
     let context = AppContext::load(&cli.config)?;
 

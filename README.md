@@ -161,6 +161,8 @@ rustgrid-agent --config path/to/agent.json status
 | `command_timeout_seconds` | No | Maximum duration of Codex, a quality gate, or required-workflow wait. Defaults to 1800. |
 | `run_timeout_seconds` | No | Maximum total active-run duration. Defaults to 7200 and cannot be shorter than the command timeout. |
 | `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces before startup cleanup. Defaults to 72. |
+| `max_command_output_bytes` | No | Combined in-memory output budget for captured commands. Defaults to 8 MiB. |
+| `max_workspace_bytes` | No | Maximum allowed run-workspace size. Defaults to 5 GiB. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
@@ -257,8 +259,8 @@ Ctrl-C also reaches an active Codex process through the cancellation token. The
 child is terminated, the run becomes `cancelled`, and the ticket returns to
 `todo` so another attempt can claim it safely.
 
-Process managers should restart `serve` after an unexpected exit and send it
-SIGINT for graceful shutdown.
+Process managers should restart `serve` after an unexpected exit. SIGINT and
+SIGTERM both stop new claims and cancel active child process groups safely.
 
 ## Run lifecycle and recovery
 

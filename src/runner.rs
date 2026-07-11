@@ -22,7 +22,7 @@ use crate::{
     journal::RunJournal,
     lifecycle::{LifecycleEvent, RunPhase},
     manifest::ExecutionManifest,
-    prompt,
+    prompt, shutdown,
     supervisor::{RunSupervisor, RunSupervisorConfig},
     token::GitHubTokenManager,
     workspace::RunWorkspace,
@@ -211,6 +211,9 @@ impl Reporter<'_> {
 
     fn fail(&self, error: &anyhow::Error) -> Result<()> {
         let message = format!("{error:#}");
+        if let Err(journal_error) = self.journal.borrow_mut().record_error(&message) {
+            eprintln!("[warning] could not retain failure diagnostic: {journal_error:#}");
+        }
         if self.phase.get() != RunPhase::TimedOut {
             self.set_phase(RunPhase::Blocked);
         }
@@ -239,6 +242,9 @@ impl Reporter<'_> {
     }
 
     fn cancel(&self) -> Result<()> {
+        self.journal
+            .borrow_mut()
+            .record_error("cancelled by operator")?;
         self.set_phase(RunPhase::Cancelled);
         let step_result = self.step(
             "run_cancelled",
@@ -374,8 +380,10 @@ fn execute_claimed(
         let clone_token = tokens.token()?;
         let prepared =
             RunWorkspace::prepare(&context.workspace_root, &run.id, &manifest, &clone_token)?;
+        let workspace_bytes = prepared.enforce_size_limit(context.config.max_workspace_bytes)?;
+        let workspace_resumed = prepared.resumed();
         let repo = prepared.repo.clone();
-        let baseline = if prepared.resumed() {
+        let baseline = if workspace_resumed {
             BTreeSet::new()
         } else {
             repo.ensure_safe(false)?
@@ -403,6 +411,12 @@ fn execute_claimed(
             &format!("Created and claimed agent run {}", run.id),
             None,
         )?;
+        reporter.step(
+            "workspace_prepared",
+            "completed",
+            "Prepared isolated repository workspace",
+            Some(json!({"bytes": workspace_bytes, "resumed": workspace_resumed})),
+        )?;
         execute(
             context,
             api,
@@ -416,12 +430,22 @@ fn execute_claimed(
             &manifest,
         )
     })();
+    let result = result.and_then(|summary| {
+        if let Some(workspace) = workspace.borrow().as_ref() {
+            workspace.enforce_size_limit(context.config.max_workspace_bytes)?;
+        }
+        Ok(summary)
+    });
 
     let supervisor_healthy = supervisor.is_healthy();
     let lease_lost = supervisor.lease_lost();
     let timed_out = supervisor.timed_out();
     drop(supervisor);
     if lease_lost {
+        let _ = reporter
+            .journal
+            .borrow_mut()
+            .record_error("run lease ownership was lost");
         bail!(
             "run lease ownership was lost; stopped local execution without publishing terminal state"
         );
@@ -735,6 +759,7 @@ fn implement_and_commit(
         Some(generated_prompt),
         running,
         Duration::from_secs(context.config.command_timeout_seconds),
+        context.config.max_command_output_bytes as usize,
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -768,6 +793,7 @@ fn implement_and_commit(
         &repo.root,
         running,
         Duration::from_secs(context.config.command_timeout_seconds),
+        context.config.max_command_output_bytes as usize,
     )?;
     print_output(&gate.stdout, &gate.stderr);
     let gate_output = combine_output(&gate.stdout, &gate.stderr);
@@ -825,10 +851,13 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     println!("[ watching] Worker {} is polling RustGrid", worker.id);
     let running = Arc::new(AtomicBool::new(true));
     let signal = Arc::clone(&running);
-    ctrlc::set_handler(move || signal.store(false, Ordering::SeqCst))
-        .context("could not install Ctrl-C handler")?;
+    ctrlc::set_handler(move || {
+        shutdown::request();
+        signal.store(false, Ordering::SeqCst);
+    })
+    .context("could not install Ctrl-C handler")?;
 
-    while running.load(Ordering::SeqCst) {
+    while running.load(Ordering::SeqCst) && !shutdown::requested() {
         api.heartbeat(&worker.id)?;
         match api.claim_next(&worker.id, &project_id)? {
             Some(run) => {
@@ -920,8 +949,9 @@ fn run_captured(
     cwd: &Path,
     running: &AtomicBool,
     timeout: Duration,
+    max_output_bytes: usize,
 ) -> Result<command::CommandOutput> {
-    command::capture_cancellable(command_text, cwd, running, timeout)
+    command::capture_cancellable(command_text, cwd, running, timeout, max_output_bytes)
 }
 
 fn combine_output(stdout: &str, stderr: &str) -> String {

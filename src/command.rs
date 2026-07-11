@@ -14,6 +14,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+use crate::shutdown;
+
 #[derive(Debug)]
 pub struct CommandOutput {
     pub status: ExitStatus,
@@ -51,6 +53,7 @@ pub fn capture_cancellable(
     cwd: &Path,
     running: &AtomicBool,
     timeout: Duration,
+    max_output_bytes: usize,
 ) -> Result<CommandOutput> {
     let parts = parse(command)?;
     println!("  $ {}", display_command(&parts));
@@ -73,17 +76,12 @@ pub fn capture_cancellable(
         .stderr
         .take()
         .context("failed to capture command stderr")?;
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    let stream_limit = max_output_bytes / 2;
+    let stdout_reader = thread::spawn(move || read_bounded(&mut stdout, stream_limit));
+    let stderr_reader = thread::spawn(move || read_bounded(&mut stderr, stream_limit));
     let started = std::time::Instant::now();
     let status = loop {
-        if !running.load(Ordering::SeqCst) {
+        if !running.load(Ordering::SeqCst) || shutdown::requested() {
             terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
@@ -205,6 +203,7 @@ where
         stdin_text,
         &running,
         Duration::from_secs(24 * 60 * 60),
+        8 * 1024 * 1024,
         on_line,
     )
 }
@@ -215,6 +214,7 @@ pub fn streaming_lines_cancellable<F>(
     stdin_text: Option<&str>,
     running: &AtomicBool,
     timeout: Duration,
+    max_output_bytes: usize,
     mut on_line: F,
 ) -> Result<ExitStatus>
 where
@@ -259,8 +259,9 @@ where
         }
     });
     let started = std::time::Instant::now();
+    let mut output_bytes = 0usize;
     loop {
-        if !running.load(Ordering::SeqCst) {
+        if !running.load(Ordering::SeqCst) || shutdown::requested() {
             terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = reader.join();
@@ -275,6 +276,13 @@ where
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
                 let line = line.context("failed to read command stdout")?;
+                output_bytes = output_bytes.saturating_add(line.len());
+                if output_bytes > max_output_bytes {
+                    terminate_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    bail!("command output exceeded {max_output_bytes} bytes");
+                }
                 if let Err(error) = on_line(&line) {
                     terminate_process_tree(&mut child);
                     let _ = child.wait();
@@ -321,6 +329,27 @@ fn sanitize_child_environment(command: &mut Command) {
     for name in ["RUSTGRID_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
         command.env_remove(name);
     }
+}
+
+fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        truncated |= read > remaining;
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[output truncated by rustgrid-agent]\n");
+    }
+    Ok(output)
 }
 
 #[cfg(not(unix))]
@@ -394,8 +423,17 @@ mod tests {
             Path::new("."),
             &running,
             Duration::from_secs(30),
+            1024 * 1024,
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn bounded_reader_drains_and_marks_truncation() {
+        let mut input = std::io::Cursor::new(vec![b'x'; 1024]);
+        let output = read_bounded(&mut input, 32).unwrap();
+        assert!(output.starts_with(&[b'x'; 32]));
+        assert!(String::from_utf8_lossy(&output).contains("output truncated"));
     }
 }
