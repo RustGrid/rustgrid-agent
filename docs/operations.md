@@ -6,6 +6,12 @@ Run one `serve` process per worker identity. The worker needs only its bound
 `RUSTGRID_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
 unprivileged OS account and a writable workspace root.
 
+Set `max_concurrency` to 1. The current in-process executor cannot establish a
+separate filesystem and process boundary for concurrent runs, so `serve` fails
+closed when a higher value is configured. Higher production concurrency requires
+an external executor that launches every run in its own container or equivalent
+runtime boundary; separate workspace directories alone are not isolation.
+
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:
 

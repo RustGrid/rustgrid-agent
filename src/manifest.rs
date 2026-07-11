@@ -156,11 +156,16 @@ impl ExecutionPolicy {
             .iter()
             .any(|value| value.trim().is_empty())
             || self.codex.command.iter().any(|value| {
+                let lower = value.to_ascii_lowercase();
                 matches!(
-                    value.as_str(),
-                    "--dangerously-bypass-approvals-and-sandbox"
+                    lower.as_str(),
+                    "--sandbox"
+                        | "-s"
+                        | "--dangerously-bypass-approvals-and-sandbox"
                         | "--dangerously-bypass-hook-trust"
-                )
+                ) || lower.starts_with("--sandbox=")
+                    || lower.contains("approval_policy")
+                    || lower.contains("sandbox_mode")
             })
             || self.quality_gates.iter().any(|gate| {
                 gate.id.trim().is_empty()
@@ -181,7 +186,7 @@ impl ExecutionPolicy {
         if self.sandbox.mode != "workspace_write"
             || !self.sandbox.network_access
             || self.sandbox.approval_policy != "never"
-            || !self.sandbox.writable_roots.iter().any(|root| root == ".")
+            || self.sandbox.writable_roots != ["."]
         {
             bail!("execution sandbox policy is not enforceable by this worker");
         }
@@ -194,28 +199,18 @@ impl ExecutionPolicy {
             .iter()
             .position(|part| part == "-")
             .unwrap_or(command.len());
-        if !command
-            .iter()
-            .any(|part| part == "--sandbox" || part == "-s")
-        {
-            command.splice(
-                insertion..insertion,
-                ["--sandbox".into(), "workspace-write".into()],
-            );
-        }
+        command.splice(
+            insertion..insertion,
+            ["--sandbox".into(), "workspace-write".into()],
+        );
         let insertion = command
             .iter()
             .position(|part| part == "-")
             .unwrap_or(command.len());
-        if !command
-            .iter()
-            .any(|part| part.starts_with("approval_policy="))
-        {
-            command.splice(
-                insertion..insertion,
-                ["-c".into(), "approval_policy=\"never\"".into()],
-            );
-        }
+        command.splice(
+            insertion..insertion,
+            ["-c".into(), "approval_policy=\"never\"".into()],
+        );
         let insertion = command
             .iter()
             .position(|part| part == "-")
@@ -306,6 +301,31 @@ mod tests {
     fn rejects_unbounded_execution_policy() {
         let mut value = manifest().execution_policy;
         value["timeout_seconds"] = serde_json::json!(86_401);
+        let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_caller_supplied_sandbox_and_approval_overrides() {
+        for command in [
+            vec!["codex", "exec", "--sandbox", "danger-full-access"],
+            vec!["codex", "exec", "--sandbox=read-only"],
+            vec!["codex", "exec", "-s", "workspace-write"],
+            vec!["codex", "exec", "-c", "approval_policy=on-request"],
+            vec!["codex", "exec", "-capproval_policy=never"],
+            vec!["codex", "exec", "-c", "sandbox_mode=workspace-write"],
+        ] {
+            let mut value = manifest().execution_policy;
+            value["codex"]["command"] = serde_json::json!(command);
+            let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
+            assert!(policy.validate().is_err(), "accepted command: {command:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_additional_writable_roots() {
+        let mut value = manifest().execution_policy;
+        value["sandbox"]["writable_roots"] = serde_json::json!([".", "/tmp"]);
         let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
         assert!(policy.validate().is_err());
     }

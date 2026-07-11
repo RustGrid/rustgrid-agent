@@ -1127,6 +1127,11 @@ pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
             "serve requires RUSTGRID_AGENT_ISOLATION=per_run after the deployment runtime gives each run an isolated filesystem and resource boundary"
         );
     }
+    if context.config.max_concurrency != 1 {
+        bail!(
+            "serve requires max_concurrency=1 until each run is launched in a separately enforced container or equivalent runtime boundary"
+        );
+    }
     watch(context, interval, false)
 }
 
@@ -1159,6 +1164,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
     let per_run_isolation = std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() == Ok("per_run");
+    let production_safe_concurrency = context.config.max_concurrency == 1;
     let remote_check = if api_key_present {
         RustGridClient::new(context).and_then(|api| api.resolve_project_id(context).map(|_| ()))
     } else {
@@ -1169,7 +1175,8 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .as_ref()
         .err()
         .map(|error| format!("{error:#}"));
-    let healthy = api_key_present && per_run_isolation && rustgrid_reachable;
+    let healthy =
+        api_key_present && per_run_isolation && production_safe_concurrency && rustgrid_reachable;
     if json_output {
         println!(
             "{}",
@@ -1185,6 +1192,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "lease_seconds": context.config.lease_seconds,
                 "api_key_present": api_key_present,
                 "per_run_isolation": per_run_isolation,
+                "production_safe_concurrency": production_safe_concurrency,
                 "rustgrid_reachable": rustgrid_reachable,
                 "remote_error": remote_error,
                 "github_credentials": "brokered_per_run"
@@ -1238,6 +1246,14 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         }
     );
     println!(
+        "  Concurrency:  {}",
+        if production_safe_concurrency {
+            "one run per worker process"
+        } else {
+            "unsafe for serve; max_concurrency must be 1"
+        }
+    );
+    println!(
         "  Working tree: {}",
         if local_repo.is_none() {
             "not applicable (isolated workspace mode)".into()
@@ -1252,6 +1268,9 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     }
     if !per_run_isolation {
         bail!("status checks failed: per-run deployment isolation is not declared");
+    }
+    if !production_safe_concurrency {
+        bail!("status checks failed: max_concurrency must be 1 for production");
     }
     remote_check.context("status checks failed: RustGrid connectivity")?;
     Ok(())

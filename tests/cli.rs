@@ -27,7 +27,7 @@ fn status_can_emit_machine_readable_health() {
     let config = directory.path().join("agent.json");
     fs::write(
         &config,
-        r#"{"project_key":"RG","project_id":null,"max_concurrency":2}"#,
+        r#"{"project_key":"RG","project_id":null,"max_concurrency":1}"#,
     )
     .expect("configuration should be written");
     let listener = match TcpListener::bind("127.0.0.1:0") {
@@ -66,7 +66,8 @@ fn status_can_emit_machine_readable_health() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("status should emit JSON");
     assert_eq!(value["healthy"], true);
-    assert_eq!(value["max_concurrency"], 2);
+    assert_eq!(value["max_concurrency"], 1);
+    assert_eq!(value["production_safe_concurrency"], true);
     assert_eq!(value["rustgrid_reachable"], true);
 }
 
@@ -88,4 +89,24 @@ fn serve_fails_closed_without_per_run_isolation() {
         .expect("rustgrid-agent serve should run");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("RUSTGRID_AGENT_ISOLATION=per_run"));
+}
+
+#[test]
+fn serve_fails_closed_with_shared_process_concurrency() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let config = directory.path().join("agent.json");
+    std::fs::write(
+        &config,
+        r#"{"project_key":"RG","project_id":null,"max_concurrency":2}"#,
+    )
+    .expect("configuration should be written");
+    let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .current_dir(directory.path())
+        .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_AGENT_ISOLATION", "per_run")
+        .args(["--config", config.to_str().unwrap(), "serve"])
+        .output()
+        .expect("rustgrid-agent serve should run");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("max_concurrency=1"));
 }

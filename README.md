@@ -78,7 +78,7 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
     "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
-  "max_concurrency": 2
+  "max_concurrency": 1
 }
 ```
 
@@ -115,8 +115,9 @@ rustgrid-agent register
 `status` validates the configuration and command strings, locates the repository, reports whether the credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` registers the machine as a RustGrid worker and sends an initial heartbeat.
 
 Use `rustgrid-agent status --json` for machine-readable readiness data. It exits
-non-zero unless credentials exist, per-run isolation is declared, and RustGrid
-authentication plus project resolution succeeds.
+non-zero unless credentials exist, per-run isolation is declared,
+`max_concurrency` is 1, and RustGrid authentication plus project resolution
+succeeds.
 Interactive lifecycle output uses color when attached to a terminal; set the
 standard `NO_COLOR` environment variable to disable it. Set
 `RUSTGRID_AGENT_LOG=json` for newline-delimited structured lifecycle events.
@@ -162,7 +163,7 @@ rustgrid-agent --config path/to/agent.json status
 | `quality_gate_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
-| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. |
+| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100 for non-production experimentation. `serve` currently requires exactly 1 because this binary does not create a separate runtime boundary for concurrent runs. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
 | `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |

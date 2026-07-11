@@ -6,7 +6,7 @@
   },
   "default_base_branch": "main",
   "heartbeat_interval_seconds": 15,
-  "max_concurrency": 2,
+  "max_concurrency": 1,
   "lease_seconds": 900,
   "workspace_root": null,
   "command_timeout_seconds": 1800,

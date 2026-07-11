@@ -20,7 +20,9 @@ resource, and network isolation.
 - **Credential theft:** secrets are removed from child environments; GitHub
   tokens are scoped, cached only in memory, and validated against the manifest.
 - **Cross-run access:** production startup fails without an explicit per-run
-  isolation declaration; operators must back it with containers or equivalent.
+  isolation declaration and currently requires one active run per worker process.
+  Operators must still back the process with a container or equivalent boundary;
+  safe concurrency requires a future executor that creates one such boundary per run.
 - **Command escape:** commands are argument-parsed without a shell, Codex uses a
   workspace sandbox, Git hooks are disabled, and quality gates receive only the
   allowlisted environment.
