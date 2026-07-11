@@ -144,7 +144,7 @@ fn default_sbx_command() -> String {
     "sbx".into()
 }
 fn default_sandbox_template() -> String {
-    "docker/sandbox-templates:codex".into()
+    "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97".into()
 }
 fn default_sandbox_cpus() -> u16 {
     4

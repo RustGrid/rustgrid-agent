@@ -381,11 +381,17 @@ impl Executor {
                     "-w".into(),
                     cwd.display().to_string(),
                 ];
+                wrapped.push(name.clone());
                 let env_file = TemporaryEnvFile::create(cwd, allowlist)?;
                 if let Some(file) = &env_file {
-                    wrapped.extend(["--env-file".into(), file.path.display().to_string()]);
+                    wrapped.extend([
+                        "sh".into(),
+                        "-c".into(),
+                        "set -a; . \"$1\"; set +a; shift; exec \"$@\"".into(),
+                        "rustgrid-env".into(),
+                        file.path.display().to_string(),
+                    ]);
                 }
-                wrapped.push(name.clone());
                 wrapped.extend_from_slice(args);
                 Ok(PreparedCommand {
                     args: wrapped,
@@ -416,10 +422,13 @@ impl TemporaryEnvFile {
         if values.is_empty() {
             return Ok(None);
         }
-        let parent = cwd
-            .parent()
-            .context("run workspace has no private parent directory")?;
-        let path = parent.join(format!(".sandbox-env-{}", uuid::Uuid::new_v4()));
+        let git_directory = cwd.join(".git");
+        if !git_directory.is_dir() {
+            bail!(
+                "run workspace has no Git metadata directory for protected sandbox environment transport"
+            );
+        }
+        let path = git_directory.join(format!("rustgrid-sandbox-env-{}", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
@@ -434,11 +443,22 @@ impl TemporaryEnvFile {
             if value.contains('\n') || value.contains('\r') {
                 bail!("environment variable {key} contains a newline");
             }
-            writeln!(file, "{key}={value}")?;
+            if !key.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || character.is_ascii_alphanumeric()
+                        && (index > 0 || !character.is_ascii_digit())
+            }) {
+                bail!("environment variable name {key} is not shell-safe");
+            }
+            writeln!(file, "{key}={}", shell_single_quote(&value))?;
         }
         file.sync_all()?;
         Ok(Some(Self { path }))
     }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 impl Drop for TemporaryEnvFile {
@@ -604,6 +624,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("repo");
         fs::create_dir(&workspace).unwrap();
+        fs::create_dir(workspace.join(".git")).unwrap();
         let command = executor
             .wrap(
                 &ExecutionHandle::DockerSandbox {
@@ -635,7 +656,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("repo");
         fs::create_dir(&workspace).unwrap();
-        let key = format!("RUSTGRID_TEST_SECRET_{}", uuid::Uuid::new_v4());
+        fs::create_dir(workspace.join(".git")).unwrap();
+        let key = format!("RUSTGRID_TEST_SECRET_{}", uuid::Uuid::new_v4().simple());
         // SAFETY: the unique name is not read by other tests or production code.
         unsafe { std::env::set_var(&key, "top-secret") };
         let temporary = TemporaryEnvFile::create(&workspace, std::slice::from_ref(&key))
@@ -644,7 +666,7 @@ mod tests {
         let path = temporary.path.clone();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            format!("{key}=top-secret\n")
+            format!("{key}='top-secret'\n")
         );
         #[cfg(unix)]
         {
@@ -658,5 +680,10 @@ mod tests {
         assert!(!path.exists());
         // SAFETY: this removes the same test-unique environment name.
         unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn shell_quotes_environment_values_without_interpolation() {
+        assert_eq!(shell_single_quote("a'b;$HOME"), "'a'\"'\"'b;$HOME'");
     }
 }

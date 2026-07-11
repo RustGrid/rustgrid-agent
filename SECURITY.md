@@ -36,6 +36,7 @@ Do not use the local executor for untrusted repositories.
 
 Production configuration must pin the sandbox template by SHA-256 digest and
 fit aggregate run allocations within declared host capacity. Allowlisted child
-environment values are written only to a mode-0600 temporary file outside the
-mounted repository, passed with `sbx exec --env-file`, and removed immediately.
+environment values are shell-quoted into a mode-0600 temporary file under the
+run clone's `.git` directory, exported by a fixed launcher, and removed
+immediately. Values never appear in host process arguments or committable paths.
 Review the effective Docker Sandbox network policy before enabling a worker.

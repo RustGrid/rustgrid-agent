@@ -36,7 +36,7 @@ satisfy this gate.
 8. Kill the coordinator after sandbox creation, restart it, and verify orphan
    reconciliation removes every sandbox not assigned to an active run.
 9. Inspect host process arguments and logs during an allowlisted-secret test;
-   neither may contain the value, and no `.sandbox-env-*` file may remain.
+   neither may contain the value, and no `.git/rustgrid-sandbox-env-*` file may remain.
 10. Fill all configured concurrency slots and verify aggregate CPU/memory
     admission, workspace-quota termination, and isolation between runs.
 

@@ -35,5 +35,5 @@ Lease loss stops and destroys the affected sandbox and suppresses stale terminal
 At startup the coordinator compares `sbx ls --json` with control-plane active
 runs and removes managed orphans. Sandbox names are hashes of run IDs, avoiding
 collisions and disclosure. Allowlisted environment values are transported in a
-private temporary env file outside the mounted repository and deleted after the
-CLI finishes reading it.
+private temporary env file under non-committable `.git` metadata and deleted
+after the sandboxed command exits.

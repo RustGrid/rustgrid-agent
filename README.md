@@ -97,7 +97,7 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
   "executor": {
     "kind": "docker_sandbox",
     "command": "sbx",
-    "template": "docker/sandbox-templates@sha256:<verified-digest>",
+    "template": "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97",
     "cpus": 4,
     "memory": "8g",
     "capacity_cpus": 16,
@@ -232,8 +232,10 @@ disposable repository clone is mounted into the sandbox. Codex and all quality
 gates run inside it; RustGrid API calls, GitHub token acquisition, commits,
 pushes, and pull-request publication remain in the trusted coordinator. The
 sandbox receives only environment variables explicitly allowed by the signed
-execution policy. Values cross the CLI through a private, short-lived env file,
-never command arguments, and the file is deleted when execution ends.
+execution policy. Values cross the boundary through a private, shell-quoted,
+short-lived file under `.git`, never command arguments; a controlled launcher
+exports them before replacing itself with the requested command, and the file is
+deleted when execution ends.
 
 Sandbox names are deterministic, collision-resistant hashes and are journaled.
 Startup lists managed sandboxes and removes any not assigned to an active run;
@@ -253,8 +255,8 @@ requires `sbx` 0.34.0 or newer. Initialize a non-interactive host with at least
 the balanced policy and review its effective rules before admitting work. The
 worker continuously measures the mounted workspace during Codex and gate
 execution and stops the sandbox when `max_workspace_bytes` is exceeded.
-Replace the all-zero digest in the example configuration with the digest of the
-template you reviewed; it is intentionally not a deployable image reference.
+Review and intentionally update the pinned template digest during upgrades; do
+not replace it with a mutable tag.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 
