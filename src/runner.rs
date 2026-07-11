@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
+    io::IsTerminal,
     path::Path,
     sync::{
         Arc,
@@ -9,6 +10,30 @@ use std::{
     thread,
     time::Duration,
 };
+
+fn console_event(label: &str, message: &str, color: &str) {
+    if std::env::var("RUSTGRID_AGENT_LOG").as_deref() == Ok("json") {
+        let timestamp_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        println!(
+            "{}",
+            json!({
+                "timestamp_unix_ms": timestamp_unix_ms,
+                "component": "rustgrid-agent",
+                "event": label.trim(),
+                "message": message
+            })
+        );
+        return;
+    }
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        println!("\x1b[1;{color}m[{label:>9}]\x1b[0m {message}");
+    } else {
+        println!("[{label:>9}] {message}");
+    }
+}
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -100,7 +125,13 @@ impl Reporter<'_> {
         message: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<()> {
-        println!("[{status:>9}] {message}");
+        let color = match status {
+            "completed" => "32",
+            "failed" => "31",
+            "running" => "36",
+            _ => "35",
+        };
+        console_event(status, message, color);
         let sequence = self.sequence.get() + 1;
         self.sequence.set(sequence);
         let mut event = LifecycleEvent::new(
@@ -128,7 +159,7 @@ impl Reporter<'_> {
     fn set_phase(&self, phase: RunPhase) {
         self.phase.set(phase);
         self.phase_started.replace(std::time::Instant::now());
-        println!("[    phase] {}", phase.as_str());
+        console_event("phase", phase.as_str(), "35");
         if let Err(error) = self
             .journal
             .borrow_mut()
@@ -166,12 +197,12 @@ impl Reporter<'_> {
             self.api
                 .update_ticket_status(self.ticket_id, self.ticket_row_version.get(), status)?;
         self.ticket_row_version.set(version);
-        println!("[   status] Ticket is now {status}");
+        console_event("status", &format!("Ticket is now {status}"), "34");
         Ok(())
     }
 
     fn feedback(&self, message: &str) -> Result<()> {
-        println!("[ feedback] {message}");
+        console_event("feedback", message, "36");
         let sequence = self.sequence.get() + 1;
         self.sequence.set(sequence);
         let mut event = LifecycleEvent::new(
@@ -266,7 +297,7 @@ impl Reporter<'_> {
 }
 
 pub fn register(context: &AppContext) -> Result<()> {
-    println!("[ starting] Registering RustGrid worker");
+    console_event("starting", "Registering RustGrid worker", "36");
     let api = RustGridClient::new(context)?;
     let worker = api.register()?;
     api.heartbeat(&worker.id)?;
@@ -280,7 +311,7 @@ pub fn register(context: &AppContext) -> Result<()> {
 pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
     sweep_workspaces(context)?;
     let api = RustGridClient::new(context)?;
-    println!("[ starting] Registering worker");
+    console_event("starting", "Registering worker", "36");
     let worker = api.register()?;
     api.heartbeat(&worker.id)?;
     run_ticket_with_worker(context, &api, &worker, ticket_id)
@@ -292,7 +323,7 @@ fn run_ticket_with_worker(
     worker: &Worker,
     ticket_id: &str,
 ) -> Result<RunSummary> {
-    println!("[ starting] Fetching ticket {ticket_id}");
+    console_event("starting", &format!("Fetching ticket {ticket_id}"), "36");
     let ticket = api.fetch_ticket(ticket_id)?;
     let run = api
         .claim_ticket(
@@ -898,7 +929,16 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         .into_iter()
         .take(context.config.max_concurrency)
     {
-        let ticket = api.fetch_ticket(&run.ticket_id)?;
+        let ticket = match api.fetch_ticket(&run.ticket_id) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                eprintln!(
+                    "[warning] could not recover run {} because ticket {} was unavailable: {error:#}",
+                    run.id, run.ticket_id
+                );
+                continue;
+            }
+        };
         println!(
             "[ recovery] Resuming assigned run {} for {}",
             run.id, ticket.key
@@ -932,14 +972,31 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
                 index += 1;
             }
         }
+        if shutdown::drain_requested() && tasks.is_empty() {
+            console_event("drained", "All active runs finished", "33");
+            break;
+        }
         api.heartbeat_with_status(&worker.id, if tasks.is_empty() { "online" } else { "busy" })?;
-        let available_slots = context.config.max_concurrency.saturating_sub(tasks.len());
+        let available_slots = if shutdown::drain_requested() {
+            0
+        } else {
+            context.config.max_concurrency.saturating_sub(tasks.len())
+        };
         let mut claimed = 0usize;
         for _ in 0..available_slots {
             match api.claim_next(&worker.id, &project_id)? {
                 Some(run) => {
-                    let ticket = api.fetch_ticket(&run.ticket_id)?;
-                    println!("[  claimed] Queue returned {}", ticket.key);
+                    let ticket = match api.fetch_ticket(&run.ticket_id) {
+                        Ok(ticket) => ticket,
+                        Err(error) => {
+                            eprintln!(
+                                "[warning] claimed run {} but ticket {} could not be fetched; the lease will expire for safe reconciliation: {error:#}",
+                                run.id, run.ticket_id
+                            );
+                            continue;
+                        }
+                    };
+                    console_event("claimed", &format!("Queue returned {}", ticket.key), "32");
                     let task_context = context.clone();
                     let task_api = api.clone();
                     let task_worker = worker.clone();
@@ -963,6 +1020,10 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         }
         if once {
             break;
+        }
+        if shutdown::drain_requested() {
+            thread::sleep(Duration::from_millis(250));
+            continue;
         }
         if claimed == 0 {
             match api.wait_for_queue_event(&worker.id, queue_sequence, interval) {
@@ -989,7 +1050,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     for task in tasks {
         let _ = task.join();
     }
-    println!("[  stopped] Watcher stopped");
+    console_event("stopped", "Watcher stopped", "33");
     Ok(())
 }
 
@@ -1009,7 +1070,7 @@ fn sweep_workspaces(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub fn status(context: &AppContext) -> Result<()> {
+pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     let local_repo = Repo::discover().ok();
     let dirty = local_repo
         .as_ref()
@@ -1017,6 +1078,29 @@ pub fn status(context: &AppContext) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let (project_kind, project) = context.project_value();
+    let api_key_present = context
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "healthy": api_key_present,
+                "config": context.config_path,
+                "api_url": context.api_url,
+                "project": {"kind": project_kind, "value": project},
+                "repository": context.config.repo.as_ref().map(|repo| format!("{}/{}", repo.owner, repo.name)),
+                "workspace_root": context.workspace_root,
+                "local_repository_root": local_repo.as_ref().map(|repo| &repo.root),
+                "max_concurrency": context.config.max_concurrency,
+                "lease_seconds": context.config.lease_seconds,
+                "api_key_present": api_key_present,
+                "github_credentials": "brokered_per_run"
+            }))?
+        );
+        return Ok(());
+    }
     println!("RustGrid agent status\n");
     println!("  Config:       {}", context.config_path.display());
     println!("  RustGrid API: {}", context.api_url);

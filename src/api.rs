@@ -348,25 +348,9 @@ impl RustGridClient {
             "tickets",
             &ticket.id,
         )?;
-        let comments: Page<Comment> = self.send_json(
-            Method::GET,
-            &format!("tickets/{ticket_id}/comments?page=1&size=100"),
-            None,
-            None,
-            &[],
-            None,
-        )?;
-        let gates: Page<QualityGateRecord> = self.send_json(
-            Method::GET,
-            &format!("tickets/{ticket_id}/quality-gate-results?page=1&size=100"),
-            None,
-            None,
-            &[],
-            None,
-        )?;
-        ticket.comments = comments.items;
-        ticket.previous_quality_gate_failures = gates
-            .items
+        ticket.comments = self.ticket_pages::<Comment>(ticket_id, "comments")?;
+        ticket.previous_quality_gate_failures = self
+            .ticket_pages::<QualityGateRecord>(ticket_id, "quality-gate-results")?
             .into_iter()
             .filter(|gate| gate.status == "failed")
             .map(|gate| QualityGateFailure {
@@ -375,6 +359,30 @@ impl RustGridClient {
             })
             .collect();
         Ok(ticket)
+    }
+
+    fn ticket_pages<T: for<'de> Deserialize<'de>>(
+        &self,
+        ticket_id: &str,
+        resource: &str,
+    ) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        for page_number in 1..=100 {
+            let mut page: Page<T> = self.send_json(
+                Method::GET,
+                &format!("tickets/{ticket_id}/{resource}?page={page_number}&size=100"),
+                None,
+                None,
+                &[],
+                None,
+            )?;
+            let page_len = page.items.len();
+            items.append(&mut page.items);
+            if page_len < 100 {
+                return Ok(items);
+            }
+        }
+        anyhow::bail!("ticket {resource} pagination exceeded 10,000 records")
     }
 
     pub fn create_comment(&self, ticket_id: &str, body: &str) -> Result<()> {

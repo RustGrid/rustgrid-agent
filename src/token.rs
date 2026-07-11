@@ -73,9 +73,25 @@ impl<'a> GitHubTokenManager<'a> {
 }
 
 fn parse_rfc3339_utc(value: &str) -> Result<SystemTime> {
-    let core = value
-        .strip_suffix('Z')
-        .context("GitHub token expiry must use UTC Z notation")?;
+    let (core, offset_seconds) = if let Some(core) = value.strip_suffix('Z') {
+        (core, 0i64)
+    } else {
+        let separator = value
+            .get(10..)
+            .and_then(|suffix| suffix.rfind(['+', '-']).map(|index| index + 10))
+            .context("GitHub token expiry must include a timezone")?;
+        let (core, offset) = value.split_at(separator);
+        let sign = if offset.starts_with('+') { 1 } else { -1 };
+        let (hours, minutes) = offset[1..]
+            .split_once(':')
+            .context("invalid timezone offset")?;
+        let hours: i64 = hours.parse()?;
+        let minutes: i64 = minutes.parse()?;
+        if hours > 23 || minutes > 59 {
+            bail!("GitHub token expiry timezone is out of range");
+        }
+        (core, sign * (hours * 3600 + minutes * 60))
+    };
     let core = core.split('.').next().unwrap_or(core);
     let (date, time) = core.split_once('T').context("missing T separator")?;
     let mut date = date.split('-').map(str::parse::<i64>);
@@ -107,8 +123,12 @@ fn parse_rfc3339_utc(value: &str) -> Result<SystemTime> {
     if days < 0 {
         bail!("GitHub token expiry predates Unix epoch");
     }
-    let seconds = days as u64 * 86_400 + hour * 3600 + minute * 60 + second;
-    Ok(UNIX_EPOCH + Duration::from_secs(seconds))
+    let seconds =
+        days * 86_400 + hour as i64 * 3600 + minute as i64 * 60 + second as i64 - offset_seconds;
+    if seconds < 0 {
+        bail!("GitHub token expiry predates Unix epoch");
+    }
+    Ok(UNIX_EPOCH + Duration::from_secs(seconds as u64))
 }
 
 fn permissions_satisfy(required: &Value, issued: &Value) -> bool {
@@ -144,6 +164,8 @@ mod tests {
     fn parses_github_expiry_timestamp() {
         let parsed = parse_rfc3339_utc("1970-01-01T00:01:00Z").unwrap();
         assert_eq!(parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(), 60);
+        let offset = parse_rfc3339_utc("1970-01-01T01:01:00+01:00").unwrap();
+        assert_eq!(offset.duration_since(UNIX_EPOCH).unwrap().as_secs(), 60);
         assert!(parse_rfc3339_utc("not-a-date").is_err());
         assert!(parse_rfc3339_utc("2026-02-30T00:00:00Z").is_err());
     }

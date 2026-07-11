@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -92,6 +93,11 @@ impl ExecutionManifest {
         if self.repository_id == 0 || self.installation_id == 0 {
             bail!("execution manifest repository and installation IDs must be non-zero");
         }
+        let web = validate_https_url("web_base_url", &self.web_base_url)?;
+        let clone = validate_https_url("clone_url", &self.clone_url)?;
+        if web.host_str() != clone.host_str() {
+            bail!("execution manifest clone_url and web_base_url hosts must match");
+        }
         let actual_hash = hex::encode(Sha256::digest(self.execution_policy.to_string().as_bytes()));
         if actual_hash != self.execution_policy_sha256 {
             bail!("execution policy hash does not match the manifest payload");
@@ -121,9 +127,27 @@ impl ExecutionManifest {
     }
 }
 
+fn validate_https_url(name: &str, value: &str) -> Result<Url> {
+    let url = Url::parse(value).with_context(|| format!("execution manifest {name} is invalid"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!("execution manifest {name} must be an HTTPS URL without credentials");
+    }
+    Ok(url)
+}
+
 impl ExecutionPolicy {
     pub fn validate(&self) -> Result<()> {
-        if self.policy_version != 1 || self.timeout_seconds == 0 || self.codex.command.is_empty() {
+        if self.policy_version != 1
+            || !(1..=86_400).contains(&self.timeout_seconds)
+            || self.codex.command.is_empty()
+            || self.codex.command.len() > 256
+            || self.quality_gates.len() > 100
+            || self.codex.environment_allowlist.len() > 128
+        {
             bail!("unsupported or incomplete execution policy");
         }
         if self
@@ -141,7 +165,7 @@ impl ExecutionPolicy {
             || self.quality_gates.iter().any(|gate| {
                 gate.id.trim().is_empty()
                     || gate.command.trim().is_empty()
-                    || gate.timeout_seconds == 0
+                    || !(1..=86_400).contains(&gate.timeout_seconds)
             })
         {
             bail!("execution policy contains an empty command, gate id, or timeout");
@@ -265,5 +289,24 @@ mod tests {
         assert!(command.contains("--sandbox workspace-write"));
         assert!(command.contains("approval_policy"));
         assert!(command.contains("--ephemeral"));
+    }
+
+    #[test]
+    fn rejects_unsafe_or_cross_origin_repository_urls() {
+        let mut unsafe_manifest = manifest();
+        unsafe_manifest.clone_url = "file:///tmp/repository".into();
+        assert!(unsafe_manifest.validate("run-1", "ticket-1").is_err());
+
+        let mut cross_origin = manifest();
+        cross_origin.clone_url = "https://evil.example/RustGrid/example.git".into();
+        assert!(cross_origin.validate("run-1", "ticket-1").is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_execution_policy() {
+        let mut value = manifest().execution_policy;
+        value["timeout_seconds"] = serde_json::json!(86_401);
+        let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
+        assert!(policy.validate().is_err());
     }
 }

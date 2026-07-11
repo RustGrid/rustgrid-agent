@@ -37,7 +37,11 @@ enum Commands {
         interval: u64,
     },
     /// Show local configuration, credentials, repository, and worker status.
-    Status,
+    Status {
+        /// Emit machine-readable JSON for health probes.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn run() -> Result<()> {
@@ -54,7 +58,7 @@ fn run() -> Result<()> {
         Commands::Serve { interval } => {
             runner::watch(&context, Duration::from_secs(interval), false)
         }
-        Commands::Status => runner::status(&context),
+        Commands::Status { json } => runner::status(&context, json),
     }
 }
 

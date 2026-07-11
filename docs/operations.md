@@ -20,6 +20,22 @@ interrupted workspaces are retained until `failed_workspace_retention_hours`.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
 container disk quota for enforcement while commands are actively writing.
 
+Use `rustgrid-agent status --json` from process-manager readiness checks. It
+reports configuration, credential presence, workspace location, and capacity
+without exposing secrets. Local interactive telemetry is colorized; set
+`NO_COLOR=1` for plain logs or `RUSTGRID_AGENT_LOG=json` for newline-delimited
+structured lifecycle events collected by a service manager.
+
+## External production boundaries
+
+Complete artifact bundles require an artifact-upload endpoint in the RustGrid
+worker API. Central OTLP export requires a deployment-selected collector and
+credentials. Continuous disk, CPU, memory, and network enforcement belongs to
+the host or container runtime; the worker performs bounded capture, policy
+validation, and before/after workspace checks. A release candidate is not
+production-approved until it completes a credentialed staging ticket against a
+real RustGrid project and GitHub App installation.
+
 ## Health and alerts
 
 Alert when any of these conditions occur:
@@ -49,8 +65,9 @@ Lease loss is fail-closed: local execution is cancelled and no terminal ticket
 or run update is attempted. The control plane decides whether to requeue or
 reassign the run.
 
-SIGINT and SIGTERM request a drain, stop new claims, and terminate the complete
-Unix child process group. Captured output is bounded by
+SIGTERM requests a drain, stops new claims, and waits for active runs. SIGINT
+requests immediate cancellation and terminates the complete Unix child process
+group. Captured output is bounded by
 `max_command_output_bytes`; the recovery journal retains the terminal diagnostic.
 
 ## Upgrade and rollback

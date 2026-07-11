@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.85 --profile minimal --component clippy,rustfmt
@@ -89,7 +89,7 @@ jobs:
           fi
 
       - name: Generate release SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           file: ${{ steps.package.outputs.archive }}
           output-file: target/package/rustgrid-agent.spdx.json
@@ -98,7 +98,7 @@ jobs:
           upload-release-assets: false
 
       - name: Attest release package provenance and SBOM
-        uses: actions/attest@v4
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
         with:
           subject-path: ${{ steps.package.outputs.archive }}
           sbom-path: target/package/rustgrid-agent.spdx.json

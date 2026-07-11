@@ -114,6 +114,11 @@ rustgrid-agent register
 
 `status` validates the configuration and command strings, locates the repository, reports whether the credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` registers the machine as a RustGrid worker and sends an initial heartbeat.
 
+Use `rustgrid-agent status --json` for machine-readable local readiness data.
+Interactive lifecycle output uses color when attached to a terminal; set the
+standard `NO_COLOR` environment variable to disable it. Set
+`RUSTGRID_AGENT_LOG=json` for newline-delimited structured lifecycle events.
+
 ### 4. Process tickets
 
 Run a specific ticket by its RustGrid UUID:
@@ -255,8 +260,9 @@ Ctrl-C also reaches an active Codex process through the cancellation token. The
 child is terminated, the run becomes `cancelled`, and the ticket returns to
 `todo` so another attempt can claim it safely.
 
-Process managers should restart `serve` after an unexpected exit. SIGINT and
-SIGTERM both stop new claims and cancel active child process groups safely.
+Process managers should restart `serve` after an unexpected exit. SIGTERM
+drains: it stops new claims and waits for active runs to finish. SIGINT cancels
+active child process groups and exits safely.
 At startup, `serve` queries RustGrid for runs already assigned to this worker
 and resumes them before claiming new work. Each run owns its cancellation token,
 so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
@@ -439,6 +445,10 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
+
+Pull requests and pushes to `main` run these gates on Linux and macOS, verify
+the release package, and apply `cargo-deny` advisory, license, dependency, and
+source policy. Dependabot maintains both Rust crates and pinned GitHub Actions.
 
 ## License
 
