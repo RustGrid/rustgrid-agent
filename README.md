@@ -168,6 +168,9 @@ rustgrid-agent --config path/to/agent.json status
 | `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces before startup cleanup. Defaults to 72. |
 | `max_command_output_bytes` | No | Combined in-memory output budget for captured commands. Defaults to 8 MiB. |
 | `max_workspace_bytes` | No | Maximum allowed run-workspace size. Defaults to 5 GiB. |
+| `max_child_memory_bytes` | No | Per-child address-space ceiling on Unix. Defaults to 8 GiB. |
+| `max_child_file_bytes` | No | Largest file a child may create on Unix. Defaults to 1 GiB. |
+| `max_child_open_files` | No | Per-child open-file ceiling on Unix. Defaults to 1024. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
@@ -180,6 +183,7 @@ Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridd
 | `RUSTGRID_API_KEY` | Yes | Authenticates RustGrid API requests. |
 | `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
+| `RUSTGRID_AGENT_ISOLATION` | Production | Must equal `per_run`; asserts that the deployment runtime isolates every run. `serve` fails closed without it. |
 
 The RustGrid API key needs these permissions:
 
@@ -270,6 +274,9 @@ so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
 ## Run lifecycle and recovery
 
 A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `awaiting_review` after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
+
+Before production promotion, complete the credentialed failure and recovery
+matrix in [`docs/staging-certification.md`](docs/staging-certification.md).
 
 Immediately after claim, the worker retrieves
 `GET /agent-runs/{run_id}/manifest`. It rejects unknown manifest

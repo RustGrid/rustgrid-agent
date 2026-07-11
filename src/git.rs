@@ -77,7 +77,11 @@ impl Repo {
         {
             bail!("local branch {branch} already exists");
         }
-        command::checked("git", ["switch", "--create", branch, base], &self.root)?;
+        command::checked(
+            "git",
+            ["-c", hooks_disabled(), "switch", "--create", branch, base],
+            &self.root,
+        )?;
         Ok(())
     }
 
@@ -95,7 +99,11 @@ impl Repo {
         .status
         .success();
         if exists {
-            command::checked("git", ["switch", branch], &self.root)?;
+            command::checked(
+                "git",
+                ["-c", hooks_disabled(), "switch", branch],
+                &self.root,
+            )?;
             return Ok(true);
         }
         self.create_branch(branch, base)?;
@@ -133,7 +141,11 @@ impl Repo {
         if staged.status.success() {
             bail!("Codex produced no committable changes");
         }
-        command::checked("git", ["commit", "-m", message], &self.root)?;
+        command::checked(
+            "git",
+            ["-c", hooks_disabled(), "commit", "-m", message],
+            &self.root,
+        )?;
         command::checked("git", ["rev-parse", "HEAD"], &self.root)
     }
 
@@ -204,6 +216,17 @@ impl Repo {
             );
         }
         Ok(output.stdout.split_whitespace().next().map(str::to_owned))
+    }
+}
+
+fn hooks_disabled() -> &'static str {
+    #[cfg(windows)]
+    {
+        "core.hooksPath=NUL"
+    }
+    #[cfg(not(windows))]
+    {
+        "core.hooksPath=/dev/null"
     }
 }
 
@@ -314,6 +337,29 @@ mod tests {
             command::checked("git", ["show", "--pretty=", "--name-only", "HEAD"], root).unwrap();
         assert_eq!(committed, "agent.txt");
         assert!(repo.dirty_paths().unwrap().contains("existing.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_commits_do_not_execute_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        command::checked("git", ["init", "--initial-branch=main"], root).unwrap();
+        command::checked("git", ["config", "user.email", "agent@example.com"], root).unwrap();
+        command::checked("git", ["config", "user.name", "Agent Test"], root).unwrap();
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        std::fs::write(root.join("agent.txt"), "agent work\n").unwrap();
+
+        Repo { root: root.into() }
+            .commit_paths(&["agent.txt".into()], "agent commit")
+            .unwrap();
+        assert!(!root.join("hook-ran").exists());
     }
 
     #[test]

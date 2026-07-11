@@ -1,12 +1,12 @@
 use std::{
     ffi::OsStr,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc::{self, SyncSender},
     },
     thread,
     time::Duration,
@@ -21,6 +21,14 @@ pub struct CommandOutput {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ChildLimits {
+    pub address_space_bytes: u64,
+    pub file_bytes: u64,
+    pub open_files: u64,
+    pub cpu_seconds: u64,
 }
 
 pub fn parse(command: &str) -> Result<Vec<String>> {
@@ -55,7 +63,15 @@ pub fn capture_cancellable(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<CommandOutput> {
-    capture_cancellable_with_environment(command, cwd, running, timeout, max_output_bytes, None)
+    capture_cancellable_with_environment(
+        command,
+        cwd,
+        running,
+        timeout,
+        max_output_bytes,
+        None,
+        None,
+    )
 }
 
 pub fn capture_cancellable_with_environment(
@@ -65,6 +81,7 @@ pub fn capture_cancellable_with_environment(
     timeout: Duration,
     max_output_bytes: usize,
     environment_allowlist: Option<&[String]>,
+    limits: Option<ChildLimits>,
 ) -> Result<CommandOutput> {
     let parts = parse(command)?;
     println!("  $ {}", display_command(&parts));
@@ -78,7 +95,7 @@ pub fn capture_cancellable_with_environment(
     if let Some(allowlist) = environment_allowlist {
         apply_environment_allowlist(&mut command, allowlist);
     }
-    configure_process_group(&mut command);
+    configure_child(&mut command, limits);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", parts[0]))?;
@@ -120,10 +137,13 @@ pub fn capture_cancellable_with_environment(
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    if stdout.truncated || stderr.truncated {
+        bail!("command output exceeded {max_output_bytes} bytes");
+    }
     Ok(CommandOutput {
         status,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
     })
 }
 
@@ -242,6 +262,7 @@ where
         timeout,
         max_output_bytes,
         None,
+        None,
         on_line,
     )
 }
@@ -255,6 +276,7 @@ pub fn streaming_lines_cancellable_with_environment<F>(
     timeout: Duration,
     max_output_bytes: usize,
     environment_allowlist: Option<&[String]>,
+    limits: Option<ChildLimits>,
     mut on_line: F,
 ) -> Result<ExitStatus>
 where
@@ -273,12 +295,12 @@ where
             Stdio::inherit()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     sanitize_child_environment(&mut command);
     if let Some(allowlist) = environment_allowlist {
         apply_environment_allowlist(&mut command, allowlist);
     }
-    configure_process_group(&mut command);
+    configure_child(&mut command, limits);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", parts[0]))?;
@@ -293,70 +315,181 @@ where
     }
 
     let stdout = child.stdout.take().context("failed to open child stdout")?;
-    let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if sender.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let mut stderr = child.stderr.take().context("failed to open child stderr")?;
+    let stream_limit = max_output_bytes / 2;
+    let (sender, receiver) = mpsc::sync_channel(32);
+    let reader = spawn_bounded_line_reader(stdout, stream_limit, 64 * 1024, sender);
+    let stderr_reader = thread::spawn(move || read_bounded(&mut stderr, stream_limit));
     let started = std::time::Instant::now();
-    let mut output_bytes = 0usize;
     loop {
         if !running.load(Ordering::SeqCst) || shutdown::requested() {
             terminate_process_tree(&mut child);
             let _ = child.wait();
+            drop(receiver);
             let _ = reader.join();
+            let _ = stderr_reader.join();
             bail!("command cancelled");
         }
         if started.elapsed() >= timeout {
             terminate_process_tree(&mut child);
             let _ = child.wait();
+            drop(receiver);
             let _ = reader.join();
+            let _ = stderr_reader.join();
             bail!("command timed out after {} seconds", timeout.as_secs());
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) => {
-                let line = line.context("failed to read command stdout")?;
-                output_bytes = output_bytes.saturating_add(line.len());
-                if output_bytes > max_output_bytes {
-                    terminate_process_tree(&mut child);
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    bail!("command output exceeded {max_output_bytes} bytes");
-                }
+            Ok(StreamMessage::Line(line)) => {
                 if let Err(error) = on_line(&line) {
                     terminate_process_tree(&mut child);
                     let _ = child.wait();
+                    drop(receiver);
                     let _ = reader.join();
+                    let _ = stderr_reader.join();
                     return Err(error);
                 }
             }
+            Ok(StreamMessage::Failure(error)) => {
+                terminate_process_tree(&mut child);
+                let _ = child.wait();
+                drop(receiver);
+                let _ = reader.join();
+                let _ = stderr_reader.join();
+                bail!("{error}");
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if child
-                    .try_wait()
-                    .context("failed while checking command")?
-                    .is_some()
-                {
-                    break;
-                }
+                let _ = child.try_wait().context("failed while checking command")?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = reader.join();
-    child.wait().context("failed while waiting for command")
+    let status = child.wait().context("failed while waiting for command")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    if stderr.truncated {
+        bail!("command stderr exceeded {stream_limit} bytes");
+    }
+    if !stderr.bytes.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&stderr.bytes));
+    }
+    Ok(status)
+}
+
+enum StreamMessage {
+    Line(String),
+    Failure(String),
+}
+
+fn spawn_bounded_line_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_bytes: usize,
+    max_line_bytes: usize,
+    sender: SyncSender<StreamMessage>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8 * 1024];
+        let mut pending = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = sender.send(StreamMessage::Failure(format!(
+                        "failed to read command stdout: {error}"
+                    )));
+                    return;
+                }
+            };
+            if read == 0 {
+                if !pending.is_empty() {
+                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    let _ = sender.send(StreamMessage::Line(line));
+                }
+                return;
+            }
+            total = total.saturating_add(read);
+            if total > max_bytes {
+                let _ = sender.send(StreamMessage::Failure(format!(
+                    "command stdout exceeded {max_bytes} bytes"
+                )));
+                return;
+            }
+            for segment in buffer[..read].split_inclusive(|byte| *byte == b'\n') {
+                let terminated = segment.last() == Some(&b'\n');
+                let content = if terminated {
+                    &segment[..segment.len() - 1]
+                } else {
+                    segment
+                };
+                pending.extend_from_slice(content);
+                if pending.len() > max_line_bytes {
+                    let _ = sender.send(StreamMessage::Failure(format!(
+                        "command output line exceeded {max_line_bytes} bytes"
+                    )));
+                    return;
+                }
+                if terminated {
+                    if pending.last() == Some(&b'\r') {
+                        pending.pop();
+                    }
+                    let line = String::from_utf8_lossy(&pending).into_owned();
+                    if sender.send(StreamMessage::Line(line)).is_err() {
+                        return;
+                    }
+                    pending.clear();
+                }
+            }
+        }
+    })
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+fn configure_child(command: &mut Command, limits: Option<ChildLimits>) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
+    if let Some(limits) = limits {
+        // SAFETY: pre_exec performs only async-signal-safe setrlimit syscalls.
+        unsafe {
+            command.pre_exec(move || {
+                set_limit(libc::RLIMIT_AS as u32, limits.address_space_bytes)?;
+                set_limit(libc::RLIMIT_FSIZE as u32, limits.file_bytes)?;
+                set_limit(libc::RLIMIT_NOFILE as u32, limits.open_files)?;
+                set_limit(libc::RLIMIT_CPU as u32, limits.cpu_seconds)?;
+                Ok(())
+            });
+        }
+    }
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+fn configure_child(_command: &mut Command, _limits: Option<ChildLimits>) {}
+
+#[cfg(unix)]
+fn set_limit(resource: u32, value: u64) -> std::io::Result<()> {
+    let mut inherited = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: inherited points to writable initialized storage for getrlimit.
+    if unsafe { libc::getrlimit(resource as _, &mut inherited) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let requested = value as libc::rlim_t;
+    let effective = requested.min(inherited.rlim_max);
+    let limit = libc::rlimit {
+        rlim_cur: effective,
+        rlim_max: effective,
+    };
+    // SAFETY: resource is a supported RLIMIT constant and limit points to a
+    // fully initialized rlimit value that lives for the syscall duration.
+    if unsafe { libc::setrlimit(resource as _, &limit) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 #[cfg(unix)]
 fn terminate_process_tree(child: &mut std::process::Child) {
@@ -385,7 +518,12 @@ fn apply_environment_allowlist(command: &mut Command, allowlist: &[String]) {
     }
 }
 
-fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<BoundedBytes> {
     let mut output = Vec::with_capacity(limit.min(64 * 1024));
     let mut buffer = [0u8; 16 * 1024];
     let mut truncated = false;
@@ -403,7 +541,10 @@ fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>
     if truncated {
         output.extend_from_slice(b"\n[output truncated by rustgrid-agent]\n");
     }
-    Ok(output)
+    Ok(BoundedBytes {
+        bytes: output,
+        truncated,
+    })
 }
 
 #[cfg(not(unix))]
@@ -487,7 +628,20 @@ mod tests {
     fn bounded_reader_drains_and_marks_truncation() {
         let mut input = std::io::Cursor::new(vec![b'x'; 1024]);
         let output = read_bounded(&mut input, 32).unwrap();
-        assert!(output.starts_with(&[b'x'; 32]));
-        assert!(String::from_utf8_lossy(&output).contains("output truncated"));
+        assert!(output.bytes.starts_with(&[b'x'; 32]));
+        assert!(output.truncated);
+        assert!(String::from_utf8_lossy(&output.bytes).contains("output truncated"));
+    }
+
+    #[test]
+    fn streaming_reader_rejects_an_unbounded_line() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let reader =
+            spawn_bounded_line_reader(std::io::Cursor::new(vec![b'x'; 1024]), 4096, 128, sender);
+        match receiver.recv().unwrap() {
+            StreamMessage::Failure(message) => assert!(message.contains("line exceeded")),
+            StreamMessage::Line(_) => panic!("oversized line should not be emitted"),
+        }
+        reader.join().unwrap();
     }
 }

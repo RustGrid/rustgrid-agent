@@ -13,5 +13,8 @@
   "run_timeout_seconds": 7200,
   "failed_workspace_retention_hours": 72,
   "max_command_output_bytes": 8388608,
-  "max_workspace_bytes": 5368709120
+  "max_workspace_bytes": 5368709120,
+  "max_child_memory_bytes": 8589934592,
+  "max_child_file_bytes": 1073741824,
+  "max_child_open_files": 1024
 }

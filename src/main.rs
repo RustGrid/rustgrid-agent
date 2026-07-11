@@ -55,9 +55,7 @@ fn run() -> Result<()> {
         Commands::Watch { interval, once } => {
             runner::watch(&context, Duration::from_secs(interval), once)
         }
-        Commands::Serve { interval } => {
-            runner::watch(&context, Duration::from_secs(interval), false)
-        }
+        Commands::Serve { interval } => runner::serve(&context, Duration::from_secs(interval)),
         Commands::Status { json } => runner::status(&context, json),
     }
 }

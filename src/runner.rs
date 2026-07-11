@@ -818,6 +818,10 @@ fn implement_and_commit(
         Duration::from_secs(policy.timeout_seconds),
         context.config.max_command_output_bytes as usize,
         Some(&policy.codex.environment_allowlist),
+        Some(child_limits(
+            context,
+            Duration::from_secs(policy.timeout_seconds),
+        )),
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -845,6 +849,7 @@ fn implement_and_commit(
             Some(json!({"gate_id": gate_policy.id, "required": gate_policy.required})),
         )?;
         let gate = run_captured(
+            context,
             &gate_policy.command,
             &repo.root,
             running,
@@ -1054,6 +1059,15 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     Ok(())
 }
 
+pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
+    if std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() != Ok("per_run") {
+        bail!(
+            "serve requires RUSTGRID_AGENT_ISOLATION=per_run after the deployment runtime gives each run an isolated filesystem and resource boundary"
+        );
+    }
+    watch(context, interval, false)
+}
+
 fn sweep_workspaces(context: &AppContext) -> Result<()> {
     let removed = RunWorkspace::sweep_stale(
         &context.workspace_root,
@@ -1082,11 +1096,12 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
+    let per_run_isolation = std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() == Ok("per_run");
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "healthy": api_key_present,
+                "healthy": api_key_present && per_run_isolation,
                 "config": context.config_path,
                 "api_url": context.api_url,
                 "project": {"kind": project_kind, "value": project},
@@ -1096,6 +1111,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "max_concurrency": context.config.max_concurrency,
                 "lease_seconds": context.config.lease_seconds,
                 "api_key_present": api_key_present,
+                "per_run_isolation": per_run_isolation,
                 "github_credentials": "brokered_per_run"
             }))?
         );
@@ -1128,6 +1144,14 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     println!("  API key:      {}", presence(context.api_key.as_deref()));
     println!("  GitHub token: brokered per run by RustGrid");
     println!(
+        "  Isolation:    {}",
+        if per_run_isolation {
+            "per-run deployment boundary declared"
+        } else {
+            "missing RUSTGRID_AGENT_ISOLATION=per_run"
+        }
+    );
+    println!(
         "  Working tree: {}",
         if local_repo.is_none() {
             "not applicable (isolated workspace mode)".into()
@@ -1140,10 +1164,14 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     if context.api_key.is_none() {
         bail!("status checks failed: required credentials are missing");
     }
+    if !per_run_isolation {
+        bail!("status checks failed: per-run deployment isolation is not declared");
+    }
     Ok(())
 }
 
 fn run_captured(
+    context: &AppContext,
     command_text: &str,
     cwd: &Path,
     running: &AtomicBool,
@@ -1158,7 +1186,17 @@ fn run_captured(
         timeout,
         max_output_bytes,
         Some(environment_allowlist),
+        Some(child_limits(context, timeout)),
     )
+}
+
+fn child_limits(context: &AppContext, timeout: Duration) -> command::ChildLimits {
+    command::ChildLimits {
+        address_space_bytes: context.config.max_child_memory_bytes,
+        file_bytes: context.config.max_child_file_bytes,
+        open_files: context.config.max_child_open_files,
+        cpu_seconds: timeout.as_secs().saturating_add(1),
+    }
 }
 
 fn combine_output(stdout: &str, stderr: &str) -> String {

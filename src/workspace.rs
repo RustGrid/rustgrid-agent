@@ -40,6 +40,8 @@ impl RunWorkspace {
             let output = command::capture_with_env(
                 "git",
                 [
+                    "-c",
+                    git_hooks_disabled(),
                     "clone",
                     "--branch",
                     base,
@@ -127,12 +129,25 @@ impl RunWorkspace {
     }
 }
 
+fn git_hooks_disabled() -> &'static str {
+    #[cfg(windows)]
+    {
+        "core.hooksPath=NUL"
+    }
+    #[cfg(not(windows))]
+    {
+        "core.hooksPath=/dev/null"
+    }
+}
+
 fn directory_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            total = total.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
             total = total.saturating_add(directory_size(&entry.path())?);
         } else if metadata.is_file() {
             total = total.saturating_add(metadata.len());
@@ -210,5 +225,21 @@ mod tests {
         let second = RunWorkspace::prepare(&root, "run-1", &manifest, "token").unwrap();
         assert!(second.resumed());
         assert!(second.enforce_size_limit(1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_accounting_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("large"), vec![0u8; 1024 * 1024]).unwrap();
+        symlink(&outside, workspace.join("escape")).unwrap();
+
+        assert!(directory_size(&workspace).unwrap() < 1024 * 1024);
     }
 }

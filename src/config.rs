@@ -39,6 +39,12 @@ pub struct Config {
     pub max_command_output_bytes: u64,
     #[serde(default = "default_max_workspace_bytes")]
     pub max_workspace_bytes: u64,
+    #[serde(default = "default_max_child_memory_bytes")]
+    pub max_child_memory_bytes: u64,
+    #[serde(default = "default_max_child_file_bytes")]
+    pub max_child_file_bytes: u64,
+    #[serde(default = "default_max_child_open_files")]
+    pub max_child_open_files: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,6 +97,18 @@ fn default_max_command_output_bytes() -> u64 {
 
 fn default_max_workspace_bytes() -> u64 {
     5 * 1024 * 1024 * 1024
+}
+
+fn default_max_child_memory_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
+}
+
+fn default_max_child_file_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_max_child_open_files() -> u64 {
+    1024
 }
 
 impl AppContext {
@@ -168,6 +186,15 @@ impl Config {
         if self.max_workspace_bytes < 64 * 1024 * 1024 {
             bail!("max_workspace_bytes must be at least 67108864");
         }
+        if self.max_child_memory_bytes < 256 * 1024 * 1024 {
+            bail!("max_child_memory_bytes must be at least 268435456");
+        }
+        if self.max_child_file_bytes < 1024 * 1024 {
+            bail!("max_child_file_bytes must be at least 1048576");
+        }
+        if !(64..=65_536).contains(&self.max_child_open_files) {
+            bail!("max_child_open_files must be between 64 and 65536");
+        }
         Ok(())
     }
 }
@@ -201,6 +228,9 @@ mod tests {
             failed_workspace_retention_hours: 72,
             max_command_output_bytes: 8 * 1024 * 1024,
             max_workspace_bytes: 5 * 1024 * 1024 * 1024,
+            max_child_memory_bytes: 8 * 1024 * 1024 * 1024,
+            max_child_file_bytes: 1024 * 1024 * 1024,
+            max_child_open_files: 1024,
         };
         assert!(
             config

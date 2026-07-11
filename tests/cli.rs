@@ -28,6 +28,7 @@ fn status_can_emit_machine_readable_health() {
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_AGENT_ISOLATION", "per_run")
         .args(["--config", config.to_str().unwrap(), "status", "--json"])
         .output()
         .expect("rustgrid-agent status should run");
@@ -40,4 +41,24 @@ fn status_can_emit_machine_readable_health() {
         serde_json::from_slice(&output.stdout).expect("status should emit JSON");
     assert_eq!(value["healthy"], true);
     assert_eq!(value["max_concurrency"], 2);
+}
+
+#[test]
+fn serve_fails_closed_without_per_run_isolation() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let config = directory.path().join("agent.json");
+    fs::write(
+        &config,
+        r#"{"project_key":"RG","project_id":null,"max_concurrency":1}"#,
+    )
+    .expect("configuration should be written");
+    let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .current_dir(directory.path())
+        .env("RUSTGRID_API_KEY", "test-key")
+        .env_remove("RUSTGRID_AGENT_ISOLATION")
+        .args(["--config", config.to_str().unwrap(), "serve"])
+        .output()
+        .expect("rustgrid-agent serve should run");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("RUSTGRID_AGENT_ISOLATION=per_run"));
 }

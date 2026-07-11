@@ -12,13 +12,22 @@ The example systemd unit is in
 ```text
 RUSTGRID_API_KEY=rgk_...
 RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
+RUSTGRID_AGENT_ISOLATION=per_run
 ```
+
+`RUSTGRID_AGENT_ISOLATION=per_run` is a fail-closed deployment assertion, not
+a sandbox implementation. Set it only after the runtime gives every run its own
+filesystem boundary and CPU, memory, process, disk, and network controls.
+`serve` refuses to start without it.
 
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and
 interrupted workspaces are retained until `failed_workspace_retention_hours`.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
 container disk quota for enforcement while commands are actively writing.
+The worker also applies Unix child limits for address space, individual file
+size, open files, CPU time, wall time, and captured output. These limits are
+defense in depth and do not replace per-run containers or host quotas.
 
 Use `rustgrid-agent status --json` from process-manager readiness checks. It
 reports configuration, credential presence, workspace location, and capacity

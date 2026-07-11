@@ -23,13 +23,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.85 --profile minimal --component clippy,rustfmt
+        run: rustup toolchain install 1.94 --profile minimal --component clippy,rustfmt
 
       - name: Use Rust toolchain
-        run: rustup default 1.85
+        run: rustup default 1.94
 
       - name: Check formatting
         run: cargo fmt --check
@@ -48,8 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Check advisories, licenses, bans, and sources
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
-
