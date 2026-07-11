@@ -3,5 +3,8 @@ pub mod command;
 pub mod config;
 pub mod git;
 pub mod github;
+pub mod journal;
+pub mod lifecycle;
 pub mod prompt;
 pub mod runner;
+pub mod supervisor;

@@ -114,10 +114,33 @@ impl RustGridClient {
     }
 
     pub fn heartbeat(&self, worker_id: &str) -> Result<()> {
+        self.heartbeat_with_status(worker_id, "online")
+    }
+
+    pub fn heartbeat_with_status(&self, worker_id: &str, status: &str) -> Result<()> {
         self.send_empty(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
-            Some(json!({"status": "online"})),
+            Some(json!({"status": status})),
+            None,
+        )
+    }
+
+    pub fn extend_lease(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<AgentRun> {
+        self.send_json(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/lease"),
+            Some(json!({
+                "worker_id": worker_id,
+                "lease_seconds": lease_seconds
+            })),
+            Some(&format!("lease-{run_id}-{}", Uuid::new_v4())),
+            &[],
             None,
         )
     }

@@ -3,6 +3,13 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -116,6 +123,20 @@ pub fn streaming_lines<F>(
     command: &str,
     cwd: &Path,
     stdin_text: Option<&str>,
+    on_line: F,
+) -> Result<ExitStatus>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let running = Arc::new(AtomicBool::new(true));
+    streaming_lines_cancellable(command, cwd, stdin_text, &running, on_line)
+}
+
+pub fn streaming_lines_cancellable<F>(
+    command: &str,
+    cwd: &Path,
+    stdin_text: Option<&str>,
+    running: &AtomicBool,
     mut on_line: F,
 ) -> Result<ExitStatus>
 where
@@ -147,14 +168,44 @@ where
     }
 
     let stdout = child.stdout.take().context("failed to open child stdout")?;
-    for line in BufReader::new(stdout).lines() {
-        let line = line.context("failed to read command stdout")?;
-        if let Err(error) = on_line(&line) {
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        if !running.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error);
+            let _ = reader.join();
+            bail!("command cancelled");
+        }
+        match receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => {
+                let line = line.context("failed to read command stdout")?;
+                if let Err(error) = on_line(&line) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if child
+                    .try_wait()
+                    .context("failed while checking command")?
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    let _ = reader.join();
     child.wait().context("failed while waiting for command")
 }
 

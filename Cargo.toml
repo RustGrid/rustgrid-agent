@@ -10,6 +10,7 @@ homepage = "https://github.com/RustGrid/agent-runner-CLI"
 repository = "https://github.com/RustGrid/agent-runner-CLI"
 keywords = ["automation", "cli", "github", "rustgrid"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["openapi.current.json", ".rustgrid-agent.json"]
 
 [[bin]]
 name = "rustgrid-agent"

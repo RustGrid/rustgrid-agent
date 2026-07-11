@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     thread,
     time::Duration,
@@ -19,7 +19,10 @@ use crate::{
     config::AppContext,
     git::{Repo, branch_name},
     github::GitHubClient,
+    journal::RunJournal,
+    lifecycle::{LifecycleEvent, RunPhase},
     prompt,
+    supervisor::RunSupervisor,
 };
 
 #[derive(Debug)]
@@ -33,9 +36,12 @@ pub struct RunSummary {
 struct Reporter<'a> {
     api: &'a RustGridClient,
     run_id: &'a str,
-    row_version: Cell<i64>,
+    row_version: Arc<AtomicI64>,
     ticket_id: &'a str,
     ticket_row_version: Cell<i64>,
+    phase: Cell<RunPhase>,
+    sequence: Cell<u64>,
+    journal: RefCell<RunJournal>,
 }
 
 impl Reporter<'_> {
@@ -47,16 +53,60 @@ impl Reporter<'_> {
         metadata: Option<serde_json::Value>,
     ) -> Result<()> {
         println!("[{status:>9}] {message}");
+        let sequence = self.sequence.get() + 1;
+        self.sequence.set(sequence);
+        let event = LifecycleEvent::new(
+            sequence,
+            self.phase.get(),
+            format!("step.{name}.{status}"),
+            if status == "failed" { "error" } else { "info" },
+            message,
+            metadata,
+        );
+        if let Err(error) = self
+            .journal
+            .borrow_mut()
+            .checkpoint(self.phase.get(), sequence)
+        {
+            eprintln!("[warning] could not persist run checkpoint: {error:#}");
+        }
         self.api
-            .append_step(self.run_id, name, status, message, metadata)
+            .append_step(self.run_id, name, status, message, Some(event.metadata()))
             .with_context(|| format!("could not report step {name} to RustGrid"))
     }
 
+    fn set_phase(&self, phase: RunPhase) {
+        self.phase.set(phase);
+        println!("[    phase] {}", phase.as_str());
+        if let Err(error) = self
+            .journal
+            .borrow_mut()
+            .checkpoint(phase, self.sequence.get())
+        {
+            eprintln!("[warning] could not persist run phase: {error:#}");
+        }
+    }
+
+    fn record_branch(&self, branch: &str) -> Result<()> {
+        self.journal.borrow_mut().record_branch(branch)
+    }
+
+    fn record_commit(&self, commit: &str) -> Result<()> {
+        self.journal.borrow_mut().record_commit(commit)
+    }
+
+    fn record_pull_request(&self, url: &str) -> Result<()> {
+        self.journal.borrow_mut().record_pull_request(url)
+    }
+
     fn update_run(&self, status: &str, message: Option<&str>) -> Result<()> {
-        let run = self
-            .api
-            .update_run(self.run_id, self.row_version.get(), status, message)?;
-        self.row_version.set(run.row_version);
+        let run = self.api.update_run(
+            self.run_id,
+            self.row_version.load(Ordering::SeqCst),
+            status,
+            message,
+        )?;
+        self.row_version.store(run.row_version, Ordering::SeqCst);
         Ok(())
     }
 
@@ -79,6 +129,7 @@ impl Reporter<'_> {
 
     fn fail(&self, error: &anyhow::Error) -> Result<()> {
         let message = format!("{error:#}");
+        self.set_phase(RunPhase::Blocked);
         let step_result = self.step("run_failed", "failed", &message, None);
         let comment_result = self.api.create_comment(
             self.ticket_id,
@@ -101,6 +152,26 @@ impl Reporter<'_> {
             eprintln!("[warning] could not mark ticket blocked: {report_error:#}");
         }
         Ok(())
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.set_phase(RunPhase::Cancelled);
+        let step_result = self.step(
+            "run_cancelled",
+            "cancelled",
+            "Agent run cancelled by operator",
+            None,
+        );
+        let comment_result = self.api.create_comment(
+            self.ticket_id,
+            "🛑 **RustGrid Agent stopped**\n\nThe run was cancelled by the worker operator and can be retried.",
+        );
+        let ticket_result = self.set_ticket_status("todo");
+        let update_result = self.update_run("cancelled", Some("cancelled by operator"));
+        step_result?;
+        comment_result?;
+        ticket_result?;
+        update_result
     }
 }
 
@@ -149,6 +220,7 @@ fn run_ticket_with_worker(
         repo,
         baseline,
         generated_prompt,
+        Arc::new(AtomicBool::new(true)),
     )
 }
 
@@ -162,17 +234,33 @@ fn execute_claimed(
     repo: Repo,
     baseline: BTreeSet<String>,
     generated_prompt: String,
+    running: Arc<AtomicBool>,
 ) -> Result<RunSummary> {
+    let row_version = Arc::new(AtomicI64::new(run.row_version));
+    let journal = RunJournal::create(&repo.root, &run.id, &ticket.id)?;
     let reporter = Reporter {
         api,
         run_id: &run.id,
-        row_version: Cell::new(run.row_version),
+        row_version: Arc::clone(&row_version),
         ticket_id: &ticket.id,
         ticket_row_version: Cell::new(ticket.row_version),
+        phase: Cell::new(RunPhase::Claimed),
+        sequence: Cell::new(0),
+        journal: RefCell::new(journal),
     };
+
+    let supervisor = RunSupervisor::start(
+        api.clone(),
+        worker.id.clone(),
+        run.id.clone(),
+        row_version,
+        Duration::from_secs(context.config.heartbeat_interval_seconds),
+        context.config.lease_seconds,
+    );
 
     let result = (|| {
         reporter.set_ticket_status("in_progress")?;
+        reporter.set_phase(RunPhase::Preparing);
         reporter.step(
             "ticket_fetched",
             "completed",
@@ -200,12 +288,26 @@ fn execute_claimed(
             repo,
             baseline,
             generated_prompt,
+            &running,
         )
     })();
 
+    let supervisor_healthy = supervisor.is_healthy();
+    drop(supervisor);
     match result {
-        Ok(summary) => Ok(summary),
+        Ok(summary) => {
+            if !supervisor_healthy {
+                eprintln!("[warning] supervisor connectivity was degraded during the run");
+            }
+            reporter.set_phase(RunPhase::Succeeded);
+            reporter.update_run("succeeded", Some(&summary.pull_request_url))?;
+            Ok(summary)
+        }
         Err(error) => {
+            if !running.load(Ordering::SeqCst) {
+                reporter.cancel()?;
+                return Err(error);
+            }
             reporter.fail(&error)?;
             Err(error)
         }
@@ -222,6 +324,7 @@ fn execute(
     repo: Repo,
     baseline: BTreeSet<String>,
     generated_prompt: String,
+    running: &AtomicBool,
 ) -> Result<RunSummary> {
     if !baseline.is_empty() {
         reporter.step(
@@ -250,6 +353,7 @@ fn execute(
         Some(json!({"base": context.config.default_base_branch})),
     )?;
     repo.create_branch(&branch, &context.config.default_base_branch)?;
+    reporter.record_branch(&branch)?;
     reporter.step(
         "branch_create",
         "completed",
@@ -264,12 +368,14 @@ fn execute(
         Some(json!({"characters": generated_prompt.len()})),
     )?;
 
+    reporter.set_phase(RunPhase::Executing);
     reporter.step("codex", "running", "Running Codex locally", None)?;
     let blocked_action = RefCell::new(None);
-    let codex_status = command::streaming_lines(
+    let codex_status = command::streaming_lines_cancellable(
         &context.codex_command,
         &repo.root,
         Some(&generated_prompt),
+        running,
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -288,6 +394,7 @@ fn execute(
     }
     reporter.step("codex", "completed", "Codex finished successfully", None)?;
 
+    reporter.set_phase(RunPhase::Verifying);
     reporter.step(
         "quality_gate",
         "running",
@@ -322,6 +429,7 @@ fn execute(
         bail!("quality gate failed with {}", gate.status);
     }
 
+    reporter.set_phase(RunPhase::Publishing);
     let paths = repo.new_agent_paths(&baseline)?;
     if paths.is_empty() {
         bail!("Codex produced no committable changes");
@@ -335,6 +443,7 @@ fn execute(
 
     reporter.step("commit", "running", "Committing agent changes", None)?;
     let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
+    reporter.record_commit(&commit)?;
     reporter.step(
         "commit",
         "completed",
@@ -366,6 +475,7 @@ fn execute(
         &branch,
         &context.config.default_base_branch,
     )?;
+    reporter.record_pull_request(&pr.html_url)?;
     reporter.step(
         "pull_request",
         "completed",
@@ -374,6 +484,7 @@ fn execute(
     )?;
 
     api.attach_pr(&ticket.id, &run.id, &pr.html_url, pr.number)?;
+    reporter.set_phase(RunPhase::AwaitingReview);
     reporter.step(
         "rustgrid_attachment",
         "completed",
@@ -387,8 +498,6 @@ fn execute(
         None,
     )?;
     reporter.set_ticket_status("done")?;
-    reporter.update_run("succeeded", Some(&pr.html_url))?;
-
     let summary = RunSummary {
         ticket_key: ticket.key.clone(),
         branch,
@@ -433,6 +542,7 @@ pub fn watch(
                     repo,
                     baseline,
                     generated_prompt,
+                    Arc::clone(&running),
                 ) {
                     eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
                 }
@@ -467,6 +577,11 @@ pub fn status(context: &AppContext) -> Result<()> {
     println!("  Base branch:  {}", context.config.default_base_branch);
     println!("  Codex:        {}", parsed_codex.join(" "));
     println!("  Quality gate: {}", parsed_gate.join(" "));
+    println!(
+        "  Heartbeat:    every {}s",
+        context.config.heartbeat_interval_seconds
+    );
+    println!("  Run lease:    {}s", context.config.lease_seconds);
     println!("  API key:      {}", presence(context.api_key.as_deref()));
     println!(
         "  GitHub token: {}",

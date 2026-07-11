@@ -38,6 +38,15 @@ enum Commands {
         #[arg(long)]
         once: bool,
     },
+    /// Run the production worker daemon with continuous supervision.
+    Serve {
+        /// Permit a dirty tree. Existing dirty paths are never staged or committed.
+        #[arg(long)]
+        allow_dirty: bool,
+        /// Seconds between empty queue polls.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
+    },
     /// Show local configuration, credentials, repository, and worker status.
     Status,
 }
@@ -57,6 +66,10 @@ fn run() -> Result<()> {
             interval,
             once,
         } => runner::watch(&context, allow_dirty, Duration::from_secs(interval), once),
+        Commands::Serve {
+            allow_dirty,
+            interval,
+        } => runner::watch(&context, allow_dirty, Duration::from_secs(interval), false),
         Commands::Status => runner::status(&context),
     }
 }

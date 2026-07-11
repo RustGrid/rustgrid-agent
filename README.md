@@ -128,6 +128,13 @@ Or continuously claim queued tickets for the configured project:
 rustgrid-agent watch
 ```
 
+For a long-lived production worker, use daemon mode. It keeps worker heartbeats
+and active-run leases alive independently while Codex and quality gates run:
+
+```sh
+rustgrid-agent serve
+```
+
 Stop watch mode with Ctrl-C. It finishes the current blocking operation before stopping.
 
 ## Configuration reference
@@ -147,6 +154,8 @@ rustgrid-agent --config path/to/agent.json status
 | `default_base_branch` | No | Local branch from which agent branches are created and the base used for pull requests. Defaults to `main`. |
 | `quality_gate_command` | Yes | Command run after Codex finishes, for example `cargo test` or `npm test`. |
 | `codex_command` | No | Command that accepts the generated prompt on stdin. Defaults to `codex exec --full-auto --json -`. The runner adds `--json` automatically when the executable is `codex`. |
+| `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
+| `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
@@ -221,9 +230,44 @@ Registers one worker, heartbeats it, and processes queued tickets serially. `--i
 
 Run only one watcher per working copy. Each successful ticket changes the current branch, and existing generated branch names are never overwritten.
 
+### `serve`
+
+```sh
+rustgrid-agent serve
+rustgrid-agent serve --interval 30
+```
+
+`serve` is the production-oriented long-running worker entrypoint. It uses the
+same atomic queue claim as `watch`, and every active run gets an independent
+supervisor that:
+
+- heartbeats the worker as `busy`;
+- extends the run lease before it can expire;
+- continues operating while Codex or a quality gate is blocking;
+- reports degraded RustGrid connectivity without discarding local work; and
+- stops before the terminal run update to preserve optimistic-concurrency correctness.
+
+Ctrl-C also reaches an active Codex process through the cancellation token. The
+child is terminated, the run becomes `cancelled`, and the ticket returns to
+`todo` so another attempt can claim it safely.
+
+Process managers should restart `serve` after an unexpected exit and send it
+SIGINT for graceful shutdown.
+
 ## Run lifecycle and recovery
 
 A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `done` only after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
+
+Run steps carry a versioned lifecycle event envelope with a per-run sequence,
+timestamp, phase, severity, event type, message, and structured data. Current
+phases are `claimed`, `preparing`, `executing`, `verifying`, `publishing`,
+`awaiting_review`, and terminal outcomes. Consumers should order the live
+timeline by `sequence` and treat unknown fields as forward-compatible.
+
+The worker also atomically checkpoints recovery state after phase and step
+changes. Journals live at `.git/rustgrid-agent/runs/<run-id>.json`; because they
+are inside Git metadata, they cannot become part of an agent commit. They record
+the last phase and sequence plus any created branch, commit, and pull request.
 
 Codex is instructed to emit concise progress updates. With Codex JSONL output, each completed `agent_message` becomes exactly one comment; reasoning summaries and command execution events are ignored. Compatible custom commands may emit plain text, where each non-empty output line becomes one comment.
 

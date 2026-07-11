@@ -6,5 +6,7 @@
   },
   "default_base_branch": "main",
   "quality_gate_command": "cargo test",
-  "codex_command": "codex exec --full-auto --json -"
+  "codex_command": "codex exec --full-auto --json -",
+  "heartbeat_interval_seconds": 15,
+  "lease_seconds": 900
 }

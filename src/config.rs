@@ -19,6 +19,10 @@ pub struct Config {
     pub quality_gate_command: String,
     #[serde(default)]
     pub codex_command: Option<String>,
+    #[serde(default = "default_heartbeat_interval_seconds")]
+    pub heartbeat_interval_seconds: u64,
+    #[serde(default = "default_lease_seconds")]
+    pub lease_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,6 +44,14 @@ pub struct AppContext {
 
 fn default_base_branch() -> String {
     "main".into()
+}
+
+fn default_heartbeat_interval_seconds() -> u64 {
+    15
+}
+
+fn default_lease_seconds() -> u64 {
+    900
 }
 
 impl AppContext {
@@ -108,6 +120,15 @@ impl Config {
                 bail!("config value {name} cannot be empty");
             }
         }
+        if !(5..=300).contains(&self.heartbeat_interval_seconds) {
+            bail!("heartbeat_interval_seconds must be between 5 and 300");
+        }
+        if !(30..=86_400).contains(&self.lease_seconds) {
+            bail!("lease_seconds must be between 30 and 86400");
+        }
+        if self.heartbeat_interval_seconds.saturating_mul(3) >= self.lease_seconds {
+            bail!("lease_seconds must exceed three heartbeat intervals");
+        }
         Ok(())
     }
 }
@@ -132,6 +153,8 @@ mod tests {
             default_base_branch: "main".into(),
             quality_gate_command: "cargo test".into(),
             codex_command: None,
+            heartbeat_interval_seconds: 15,
+            lease_seconds: 900,
         };
         assert!(
             config
