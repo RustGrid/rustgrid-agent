@@ -777,11 +777,16 @@ fn retry_delay(attempt: u32, session_id: Uuid) {
 
 pub fn is_lease_lost(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
+        let detail = failure.body.to_ascii_lowercase();
+        let identifies_lease_loss = detail.contains("lease")
+            || detail.contains("ownership")
+            || detail.contains("assigned worker");
         (failure.status == StatusCode::NOT_FOUND && failure.path.ends_with("/lease"))
             || (failure.status == StatusCode::CONFLICT
                 && (failure.path.ends_with("/lease")
-                    || failure.path.ends_with("/events")
-                    || failure.path.ends_with("/github-token")))
+                    || ((failure.path.ends_with("/events")
+                        || failure.path.ends_with("/github-token"))
+                        && identifies_lease_loss)))
     })
 }
 
@@ -836,11 +841,15 @@ fn truncate(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
     }
-    let mut end = max;
+    let suffix = "…";
+    if max < suffix.len() {
+        return String::new();
+    }
+    let mut end = max - suffix.len();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &value[..end])
+    format!("{}{suffix}", &value[..end])
 }
 
 fn url_encode(value: &str) -> String {
@@ -885,7 +894,7 @@ mod tests {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/lease".into(),
             request_id: None,
-            body: "lost".into(),
+            body: "run lease ownership was lost".into(),
         });
         assert!(is_conflict(&conflict));
         assert!(is_lease_lost(&conflict));
@@ -897,6 +906,14 @@ mod tests {
             body: "multiple repositories".into(),
         });
         assert!(!is_lease_lost(&ambiguous_manifest));
+
+        let github_permissions = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/github-token".into(),
+            request_id: None,
+            body: "GitHub App installation requires contents:write".into(),
+        });
+        assert!(!is_lease_lost(&github_permissions));
 
         let transient = anyhow::Error::new(HttpFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -916,5 +933,12 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(events.next_sequence, 7);
+    }
+
+    #[test]
+    fn truncation_includes_the_suffix_in_the_limit() {
+        assert_eq!(truncate("abcdef", 5), "ab…");
+        assert!(truncate("éééé", 7).len() <= 7);
+        assert_eq!(truncate("abc", 2), "");
     }
 }
