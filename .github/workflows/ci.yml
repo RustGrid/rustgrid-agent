@@ -52,3 +52,20 @@ jobs:
 
       - name: Check advisories, licenses, bans, and sources
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+
+      - name: Verify required RustGrid worker contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for path in \
+            '/api/v1/agent-runs' \
+            '/api/v1/agent-runs/claim-next' \
+            '/api/v1/agent-runs/{run_id}/events' \
+            '/api/v1/agent-runs/{run_id}/github-token' \
+            '/api/v1/agent-runs/{run_id}/lease' \
+            '/api/v1/agent-runs/{run_id}/manifest' \
+            '/api/v1/agent-workers/{id}/heartbeat' \
+            '/api/v1/agent-workers/{id}/queue' \
+            '/api/v1/agent-workers/{id}/queue/stream'; do
+            jq -e --arg path "${path}" '.paths[$path]' openapi.current.json >/dev/null
+          done

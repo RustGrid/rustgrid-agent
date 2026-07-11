@@ -385,12 +385,12 @@ impl RustGridClient {
         anyhow::bail!("ticket {resource} pagination exceeded 10,000 records")
     }
 
-    pub fn create_comment(&self, ticket_id: &str, body: &str) -> Result<()> {
+    pub fn create_comment(&self, ticket_id: &str, body: &str, idempotency_key: &str) -> Result<()> {
         self.send_empty(
             Method::POST,
             &format!("tickets/{ticket_id}/comments"),
             Some(json!({"body": truncate(body, 5000)})),
-            Some(&format!("agent-comment-{}", Uuid::new_v4())),
+            Some(idempotency_key),
         )
     }
 
@@ -399,15 +399,13 @@ impl RustGridClient {
         ticket_id: &str,
         row_version: i64,
         status: &str,
+        idempotency_key: &str,
     ) -> Result<i64> {
         let (_, etag) = self.send_value_with_etag(
             Method::PATCH,
             &format!("tickets/{ticket_id}"),
             Some(json!({"status": status})),
-            Some(&format!(
-                "ticket-status-{ticket_id}-{status}-{}",
-                Uuid::new_v4()
-            )),
+            Some(idempotency_key),
             Some(&format!("\"tickets:{ticket_id}:{row_version}\"")),
         )?;
         parse_etag_row_version(
@@ -507,11 +505,7 @@ impl RustGridClient {
         message: &str,
         metadata: Option<Value>,
     ) -> Result<()> {
-        let step_key = format!(
-            "{}-{}",
-            name.replace('_', "-"),
-            &Uuid::new_v4().simple().to_string()[..8]
-        );
+        let step_key = format!("{}-{status}", name.replace('_', "-"));
         self.send_empty(
             Method::POST,
             &format!("{RUNS}/{run_id}/steps"),
@@ -544,7 +538,7 @@ impl RustGridClient {
             Method::PATCH,
             &format!("{RUNS}/{run_id}"),
             Some(body),
-            None,
+            Some(&format!("run-status-{run_id}-{status}")),
             &[],
             Some(&format!("\"agent-runs:{run_id}:{row_version}\"")),
         )

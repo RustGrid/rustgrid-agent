@@ -35,8 +35,14 @@ fn console_event(label: &str, message: &str, color: &str) {
     }
 }
 
+fn feedback_idempotency_key(run_id: &str, message: &str) -> String {
+    let digest = hex::encode(Sha256::digest(message.as_bytes()));
+    format!("agent-comment-{run_id}-{}", &digest[..16])
+}
+
 use anyhow::{Context, Result, bail};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     api::{AgentRun, RustGridClient, Ticket, Worker, is_lease_lost},
@@ -59,6 +65,31 @@ pub struct RunSummary {
     pub branch: String,
     pub commit: String,
     pub pull_request_url: String,
+}
+
+#[derive(Debug)]
+enum RunFailure {
+    RequiredWorkflowsTimedOut { seconds: u64 },
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequiredWorkflowsTimedOut { seconds } => write!(
+                formatter,
+                "required GitHub workflows timed out after {seconds} seconds"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RunFailure {}
+
+fn is_execution_timeout(error: &anyhow::Error) -> bool {
+    command::is_timeout(error)
+        || error
+            .downcast_ref::<RunFailure>()
+            .is_some_and(|failure| matches!(failure, RunFailure::RequiredWorkflowsTimedOut { .. }))
 }
 
 struct Reporter<'a> {
@@ -193,9 +224,12 @@ impl Reporter<'_> {
     }
 
     fn set_ticket_status(&self, status: &str) -> Result<()> {
-        let version =
-            self.api
-                .update_ticket_status(self.ticket_id, self.ticket_row_version.get(), status)?;
+        let version = self.api.update_ticket_status(
+            self.ticket_id,
+            self.ticket_row_version.get(),
+            status,
+            &format!("ticket-status-{}-{status}", self.run_id),
+        )?;
         self.ticket_row_version.set(version);
         console_event("status", &format!("Ticket is now {status}"), "34");
         Ok(())
@@ -214,10 +248,14 @@ impl Reporter<'_> {
             None,
         );
         self.enrich_event(&mut event);
+        self.journal
+            .borrow_mut()
+            .checkpoint(self.phase.get(), sequence)?;
         self.publish_event("message", &event)?;
         self.api.create_comment(
             self.ticket_id,
             &format!("🤖 **RustGrid Agent update**\n\n{message}"),
+            &feedback_idempotency_key(self.run_id, message),
         )
     }
 
@@ -237,6 +275,9 @@ impl Reporter<'_> {
             Some(json!({"output": bounded})),
         );
         self.enrich_event(&mut event);
+        self.journal
+            .borrow_mut()
+            .checkpoint(self.phase.get(), sequence)?;
         self.publish_event("log", &event)
     }
 
@@ -254,6 +295,7 @@ impl Reporter<'_> {
             &format!(
                 "⛔ **RustGrid Agent blocked**\n\n{message}\n\nHuman intervention is required before the agent can continue."
             ),
+            &format!("agent-comment-{}-blocked", self.run_id),
         );
         let ticket_result = self.set_ticket_status("blocked");
         let update_result = self.update_run("failed", Some(&message));
@@ -286,6 +328,7 @@ impl Reporter<'_> {
         let comment_result = self.api.create_comment(
             self.ticket_id,
             "🛑 **RustGrid Agent stopped**\n\nThe run was cancelled by the worker operator and can be retried.",
+            &format!("agent-comment-{}-cancelled", self.run_id),
         );
         let ticket_result = self.set_ticket_status("todo");
         let update_result = self.update_run("cancelled", Some("cancelled by operator"));
@@ -519,7 +562,7 @@ fn execute_claimed(
                 reporter.cancel()?;
                 return Err(error);
             }
-            if format!("{error:#}").contains("timed out") {
+            if is_execution_timeout(&error) {
                 reporter.set_phase(RunPhase::TimedOut);
             }
             reporter.fail(&error)?;
@@ -742,24 +785,21 @@ fn wait_for_required_workflows(
             bail!("required workflow wait cancelled");
         }
         if started.elapsed() >= requirements.timeout {
-            bail!(
-                "required GitHub workflows timed out after {} seconds",
-                requirements.timeout.as_secs()
-            );
+            return Err(RunFailure::RequiredWorkflowsTimedOut {
+                seconds: requirements.timeout.as_secs(),
+            }
+            .into());
         }
         let token = tokens.token()?;
         let github = GitHubClient::new(&token, requirements.web_base_url)?;
         let checks = github.check_runs(requirements.repo, requirements.commit)?;
         let mut all_passed = true;
         for name in requirements.required {
-            let matching = checks.iter().find(|check| check.name == *name);
+            let matching = latest_check_run(&checks, name);
             match matching {
                 Some(check)
                     if check.status == "completed"
-                        && matches!(
-                            check.conclusion.as_deref(),
-                            Some("success" | "neutral" | "skipped")
-                        ) => {}
+                        && check.conclusion.as_deref() == Some("success") => {}
                 Some(check) if check.status == "completed" => {
                     bail!(
                         "required GitHub workflow {name} concluded as {}",
@@ -785,6 +825,28 @@ fn wait_for_required_workflows(
             thread::sleep(Duration::from_millis(250));
         }
     }
+}
+
+fn latest_check_run<'a>(
+    checks: &'a [crate::github::CheckRun],
+    name: &str,
+) -> Option<&'a crate::github::CheckRun> {
+    checks
+        .iter()
+        .filter(|check| check.name == name)
+        .max_by(|a, b| {
+            let a_time = a
+                .completed_at
+                .as_deref()
+                .or(a.started_at.as_deref())
+                .unwrap_or("");
+            let b_time = b
+                .completed_at
+                .as_deref()
+                .or(b.started_at.as_deref())
+                .unwrap_or("");
+            (a_time, a.id).cmp(&(b_time, b.id))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1097,11 +1159,22 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
     let per_run_isolation = std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() == Ok("per_run");
+    let remote_check = if api_key_present {
+        RustGridClient::new(context).and_then(|api| api.resolve_project_id(context).map(|_| ()))
+    } else {
+        Err(anyhow::anyhow!("RustGrid API key is missing"))
+    };
+    let rustgrid_reachable = remote_check.is_ok();
+    let remote_error = remote_check
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let healthy = api_key_present && per_run_isolation && rustgrid_reachable;
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "healthy": api_key_present && per_run_isolation,
+                "healthy": healthy,
                 "config": context.config_path,
                 "api_url": context.api_url,
                 "project": {"kind": project_kind, "value": project},
@@ -1112,10 +1185,15 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "lease_seconds": context.config.lease_seconds,
                 "api_key_present": api_key_present,
                 "per_run_isolation": per_run_isolation,
+                "rustgrid_reachable": rustgrid_reachable,
+                "remote_error": remote_error,
                 "github_credentials": "brokered_per_run"
             }))?
         );
-        return Ok(());
+        if healthy {
+            return Ok(());
+        }
+        bail!("status checks failed");
     }
     println!("RustGrid agent status\n");
     println!("  Config:       {}", context.config_path.display());
@@ -1144,6 +1222,14 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     println!("  API key:      {}", presence(context.api_key.as_deref()));
     println!("  GitHub token: brokered per run by RustGrid");
     println!(
+        "  RustGrid:     {}",
+        if rustgrid_reachable {
+            "authenticated and project resolved"
+        } else {
+            "unreachable or unauthorized"
+        }
+    );
+    println!(
         "  Isolation:    {}",
         if per_run_isolation {
             "per-run deployment boundary declared"
@@ -1167,6 +1253,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     if !per_run_isolation {
         bail!("status checks failed: per-run deployment isolation is not declared");
     }
+    remote_check.context("status checks failed: RustGrid connectivity")?;
     Ok(())
 }
 
@@ -1322,5 +1409,40 @@ mod tests {
             Some("Add the signing key.")
         );
         assert_eq!(blocked_action_from_feedback("Still working"), None);
+    }
+
+    #[test]
+    fn feedback_comment_keys_are_stable_and_message_specific() {
+        assert_eq!(
+            feedback_idempotency_key("run-1", "done"),
+            feedback_idempotency_key("run-1", "done")
+        );
+        assert_ne!(
+            feedback_idempotency_key("run-1", "done"),
+            feedback_idempotency_key("run-1", "blocked")
+        );
+    }
+
+    #[test]
+    fn required_workflow_reconciliation_uses_the_latest_run() {
+        let checks = vec![
+            crate::github::CheckRun {
+                id: 1,
+                name: "CI".into(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                started_at: Some("2026-07-11T10:00:00Z".into()),
+                completed_at: Some("2026-07-11T10:01:00Z".into()),
+            },
+            crate::github::CheckRun {
+                id: 2,
+                name: "CI".into(),
+                status: "completed".into(),
+                conclusion: Some("success".into()),
+                started_at: Some("2026-07-11T10:02:00Z".into()),
+                completed_at: Some("2026-07-11T10:03:00Z".into()),
+            },
+        ];
+        assert_eq!(latest_check_run(&checks, "CI").unwrap().id, 2);
     }
 }

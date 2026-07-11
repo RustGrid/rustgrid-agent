@@ -31,6 +31,33 @@ pub struct ChildLimits {
     pub cpu_seconds: u64,
 }
 
+#[derive(Debug)]
+pub enum CommandFailure {
+    Cancelled,
+    TimedOut { seconds: u64 },
+    OutputLimit { detail: String },
+}
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(formatter, "command cancelled"),
+            Self::TimedOut { seconds } => {
+                write!(formatter, "command timed out after {seconds} seconds")
+            }
+            Self::OutputLimit { detail } => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for CommandFailure {}
+
+pub fn is_timeout(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<CommandFailure>()
+        .is_some_and(|failure| matches!(failure, CommandFailure::TimedOut { .. }))
+}
+
 pub fn parse(command: &str) -> Result<Vec<String>> {
     let parts = shlex::split(command).context("command contains invalid shell quoting")?;
     if parts.is_empty() {
@@ -117,14 +144,17 @@ pub fn capture_cancellable_with_environment(
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            bail!("command cancelled");
+            return Err(CommandFailure::Cancelled.into());
         }
         if started.elapsed() >= timeout {
             terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            bail!("command timed out after {} seconds", timeout.as_secs());
+            return Err(CommandFailure::TimedOut {
+                seconds: timeout.as_secs(),
+            }
+            .into());
         }
         if let Some(status) = child.try_wait().context("failed while checking command")? {
             break status;
@@ -138,7 +168,10 @@ pub fn capture_cancellable_with_environment(
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
     if stdout.truncated || stderr.truncated {
-        bail!("command output exceeded {max_output_bytes} bytes");
+        return Err(CommandFailure::OutputLimit {
+            detail: format!("command output exceeded {max_output_bytes} bytes"),
+        }
+        .into());
     }
     Ok(CommandOutput {
         status,
@@ -328,7 +361,7 @@ where
             drop(receiver);
             let _ = reader.join();
             let _ = stderr_reader.join();
-            bail!("command cancelled");
+            return Err(CommandFailure::Cancelled.into());
         }
         if started.elapsed() >= timeout {
             terminate_process_tree(&mut child);
@@ -336,7 +369,10 @@ where
             drop(receiver);
             let _ = reader.join();
             let _ = stderr_reader.join();
-            bail!("command timed out after {} seconds", timeout.as_secs());
+            return Err(CommandFailure::TimedOut {
+                seconds: timeout.as_secs(),
+            }
+            .into());
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(StreamMessage::Line(line)) => {
@@ -355,7 +391,7 @@ where
                 drop(receiver);
                 let _ = reader.join();
                 let _ = stderr_reader.join();
-                bail!("{error}");
+                return Err(CommandFailure::OutputLimit { detail: error }.into());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = child.try_wait().context("failed while checking command")?;
@@ -369,7 +405,10 @@ where
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
     if stderr.truncated {
-        bail!("command stderr exceeded {stream_limit} bytes");
+        return Err(CommandFailure::OutputLimit {
+            detail: format!("command stderr exceeded {stream_limit} bytes"),
+        }
+        .into());
     }
     if !stderr.bytes.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&stderr.bytes));
@@ -453,10 +492,10 @@ fn configure_child(command: &mut Command, limits: Option<ChildLimits>) {
         // SAFETY: pre_exec performs only async-signal-safe setrlimit syscalls.
         unsafe {
             command.pre_exec(move || {
-                set_limit(libc::RLIMIT_AS as u32, limits.address_space_bytes)?;
-                set_limit(libc::RLIMIT_FSIZE as u32, limits.file_bytes)?;
-                set_limit(libc::RLIMIT_NOFILE as u32, limits.open_files)?;
-                set_limit(libc::RLIMIT_CPU as u32, limits.cpu_seconds)?;
+                set_limit(libc::RLIMIT_AS, limits.address_space_bytes)?;
+                set_limit(libc::RLIMIT_FSIZE, limits.file_bytes)?;
+                set_limit(libc::RLIMIT_NOFILE, limits.open_files)?;
+                set_limit(libc::RLIMIT_CPU, limits.cpu_seconds)?;
                 Ok(())
             });
         }
@@ -467,13 +506,21 @@ fn configure_child(command: &mut Command, limits: Option<ChildLimits>) {
 fn configure_child(_command: &mut Command, _limits: Option<ChildLimits>) {}
 
 #[cfg(unix)]
-fn set_limit(resource: u32, value: u64) -> std::io::Result<()> {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type RlimitResource = libc::__rlimit_resource_t;
+
+#[cfg(unix)]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type RlimitResource = libc::c_int;
+
+#[cfg(unix)]
+fn set_limit(resource: RlimitResource, value: u64) -> std::io::Result<()> {
     let mut inherited = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: inherited points to writable initialized storage for getrlimit.
-    if unsafe { libc::getrlimit(resource as _, &mut inherited) } != 0 {
+    if unsafe { libc::getrlimit(resource, &mut inherited) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     let requested = value as libc::rlim_t;
@@ -484,7 +531,7 @@ fn set_limit(resource: u32, value: u64) -> std::io::Result<()> {
     };
     // SAFETY: resource is a supported RLIMIT constant and limit points to a
     // fully initialized rlimit value that lives for the syscall duration.
-    if unsafe { libc::setrlimit(resource as _, &limit) } == 0 {
+    if unsafe { libc::setrlimit(resource, &limit) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
@@ -621,7 +668,24 @@ mod tests {
             1024 * 1024,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("cancelled"));
+        assert!(matches!(
+            error.downcast_ref::<CommandFailure>(),
+            Some(CommandFailure::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn captured_command_timeouts_are_typed() {
+        let running = AtomicBool::new(true);
+        let error = capture_cancellable(
+            "rustc --version",
+            Path::new("."),
+            &running,
+            Duration::ZERO,
+            1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(is_timeout(&error));
     }
 
     #[test]

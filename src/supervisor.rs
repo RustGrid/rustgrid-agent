@@ -127,3 +127,96 @@ impl Drop for RunSupervisor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+    };
+
+    use super::*;
+    use crate::config::{AppContext, Config};
+
+    #[test]
+    fn lease_loss_cancels_only_its_execution_token() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("could not bind supervisor test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in [
+                (200, r#"{"id":"worker-1","status":"busy"}"#),
+                (409, r#"{"error":"lease lost"}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                let reason = if response.0 == 200 { "OK" } else { "Conflict" };
+                write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.0,
+                    reason,
+                    response.1.len(),
+                    response.1
+                )
+                .unwrap();
+            }
+        });
+        let context = AppContext {
+            config: Config {
+                project_id: Some("project-1".into()),
+                project_key: None,
+                repo: None,
+                default_base_branch: "main".into(),
+                quality_gate_command: None,
+                codex_command: None,
+                heartbeat_interval_seconds: 5,
+                max_concurrency: 2,
+                lease_seconds: 30,
+                workspace_root: None,
+                command_timeout_seconds: 1800,
+                run_timeout_seconds: 7200,
+                failed_workspace_retention_hours: 72,
+                max_command_output_bytes: 8 * 1024 * 1024,
+                max_workspace_bytes: 5 * 1024 * 1024 * 1024,
+                max_child_memory_bytes: 8 * 1024 * 1024 * 1024,
+                max_child_file_bytes: 1024 * 1024 * 1024,
+                max_child_open_files: 1024,
+            },
+            config_path: PathBuf::from("test.json"),
+            api_url: format!("http://{address}"),
+            api_key: Some("test-key".into()),
+            workspace_root: PathBuf::from("/tmp/rustgrid-agent-supervisor-test"),
+        };
+        let execution = Arc::new(AtomicBool::new(true));
+        let unrelated = Arc::new(AtomicBool::new(true));
+        let supervisor = RunSupervisor::start(
+            RustGridClient::new(&context).unwrap(),
+            "worker-1".into(),
+            "run-1".into(),
+            Arc::new(AtomicI64::new(1)),
+            Arc::clone(&execution),
+            RunSupervisorConfig {
+                heartbeat_interval: Duration::from_millis(10),
+                lease_seconds: 30,
+                run_timeout: Duration::from_secs(10),
+            },
+        );
+        for _ in 0..100 {
+            if !execution.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(supervisor.lease_lost());
+        assert!(!execution.load(Ordering::SeqCst));
+        assert!(unrelated.load(Ordering::SeqCst));
+        drop(supervisor);
+        server.join().unwrap();
+    }
+}

@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -38,6 +39,12 @@ impl RunJournal {
                 .with_context(|| format!("invalid recovery journal {}", path.display()))?;
             if journal.run_id != run_id || journal.ticket_id != ticket_id {
                 anyhow::bail!("recovery journal identity does not match claimed run");
+            }
+            if journal.schema_version != 1 {
+                anyhow::bail!(
+                    "unsupported recovery journal schema version {}",
+                    journal.schema_version
+                );
             }
             journal.path = path;
             return Ok(journal);
@@ -93,15 +100,40 @@ impl RunJournal {
     }
 
     fn persist(&self) -> Result<()> {
-        let parent = self.path.parent().expect("journal path has parent");
+        let parent = self
+            .path
+            .parent()
+            .context("recovery journal path has no parent")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
         let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(self)?)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("could not open {}", temporary.display()))?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)
             .with_context(|| format!("could not write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync {}", temporary.display()))?;
         fs::rename(&temporary, &self.path)
-            .with_context(|| format!("could not replace {}", self.path.display()))
+            .with_context(|| format!("could not replace {}", self.path.display()))?;
+        sync_directory(parent)
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .with_context(|| format!("could not open {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("could not sync {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -117,5 +149,17 @@ mod tests {
         let text = fs::read_to_string(path).unwrap();
         assert!(text.contains("\"executing\""));
         assert!(text.contains("\"last_sequence\": 4"));
+    }
+
+    #[test]
+    fn rejects_unknown_journal_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        fs::write(
+            &path,
+            r#"{"schema_version":2,"run_id":"run-1","ticket_id":"ticket-1","phase":"claimed","last_sequence":0,"branch":null,"commit":null,"pull_request_url":null}"#,
+        )
+        .unwrap();
+        assert!(RunJournal::create(&path, "run-1", "ticket-1").is_err());
     }
 }

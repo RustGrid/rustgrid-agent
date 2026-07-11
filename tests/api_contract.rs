@@ -232,3 +232,38 @@ fn lists_assigned_active_runs_for_startup_recovery() {
         "GET /agent-runs?project_id=project-1&status=running&worker_id=worker-1&page=1&size=100 HTTP/1.1"
     ));
 }
+
+#[test]
+fn lifecycle_side_effects_use_stable_idempotency_keys() {
+    let Some((url, request)) = server(json!({})) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .create_comment("ticket-1", "progress", "agent-comment-run-1-message")
+        .unwrap();
+    let request = request.recv().unwrap().to_ascii_lowercase();
+    assert!(request.contains("idempotency-key: agent-comment-run-1-message"));
+
+    let Some((url, request)) = server(json!({})) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .append_step("run-1", "codex", "completed", "done", None)
+        .unwrap();
+    let request = request.recv().unwrap().to_ascii_lowercase();
+    assert!(request.contains("idempotency-key: step-run-1-codex-completed"));
+
+    let Some((url, request)) = server(json!({
+        "id": "run-1", "ticket_id": "ticket-1", "row_version": 4
+    })) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .update_run("run-1", 3, "succeeded", Some("complete"))
+        .unwrap();
+    let request = request.recv().unwrap().to_ascii_lowercase();
+    assert!(request.contains("idempotency-key: run-status-run-1-succeeded"));
+}

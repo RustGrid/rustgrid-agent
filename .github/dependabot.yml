@@ -4,9 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    groups:
-      rust-dependencies:
-        patterns: ["*"]
+    open-pull-requests-limit: 10
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -14,4 +12,3 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
-

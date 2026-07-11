@@ -31,7 +31,9 @@ defense in depth and do not replace per-run containers or host quotas.
 
 Use `rustgrid-agent status --json` from process-manager readiness checks. It
 reports configuration, credential presence, workspace location, and capacity
-without exposing secrets. Local interactive telemetry is colorized; set
+without exposing secrets. It also authenticates to RustGrid and resolves the
+configured project; unhealthy JSON output is still printed before the command
+exits non-zero. Local interactive telemetry is colorized; set
 `NO_COLOR=1` for plain logs or `RUSTGRID_AGENT_LOG=json` for newline-delimited
 structured lifecycle events collected by a service manager.
 

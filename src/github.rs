@@ -24,9 +24,14 @@ pub struct PullRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CheckRun {
+    pub id: u64,
     pub name: String,
     pub status: String,
     pub conclusion: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

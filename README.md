@@ -114,7 +114,9 @@ rustgrid-agent register
 
 `status` validates the configuration and command strings, locates the repository, reports whether the credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` registers the machine as a RustGrid worker and sends an initial heartbeat.
 
-Use `rustgrid-agent status --json` for machine-readable local readiness data.
+Use `rustgrid-agent status --json` for machine-readable readiness data. It exits
+non-zero unless credentials exist, per-run isolation is declared, and RustGrid
+authentication plus project resolution succeeds.
 Interactive lifecycle output uses color when attached to a terminal; set the
 standard `NO_COLOR` environment variable to disable it. Set
 `RUSTGRID_AGENT_LOG=json` for newline-delimited structured lifecycle events.
