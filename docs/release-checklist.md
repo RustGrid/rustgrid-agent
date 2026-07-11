@@ -4,6 +4,7 @@
 
 - [ ] Version and `CHANGELOG.md` are updated.
 - [ ] CI, dependency policy, secret scan, and container scan pass.
+- [ ] Sandbox template is pinned by verified digest and effective network policy is reviewed.
 - [ ] Security and compatibility impacts are documented.
 - [ ] Release notes include known limitations and rollback instructions.
 
@@ -18,6 +19,7 @@
 
 - [ ] `docs/staging-certification.md` is completed against the exact image digest.
 - [ ] Evidence includes run IDs, PR URLs, ordered events, sanitized logs, and resource-limit results.
+- [ ] Evidence includes concurrent isolation, orphan cleanup, secret-argv inspection, and workspace-quota termination.
 - [ ] The release candidate has operated in staging for the agreed soak period without unresolved P0/P1 findings.
 - [ ] Rollback to the previous image has been exercised.
 - [ ] An operator and security reviewer approve promotion.

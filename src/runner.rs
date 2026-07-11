@@ -495,6 +495,15 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         .iter()
         .map(|run| run.id.clone())
         .collect::<HashSet<_>>();
+    let removed_orphans = Executor::from_config(&context.config.executor)
+        .reconcile_orphans(&protected_run_ids, &context.workspace_root)?;
+    if removed_orphans > 0 {
+        console_event(
+            "cleanup",
+            &format!("Removed {removed_orphans} orphan Docker Sandbox(es)"),
+            "33",
+        );
+    }
     sweep_workspaces(context, &protected_run_ids)?;
     let mut tasks: Vec<thread::JoinHandle<()>> = Vec::new();
     for run in active_runs.into_iter().take(context.config.max_concurrency) {
@@ -651,11 +660,10 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
 }
 
 pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
-    if !context.config.executor.is_isolated() {
-        bail!(
-            "serve requires executor.kind=docker_sandbox; the local executor is development-only"
-        );
-    }
+    context
+        .config
+        .executor
+        .validate_production(context.config.max_concurrency)?;
     Executor::from_config(&context.config.executor).preflight(&context.workspace_root)?;
     watch(context, interval, false)
 }

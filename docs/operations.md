@@ -14,6 +14,11 @@ Set `max_concurrency` from measured host capacity. Each claimed run receives its
 own microVM with configured CPU and memory limits. The local executor is limited
 to one run and is rejected by `serve`.
 
+Set `capacity_cpus` and `capacity_memory` to the capacity reserved for this
+worker. Startup rejects configurations where concurrent sandbox allocations can
+exceed either ceiling. Pin `template` by verified `@sha256:` digest; tags are
+rejected by production readiness. Use `sbx` 0.34.0 or newer.
+
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:
 
@@ -27,6 +32,9 @@ Successful workspaces are removed immediately. Failed, blocked, cancelled, and
 interrupted workspaces are retained until `failed_workspace_retention_hours`.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
 host disk quota for enforcement while commands are actively writing.
+The worker also monitors workspace growth while sandbox commands run and stops
+the sandbox if `max_workspace_bytes` is crossed. Retain a host filesystem quota
+as defense against races and writes outside the polling interval.
 The worker also applies Unix child limits for address space, individual file
 size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.

@@ -11,7 +11,8 @@ All notable changes to rustgrid-agent are documented here. The project follows S
 
 ### Security
 
-- Production serving fails closed without an explicit isolation declaration and currently restricts each worker process to one active run.
+- Production serving requires a preflighted Docker Sandbox executor, digest-pinned template, effective network policy, and aggregate capacity admission. Every concurrent run receives its own microVM.
+- Sandbox identities are collision-resistant and journaled; startup removes managed orphans, active execution enforces workspace quotas, and allowlisted secrets use short-lived mode-0600 env files rather than process arguments.
 - Server-provided execution policy cannot override worker-enforced Codex sandbox or approval settings.
 
 ## 0.1.0 - Unreleased

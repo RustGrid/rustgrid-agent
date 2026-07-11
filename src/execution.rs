@@ -75,6 +75,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                 context,
                 Duration::from_secs(policy.timeout_seconds),
             )),
+            max_workspace_bytes: context.config.max_workspace_bytes,
         },
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
@@ -122,6 +123,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                     context,
                     Duration::from_secs(gate_policy.timeout_seconds),
                 )),
+                max_workspace_bytes: context.config.max_workspace_bytes,
             },
         )?;
         print_output(&gate.stdout, &gate.stderr);

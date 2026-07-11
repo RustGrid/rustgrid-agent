@@ -97,9 +97,11 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
   "executor": {
     "kind": "docker_sandbox",
     "command": "sbx",
-    "template": "docker/sandbox-templates:codex",
+    "template": "docker/sandbox-templates@sha256:<verified-digest>",
     "cpus": 4,
-    "memory": "8g"
+    "memory": "8g",
+    "capacity_cpus": 16,
+    "capacity_memory": "32g"
   }
 }
 ```
@@ -185,7 +187,7 @@ rustgrid-agent --config path/to/agent.json status
 | `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
 | `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. Values above 1 require the Docker Sandbox executor. |
-| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production `serve` requires `docker_sandbox`; its options are `command`, `template`, `cpus`, and `memory`. |
+| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production requires `docker_sandbox`, a template pinned by SHA-256, per-run `cpus`/`memory`, and aggregate `capacity_cpus`/`capacity_memory`. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
 | `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
@@ -230,10 +232,12 @@ disposable repository clone is mounted into the sandbox. Codex and all quality
 gates run inside it; RustGrid API calls, GitHub token acquisition, commits,
 pushes, and pull-request publication remain in the trusted coordinator. The
 sandbox receives only environment variables explicitly allowed by the signed
-execution policy, and command logging redacts their values.
+execution policy. Values cross the CLI through a private, short-lived env file,
+never command arguments, and the file is deleted when execution ends.
 
-Sandbox names are deterministic and journaled. A restarted worker removes any
-orphan with the same name before recreating it, and every terminal path removes
+Sandbox names are deterministic, collision-resistant hashes and are journaled.
+Startup lists managed sandboxes and removes any not assigned to an active run;
+every terminal path removes
 the sandbox with `sbx rm --force`. Cancellation or lease loss first stops the
 sandbox. Failed sandbox destruction changes an otherwise successful run into a
 failure so resource leaks are visible rather than silently accepted.
@@ -243,6 +247,14 @@ workers. `rustgrid-agent status` and `serve` verify both the `sbx` client and it
 daemon and fail closed if either is unavailable. Docker Sandboxes currently require
 Docker Desktop and are not supported on Linux hosts; choose production worker
 hosts accordingly.
+
+Production readiness also inspects the active Docker Sandbox network policy and
+requires `sbx` 0.34.0 or newer. Initialize a non-interactive host with at least
+the balanced policy and review its effective rules before admitting work. The
+worker continuously measures the mounted workspace during Codex and gate
+execution and stops the sandbox when `max_workspace_bytes` is exceeded.
+Replace the all-zero digest in the example configuration with the digest of the
+template you reviewed; it is intentionally not a deployable image reference.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 
@@ -379,7 +391,7 @@ Common checks:
 - Only new changed paths reported by Git inside the discovered repository root are staged. The runner never uses `git add .`.
 - Existing local branches are never overwritten.
 - Codex and quality-gate commands run directly without a shell.
-- Secrets are not logged, embedded in Git URLs, written to disk, or included in prompts.
+- Long-lived credentials are not logged, embedded in Git URLs, persisted, or included in prompts. Explicitly allowlisted child values use a protected temporary env file that is deleted after execution.
 - API errors include the HTTP status, a bounded response body, and the RustGrid request ID when available.
 - Failed runs leave the branch and worktree in place for recovery.
 

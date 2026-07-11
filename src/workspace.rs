@@ -148,7 +148,7 @@ fn git_hooks_disabled() -> &'static str {
     }
 }
 
-fn directory_size(path: &Path) -> Result<u64> {
+pub(crate) fn directory_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;

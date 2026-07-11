@@ -8,7 +8,7 @@
 
 ## Toward 1.0
 
-- Introduce a dedicated executor protocol so long-lived coordinators can launch every run in a separately attested container or microVM.
+- Add a remote executor option for Linux worker fleets; the current production executor launches a Docker Sandbox microVM per run.
 - Add tenant-scoped artifact upload with bounded retention and redaction policy.
 - Add deployment-integrated metrics/OTLP export without exposing ticket content.
 - Formalize RustGrid worker API version negotiation and deprecation windows.

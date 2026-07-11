@@ -63,6 +63,10 @@ pub enum ExecutorConfig {
         cpus: u16,
         #[serde(default = "default_sandbox_memory")]
         memory: String,
+        #[serde(default = "default_sandbox_capacity_cpus")]
+        capacity_cpus: u16,
+        #[serde(default = "default_sandbox_capacity_memory")]
+        capacity_memory: String,
     },
 }
 
@@ -76,6 +80,35 @@ impl ExecutorConfig {
             Self::Local => "local",
             Self::DockerSandbox { .. } => "docker_sandbox",
         }
+    }
+
+    pub(crate) fn validate_production(&self, max_concurrency: usize) -> Result<()> {
+        let Self::DockerSandbox {
+            template,
+            cpus,
+            memory,
+            capacity_cpus,
+            capacity_memory,
+            ..
+        } = self
+        else {
+            bail!("executor.kind=docker_sandbox is required for production");
+        };
+        let digest = template.split_once("@sha256:").map(|(_, value)| value);
+        if !digest
+            .is_some_and(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            bail!("production sandbox template must be pinned by a 64-character sha256 digest");
+        }
+        let required_cpus = usize::from(*cpus).saturating_mul(max_concurrency);
+        if required_cpus > usize::from(*capacity_cpus) {
+            bail!("sandbox CPU allocation exceeds configured host capacity");
+        }
+        let required_memory = parse_binary_size(memory)?.saturating_mul(max_concurrency as u64);
+        if required_memory > parse_binary_size(capacity_memory)? {
+            bail!("sandbox memory allocation exceeds configured host capacity");
+        }
+        Ok(())
     }
 }
 
@@ -118,6 +151,35 @@ fn default_sandbox_cpus() -> u16 {
 }
 fn default_sandbox_memory() -> String {
     "8g".into()
+}
+fn default_sandbox_capacity_cpus() -> u16 {
+    4
+}
+fn default_sandbox_capacity_memory() -> String {
+    "8g".into()
+}
+
+fn parse_binary_size(value: &str) -> Result<u64> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let split = normalized
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(normalized.len());
+    let number: u64 = normalized[..split]
+        .parse()
+        .context("memory size must start with a number")?;
+    if number == 0 {
+        bail!("memory size must be greater than zero");
+    }
+    let multiplier = match &normalized[split..] {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => bail!("memory size must use b, k, m, or g binary units"),
+    };
+    number
+        .checked_mul(multiplier)
+        .context("memory size overflow")
 }
 
 fn default_lease_seconds() -> u64 {
@@ -225,16 +287,24 @@ impl Config {
                 template,
                 cpus,
                 memory,
+                capacity_cpus,
+                capacity_memory,
             } => {
                 if command.trim().is_empty()
                     || template.trim().is_empty()
                     || memory.trim().is_empty()
+                    || capacity_memory.trim().is_empty()
                 {
                     bail!("docker sandbox command, template, and memory cannot be empty");
                 }
                 if !(1..=64).contains(cpus) {
                     bail!("docker sandbox cpus must be between 1 and 64");
                 }
+                if !(1..=256).contains(capacity_cpus) {
+                    bail!("docker sandbox capacity_cpus must be between 1 and 256");
+                }
+                parse_binary_size(memory)?;
+                parse_binary_size(capacity_memory)?;
             }
             ExecutorConfig::Local => {}
         }
@@ -327,7 +397,32 @@ mod tests {
             template: "test".into(),
             cpus: 1,
             memory: "1g".into(),
+            capacity_cpus: 2,
+            capacity_memory: "2g".into(),
         };
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn production_requires_digest_and_capacity() {
+        let mutable = ExecutorConfig::DockerSandbox {
+            command: "sbx".into(),
+            template: "example:latest".into(),
+            cpus: 4,
+            memory: "8g".into(),
+            capacity_cpus: 8,
+            capacity_memory: "16g".into(),
+        };
+        assert!(mutable.validate_production(2).is_err());
+        let pinned = ExecutorConfig::DockerSandbox {
+            command: "sbx".into(),
+            template: format!("example@sha256:{}", "a".repeat(64)),
+            cpus: 4,
+            memory: "8g".into(),
+            capacity_cpus: 8,
+            capacity_memory: "16g".into(),
+        };
+        pinned.validate_production(2).unwrap();
+        assert!(pinned.validate_production(3).is_err());
     }
 }

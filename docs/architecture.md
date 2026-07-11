@@ -31,3 +31,9 @@ The worker API key remains in the parent process. Child environments are rebuilt
 ## Ownership and concurrency
 
 Lease loss stops and destroys the affected sandbox and suppresses stale terminal writes. ETags and semantic idempotency keys protect concurrent control-plane mutations. Each active run has a unique sandbox and workspace, so `serve` may safely claim up to its configured capacity.
+
+At startup the coordinator compares `sbx ls --json` with control-plane active
+runs and removes managed orphans. Sandbox names are hashes of run IDs, avoiding
+collisions and disclosure. Allowlisted environment values are transported in a
+private temporary env file outside the mounted repository and deleted after the
+CLI finishes reading it.

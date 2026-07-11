@@ -183,6 +183,8 @@ mod tests {
                     template: "test".into(),
                     cpus: 1,
                     memory: "1g".into(),
+                    capacity_cpus: 2,
+                    capacity_memory: "2g".into(),
                 },
                 lease_seconds: 30,
                 workspace_root: None,

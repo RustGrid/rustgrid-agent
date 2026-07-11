@@ -16,6 +16,15 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
     let per_run_isolation = context.config.executor.is_isolated();
+    let production_config = context
+        .config
+        .executor
+        .validate_production(context.config.max_concurrency);
+    let production_config_ready = production_config.is_ok();
+    let production_config_error = production_config
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
     let executor_check =
         Executor::from_config(&context.config.executor).preflight(&context.workspace_root);
     let executor_ready = executor_check.is_ok();
@@ -37,6 +46,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     let healthy = api_key_present
         && per_run_isolation
         && executor_ready
+        && production_config_ready
         && production_safe_concurrency
         && rustgrid_reachable;
     if json_output {
@@ -57,6 +67,8 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "executor": context.config.executor.kind(),
                 "executor_ready": executor_ready,
                 "executor_error": executor_error,
+                "production_config_ready": production_config_ready,
+                "production_config_error": production_config_error,
                 "production_safe_concurrency": production_safe_concurrency,
                 "rustgrid_reachable": rustgrid_reachable,
                 "remote_error": remote_error,
@@ -141,6 +153,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     if !per_run_isolation {
         bail!("status checks failed: executor.kind=docker_sandbox is required for production");
     }
+    production_config.context("status checks failed: production executor configuration")?;
     executor_check.context("status checks failed: Docker Sandbox executor")?;
     if !production_safe_concurrency {
         bail!("status checks failed: max_concurrency must be 1 for production");

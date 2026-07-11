@@ -13,6 +13,8 @@ The RustGrid control plane and deployment platform should alert on:
 - API and GitHub retry counts;
 - ambiguous event reconciliation;
 - workspace bytes and retained workspace count;
+- sandbox create/destroy latency, orphan cleanup count, and quota-stop events;
+- active sandbox count compared with assigned active runs;
 - run outcome category and child termination reason;
 - process and container restart rate.
 
@@ -24,6 +26,11 @@ Retained logs and workspaces need documented owner, region, access policy, encry
 
 ## Export integration
 
-The worker does not embed an OTLP client. Collect structured stdout through the deployment logging agent and derive infrastructure metrics from RustGrid worker/run state plus container metrics. A future native metrics endpoint must remain unauthenticated only on a private loopback or sidecar network and must never expose ticket content.
+The worker does not embed an OTLP client. Sandbox lifecycle, cleanup, and quota
+events are included in structured stdout. Collect them through the deployment
+logging agent and derive infrastructure metrics from RustGrid worker/run state
+plus Docker Sandbox metrics. A future native metrics endpoint must remain
+unauthenticated only on a private loopback or sidecar network and must never
+expose ticket content.
 
 Artifact upload is not enabled until the RustGrid worker API supplies a tenant-scoped artifact endpoint with size, retention, and authorization policy. Until then, retain only bounded lifecycle data and the local failed workspace.

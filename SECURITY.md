@@ -33,3 +33,9 @@ be issued through the RustGrid broker.
 The worker executes repository-controlled code. Production `serve` therefore
 requires the Docker Sandbox executor and fails closed if `sbx` is unavailable.
 Do not use the local executor for untrusted repositories.
+
+Production configuration must pin the sandbox template by SHA-256 digest and
+fit aggregate run allocations within declared host capacity. Allowlisted child
+environment values are written only to a mode-0600 temporary file outside the
+mounted repository, passed with `sbx exec --env-file`, and removed immediately.
+Review the effective Docker Sandbox network policy before enabling a worker.

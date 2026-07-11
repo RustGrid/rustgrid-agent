@@ -10,9 +10,11 @@
   "executor": {
     "kind": "docker_sandbox",
     "command": "sbx",
-    "template": "docker/sandbox-templates:codex",
+    "template": "docker/sandbox-templates@sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "cpus": 4,
-    "memory": "8g"
+    "memory": "8g",
+    "capacity_cpus": 16,
+    "capacity_memory": "32g"
   },
   "lease_seconds": 900,
   "workspace_root": null,
