@@ -1,6 +1,6 @@
 use std::{
     ffi::OsStr,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -46,6 +46,75 @@ where
     })
 }
 
+pub fn capture_cancellable(
+    command: &str,
+    cwd: &Path,
+    running: &AtomicBool,
+    timeout: Duration,
+) -> Result<CommandOutput> {
+    let parts = parse(command)?;
+    println!("  $ {}", display_command(&parts));
+    let mut command = Command::new(&parts[0]);
+    command
+        .args(&parts[1..])
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sanitize_child_environment(&mut command);
+    configure_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", parts[0]))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture command stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("failed to capture command stderr")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if !running.load(Ordering::SeqCst) {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("command cancelled");
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            bail!("command timed out after {} seconds", timeout.as_secs());
+        }
+        if let Some(status) = child.try_wait().context("failed while checking command")? {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    Ok(CommandOutput {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
 pub fn capture_with_env<I, S, E, K, V>(
     program: &str,
     args: I,
@@ -59,9 +128,10 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    sanitize_child_environment(&mut command);
+    let output = command
         .envs(env)
         .output()
         .with_context(|| format!("failed to start {program}"))?;
@@ -129,7 +199,14 @@ where
     F: FnMut(&str) -> Result<()>,
 {
     let running = Arc::new(AtomicBool::new(true));
-    streaming_lines_cancellable(command, cwd, stdin_text, &running, on_line)
+    streaming_lines_cancellable(
+        command,
+        cwd,
+        stdin_text,
+        &running,
+        Duration::from_secs(24 * 60 * 60),
+        on_line,
+    )
 }
 
 pub fn streaming_lines_cancellable<F>(
@@ -137,6 +214,7 @@ pub fn streaming_lines_cancellable<F>(
     cwd: &Path,
     stdin_text: Option<&str>,
     running: &AtomicBool,
+    timeout: Duration,
     mut on_line: F,
 ) -> Result<ExitStatus>
 where
@@ -145,7 +223,8 @@ where
     let mut parts = parse(command)?;
     add_codex_json_flag(&mut parts);
     println!("  $ {}", display_command(&parts));
-    let mut child = Command::new(&parts[0])
+    let mut command = Command::new(&parts[0]);
+    command
         .args(&parts[1..])
         .current_dir(cwd)
         .stdin(if stdin_text.is_some() {
@@ -154,7 +233,10 @@ where
             Stdio::inherit()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    sanitize_child_environment(&mut command);
+    configure_process_group(&mut command);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", parts[0]))?;
 
@@ -176,18 +258,25 @@ where
             }
         }
     });
+    let started = std::time::Instant::now();
     loop {
         if !running.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = reader.join();
             bail!("command cancelled");
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!("command timed out after {} seconds", timeout.as_secs());
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(line) => {
                 let line = line.context("failed to read command stdout")?;
                 if let Err(error) = on_line(&line) {
-                    let _ = child.kill();
+                    terminate_process_tree(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     return Err(error);
@@ -207,6 +296,36 @@ where
     }
     let _ = reader.join();
     child.wait().context("failed while waiting for command")
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let process_group = -(child.id() as i32);
+    // SAFETY: the child was placed in its own process group immediately before
+    // spawn, and kill receives only that known process-group identifier.
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+}
+
+fn sanitize_child_environment(command: &mut Command) {
+    for name in ["RUSTGRID_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
+        command.env_remove(name);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn add_codex_json_flag(parts: &mut Vec<String>) {
@@ -265,5 +384,18 @@ mod tests {
 
         add_codex_json_flag(&mut parts);
         assert_eq!(parts.iter().filter(|part| *part == "--json").count(), 1);
+    }
+
+    #[test]
+    fn captured_commands_honor_cancellation() {
+        let running = AtomicBool::new(false);
+        let error = capture_cancellable(
+            "rustc --version",
+            Path::new("."),
+            &running,
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
     }
 }

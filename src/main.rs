@@ -20,17 +20,9 @@ enum Commands {
     /// Register this machine as a RustGrid worker.
     Register,
     /// Run one RustGrid ticket in the current Git repository.
-    Run {
-        ticket_id: String,
-        /// Permit a dirty tree. Existing dirty paths are never staged or committed.
-        #[arg(long)]
-        allow_dirty: bool,
-    },
+    Run { ticket_id: String },
     /// Poll RustGrid for tickets and run them one at a time.
     Watch {
-        /// Permit a dirty tree. Existing dirty paths are never staged or committed.
-        #[arg(long)]
-        allow_dirty: bool,
         /// Seconds between empty queue polls.
         #[arg(long, default_value_t = 15)]
         interval: u64,
@@ -40,9 +32,6 @@ enum Commands {
     },
     /// Run the production worker daemon with continuous supervision.
     Serve {
-        /// Permit a dirty tree. Existing dirty paths are never staged or committed.
-        #[arg(long)]
-        allow_dirty: bool,
         /// Seconds between empty queue polls.
         #[arg(long, default_value_t = 15)]
         interval: u64,
@@ -57,19 +46,13 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Register => runner::register(&context),
-        Commands::Run {
-            ticket_id,
-            allow_dirty,
-        } => runner::run_ticket(&context, &ticket_id, allow_dirty).map(|_| ()),
-        Commands::Watch {
-            allow_dirty,
-            interval,
-            once,
-        } => runner::watch(&context, allow_dirty, Duration::from_secs(interval), once),
-        Commands::Serve {
-            allow_dirty,
-            interval,
-        } => runner::watch(&context, allow_dirty, Duration::from_secs(interval), false),
+        Commands::Run { ticket_id } => runner::run_ticket(&context, &ticket_id).map(|_| ()),
+        Commands::Watch { interval, once } => {
+            runner::watch(&context, Duration::from_secs(interval), once)
+        }
+        Commands::Serve { interval } => {
+            runner::watch(&context, Duration::from_secs(interval), false)
+        }
         Commands::Status => runner::status(&context),
     }
 }

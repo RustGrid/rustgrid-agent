@@ -23,6 +23,14 @@ pub struct Config {
     pub heartbeat_interval_seconds: u64,
     #[serde(default = "default_lease_seconds")]
     pub lease_seconds: u64,
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default = "default_command_timeout_seconds")]
+    pub command_timeout_seconds: u64,
+    #[serde(default = "default_run_timeout_seconds")]
+    pub run_timeout_seconds: u64,
+    #[serde(default = "default_failed_workspace_retention_hours")]
+    pub failed_workspace_retention_hours: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,8 +46,8 @@ pub struct AppContext {
     pub config_path: PathBuf,
     pub api_url: String,
     pub api_key: Option<String>,
-    pub github_token: Option<String>,
     pub codex_command: String,
+    pub workspace_root: PathBuf,
 }
 
 fn default_base_branch() -> String {
@@ -52,6 +60,18 @@ fn default_heartbeat_interval_seconds() -> u64 {
 
 fn default_lease_seconds() -> u64 {
     900
+}
+
+fn default_command_timeout_seconds() -> u64 {
+    1800
+}
+
+fn default_run_timeout_seconds() -> u64 {
+    7200
+}
+
+fn default_failed_workspace_retention_hours() -> u64 {
+    72
 }
 
 impl AppContext {
@@ -67,13 +87,18 @@ impl AppContext {
             .or_else(|| config.codex_command.clone())
             .unwrap_or_else(|| "codex exec --full-auto --json -".into());
 
+        let workspace_root = config.workspace_root.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("rustgrid-agent")
+                .join("workspaces")
+        });
         Ok(Self {
             config,
             config_path: path.to_path_buf(),
             api_url: env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into()),
             api_key: nonempty_env("RUSTGRID_API_KEY"),
-            github_token: nonempty_env("GITHUB_TOKEN"),
             codex_command,
+            workspace_root,
         })
     }
 
@@ -81,12 +106,6 @@ impl AppContext {
         self.api_key
             .as_deref()
             .context("RUSTGRID_API_KEY is required")
-    }
-
-    pub fn require_github_token(&self) -> Result<&str> {
-        self.github_token
-            .as_deref()
-            .context("GITHUB_TOKEN is required")
     }
 
     pub fn project_value(&self) -> (&'static str, &str) {
@@ -129,6 +148,15 @@ impl Config {
         if self.heartbeat_interval_seconds.saturating_mul(3) >= self.lease_seconds {
             bail!("lease_seconds must exceed three heartbeat intervals");
         }
+        if self.command_timeout_seconds < 30 {
+            bail!("command_timeout_seconds must be at least 30");
+        }
+        if self.run_timeout_seconds < self.command_timeout_seconds {
+            bail!("run_timeout_seconds must be at least command_timeout_seconds");
+        }
+        if self.failed_workspace_retention_hours > 24 * 30 {
+            bail!("failed_workspace_retention_hours cannot exceed 720");
+        }
         Ok(())
     }
 }
@@ -155,6 +183,10 @@ mod tests {
             codex_command: None,
             heartbeat_interval_seconds: 15,
             lease_seconds: 900,
+            workspace_root: None,
+            command_timeout_seconds: 1800,
+            run_timeout_seconds: 7200,
+            failed_workspace_retention_hours: 72,
         };
         assert!(
             config

@@ -238,6 +238,167 @@
         ],
         "type": "object"
       },
+      "AgentExecutionManifestResponse": {
+        "properties": {
+          "clone_url": {
+            "format": "uri",
+            "type": "string"
+          },
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installation_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "manifest_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "project_key": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "repository_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "required_permissions": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "required_workflows": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "run": {
+            "$ref": "#/components/schemas/AgentRunResponse"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ticket_key": {
+            "type": "string"
+          },
+          "ticket_title": {
+            "type": "string"
+          },
+          "web_base_url": {
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "manifest_version",
+          "run",
+          "project_id",
+          "project_key",
+          "project_name",
+          "ticket_id",
+          "ticket_key",
+          "ticket_title",
+          "repository_id",
+          "repository",
+          "clone_url",
+          "web_base_url",
+          "installation_id",
+          "required_workflows",
+          "required_permissions"
+        ],
+        "type": "object"
+      },
+      "AgentGithubTokenResponse": {
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "permissions": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "token": {
+            "description": "Secret returned once. Never persisted by RustGrid.",
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "permissions",
+          "repository"
+        ],
+        "type": "object"
+      },
+      "AgentRunEventResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sequence": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "run_id",
+          "event_type",
+          "data",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AgentRunEventsResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentRunEventResponse"
+            },
+            "type": "array"
+          },
+          "next_sequence": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "next_sequence"
+        ],
+        "type": "object"
+      },
       "AgentRunPageResponse": {
         "properties": {
           "items": {
@@ -1459,6 +1620,27 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "CreateAgentRunEventRequest": {
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "event_type": {
+            "enum": [
+              "progress",
+              "message",
+              "log"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_type",
+          "data"
         ],
         "type": "object"
       },
@@ -6928,6 +7110,360 @@
         ]
       }
     },
+    "/api/v1/agent-runs/{run_id}/events": {
+      "get": {
+        "description": "Replay durable agent-run events in ascending sequence order.",
+        "operationId": "listAgentRunEvents",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "format": "int64",
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRunEventsResponse"
+                }
+              }
+            },
+            "description": "Sequenced event replay"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replay agent-run events",
+        "tags": [
+          "agents"
+        ]
+      },
+      "post": {
+        "description": "Append a durable progress, message, or log event. Requires the bound worker credential and an active lease.",
+        "operationId": "appendAgentRunEvent",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAgentRunEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRunEventResponse"
+                }
+              }
+            },
+            "description": "Durable progress event"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid event"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not a bound worker credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run lease is not active"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Append an agent-run progress event",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/events/stream": {
+      "get": {
+        "description": "Stream durable agent-run events as SSE. Resume with Last-Event-ID or after_sequence.",
+        "operationId": "streamAgentRunEvents",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "format": "int64",
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Server-sent agent-run event stream"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Stream agent-run events",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/github-token": {
+      "post": {
+        "description": "Issue a short-lived GitHub App installation token restricted to the claimed run repository. Requires the bound worker credential and an active lease.",
+        "operationId": "issueAgentGithubToken",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentGithubTokenResponse"
+                }
+              }
+            },
+            "description": "Short-lived repository token",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "example": "no-store",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not a bound worker credential"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run lease is not active"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub token issuance failed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Issue a run-scoped GitHub token",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-runs/{run_id}/lease": {
       "post": {
         "description": "Extend an active agent run claim lease for the worker that owns the run.",
@@ -7098,6 +7634,84 @@
           }
         ],
         "summary": "Extend an agent run lease",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/manifest": {
+      "get": {
+        "description": "Resolve the claimed run to its project and single active GitHub App repository binding.",
+        "operationId": "getAgentExecutionManifest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentExecutionManifestResponse"
+                }
+              }
+            },
+            "description": "Worker execution manifest"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run or repository binding not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Repository binding is ambiguous"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get an agent execution manifest",
         "tags": [
           "agents"
         ]

@@ -22,12 +22,14 @@ For each ticket, the agent:
 - macOS or Linux with Git installed.
 - Access to the GitHub repository named in the agent configuration.
 - A RustGrid API key with the permissions listed in [Credentials](#credentials).
-- A GitHub token that can push branches and create pull requests.
+- A RustGrid project linked to a GitHub repository through the RustGrid GitHub App.
 - Codex CLI installed, authenticated, and available as `codex`, unless `codex_command` or `CODEX_COMMAND` points to another compatible command.
 - A Git author name and email configured for the commit the agent creates.
 - Rust 1.85 or newer when installing from source. A Homebrew installation does not require a separate Rust toolchain at runtime.
 
-The agent must be run from inside the Git repository it will modify. Its configured base branch must already exist locally, and the repository must have an `origin` remote for the configured GitHub repository.
+The agent creates an isolated clone for every run from the repository in the
+RustGrid execution manifest. It does not need to start inside the target
+repository.
 
 ## Install
 
@@ -94,7 +96,6 @@ Export credentials in the shell or inject them through the process manager that 
 
 ```sh
 export RUSTGRID_API_KEY=rg_...
-export GITHUB_TOKEN=github_pat_...
 ```
 
 The production RustGrid API URL is used by default. Set `RUSTGRID_API_URL` only when targeting a different deployment:
@@ -151,11 +152,15 @@ rustgrid-agent --config path/to/agent.json status
 | `project_id` | One project field | RustGrid project UUID. Mutually exclusive with `project_key`. |
 | `repo.owner` | Yes | GitHub organization or account that owns the target repository. |
 | `repo.name` | Yes | GitHub repository name. |
-| `default_base_branch` | No | Local branch from which agent branches are created and the base used for pull requests. Defaults to `main`. |
-| `quality_gate_command` | Yes | Command run after Codex finishes, for example `cargo test` or `npm test`. |
+| `default_base_branch` | No | Bootstrap value used before a run is claimed. The execution manifest is authoritative for claimed runs. |
+| `quality_gate_command` | Yes | Bootstrap quality gate used to build the initial claim prompt. The execution manifest is authoritative after claim. |
 | `codex_command` | No | Command that accepts the generated prompt on stdin. Defaults to `codex exec --full-auto --json -`. The runner adds `--json` automatically when the executable is `codex`. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
+| `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
+| `command_timeout_seconds` | No | Maximum duration of Codex, a quality gate, or required-workflow wait. Defaults to 1800. |
+| `run_timeout_seconds` | No | Maximum total active-run duration. Defaults to 7200 and cannot be shorter than the command timeout. |
+| `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces before startup cleanup. Defaults to 72. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
@@ -170,7 +175,6 @@ export CODEX_COMMAND='codex exec --full-auto --json -'
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `RUSTGRID_API_KEY` | Yes | Authenticates RustGrid API requests. |
-| `GITHUB_TOKEN` | Yes | Pushes the generated branch and creates its pull request. |
 | `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
 
@@ -184,7 +188,9 @@ The RustGrid API key needs these permissions:
 - `agents:quality_gates:read` and `agents:quality_gates:create`
 - `projects:read` when `watch` resolves a configured `project_key`
 
-`GITHUB_TOKEN` needs permission to push branches and create pull requests in the configured repository. With a fine-grained personal access token, grant repository contents read/write and pull requests read/write. Organization policy or branch protection may require additional approval.
+GitHub credentials are issued by RustGrid for the GitHub App installation in
+the claimed execution manifest. Tokens are held only in memory, refreshed before
+expiry, and scoped by the server to the claimed run and repository.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 
@@ -210,12 +216,12 @@ Shows the resolved configuration path, API URL, project, repository root, base b
 
 ```sh
 rustgrid-agent run <ticket-uuid>
-rustgrid-agent run <ticket-uuid> --allow-dirty
 ```
 
 Fetches and processes one ticket. The identifier is the RustGrid ticket UUID, not a key such as `RG-1`.
 
-By default, a dirty worktree stops the run before the ticket is claimed. `--allow-dirty` records all paths that were already dirty and excludes them from the agent commit. If Codex edits one of those paths, that path remains uncommitted.
+Every run uses a clean isolated workspace. Existing files in the directory from
+which the agent was started are never staged or committed.
 
 ### `watch`
 
@@ -223,12 +229,12 @@ By default, a dirty worktree stops the run before the ticket is claimed. `--allo
 rustgrid-agent watch
 rustgrid-agent watch --interval 30
 rustgrid-agent watch --once
-rustgrid-agent watch --allow-dirty
 ```
 
 Registers one worker, heartbeats it, and processes queued tickets serially. `--interval` controls the delay in seconds after each poll and defaults to 15. `--once` performs one poll and exits, which is useful for schedulers and smoke tests. A failed ticket is reported and watch mode continues to the next poll.
 
-Run only one watcher per working copy. Each successful ticket changes the current branch, and existing generated branch names are never overwritten.
+Multiple worker processes must use distinct worker credentials and workspace
+roots. A single `serve` process claims and executes one run at a time.
 
 ### `serve`
 
@@ -258,6 +264,18 @@ SIGINT for graceful shutdown.
 
 A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `done` only after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
 
+Immediately after claim, the worker retrieves
+`GET /agent-runs/{run_id}/manifest`. It rejects unknown manifest
+versions, mismatched run/ticket identities, incomplete repository data, and a
+local `origin` that does not match the claimed repository. GitHub tokens come
+from `POST /agent-runs/{run_id}/github-token` and are refreshed before expiry.
+
+Each structured lifecycle event is published to
+`POST /agent-runs/{run_id}/events` with a stable idempotency key. If the
+response is ambiguous, the agent replays events after its last accepted server
+sequence and retries once only when the event was not already committed.
+Accepted sequences are persisted in the recovery journal.
+
 Run steps carry a versioned lifecycle event envelope with a per-run sequence,
 timestamp, phase, severity, event type, message, and structured data. Current
 phases are `claimed`, `preparing`, `executing`, `verifying`, `publishing`,
@@ -278,17 +296,19 @@ If Codex, the quality gate, Git push, or pull-request creation fails, the agent 
 Common checks:
 
 - **Configuration cannot be read:** run from the directory containing `.rustgrid-agent.json`, or pass `--config`.
-- **Working tree is dirty:** commit or stash the changes, or deliberately use `--allow-dirty`.
 - **Base branch is missing:** fetch it and create or switch to the locally configured `default_base_branch` before running the agent.
 - **Codex cannot start:** confirm the Codex CLI is installed, authenticated, and available on `PATH`; then inspect `rustgrid-agent status`.
 - **Quality gate fails:** run the exact configured command locally. Shell syntax is not interpreted.
 - **Push or pull-request creation fails:** verify the `origin` remote, repository fields, token permissions, organization policy, and base branch.
-- **No committable changes:** Codex either changed nothing or changed only paths that were dirty before an `--allow-dirty` run.
+- **Execution manifest fails:** verify that the project has an enabled GitHub App repository binding and that the run manifest matches the local `origin`.
+- **Progress cursor conflict:** the agent automatically resynchronizes once; repeated conflicts stop the run to preserve ordered telemetry.
+- **Lease ownership is lost:** local execution stops without publishing a terminal state because another worker or the control plane is authoritative.
+- **No committable changes:** Codex did not change the isolated run workspace.
 
 ## Safety model
 
 - A dirty worktree is rejected by default.
-- With `--allow-dirty`, paths that were already dirty are excluded from the agent commit.
+- Every run uses a repository clone dedicated to that run ID.
 - Only new changed paths reported by Git inside the discovered repository root are staged. The runner never uses `git add .`.
 - Existing local branches are never overwritten.
 - Codex and quality-gate commands run directly without a shell.

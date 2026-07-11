@@ -16,6 +16,7 @@ pub enum RunPhase {
     Blocked,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 impl RunPhase {
@@ -31,13 +32,14 @@ impl RunPhase {
             Self::Blocked => "blocked",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
         }
     }
 
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Blocked | Self::Failed | Self::Cancelled
+            Self::Succeeded | Self::Blocked | Self::Failed | Self::Cancelled | Self::TimedOut
         )
     }
 }

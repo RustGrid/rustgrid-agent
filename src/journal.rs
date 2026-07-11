@@ -18,17 +18,28 @@ pub struct RunJournal {
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub pull_request_url: Option<String>,
+    #[serde(default)]
+    pub pull_request_number: Option<u64>,
+    #[serde(default)]
+    pub progress_sequence: u64,
     #[serde(skip)]
     path: PathBuf,
 }
 
 impl RunJournal {
-    pub fn create(repo_root: &Path, run_id: &str, ticket_id: &str) -> Result<Self> {
-        let path = repo_root
-            .join(".git")
-            .join("rustgrid-agent")
-            .join("runs")
-            .join(format!("{run_id}.json"));
+    pub fn create(path: &Path, run_id: &str, ticket_id: &str) -> Result<Self> {
+        let path = path.to_path_buf();
+        if path.is_file() {
+            let bytes =
+                fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
+            let mut journal: Self = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid recovery journal {}", path.display()))?;
+            if journal.run_id != run_id || journal.ticket_id != ticket_id {
+                anyhow::bail!("recovery journal identity does not match claimed run");
+            }
+            journal.path = path;
+            return Ok(journal);
+        }
         let journal = Self {
             schema_version: 1,
             run_id: run_id.to_owned(),
@@ -38,6 +49,8 @@ impl RunJournal {
             branch: None,
             commit: None,
             pull_request_url: None,
+            pull_request_number: None,
+            progress_sequence: 0,
             path,
         };
         journal.persist()?;
@@ -60,8 +73,14 @@ impl RunJournal {
         self.persist()
     }
 
-    pub fn record_pull_request(&mut self, url: &str) -> Result<()> {
+    pub fn record_pull_request(&mut self, url: &str, number: u64) -> Result<()> {
         self.pull_request_url = Some(url.to_owned());
+        self.pull_request_number = Some(number);
+        self.persist()
+    }
+
+    pub fn record_progress_sequence(&mut self, sequence: u64) -> Result<()> {
+        self.progress_sequence = sequence;
         self.persist()
     }
 
@@ -84,11 +103,10 @@ mod tests {
     #[test]
     fn persists_recovery_checkpoint_outside_worktree_changes() {
         let directory = tempfile::tempdir().unwrap();
-        fs::create_dir(directory.path().join(".git")).unwrap();
-        let mut journal = RunJournal::create(directory.path(), "run-1", "ticket-1").unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
         journal.checkpoint(RunPhase::Executing, 4).unwrap();
-        let text = fs::read_to_string(directory.path().join(".git/rustgrid-agent/runs/run-1.json"))
-            .unwrap();
+        let text = fs::read_to_string(path).unwrap();
         assert!(text.contains("\"executing\""));
         assert!(text.contains("\"last_sequence\": 4"));
     }

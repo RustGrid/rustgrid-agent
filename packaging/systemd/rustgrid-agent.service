@@ -1,0 +1,25 @@
+[Unit]
+Description=RustGrid Agent Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustgrid-agent
+Group=rustgrid-agent
+WorkingDirectory=/var/lib/rustgrid-agent
+EnvironmentFile=/etc/rustgrid-agent/environment
+ExecStart=/usr/local/bin/rustgrid-agent --config /etc/rustgrid-agent/agent.json serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rustgrid-agent
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

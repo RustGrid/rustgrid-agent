@@ -14,15 +14,18 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::{
-    api::{AgentRun, RustGridClient, Ticket, Worker},
+    api::{AgentRun, RustGridClient, Ticket, Worker, is_lease_lost},
     command,
     config::AppContext,
     git::{Repo, branch_name},
     github::GitHubClient,
     journal::RunJournal,
     lifecycle::{LifecycleEvent, RunPhase},
+    manifest::ExecutionManifest,
     prompt,
-    supervisor::RunSupervisor,
+    supervisor::{RunSupervisor, RunSupervisorConfig},
+    token::GitHubTokenManager,
+    workspace::RunWorkspace,
 };
 
 #[derive(Debug)]
@@ -42,9 +45,54 @@ struct Reporter<'a> {
     phase: Cell<RunPhase>,
     sequence: Cell<u64>,
     journal: RefCell<RunJournal>,
+    progress_sequence: Cell<u64>,
+    run_started: std::time::Instant,
+    phase_started: RefCell<std::time::Instant>,
 }
 
 impl Reporter<'_> {
+    fn enrich_event(&self, event: &mut LifecycleEvent) {
+        if let Some(data) = event.data.as_object_mut() {
+            data.insert(
+                "run_elapsed_ms".into(),
+                json!(self.run_started.elapsed().as_millis()),
+            );
+            data.insert(
+                "phase_elapsed_ms".into(),
+                json!(self.phase_started.borrow().elapsed().as_millis()),
+            );
+        }
+    }
+
+    fn publish_event(&self, event_kind: &str, event: &LifecycleEvent) -> Result<()> {
+        let published_sequence = match self.api.publish_run_event(self.run_id, event_kind, event) {
+            Ok(published) => published.sequence,
+            Err(first_error) => {
+                if is_lease_lost(&first_error) {
+                    return Err(first_error);
+                }
+                if let Some(accepted_sequence) = self.api.find_event_by_client_sequence(
+                    self.run_id,
+                    self.progress_sequence.get(),
+                    event.sequence,
+                )? {
+                    accepted_sequence
+                } else {
+                    eprintln!(
+                        "[warning] event publish outcome was ambiguous; retrying once: {first_error:#}"
+                    );
+                    self.api
+                        .publish_run_event(self.run_id, event_kind, event)?
+                        .sequence
+                }
+            }
+        };
+        self.progress_sequence.set(published_sequence);
+        self.journal
+            .borrow_mut()
+            .record_progress_sequence(published_sequence)
+    }
+
     fn step(
         &self,
         name: &str,
@@ -55,7 +103,7 @@ impl Reporter<'_> {
         println!("[{status:>9}] {message}");
         let sequence = self.sequence.get() + 1;
         self.sequence.set(sequence);
-        let event = LifecycleEvent::new(
+        let mut event = LifecycleEvent::new(
             sequence,
             self.phase.get(),
             format!("step.{name}.{status}"),
@@ -63,6 +111,7 @@ impl Reporter<'_> {
             message,
             metadata,
         );
+        self.enrich_event(&mut event);
         if let Err(error) = self
             .journal
             .borrow_mut()
@@ -70,6 +119,7 @@ impl Reporter<'_> {
         {
             eprintln!("[warning] could not persist run checkpoint: {error:#}");
         }
+        self.publish_event("progress", &event)?;
         self.api
             .append_step(self.run_id, name, status, message, Some(event.metadata()))
             .with_context(|| format!("could not report step {name} to RustGrid"))
@@ -77,6 +127,7 @@ impl Reporter<'_> {
 
     fn set_phase(&self, phase: RunPhase) {
         self.phase.set(phase);
+        self.phase_started.replace(std::time::Instant::now());
         println!("[    phase] {}", phase.as_str());
         if let Err(error) = self
             .journal
@@ -95,8 +146,8 @@ impl Reporter<'_> {
         self.journal.borrow_mut().record_commit(commit)
     }
 
-    fn record_pull_request(&self, url: &str) -> Result<()> {
-        self.journal.borrow_mut().record_pull_request(url)
+    fn record_pull_request(&self, url: &str, number: u64) -> Result<()> {
+        self.journal.borrow_mut().record_pull_request(url, number)
     }
 
     fn update_run(&self, status: &str, message: Option<&str>) -> Result<()> {
@@ -121,15 +172,48 @@ impl Reporter<'_> {
 
     fn feedback(&self, message: &str) -> Result<()> {
         println!("[ feedback] {message}");
+        let sequence = self.sequence.get() + 1;
+        self.sequence.set(sequence);
+        let mut event = LifecycleEvent::new(
+            sequence,
+            self.phase.get(),
+            "agent.message",
+            "info",
+            message,
+            None,
+        );
+        self.enrich_event(&mut event);
+        self.publish_event("message", &event)?;
         self.api.create_comment(
             self.ticket_id,
             &format!("🤖 **RustGrid Agent update**\n\n{message}"),
         )
     }
 
+    fn log(&self, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            return Ok(());
+        }
+        let sequence = self.sequence.get() + 1;
+        self.sequence.set(sequence);
+        let bounded = truncate(message, 16_000);
+        let mut event = LifecycleEvent::new(
+            sequence,
+            self.phase.get(),
+            "quality_gate.output",
+            "info",
+            "Quality gate produced output",
+            Some(json!({"output": bounded})),
+        );
+        self.enrich_event(&mut event);
+        self.publish_event("log", &event)
+    }
+
     fn fail(&self, error: &anyhow::Error) -> Result<()> {
         let message = format!("{error:#}");
-        self.set_phase(RunPhase::Blocked);
+        if self.phase.get() != RunPhase::TimedOut {
+            self.set_phase(RunPhase::Blocked);
+        }
         let step_result = self.step("run_failed", "failed", &message, None);
         let comment_result = self.api.create_comment(
             self.ticket_id,
@@ -187,12 +271,13 @@ pub fn register(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub fn run_ticket(context: &AppContext, ticket_id: &str, allow_dirty: bool) -> Result<RunSummary> {
+pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
+    sweep_workspaces(context)?;
     let api = RustGridClient::new(context)?;
     println!("[ starting] Registering worker");
     let worker = api.register()?;
     api.heartbeat(&worker.id)?;
-    run_ticket_with_worker(context, &api, &worker, ticket_id, allow_dirty)
+    run_ticket_with_worker(context, &api, &worker, ticket_id)
 }
 
 fn run_ticket_with_worker(
@@ -200,16 +285,15 @@ fn run_ticket_with_worker(
     api: &RustGridClient,
     worker: &Worker,
     ticket_id: &str,
-    allow_dirty: bool,
 ) -> Result<RunSummary> {
     println!("[ starting] Fetching ticket {ticket_id}");
     let ticket = api.fetch_ticket(ticket_id)?;
-    let repo = Repo::discover()?;
-    let baseline = repo.ensure_safe(allow_dirty)?;
-    let generated_prompt =
-        prompt::build(&ticket, &repo.root, &context.config.quality_gate_command)?;
     let run = api
-        .claim_ticket(&ticket.id, &worker.id, &generated_prompt)
+        .claim_ticket(
+            &ticket.id,
+            &worker.id,
+            "Claimed by rustgrid-agent; execution context is resolved from the run manifest.",
+        )
         .with_context(|| format!("could not claim ticket {}", ticket.key))?;
     execute_claimed(
         context,
@@ -217,9 +301,6 @@ fn run_ticket_with_worker(
         worker,
         &run,
         &ticket,
-        repo,
-        baseline,
-        generated_prompt,
         Arc::new(AtomicBool::new(true)),
     )
 }
@@ -231,13 +312,13 @@ fn execute_claimed(
     worker: &Worker,
     run: &AgentRun,
     ticket: &Ticket,
-    repo: Repo,
-    baseline: BTreeSet<String>,
-    generated_prompt: String,
     running: Arc<AtomicBool>,
 ) -> Result<RunSummary> {
     let row_version = Arc::new(AtomicI64::new(run.row_version));
-    let journal = RunJournal::create(&repo.root, &run.id, &ticket.id)?;
+    let journal_path = RunWorkspace::journal_path(&context.workspace_root, &run.id)?;
+    let journal = RunJournal::create(&journal_path, &run.id, &ticket.id)?;
+    let progress_sequence = journal.progress_sequence;
+    let last_sequence = journal.last_sequence;
     let reporter = Reporter {
         api,
         run_id: &run.id,
@@ -245,8 +326,11 @@ fn execute_claimed(
         ticket_id: &ticket.id,
         ticket_row_version: Cell::new(ticket.row_version),
         phase: Cell::new(RunPhase::Claimed),
-        sequence: Cell::new(0),
+        sequence: Cell::new(last_sequence),
         journal: RefCell::new(journal),
+        progress_sequence: Cell::new(progress_sequence),
+        run_started: std::time::Instant::now(),
+        phase_started: RefCell::new(std::time::Instant::now()),
     };
 
     let supervisor = RunSupervisor::start(
@@ -254,11 +338,51 @@ fn execute_claimed(
         worker.id.clone(),
         run.id.clone(),
         row_version,
-        Duration::from_secs(context.config.heartbeat_interval_seconds),
-        context.config.lease_seconds,
+        Arc::clone(&running),
+        RunSupervisorConfig {
+            heartbeat_interval: Duration::from_secs(context.config.heartbeat_interval_seconds),
+            lease_seconds: context.config.lease_seconds,
+            run_timeout: Duration::from_secs(context.config.run_timeout_seconds),
+        },
     );
+    let workspace = RefCell::new(None::<RunWorkspace>);
 
     let result = (|| {
+        let manifest = api
+            .execution_manifest(&run.id)
+            .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
+        manifest.validate(&run.id, &ticket.id)?;
+        let manifest_project_matches = context
+            .config
+            .project_id
+            .as_deref()
+            .is_some_and(|id| id == manifest.project_id)
+            || context
+                .config
+                .project_key
+                .as_deref()
+                .is_some_and(|key| key.eq_ignore_ascii_case(&manifest.project_key));
+        if !manifest_project_matches || manifest.ticket_key != ticket.key {
+            bail!("execution manifest does not match the configured project and fetched ticket");
+        }
+        let tokens = GitHubTokenManager::new(
+            api,
+            &run.id,
+            &manifest.repository,
+            &manifest.required_permissions,
+        );
+        let clone_token = tokens.token()?;
+        let prepared =
+            RunWorkspace::prepare(&context.workspace_root, &run.id, &manifest, &clone_token)?;
+        let repo = prepared.repo.clone();
+        let baseline = if prepared.resumed() {
+            BTreeSet::new()
+        } else {
+            repo.ensure_safe(false)?
+        };
+        workspace.replace(Some(prepared));
+        let generated_prompt =
+            prompt::build(ticket, &repo.root, &context.config.quality_gate_command)?;
         reporter.set_ticket_status("in_progress")?;
         reporter.set_phase(RunPhase::Preparing);
         reporter.step(
@@ -289,11 +413,28 @@ fn execute_claimed(
             baseline,
             generated_prompt,
             &running,
+            &manifest,
         )
     })();
 
     let supervisor_healthy = supervisor.is_healthy();
+    let lease_lost = supervisor.lease_lost();
+    let timed_out = supervisor.timed_out();
     drop(supervisor);
+    if lease_lost {
+        bail!(
+            "run lease ownership was lost; stopped local execution without publishing terminal state"
+        );
+    }
+    if timed_out {
+        reporter.set_phase(RunPhase::TimedOut);
+        let timeout = anyhow::anyhow!(
+            "agent run timed out after {} seconds",
+            context.config.run_timeout_seconds
+        );
+        reporter.fail(&timeout)?;
+        return Err(timeout);
+    }
     match result {
         Ok(summary) => {
             if !supervisor_healthy {
@@ -301,12 +442,23 @@ fn execute_claimed(
             }
             reporter.set_phase(RunPhase::Succeeded);
             reporter.update_run("succeeded", Some(&summary.pull_request_url))?;
+            if let Some(workspace) = workspace.borrow_mut().take() {
+                workspace.cleanup()?;
+            }
             Ok(summary)
         }
         Err(error) => {
+            if is_lease_lost(&error) {
+                return Err(
+                    error.context("run lease ownership was lost; skipped stale terminal updates")
+                );
+            }
             if !running.load(Ordering::SeqCst) {
                 reporter.cancel()?;
                 return Err(error);
+            }
+            if format!("{error:#}").contains("timed out") {
+                reporter.set_phase(RunPhase::TimedOut);
             }
             reporter.fail(&error)?;
             Err(error)
@@ -325,7 +477,12 @@ fn execute(
     baseline: BTreeSet<String>,
     generated_prompt: String,
     running: &AtomicBool,
+    manifest: &ExecutionManifest,
 ) -> Result<RunSummary> {
+    let base_branch = manifest
+        .default_branch
+        .as_deref()
+        .unwrap_or(&context.config.default_base_branch);
     if !baseline.is_empty() {
         reporter.step(
             "working_tree_checked",
@@ -350,32 +507,234 @@ fn execute(
         "branch_create",
         "running",
         &format!("Creating branch {branch}"),
-        Some(json!({"base": context.config.default_base_branch})),
+        Some(json!({"base": base_branch})),
     )?;
-    repo.create_branch(&branch, &context.config.default_base_branch)?;
+    let resumed_branch = repo.checkout_or_create_branch(&branch, base_branch)?;
     reporter.record_branch(&branch)?;
     reporter.step(
         "branch_create",
         "completed",
-        &format!("Created branch {branch}"),
+        &format!(
+            "{} branch {branch}",
+            if resumed_branch { "Resumed" } else { "Created" }
+        ),
+        Some(json!({"resumed": resumed_branch})),
+    )?;
+
+    let recovered_commit = reporter.journal.borrow().commit.clone();
+    let commit = if let Some(commit) = recovered_commit {
+        if !repo.has_commit(&commit)? {
+            bail!("recovery journal commit {commit} is missing from the run workspace");
+        }
+        reporter.step(
+            "recovery",
+            "completed",
+            &format!("Resuming from commit {}", short_sha(&commit)),
+            Some(json!({"commit": commit})),
+        )?;
+        commit
+    } else {
+        implement_and_commit(
+            context,
+            api,
+            run,
+            ticket,
+            reporter,
+            &repo,
+            &baseline,
+            &generated_prompt,
+            running,
+        )?
+    };
+
+    reporter.step("push", "running", &format!("Pushing branch {branch}"), None)?;
+    let tokens = GitHubTokenManager::new(
+        api,
+        &run.id,
+        &manifest.repository,
+        &manifest.required_permissions,
+    );
+    let push_token = tokens.token()?;
+    repo.push(&branch, &push_token)?;
+    reporter.step(
+        "push",
+        "completed",
+        &format!("Pushed branch {branch}"),
         None,
     )?;
 
+    reporter.step(
+        "pull_request",
+        "running",
+        "Opening GitHub pull request",
+        None,
+    )?;
+    let recovered_pr = {
+        let journal = reporter.journal.borrow();
+        journal
+            .pull_request_url
+            .clone()
+            .zip(journal.pull_request_number)
+    };
+    let pr = if let Some((html_url, number)) = recovered_pr {
+        crate::github::PullRequest { number, html_url }
+    } else {
+        let pr_token = tokens.token()?;
+        let github = GitHubClient::new(&pr_token)?;
+        let repo_config = manifest.repo_config()?;
+        if let Some(existing) = github.find_open_pull_request(&repo_config, &branch)? {
+            existing
+        } else {
+            github.create_pull_request(
+                &repo_config,
+                &format!("{}: {}", ticket.key, ticket.title),
+                &pull_request_body(ticket, &run.id, &context.config.quality_gate_command),
+                &branch,
+                base_branch,
+            )?
+        }
+    };
+    reporter.record_pull_request(&pr.html_url, pr.number)?;
+    reporter.step(
+        "pull_request",
+        "completed",
+        &format!("Opened pull request #{}", pr.number),
+        Some(json!({"url": pr.html_url})),
+    )?;
+
+    if !manifest.required_workflows.is_empty() {
+        wait_for_required_workflows(
+            &tokens,
+            &manifest.repo_config()?,
+            &commit,
+            &manifest.required_workflows,
+            Duration::from_secs(context.config.command_timeout_seconds),
+            running,
+            reporter,
+        )?;
+    }
+
+    api.attach_pr(&ticket.id, &run.id, &pr.html_url, pr.number)?;
+    reporter.set_phase(RunPhase::AwaitingReview);
+    reporter.step(
+        "rustgrid_attachment",
+        "completed",
+        "Attached pull request to RustGrid",
+        Some(json!({"url": pr.html_url})),
+    )?;
+    reporter.step(
+        "run_complete",
+        "completed",
+        "Agent run completed successfully",
+        None,
+    )?;
+    reporter.set_ticket_status("done")?;
+    let summary = RunSummary {
+        ticket_key: ticket.key.clone(),
+        branch,
+        commit,
+        pull_request_url: pr.html_url,
+    };
+    print_summary(&summary, &context.config.quality_gate_command);
+    Ok(summary)
+}
+
+fn wait_for_required_workflows(
+    tokens: &GitHubTokenManager<'_>,
+    repo: &crate::config::RepoConfig,
+    commit: &str,
+    required: &[String],
+    timeout: Duration,
+    running: &AtomicBool,
+    reporter: &Reporter<'_>,
+) -> Result<()> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    reporter.step(
+        "required_workflows",
+        "running",
+        "Waiting for required GitHub workflows",
+        Some(json!({"required": required})),
+    )?;
+    let started = std::time::Instant::now();
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            bail!("required workflow wait cancelled");
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "required GitHub workflows timed out after {} seconds",
+                timeout.as_secs()
+            );
+        }
+        let token = tokens.token()?;
+        let github = GitHubClient::new(&token)?;
+        let checks = github.check_runs(repo, commit)?;
+        let mut all_passed = true;
+        for name in required {
+            let matching = checks.iter().find(|check| check.name == *name);
+            match matching {
+                Some(check)
+                    if check.status == "completed"
+                        && matches!(
+                            check.conclusion.as_deref(),
+                            Some("success" | "neutral" | "skipped")
+                        ) => {}
+                Some(check) if check.status == "completed" => {
+                    bail!(
+                        "required GitHub workflow {name} concluded as {}",
+                        check.conclusion.as_deref().unwrap_or("unknown")
+                    );
+                }
+                _ => all_passed = false,
+            }
+        }
+        if all_passed {
+            reporter.step(
+                "required_workflows",
+                "completed",
+                "Required GitHub workflows passed",
+                Some(json!({"required": required})),
+            )?;
+            return Ok(());
+        }
+        for _ in 0..20 {
+            if !running.load(Ordering::SeqCst) {
+                bail!("required workflow wait cancelled");
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn implement_and_commit(
+    context: &AppContext,
+    api: &RustGridClient,
+    run: &AgentRun,
+    ticket: &Ticket,
+    reporter: &Reporter<'_>,
+    repo: &Repo,
+    baseline: &BTreeSet<String>,
+    generated_prompt: &str,
+    running: &AtomicBool,
+) -> Result<String> {
     reporter.step(
         "prompt_built",
         "completed",
         "Built Codex prompt from ticket and repository context",
         Some(json!({"characters": generated_prompt.len()})),
     )?;
-
     reporter.set_phase(RunPhase::Executing);
     reporter.step("codex", "running", "Running Codex locally", None)?;
     let blocked_action = RefCell::new(None);
     let codex_status = command::streaming_lines_cancellable(
         &context.codex_command,
         &repo.root,
-        Some(&generated_prompt),
+        Some(generated_prompt),
         running,
+        Duration::from_secs(context.config.command_timeout_seconds),
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -404,9 +763,15 @@ fn execute(
         ),
         None,
     )?;
-    let gate = run_captured(&context.config.quality_gate_command, &repo.root)?;
+    let gate = run_captured(
+        &context.config.quality_gate_command,
+        &repo.root,
+        running,
+        Duration::from_secs(context.config.command_timeout_seconds),
+    )?;
     print_output(&gate.stdout, &gate.stderr);
     let gate_output = combine_output(&gate.stdout, &gate.stderr);
+    reporter.log(&gate_output)?;
     let passed = gate.status.success();
     api.report_quality_gate(
         &ticket.id,
@@ -430,7 +795,7 @@ fn execute(
     }
 
     reporter.set_phase(RunPhase::Publishing);
-    let paths = repo.new_agent_paths(&baseline)?;
+    let paths = repo.new_agent_paths(baseline)?;
     if paths.is_empty() {
         bail!("Codex produced no committable changes");
     }
@@ -440,7 +805,6 @@ fn execute(
         &format!("Found {} agent-created changed path(s)", paths.len()),
         Some(json!({"paths": paths})),
     )?;
-
     reporter.step("commit", "running", "Committing agent changes", None)?;
     let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
     reporter.record_commit(&commit)?;
@@ -450,70 +814,11 @@ fn execute(
         &format!("Created commit {}", short_sha(&commit)),
         Some(json!({"commit": commit})),
     )?;
-
-    reporter.step("push", "running", &format!("Pushing branch {branch}"), None)?;
-    let github_token = context.require_github_token()?;
-    repo.push(&branch, github_token)?;
-    reporter.step(
-        "push",
-        "completed",
-        &format!("Pushed branch {branch}"),
-        None,
-    )?;
-
-    reporter.step(
-        "pull_request",
-        "running",
-        "Opening GitHub pull request",
-        None,
-    )?;
-    let github = GitHubClient::new(github_token)?;
-    let pr = github.create_pull_request(
-        &context.config.repo,
-        &format!("{}: {}", ticket.key, ticket.title),
-        &pull_request_body(ticket, &run.id, &context.config.quality_gate_command),
-        &branch,
-        &context.config.default_base_branch,
-    )?;
-    reporter.record_pull_request(&pr.html_url)?;
-    reporter.step(
-        "pull_request",
-        "completed",
-        &format!("Opened pull request #{}", pr.number),
-        Some(json!({"url": pr.html_url})),
-    )?;
-
-    api.attach_pr(&ticket.id, &run.id, &pr.html_url, pr.number)?;
-    reporter.set_phase(RunPhase::AwaitingReview);
-    reporter.step(
-        "rustgrid_attachment",
-        "completed",
-        "Attached pull request to RustGrid",
-        Some(json!({"url": pr.html_url})),
-    )?;
-    reporter.step(
-        "run_complete",
-        "completed",
-        "Agent run completed successfully",
-        None,
-    )?;
-    reporter.set_ticket_status("done")?;
-    let summary = RunSummary {
-        ticket_key: ticket.key.clone(),
-        branch,
-        commit,
-        pull_request_url: pr.html_url,
-    };
-    print_summary(&summary, &context.config.quality_gate_command);
-    Ok(summary)
+    Ok(commit)
 }
 
-pub fn watch(
-    context: &AppContext,
-    allow_dirty: bool,
-    interval: Duration,
-    once: bool,
-) -> Result<()> {
+pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
+    sweep_workspaces(context)?;
     let api = RustGridClient::new(context)?;
     let worker = api.register()?;
     let project_id = api.resolve_project_id(context)?;
@@ -525,25 +830,13 @@ pub fn watch(
 
     while running.load(Ordering::SeqCst) {
         api.heartbeat(&worker.id)?;
-        let repo = Repo::discover()?;
-        let baseline = repo.ensure_safe(allow_dirty)?;
         match api.claim_next(&worker.id, &project_id)? {
             Some(run) => {
                 let ticket = api.fetch_ticket(&run.ticket_id)?;
                 println!("[  claimed] Queue returned {}", ticket.key);
-                let generated_prompt =
-                    prompt::build(&ticket, &repo.root, &context.config.quality_gate_command)?;
-                if let Err(error) = execute_claimed(
-                    context,
-                    &api,
-                    &worker,
-                    &run,
-                    &ticket,
-                    repo,
-                    baseline,
-                    generated_prompt,
-                    Arc::clone(&running),
-                ) {
+                if let Err(error) =
+                    execute_claimed(context, &api, &worker, &run, &ticket, Arc::clone(&running))
+                {
                     eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
                 }
             }
@@ -558,9 +851,29 @@ pub fn watch(
     Ok(())
 }
 
+fn sweep_workspaces(context: &AppContext) -> Result<()> {
+    let removed = RunWorkspace::sweep_stale(
+        &context.workspace_root,
+        Duration::from_secs(
+            context
+                .config
+                .failed_workspace_retention_hours
+                .saturating_mul(3600),
+        ),
+    )?;
+    if removed > 0 {
+        println!("[  cleanup] Removed {removed} expired run workspace(s)");
+    }
+    Ok(())
+}
+
 pub fn status(context: &AppContext) -> Result<()> {
-    let repo = Repo::discover()?;
-    let dirty = repo.dirty_paths()?;
+    let local_repo = Repo::discover().ok();
+    let dirty = local_repo
+        .as_ref()
+        .map(Repo::dirty_paths)
+        .transpose()?
+        .unwrap_or_default();
     let parsed_codex = command::parse(&context.codex_command)?;
     let parsed_gate = command::parse(&context.config.quality_gate_command)?;
     let (project_kind, project) = context.project_value();
@@ -569,11 +882,13 @@ pub fn status(context: &AppContext) -> Result<()> {
     println!("  RustGrid API: {}", context.api_url);
     println!("  Project:      {project_kind}={project}");
     println!(
-        "  Repository:   {}/{} ({})",
-        context.config.repo.owner,
-        context.config.repo.name,
-        repo.root.display()
+        "  Repository:   {}/{}",
+        context.config.repo.owner, context.config.repo.name
     );
+    println!("  Workspaces:   {}", context.workspace_root.display());
+    if let Some(repo) = &local_repo {
+        println!("  Local repo:   {}", repo.root.display());
+    }
     println!("  Base branch:  {}", context.config.default_base_branch);
     println!("  Codex:        {}", parsed_codex.join(" "));
     println!("  Quality gate: {}", parsed_gate.join(" "));
@@ -583,28 +898,30 @@ pub fn status(context: &AppContext) -> Result<()> {
     );
     println!("  Run lease:    {}s", context.config.lease_seconds);
     println!("  API key:      {}", presence(context.api_key.as_deref()));
-    println!(
-        "  GitHub token: {}",
-        presence(context.github_token.as_deref())
-    );
+    println!("  GitHub token: brokered per run by RustGrid");
     println!(
         "  Working tree: {}",
-        if dirty.is_empty() {
+        if local_repo.is_none() {
+            "not applicable (isolated workspace mode)".into()
+        } else if dirty.is_empty() {
             "clean".into()
         } else {
             format!("dirty ({} path(s))", dirty.len())
         }
     );
-    if context.api_key.is_none() || context.github_token.is_none() {
+    if context.api_key.is_none() {
         bail!("status checks failed: required credentials are missing");
     }
     Ok(())
 }
 
-fn run_captured(command_text: &str, cwd: &Path) -> Result<command::CommandOutput> {
-    let parts = command::parse(command_text)?;
-    println!("  $ {}", parts.join(" "));
-    command::capture(&parts[0], &parts[1..], cwd)
+fn run_captured(
+    command_text: &str,
+    cwd: &Path,
+    running: &AtomicBool,
+    timeout: Duration,
+) -> Result<command::CommandOutput> {
+    command::capture_cancellable(command_text, cwd, running, timeout)
 }
 
 fn combine_output(stdout: &str, stderr: &str) -> String {
@@ -691,6 +1008,17 @@ fn print_summary(summary: &RunSummary, gate: &str) {
 
 fn short_sha(sha: &str) -> &str {
     sha.get(..sha.len().min(12)).unwrap_or(sha)
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 fn presence(value: Option<&str>) -> &'static str {
     if value.is_some() { "set" } else { "missing" }

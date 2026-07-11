@@ -63,8 +63,11 @@ jobs:
           cargo package --locked
           archive="target/package/rustgrid-agent-${VERSION}.crate"
           checksum="$(sha256sum "${archive}" | awk '{print $1}')"
+          checksum_file="${archive}.sha256"
+          printf '%s  %s\n' "${checksum}" "$(basename "${archive}")" > "${checksum_file}"
           echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
           echo "checksum=${checksum}" >> "${GITHUB_OUTPUT}"
+          echo "checksum_file=${checksum_file}" >> "${GITHUB_OUTPUT}"
 
       - name: Generate Homebrew formula
         shell: bash
@@ -87,9 +90,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM_FILE: ${{ steps.package.outputs.checksum_file }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             "${ARCHIVE}" \
+            "${CHECKSUM_FILE}#SHA-256 checksum" \
             "target/package/rustgrid-cli.rb#Homebrew formula" \
             --verify-tag \
             --generate-notes \

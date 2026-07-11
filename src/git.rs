@@ -50,6 +50,17 @@ impl Repo {
         Ok(dirty)
     }
 
+    pub fn verify_origin(&self, owner: &str, name: &str) -> Result<()> {
+        let remote = command::checked("git", ["remote", "get-url", "origin"], &self.root)
+            .context("repository does not have an origin remote")?;
+        let normalized = remote.trim_end_matches('/').trim_end_matches(".git");
+        let expected = format!("{owner}/{name}");
+        if !normalized.ends_with(&expected) {
+            bail!("claimed manifest repository {expected} does not match origin {remote}");
+        }
+        Ok(())
+    }
+
     pub fn create_branch(&self, branch: &str, base: &str) -> Result<()> {
         if command::capture(
             "git",
@@ -70,9 +81,40 @@ impl Repo {
         Ok(())
     }
 
+    pub fn checkout_or_create_branch(&self, branch: &str, base: &str) -> Result<bool> {
+        let exists = command::capture(
+            "git",
+            [
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+            &self.root,
+        )?
+        .status
+        .success();
+        if exists {
+            command::checked("git", ["switch", branch], &self.root)?;
+            return Ok(true);
+        }
+        self.create_branch(branch, base)?;
+        Ok(false)
+    }
+
     pub fn new_agent_paths(&self, baseline: &BTreeSet<String>) -> Result<Vec<String>> {
         let now = self.dirty_paths()?;
         Ok(now.difference(baseline).cloned().collect())
+    }
+
+    pub fn has_commit(&self, commit: &str) -> Result<bool> {
+        Ok(command::capture(
+            "git",
+            ["cat-file", "-e", &format!("{commit}^{{commit}}")],
+            &self.root,
+        )?
+        .status
+        .success())
     }
 
     pub fn commit_paths(&self, paths: &[String], message: &str) -> Result<String> {

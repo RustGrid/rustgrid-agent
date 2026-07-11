@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::config::AppContext;
+use crate::{lifecycle::LifecycleEvent, manifest::ExecutionManifest};
 
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
@@ -67,6 +68,27 @@ pub struct AgentRun {
     pub id: String,
     pub ticket_id: String,
     pub row_version: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GitHubAccessToken {
+    pub token: String,
+    pub expires_at: String,
+    pub repository: String,
+    #[serde(default)]
+    pub permissions: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AgentRunEvent {
+    pub sequence: u64,
+    pub data: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AgentRunEvents {
+    pub items: Vec<AgentRunEvent>,
+    pub next_sequence: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +165,89 @@ impl RustGridClient {
             &[],
             None,
         )
+    }
+
+    pub fn execution_manifest(&self, run_id: &str) -> Result<ExecutionManifest> {
+        self.send_json(
+            Method::GET,
+            &format!("{RUNS}/{run_id}/manifest"),
+            None,
+            None,
+            &[],
+            None,
+        )
+    }
+
+    pub fn issue_github_token(&self, run_id: &str) -> Result<GitHubAccessToken> {
+        let token: GitHubAccessToken = self.send_json(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/github-token"),
+            None,
+            Some(&format!("github-token-{run_id}-{}", Uuid::new_v4())),
+            &[],
+            None,
+        )?;
+        if token.token.trim().is_empty()
+            || token.expires_at.trim().is_empty()
+            || token.repository.trim().is_empty()
+        {
+            anyhow::bail!("RustGrid issued an invalid GitHub token response");
+        }
+        Ok(token)
+    }
+
+    pub fn publish_run_event(
+        &self,
+        run_id: &str,
+        event_kind: &str,
+        event: &LifecycleEvent,
+    ) -> Result<AgentRunEvent> {
+        self.send_json(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/events"),
+            Some(json!({
+                "event_type": event_kind,
+                "data": event.metadata()
+            })),
+            Some(&format!("progress-{run_id}-{}", event.sequence)),
+            &[],
+            None,
+        )
+    }
+
+    pub fn progress_events(&self, run_id: &str, after_sequence: u64) -> Result<AgentRunEvents> {
+        self.send_json(
+            Method::GET,
+            &format!("{RUNS}/{run_id}/events?after_sequence={after_sequence}&limit=500"),
+            None,
+            None,
+            &[],
+            None,
+        )
+    }
+
+    pub fn find_event_by_client_sequence(
+        &self,
+        run_id: &str,
+        mut after_sequence: u64,
+        client_sequence: u64,
+    ) -> Result<Option<u64>> {
+        for _ in 0..20 {
+            let page = self.progress_events(run_id, after_sequence)?;
+            if let Some(event) = page.items.iter().find(|item| {
+                item.data
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(client_sequence)
+            }) {
+                return Ok(Some(event.sequence));
+            }
+            if page.items.is_empty() || page.next_sequence <= after_sequence {
+                return Ok(None);
+            }
+            after_sequence = page.next_sequence;
+        }
+        anyhow::bail!("agent event replay exceeded 10,000 events while reconciling cursor")
     }
 
     pub fn fetch_ticket(&self, ticket_id: &str) -> Result<Ticket> {
@@ -401,51 +506,77 @@ impl RustGridClient {
         idempotency: Option<&str>,
         if_match: Option<&str>,
     ) -> std::result::Result<(Value, Option<String>), HttpFailure> {
-        let mut request = self.request(method, path);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        if let Some(key) = idempotency {
-            request = request.header("Idempotency-Key", key);
-        }
-        if let Some(etag) = if_match {
-            request = request.header("If-Match", etag);
-        }
-        let response = request
-            .send()
-            .map_err(|error| HttpFailure::transport(path, error))?;
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let text = response
-            .text()
-            .map_err(|error| HttpFailure::transport(path, error))?;
-        if !status.is_success() {
-            return Err(HttpFailure {
+        let retry_safe = method == Method::GET || idempotency.is_some();
+        for attempt in 0..3u32 {
+            let mut request = self.request(method.clone(), path);
+            if let Some(body) = body.as_ref() {
+                request = request.json(body);
+            }
+            if let Some(key) = idempotency {
+                request = request.header("Idempotency-Key", key);
+            }
+            if let Some(etag) = if_match {
+                request = request.header("If-Match", etag);
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(error) if retry_safe && attempt < 2 => {
+                    retry_delay(attempt, self.session_id);
+                    eprintln!("[warning] retrying RustGrid {path} after transport error: {error}");
+                    continue;
+                }
+                Err(error) => return Err(HttpFailure::transport(path, error)),
+            };
+            let status = response.status();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let etag = response
+                .headers()
+                .get("etag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let text = response
+                .text()
+                .map_err(|error| HttpFailure::transport(path, error))?;
+            if !status.is_success() {
+                if retry_safe
+                    && attempt < 2
+                    && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                {
+                    if let Some(seconds) = retry_after {
+                        std::thread::sleep(Duration::from_secs(seconds.min(30)));
+                    } else {
+                        retry_delay(attempt, self.session_id);
+                    }
+                    continue;
+                }
+                return Err(HttpFailure {
+                    status,
+                    path: path.to_owned(),
+                    request_id,
+                    body: truncate(&text, 2000),
+                });
+            }
+            if text.trim().is_empty() {
+                return Ok((Value::Null, etag));
+            }
+            let value = serde_json::from_str(&text).map_err(|error| HttpFailure {
                 status,
                 path: path.to_owned(),
                 request_id,
-                body: truncate(&text, 2000),
-            });
+                body: format!("invalid JSON response: {error}"),
+            })?;
+            return Ok((value, etag));
         }
-        if text.trim().is_empty() {
-            return Ok((Value::Null, etag));
-        }
-        let value = serde_json::from_str(&text).map_err(|error| HttpFailure {
-            status,
-            path: path.to_owned(),
-            request_id,
-            body: format!("invalid JSON response: {error}"),
-        })?;
-        Ok((value, etag))
+        unreachable!("retry loop always returns")
     }
 
     fn send_json<T: DeserializeOwned>(
@@ -474,6 +605,28 @@ impl RustGridClient {
             .map(|_| ())
             .map_err(Into::into)
     }
+}
+
+pub fn is_conflict(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HttpFailure>()
+        .is_some_and(|failure| failure.status == StatusCode::CONFLICT)
+}
+
+fn retry_delay(attempt: u32, session_id: Uuid) {
+    let backoff_ms = 250u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter_ms = (session_id.as_u128() % 101) as u64;
+    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
+}
+
+pub fn is_lease_lost(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
+        (failure.status == StatusCode::NOT_FOUND && failure.path.ends_with("/lease"))
+            || (failure.status == StatusCode::CONFLICT
+                && (failure.path.ends_with("/lease")
+                    || failure.path.ends_with("/events")
+                    || failure.path.ends_with("/github-token")))
+    })
 }
 
 #[derive(Debug)]
@@ -568,5 +721,44 @@ mod tests {
             7
         );
         assert!(parse_etag_row_version("\"agent-runs:abc:7\"", "tickets", "abc").is_err());
+    }
+
+    #[test]
+    fn classifies_cursor_conflicts_and_lost_leases() {
+        let conflict = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/lease".into(),
+            request_id: None,
+            body: "lost".into(),
+        });
+        assert!(is_conflict(&conflict));
+        assert!(is_lease_lost(&conflict));
+
+        let ambiguous_manifest = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/manifest".into(),
+            request_id: None,
+            body: "multiple repositories".into(),
+        });
+        assert!(!is_lease_lost(&ambiguous_manifest));
+
+        let transient = anyhow::Error::new(HttpFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            path: "agent-runs/run/lease".into(),
+            request_id: None,
+            body: "retry".into(),
+        });
+        assert!(!is_conflict(&transient));
+        assert!(!is_lease_lost(&transient));
+    }
+
+    #[test]
+    fn parses_progress_replay_cursor() {
+        let events: AgentRunEvents = serde_json::from_value(json!({
+            "items": [{"sequence": 7, "data": {"sequence": 4}}],
+            "next_sequence": 7
+        }))
+        .unwrap();
+        assert_eq!(events.next_sequence, 7);
     }
 }
