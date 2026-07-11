@@ -238,6 +238,27 @@
         ],
         "type": "object"
       },
+      "AgentCodexPolicyResponse": {
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "environment_allowlist": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command",
+          "environment_allowlist"
+        ],
+        "type": "object"
+      },
       "AgentExecutionManifestResponse": {
         "properties": {
           "clone_url": {
@@ -249,6 +270,13 @@
               "string",
               "null"
             ]
+          },
+          "execution_policy": {
+            "$ref": "#/components/schemas/AgentExecutionPolicyResponse"
+          },
+          "execution_policy_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
           },
           "installation_id": {
             "format": "int64",
@@ -318,7 +346,41 @@
           "web_base_url",
           "installation_id",
           "required_workflows",
-          "required_permissions"
+          "required_permissions",
+          "execution_policy",
+          "execution_policy_sha256"
+        ],
+        "type": "object"
+      },
+      "AgentExecutionPolicyResponse": {
+        "properties": {
+          "codex": {
+            "$ref": "#/components/schemas/AgentCodexPolicyResponse"
+          },
+          "policy_version": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "quality_gates": {
+            "items": {
+              "$ref": "#/components/schemas/AgentQualityGatePolicyResponse"
+            },
+            "type": "array"
+          },
+          "sandbox": {
+            "$ref": "#/components/schemas/AgentSandboxPolicyResponse"
+          },
+          "timeout_seconds": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "policy_version",
+          "codex",
+          "quality_gates",
+          "timeout_seconds",
+          "sandbox"
         ],
         "type": "object"
       },
@@ -346,6 +408,115 @@
           "expires_at",
           "permissions",
           "repository"
+        ],
+        "type": "object"
+      },
+      "AgentQualityGatePolicyResponse": {
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "timeout_seconds": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "command",
+          "timeout_seconds",
+          "required"
+        ],
+        "type": "object"
+      },
+      "AgentQueueEventResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "event_type": {
+            "enum": [
+              "work_available",
+              "work_claimed",
+              "work_requeued",
+              "capacity_available",
+              "capacity_changed"
+            ],
+            "type": "string"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "format": "uuid",
+            "nullable": true,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sequence": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sequence",
+          "event_type",
+          "data",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AgentQueueEventsResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentQueueEventResponse"
+            },
+            "type": "array"
+          },
+          "next_sequence": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "worker": {
+            "$ref": "#/components/schemas/AgentWorkerResponse"
+          }
+        },
+        "required": [
+          "worker",
+          "items",
+          "next_sequence"
         ],
         "type": "object"
       },
@@ -653,6 +824,40 @@
         ],
         "type": "object"
       },
+      "AgentSandboxPolicyResponse": {
+        "properties": {
+          "approval_policy": {
+            "enum": [
+              "never",
+              "on_request"
+            ],
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "read_only",
+              "workspace_write"
+            ],
+            "type": "string"
+          },
+          "network_access": {
+            "type": "boolean"
+          },
+          "writable_roots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "network_access",
+          "writable_roots",
+          "approval_policy"
+        ],
+        "type": "object"
+      },
       "AgentWorkerCredentialResponse": {
         "properties": {
           "api_key_id": {
@@ -719,6 +924,14 @@
       },
       "AgentWorkerResponse": {
         "properties": {
+          "active_runs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "available_slots": {
+            "format": "int64",
+            "type": "integer"
+          },
           "capabilities": {
             "items": {},
             "type": "array"
@@ -745,6 +958,12 @@
               }
             ]
           },
+          "max_concurrency": {
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
           "name": {
             "type": "string"
           },
@@ -768,8 +987,25 @@
           "kind",
           "capabilities",
           "status",
+          "max_concurrency",
+          "active_runs",
+          "available_slots",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "AgentWorkersResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentWorkerResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -2724,6 +2960,13 @@
       },
       "HeartbeatAgentWorkerRequest": {
         "properties": {
+          "max_concurrency": {
+            "default": 1,
+            "format": "int32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
           "status": {
             "default": "online",
             "enum": [
@@ -4487,6 +4730,7 @@
           "pr_opened",
           "quality_gate_running",
           "needs_refinement",
+          "awaiting_review",
           "ready_for_review",
           "blocked",
           "done",
@@ -8423,6 +8667,32 @@
         ]
       }
     },
+    "/api/v1/agent-workers": {
+      "get": {
+        "operationId": "listAgentWorkers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentWorkersResponse"
+                }
+              }
+            },
+            "description": "Tenant worker fleet with current capacity"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List agent worker capacity",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-workers/mark-stale-offline": {
       "post": {
         "description": "Mark online or busy workers offline when they have not heartbeated within the requested threshold.",
@@ -9266,6 +9536,135 @@
           }
         ],
         "summary": "Heartbeat an agent worker",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/{id}/queue": {
+      "get": {
+        "operationId": "listAgentQueueEvents",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "format": "int64",
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentQueueEventsResponse"
+                }
+              }
+            },
+            "description": "Queue events and current worker capacity"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replay durable agent queue events",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/{id}/queue/stream": {
+      "get": {
+        "operationId": "streamAgentQueueEvents",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_sequence",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "format": "int64",
+              "maximum": 500,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Replayable server-sent queue event stream"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Stream durable agent queue events",
         "tags": [
           "agents"
         ]

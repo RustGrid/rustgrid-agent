@@ -15,7 +15,7 @@ For each ticket, the agent:
 5. Marks the ticket `in_progress`, runs Codex locally, and publishes each Codex agent update as one ticket comment.
 6. Runs the configured quality gate without shell evaluation.
 7. Commits only agent-created paths, pushes the branch, and opens a GitHub pull request.
-8. Attaches the pull request, marks the ticket `done`, and completes the RustGrid run. Terminal failures and explicit requests for human intervention mark the ticket `blocked`.
+8. Attaches the pull request, marks the ticket `awaiting_review`, and completes the RustGrid run. Terminal failures and explicit requests for human intervention mark the ticket `blocked`.
 
 ## Requirements
 
@@ -23,7 +23,7 @@ For each ticket, the agent:
 - Access to the GitHub repository named in the agent configuration.
 - A RustGrid API key with the permissions listed in [Credentials](#credentials).
 - A RustGrid project linked to a GitHub repository through the RustGrid GitHub App.
-- Codex CLI installed, authenticated, and available as `codex`, unless `codex_command` or `CODEX_COMMAND` points to another compatible command.
+- The server-selected Codex executable installed and authenticated on the worker host.
 - A Git author name and email configured for the commit the agent creates.
 - Rust 1.85 or newer when installing from source. A Homebrew installation does not require a separate Rust toolchain at runtime.
 
@@ -78,12 +78,11 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
     "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
-  "quality_gate_command": "cargo test",
-  "codex_command": "codex exec --full-auto --json -"
+  "max_concurrency": 2
 }
 ```
 
-Commit this file with the repository so every agent uses the same project, base branch, and quality gate. Do not put secrets in it.
+Commit this file with the repository so every agent uses the same project and local capacity. Do not put secrets in it.
 
 Exactly one of `project_id` and `project_key` is required:
 
@@ -153,24 +152,21 @@ rustgrid-agent --config path/to/agent.json status
 | `repo.owner` | Yes | GitHub organization or account that owns the target repository. |
 | `repo.name` | Yes | GitHub repository name. |
 | `default_base_branch` | No | Bootstrap value used before a run is claimed. The execution manifest is authoritative for claimed runs. |
-| `quality_gate_command` | Yes | Bootstrap quality gate used to build the initial claim prompt. The execution manifest is authoritative after claim. |
-| `codex_command` | No | Command that accepts the generated prompt on stdin. Defaults to `codex exec --full-auto --json -`. The runner adds `--json` automatically when the executable is `codex`. |
+| `quality_gate_command` | No | Deprecated compatibility field; ignored for claimed runs. |
+| `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
+| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
-| `command_timeout_seconds` | No | Maximum duration of Codex, a quality gate, or required-workflow wait. Defaults to 1800. |
-| `run_timeout_seconds` | No | Maximum total active-run duration. Defaults to 7200 and cannot be shorter than the command timeout. |
+| `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
+| `run_timeout_seconds` | No | Deprecated compatibility field; the manifest owns total run timeout. |
 | `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces before startup cleanup. Defaults to 72. |
 | `max_command_output_bytes` | No | Combined in-memory output budget for captured commands. Defaults to 8 MiB. |
 | `max_workspace_bytes` | No | Maximum allowed run-workspace size. Defaults to 5 GiB. |
 
 Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
 
-`CODEX_COMMAND` overrides `codex_command`, which is useful for local experiments without changing the committed configuration:
-
-```sh
-export CODEX_COMMAND='codex exec --full-auto --json -'
-```
+Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridden locally; RustGrid snapshots them into each execution manifest.
 
 ## Credentials
 
@@ -264,13 +260,17 @@ SIGTERM both stop new claims and cancel active child process groups safely.
 
 ## Run lifecycle and recovery
 
-A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `done` only after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
+A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `awaiting_review` after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
 
 Immediately after claim, the worker retrieves
 `GET /agent-runs/{run_id}/manifest`. It rejects unknown manifest
 versions, mismatched run/ticket identities, incomplete repository data, and a
 local `origin` that does not match the claimed repository. GitHub tokens come
 from `POST /agent-runs/{run_id}/github-token` and are refreshed before expiry.
+Manifest version 2 also owns the Codex command, structured quality gates,
+timeouts, environment allowlist, and sandbox policy. Local command settings are
+accepted only for configuration-file compatibility and are not used to execute
+a claimed run.
 
 Each structured lifecycle event is published to
 `POST /agent-runs/{run_id}/events` with a stable idempotency key. If the

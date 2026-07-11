@@ -338,6 +338,11 @@ fn execute_claimed(
         run_started: std::time::Instant::now(),
         phase_started: RefCell::new(std::time::Instant::now()),
     };
+    let manifest = api
+        .execution_manifest(&run.id)
+        .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
+    manifest.validate(&run.id, &ticket.id)?;
+    let execution_policy = manifest.policy()?;
 
     let supervisor = RunSupervisor::start(
         api.clone(),
@@ -348,16 +353,12 @@ fn execute_claimed(
         RunSupervisorConfig {
             heartbeat_interval: Duration::from_secs(context.config.heartbeat_interval_seconds),
             lease_seconds: context.config.lease_seconds,
-            run_timeout: Duration::from_secs(context.config.run_timeout_seconds),
+            run_timeout: Duration::from_secs(execution_policy.timeout_seconds),
         },
     );
     let workspace = RefCell::new(None::<RunWorkspace>);
 
     let result = (|| {
-        let manifest = api
-            .execution_manifest(&run.id)
-            .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
-        manifest.validate(&run.id, &ticket.id)?;
         let manifest_project_matches = context
             .config
             .project_id
@@ -389,8 +390,14 @@ fn execute_claimed(
             repo.ensure_safe(false)?
         };
         workspace.replace(Some(prepared));
-        let generated_prompt =
-            prompt::build(ticket, &repo.root, &context.config.quality_gate_command)?;
+        let required_gates = execution_policy
+            .quality_gates
+            .iter()
+            .filter(|gate| gate.required)
+            .map(|gate| gate.command.as_str())
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let generated_prompt = prompt::build(ticket, &repo.root, &required_gates)?;
         reporter.set_ticket_status("in_progress")?;
         reporter.set_phase(RunPhase::Preparing);
         reporter.step(
@@ -454,7 +461,7 @@ fn execute_claimed(
         reporter.set_phase(RunPhase::TimedOut);
         let timeout = anyhow::anyhow!(
             "agent run timed out after {} seconds",
-            context.config.run_timeout_seconds
+            execution_policy.timeout_seconds
         );
         reporter.fail(&timeout)?;
         return Err(timeout);
@@ -503,6 +510,14 @@ fn execute(
     running: &AtomicBool,
     manifest: &ExecutionManifest,
 ) -> Result<RunSummary> {
+    let policy = manifest.policy()?;
+    let gate_summary = policy
+        .quality_gates
+        .iter()
+        .filter(|gate| gate.required)
+        .map(|gate| gate.command.as_str())
+        .collect::<Vec<_>>()
+        .join(" && ");
     let base_branch = manifest
         .default_branch
         .as_deref()
@@ -568,6 +583,7 @@ fn execute(
             &baseline,
             &generated_prompt,
             running,
+            manifest,
         )?
     };
 
@@ -612,7 +628,7 @@ fn execute(
             github.create_pull_request(
                 &repo_config,
                 &format!("{}: {}", ticket.key, ticket.title),
-                &pull_request_body(ticket, &run.id, &context.config.quality_gate_command),
+                &pull_request_body(ticket, &run.id, &gate_summary),
                 &branch,
                 base_branch,
             )?
@@ -632,7 +648,7 @@ fn execute(
             &manifest.repo_config()?,
             &commit,
             &manifest.required_workflows,
-            Duration::from_secs(context.config.command_timeout_seconds),
+            Duration::from_secs(policy.timeout_seconds),
             running,
             reporter,
         )?;
@@ -652,14 +668,14 @@ fn execute(
         "Agent run completed successfully",
         None,
     )?;
-    reporter.set_ticket_status("done")?;
+    reporter.set_ticket_status("awaiting_review")?;
     let summary = RunSummary {
         ticket_key: ticket.key.clone(),
         branch,
         commit,
         pull_request_url: pr.html_url,
     };
-    print_summary(&summary, &context.config.quality_gate_command);
+    print_summary(&summary, &gate_summary);
     Ok(summary)
 }
 
@@ -743,7 +759,9 @@ fn implement_and_commit(
     baseline: &BTreeSet<String>,
     generated_prompt: &str,
     running: &AtomicBool,
+    manifest: &ExecutionManifest,
 ) -> Result<String> {
+    let policy = manifest.policy()?;
     reporter.step(
         "prompt_built",
         "completed",
@@ -753,13 +771,14 @@ fn implement_and_commit(
     reporter.set_phase(RunPhase::Executing);
     reporter.step("codex", "running", "Running Codex locally", None)?;
     let blocked_action = RefCell::new(None);
-    let codex_status = command::streaming_lines_cancellable(
-        &context.codex_command,
+    let codex_status = command::streaming_lines_cancellable_with_environment(
+        &policy.codex_command(),
         &repo.root,
         Some(generated_prompt),
         running,
-        Duration::from_secs(context.config.command_timeout_seconds),
+        Duration::from_secs(policy.timeout_seconds),
         context.config.max_command_output_bytes as usize,
+        Some(&policy.codex.environment_allowlist),
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -779,45 +798,50 @@ fn implement_and_commit(
     reporter.step("codex", "completed", "Codex finished successfully", None)?;
 
     reporter.set_phase(RunPhase::Verifying);
-    reporter.step(
-        "quality_gate",
-        "running",
-        &format!(
-            "Running quality gate: {}",
-            context.config.quality_gate_command
-        ),
-        None,
-    )?;
-    let gate = run_captured(
-        &context.config.quality_gate_command,
-        &repo.root,
-        running,
-        Duration::from_secs(context.config.command_timeout_seconds),
-        context.config.max_command_output_bytes as usize,
-    )?;
-    print_output(&gate.stdout, &gate.stderr);
-    let gate_output = combine_output(&gate.stdout, &gate.stderr);
-    reporter.log(&gate_output)?;
-    let passed = gate.status.success();
-    api.report_quality_gate(
-        &ticket.id,
-        &run.id,
-        &context.config.quality_gate_command,
-        passed,
-        &gate_output,
-    )?;
-    reporter.step(
-        "quality_gate",
-        if passed { "completed" } else { "failed" },
-        if passed {
-            "Quality gate passed"
-        } else {
-            "Quality gate failed"
-        },
-        Some(json!({"exit_code": gate.status.code()})),
-    )?;
-    if !passed {
-        bail!("quality gate failed with {}", gate.status);
+    for gate_policy in &policy.quality_gates {
+        reporter.step(
+            &gate_policy.id,
+            "running",
+            &format!("Running quality gate: {}", gate_policy.command),
+            Some(json!({"gate_id": gate_policy.id, "required": gate_policy.required})),
+        )?;
+        let gate = run_captured(
+            &gate_policy.command,
+            &repo.root,
+            running,
+            Duration::from_secs(gate_policy.timeout_seconds),
+            context.config.max_command_output_bytes as usize,
+            &policy.codex.environment_allowlist,
+        )?;
+        print_output(&gate.stdout, &gate.stderr);
+        let gate_output = combine_output(&gate.stdout, &gate.stderr);
+        reporter.log(&gate_output)?;
+        let passed = gate.status.success();
+        api.report_quality_gate(
+            &ticket.id,
+            &run.id,
+            &gate_policy.id,
+            &gate_policy.command,
+            passed,
+            &gate_output,
+        )?;
+        reporter.step(
+            &gate_policy.id,
+            if passed { "completed" } else { "failed" },
+            if passed {
+                "Quality gate passed"
+            } else {
+                "Quality gate failed"
+            },
+            Some(json!({"gate_id": gate_policy.id, "exit_code": gate.status.code()})),
+        )?;
+        if gate_policy.required && !passed {
+            bail!(
+                "required quality gate {} failed with {}",
+                gate_policy.id,
+                gate.status
+            );
+        }
     }
 
     reporter.set_phase(RunPhase::Publishing);
@@ -848,7 +872,10 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     let api = RustGridClient::new(context)?;
     let worker = api.register()?;
     let project_id = api.resolve_project_id(context)?;
-    println!("[ watching] Worker {} is polling RustGrid", worker.id);
+    println!(
+        "[ watching] Worker {} is streaming RustGrid queue events with capacity {}",
+        worker.id, context.config.max_concurrency
+    );
     let running = Arc::new(AtomicBool::new(true));
     let signal = Arc::clone(&running);
     ctrlc::set_handler(move || {
@@ -857,24 +884,76 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     })
     .context("could not install Ctrl-C handler")?;
 
+    let mut tasks: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut queue_sequence = api.queue_events(&worker.id, 0)?.next_sequence;
     while running.load(Ordering::SeqCst) && !shutdown::requested() {
-        api.heartbeat(&worker.id)?;
-        match api.claim_next(&worker.id, &project_id)? {
-            Some(run) => {
-                let ticket = api.fetch_ticket(&run.ticket_id)?;
-                println!("[  claimed] Queue returned {}", ticket.key);
-                if let Err(error) =
-                    execute_claimed(context, &api, &worker, &run, &ticket, Arc::clone(&running))
-                {
-                    eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
+        let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                let task = tasks.swap_remove(index);
+                if task.join().is_err() {
+                    eprintln!("[error] worker execution thread panicked");
                 }
+            } else {
+                index += 1;
             }
-            None => println!("[     idle] No tickets available"),
+        }
+        api.heartbeat(&worker.id)?;
+        let available_slots = context.config.max_concurrency.saturating_sub(tasks.len());
+        let mut claimed = 0usize;
+        for _ in 0..available_slots {
+            match api.claim_next(&worker.id, &project_id)? {
+                Some(run) => {
+                    let ticket = api.fetch_ticket(&run.ticket_id)?;
+                    println!("[  claimed] Queue returned {}", ticket.key);
+                    let task_context = context.clone();
+                    let task_api = api.clone();
+                    let task_worker = worker.clone();
+                    let task_running = Arc::clone(&running);
+                    tasks.push(thread::spawn(move || {
+                        if let Err(error) = execute_claimed(
+                            &task_context,
+                            &task_api,
+                            &task_worker,
+                            &run,
+                            &ticket,
+                            task_running,
+                        ) {
+                            eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
+                        }
+                    }));
+                    claimed += 1;
+                }
+                None => break,
+            }
         }
         if once {
             break;
         }
-        thread::sleep(interval);
+        if claimed == 0 {
+            match api.wait_for_queue_event(&worker.id, queue_sequence, interval) {
+                Ok(Some(sequence)) => queue_sequence = sequence,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[warning] queue stream unavailable; falling back to poll: {error:#}"
+                    );
+                    thread::sleep(interval.min(Duration::from_secs(5)));
+                }
+            }
+            match api.queue_events(&worker.id, queue_sequence) {
+                Ok(events) => queue_sequence = events.next_sequence,
+                Err(error) => {
+                    eprintln!(
+                        "[warning] queue replay failed; restarting retained replay: {error:#}"
+                    );
+                    queue_sequence = api.queue_events(&worker.id, 0)?.next_sequence;
+                }
+            }
+        }
+    }
+    for task in tasks {
+        let _ = task.join();
     }
     println!("[  stopped] Watcher stopped");
     Ok(())
@@ -903,8 +982,6 @@ pub fn status(context: &AppContext) -> Result<()> {
         .map(Repo::dirty_paths)
         .transpose()?
         .unwrap_or_default();
-    let parsed_codex = command::parse(&context.codex_command)?;
-    let parsed_gate = command::parse(&context.config.quality_gate_command)?;
     let (project_kind, project) = context.project_value();
     println!("RustGrid agent status\n");
     println!("  Config:       {}", context.config_path.display());
@@ -919,8 +996,7 @@ pub fn status(context: &AppContext) -> Result<()> {
         println!("  Local repo:   {}", repo.root.display());
     }
     println!("  Base branch:  {}", context.config.default_base_branch);
-    println!("  Codex:        {}", parsed_codex.join(" "));
-    println!("  Quality gate: {}", parsed_gate.join(" "));
+    println!("  Execution:    command, gates, timeout, and sandbox are server-owned per run");
     println!(
         "  Heartbeat:    every {}s",
         context.config.heartbeat_interval_seconds
@@ -950,8 +1026,16 @@ fn run_captured(
     running: &AtomicBool,
     timeout: Duration,
     max_output_bytes: usize,
+    environment_allowlist: &[String],
 ) -> Result<command::CommandOutput> {
-    command::capture_cancellable(command_text, cwd, running, timeout, max_output_bytes)
+    command::capture_cancellable_with_environment(
+        command_text,
+        cwd,
+        running,
+        timeout,
+        max_output_bytes,
+        Some(environment_allowlist),
+    )
 }
 
 fn combine_output(stdout: &str, stderr: &str) -> String {

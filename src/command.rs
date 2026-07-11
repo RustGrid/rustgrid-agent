@@ -55,6 +55,17 @@ pub fn capture_cancellable(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<CommandOutput> {
+    capture_cancellable_with_environment(command, cwd, running, timeout, max_output_bytes, None)
+}
+
+pub fn capture_cancellable_with_environment(
+    command: &str,
+    cwd: &Path,
+    running: &AtomicBool,
+    timeout: Duration,
+    max_output_bytes: usize,
+    environment_allowlist: Option<&[String]>,
+) -> Result<CommandOutput> {
     let parts = parse(command)?;
     println!("  $ {}", display_command(&parts));
     let mut command = Command::new(&parts[0]);
@@ -64,6 +75,9 @@ pub fn capture_cancellable(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sanitize_child_environment(&mut command);
+    if let Some(allowlist) = environment_allowlist {
+        apply_environment_allowlist(&mut command, allowlist);
+    }
     configure_process_group(&mut command);
     let mut child = command
         .spawn()
@@ -215,6 +229,32 @@ pub fn streaming_lines_cancellable<F>(
     running: &AtomicBool,
     timeout: Duration,
     max_output_bytes: usize,
+    on_line: F,
+) -> Result<ExitStatus>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    streaming_lines_cancellable_with_environment(
+        command,
+        cwd,
+        stdin_text,
+        running,
+        timeout,
+        max_output_bytes,
+        None,
+        on_line,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn streaming_lines_cancellable_with_environment<F>(
+    command: &str,
+    cwd: &Path,
+    stdin_text: Option<&str>,
+    running: &AtomicBool,
+    timeout: Duration,
+    max_output_bytes: usize,
+    environment_allowlist: Option<&[String]>,
     mut on_line: F,
 ) -> Result<ExitStatus>
 where
@@ -235,6 +275,9 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     sanitize_child_environment(&mut command);
+    if let Some(allowlist) = environment_allowlist {
+        apply_environment_allowlist(&mut command, allowlist);
+    }
     configure_process_group(&mut command);
     let mut child = command
         .spawn()
@@ -328,6 +371,17 @@ fn terminate_process_tree(child: &mut std::process::Child) {
 fn sanitize_child_environment(command: &mut Command) {
     for name in ["RUSTGRID_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
         command.env_remove(name);
+    }
+}
+
+fn apply_environment_allowlist(command: &mut Command, allowlist: &[String]) {
+    let values = allowlist
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    for (name, value) in values {
+        command.env(name, value);
     }
 }
 

@@ -10,7 +10,7 @@ contains `/api/v1`.
 
 ```json
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "run": { "id": "run-uuid", "ticket_id": "ticket-uuid" },
   "project_id": "project-uuid",
   "project_key": "RG",
@@ -25,7 +25,23 @@ contains `/api/v1`.
   "default_branch": "main",
   "installation_id": 12345,
   "required_workflows": [],
-  "required_permissions": {}
+  "required_permissions": {},
+  "execution_policy": {
+    "policy_version": 1,
+    "codex": {
+      "command": ["codex", "exec", "--json"],
+      "environment_allowlist": ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"]
+    },
+    "quality_gates": [
+      {"id": "gate-1", "command": "cargo test", "timeout_seconds": 900, "required": true}
+    ],
+    "timeout_seconds": 3600,
+    "sandbox": {
+      "mode": "workspace_write", "network_access": true,
+      "writable_roots": ["."], "approval_policy": "never"
+    }
+  },
+  "execution_policy_sha256": "64-lowercase-hex-characters"
 }
 ```
 
@@ -33,6 +49,18 @@ The server must derive this document from the claimed ticket, project binding,
 and GitHub App installation. The worker rejects unsupported schema versions,
 identity mismatches, missing values, zero installation IDs, and a local origin
 that does not match `owner/name`.
+
+The worker verifies the policy SHA-256, executes only the server-owned Codex
+command and gates, applies their timeouts and environment allowlist, and refuses
+a sandbox policy it cannot enforce.
+
+## Queue and capacity
+
+The heartbeat advertises `max_concurrency`. The worker resumes
+`GET /agent-workers/{worker_id}/queue/stream` with `Last-Event-ID`, replays gaps
+through `GET /agent-workers/{worker_id}/queue`, and claims concurrently only up
+to its advertised capacity. Polling remains a bounded fallback when the stream
+is temporarily unavailable.
 
 ## GitHub installation token
 

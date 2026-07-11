@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    io::{BufRead, BufReader},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use reqwest::{
@@ -21,12 +24,23 @@ pub struct RustGridClient {
     base_url: String,
     api_key: String,
     session_id: Uuid,
+    max_concurrency: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Worker {
     pub id: String,
     pub status: String,
+    #[serde(default = "default_worker_capacity")]
+    pub max_concurrency: usize,
+    #[serde(default)]
+    pub active_runs: usize,
+    #[serde(default)]
+    pub available_slots: usize,
+}
+
+fn default_worker_capacity() -> usize {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +105,23 @@ pub struct AgentRunEvents {
     pub next_sequence: u64,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AgentQueueEvent {
+    pub sequence: u64,
+    pub event_type: String,
+    #[serde(default)]
+    pub ticket_id: Option<String>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AgentQueueEvents {
+    pub worker: Worker,
+    pub items: Vec<AgentQueueEvent>,
+    pub next_sequence: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct Page<T> {
     items: Vec<T>,
@@ -115,6 +146,7 @@ impl RustGridClient {
             base_url: context.api_url.trim_end_matches('/').to_owned(),
             api_key: context.require_api_key()?.to_owned(),
             session_id: Uuid::new_v4(),
+            max_concurrency: context.config.max_concurrency,
         })
     }
 
@@ -143,7 +175,7 @@ impl RustGridClient {
         self.send_empty(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
-            Some(json!({"status": status})),
+            Some(json!({"status": status, "max_concurrency": self.max_concurrency})),
             None,
         )
     }
@@ -176,6 +208,52 @@ impl RustGridClient {
             &[],
             None,
         )
+    }
+
+    pub fn queue_events(&self, worker_id: &str, after_sequence: u64) -> Result<AgentQueueEvents> {
+        self.send_json(
+            Method::GET,
+            &format!("{WORKERS}/{worker_id}/queue?after_sequence={after_sequence}&limit=500"),
+            None,
+            None,
+            &[],
+            None,
+        )
+    }
+
+    pub fn wait_for_queue_event(
+        &self,
+        worker_id: &str,
+        after_sequence: u64,
+        timeout: Duration,
+    ) -> Result<Option<u64>> {
+        let path =
+            format!("{WORKERS}/{worker_id}/queue/stream?after_sequence={after_sequence}&limit=100");
+        let response = match self
+            .request(Method::GET, &path)
+            .header("Accept", "text/event-stream")
+            .header("Last-Event-ID", after_sequence)
+            .timeout(timeout)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() => return Ok(None),
+            Err(error) => return Err(error).context("agent queue stream failed"),
+        };
+        if !response.status().is_success() {
+            anyhow::bail!("agent queue stream returned {}", response.status());
+        }
+        for line in BufReader::new(response).lines() {
+            let line = line.context("failed to read agent queue stream")?;
+            if let Some(value) = line.strip_prefix("id:") {
+                return value
+                    .trim()
+                    .parse::<u64>()
+                    .map(Some)
+                    .context("agent queue stream returned an invalid sequence");
+            }
+        }
+        Ok(None)
     }
 
     pub fn issue_github_token(&self, run_id: &str) -> Result<GitHubAccessToken> {
@@ -447,6 +525,7 @@ impl RustGridClient {
         &self,
         ticket_id: &str,
         run_id: &str,
+        gate_id: &str,
         command: &str,
         passed: bool,
         output: &str,
@@ -457,10 +536,10 @@ impl RustGridClient {
             Some(json!({
                 "run_id": run_id,
                 "status": if passed { "passed" } else { "failed" },
-                "checks": [{"name": command, "status": if passed { "passed" } else { "failed" }, "summary": truncate(output, 16000)}],
+                "checks": [{"id": gate_id, "name": command, "status": if passed { "passed" } else { "failed" }, "summary": truncate(output, 16000)}],
                 "summary": truncate(if passed { "Local quality gate passed" } else { output }, 5000)
             })),
-            Some(&format!("gate-{run_id}")),
+            Some(&format!("gate-{run_id}-{gate_id}")),
         )
     }
 

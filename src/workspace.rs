@@ -178,7 +178,7 @@ mod tests {
         command::checked("git", ["add", "README.md"], &source).unwrap();
         command::checked("git", ["commit", "-m", "initial"], &source).unwrap();
         let manifest = ExecutionManifest {
-            manifest_version: 1,
+            manifest_version: 2,
             run: ManifestRun {
                 id: "run-1".into(),
                 ticket_id: "ticket-1".into(),
@@ -197,6 +197,8 @@ mod tests {
             default_branch: Some("main".into()),
             required_workflows: vec![],
             required_permissions: json!({}),
+            execution_policy: json!({}),
+            execution_policy_sha256: String::new(),
         };
         let root = directory.path().join("workspaces");
         let first = RunWorkspace::prepare(&root, "run-1", &manifest, "token").unwrap();

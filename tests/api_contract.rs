@@ -23,9 +23,10 @@ fn context(base_url: String) -> AppContext {
                 name: "example".into(),
             },
             default_base_branch: "main".into(),
-            quality_gate_command: "cargo test".into(),
+            quality_gate_command: None,
             codex_command: None,
             heartbeat_interval_seconds: 15,
+            max_concurrency: 1,
             lease_seconds: 900,
             workspace_root: None,
             command_timeout_seconds: 1800,
@@ -37,7 +38,6 @@ fn context(base_url: String) -> AppContext {
         config_path: PathBuf::from("test.json"),
         api_url: base_url,
         api_key: Some("rgk_test".into()),
-        codex_command: "codex exec -".into(),
         workspace_root: PathBuf::from("/tmp/rustgrid-agent-tests"),
     }
 }
@@ -88,14 +88,21 @@ fn server(response_body: serde_json::Value) -> Option<(String, mpsc::Receiver<St
 #[test]
 fn retrieves_the_run_manifest_contract() {
     let Some((url, request)) = server(json!({
-        "manifest_version": 1,
+        "manifest_version": 2,
         "run": {"id": "run-1", "ticket_id": "ticket-1"},
         "project_id": "project-1", "project_key": "RG", "project_name": "RustGrid",
         "ticket_id": "ticket-1", "ticket_key": "RG-1", "ticket_title": "Task",
         "repository_id": 7, "repository": "RustGrid/example",
         "clone_url": "https://github.com/RustGrid/example.git", "web_base_url": "https://github.com",
         "installation_id": 42, "default_branch": "main",
-        "required_workflows": [], "required_permissions": {}
+        "required_workflows": [], "required_permissions": {},
+        "execution_policy": {
+          "policy_version": 1,
+          "codex": {"command":["codex","exec","--json"],"environment_allowlist":["PATH","HOME"]},
+          "quality_gates": [], "timeout_seconds": 3600,
+          "sandbox":{"mode":"workspace_write","network_access":true,"writable_roots":["."],"approval_policy":"never"}
+        },
+        "execution_policy_sha256": "unused-by-deserialization-test"
     })) else {
         return;
     };
@@ -109,6 +116,44 @@ fn retrieves_the_run_manifest_contract() {
             .recv()
             .unwrap()
             .starts_with("GET /agent-runs/run-1/manifest HTTP/1.1")
+    );
+}
+
+#[test]
+fn heartbeat_advertises_configured_capacity() {
+    let Some((url, request)) = server(json!({})) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .heartbeat("worker-1")
+        .unwrap();
+    let request = request.recv().unwrap();
+    assert!(request.starts_with("POST /agent-workers/worker-1/heartbeat HTTP/1.1"));
+    assert!(request.contains("\"max_concurrency\":1"));
+}
+
+#[test]
+fn replays_the_durable_worker_queue_contract() {
+    let Some((url, request)) = server(json!({
+      "worker": {"id":"00000000-0000-4000-8000-000000000001","status":"online","max_concurrency":2,"active_runs":1,"available_slots":1},
+      "items": [{"sequence":7,"event_type":"work_available","ticket_id":"00000000-0000-4000-8000-000000000002","worker_id":null}],
+      "next_sequence": 7
+    })) else {
+        return;
+    };
+    let queue = RustGridClient::new(&context(url))
+        .unwrap()
+        .queue_events("worker-1", 3)
+        .unwrap();
+    assert_eq!(queue.next_sequence, 7);
+    assert_eq!(queue.worker.available_slots, 1);
+    assert_eq!(queue.items[0].event_type, "work_available");
+    assert!(
+        request
+            .recv()
+            .unwrap()
+            .starts_with("GET /agent-workers/worker-1/queue?after_sequence=3&limit=500 HTTP/1.1")
     );
 }
 

@@ -5,9 +5,8 @@
     "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
-  "quality_gate_command": "cargo test",
-  "codex_command": "codex exec --full-auto --json -",
   "heartbeat_interval_seconds": 15,
+  "max_concurrency": 2,
   "lease_seconds": 900,
   "workspace_root": null,
   "command_timeout_seconds": 1800,

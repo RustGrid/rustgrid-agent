@@ -56,14 +56,11 @@ Unix child process group. Captured output is bounded by
 4. Run `rustgrid-agent status`.
 5. Start `serve` and confirm registration, heartbeat, and an empty claim poll.
 
-Manifest version `1` is the current compatibility boundary. A worker refuses
+Manifest version `2` is the current compatibility boundary. A worker refuses
 unknown manifest versions. Roll back to the previous binary if registration or
 manifest retrieval fails after an upgrade; retained workspaces remain available.
 
-## Current server-owned follow-ups
-
-The checked API does not expose a queue notification stream, an
-`awaiting_review` ticket status, or manifest fields for command/time-limit
-policy. The worker therefore polls `claim-next`, records `awaiting_review` as a
-run phase, and uses locally configured commands and limits until those contracts
-are added.
+The worker advertises configured concurrency on every heartbeat, consumes the
+durable queue stream with replay, and falls back to bounded polling only while
+the stream is unavailable. Claimed runs use only the snapshotted server policy
+and finish in `awaiting_review` after publishing the pull request.
