@@ -195,6 +195,10 @@ impl<'a> Reporter<'a> {
         self.journal.borrow_mut().record_error(message)
     }
 
+    pub(crate) fn record_executor(&self, kind: &str, id: &str, state: &str) -> Result<()> {
+        self.journal.borrow_mut().record_executor(kind, id, state)
+    }
+
     pub(crate) fn record_branch(&self, branch: &str) -> Result<()> {
         self.journal.borrow_mut().record_branch(branch)
     }

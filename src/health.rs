@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use crate::{api::RustGridClient, config::AppContext, git::Repo};
+use crate::{api::RustGridClient, config::AppContext, executor::Executor, git::Repo};
 
 pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     let local_repo = Repo::discover().ok();
@@ -15,8 +15,15 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
-    let per_run_isolation = std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() == Ok("per_run");
-    let production_safe_concurrency = context.config.max_concurrency == 1;
+    let per_run_isolation = context.config.executor.is_isolated();
+    let executor_check =
+        Executor::from_config(&context.config.executor).preflight(&context.workspace_root);
+    let executor_ready = executor_check.is_ok();
+    let executor_error = executor_check
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let production_safe_concurrency = per_run_isolation || context.config.max_concurrency == 1;
     let remote_check = if api_key_present {
         RustGridClient::new(context).and_then(|api| api.resolve_project_id(context).map(|_| ()))
     } else {
@@ -27,8 +34,11 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .as_ref()
         .err()
         .map(|error| format!("{error:#}"));
-    let healthy =
-        api_key_present && per_run_isolation && production_safe_concurrency && rustgrid_reachable;
+    let healthy = api_key_present
+        && per_run_isolation
+        && executor_ready
+        && production_safe_concurrency
+        && rustgrid_reachable;
     if json_output {
         println!(
             "{}",
@@ -44,6 +54,9 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "lease_seconds": context.config.lease_seconds,
                 "api_key_present": api_key_present,
                 "per_run_isolation": per_run_isolation,
+                "executor": context.config.executor.kind(),
+                "executor_ready": executor_ready,
+                "executor_error": executor_error,
                 "production_safe_concurrency": production_safe_concurrency,
                 "rustgrid_reachable": rustgrid_reachable,
                 "remote_error": remote_error,
@@ -99,17 +112,17 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     println!(
         "  Isolation:    {}",
         if per_run_isolation {
-            "per-run deployment boundary declared"
+            "Docker Sandbox per run"
         } else {
-            "missing RUSTGRID_AGENT_ISOLATION=per_run"
+            "local development executor"
         }
     );
     println!(
         "  Concurrency:  {}",
         if production_safe_concurrency {
-            "one run per worker process"
+            "safe for configured executor"
         } else {
-            "unsafe for serve; max_concurrency must be 1"
+            "unsafe executor/concurrency combination"
         }
     );
     println!(
@@ -126,8 +139,9 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         bail!("status checks failed: required credentials are missing");
     }
     if !per_run_isolation {
-        bail!("status checks failed: per-run deployment isolation is not declared");
+        bail!("status checks failed: executor.kind=docker_sandbox is required for production");
     }
+    executor_check.context("status checks failed: Docker Sandbox executor")?;
     if !production_safe_concurrency {
         bail!("status checks failed: max_concurrency must be 1 for production");
     }

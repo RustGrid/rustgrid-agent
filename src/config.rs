@@ -25,6 +25,8 @@ pub struct Config {
     pub heartbeat_interval_seconds: u64,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    #[serde(default)]
+    pub executor: ExecutorConfig,
     #[serde(default = "default_lease_seconds")]
     pub lease_seconds: u64,
     #[serde(default)]
@@ -45,6 +47,36 @@ pub struct Config {
     pub max_child_file_bytes: u64,
     #[serde(default = "default_max_child_open_files")]
     pub max_child_open_files: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutorConfig {
+    #[default]
+    Local,
+    DockerSandbox {
+        #[serde(default = "default_sbx_command")]
+        command: String,
+        #[serde(default = "default_sandbox_template")]
+        template: String,
+        #[serde(default = "default_sandbox_cpus")]
+        cpus: u16,
+        #[serde(default = "default_sandbox_memory")]
+        memory: String,
+    },
+}
+
+impl ExecutorConfig {
+    pub fn is_isolated(&self) -> bool {
+        matches!(self, Self::DockerSandbox { .. })
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::DockerSandbox { .. } => "docker_sandbox",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -73,6 +105,19 @@ fn default_heartbeat_interval_seconds() -> u64 {
 
 fn default_max_concurrency() -> usize {
     1
+}
+
+fn default_sbx_command() -> String {
+    "sbx".into()
+}
+fn default_sandbox_template() -> String {
+    "docker/sandbox-templates:codex".into()
+}
+fn default_sandbox_cpus() -> u16 {
+    4
+}
+fn default_sandbox_memory() -> String {
+    "8g".into()
 }
 
 fn default_lease_seconds() -> u64 {
@@ -171,6 +216,28 @@ impl Config {
         if !(1..=100).contains(&self.max_concurrency) {
             bail!("max_concurrency must be between 1 and 100");
         }
+        match &self.executor {
+            ExecutorConfig::Local if self.max_concurrency != 1 => {
+                bail!("local executor requires max_concurrency=1")
+            }
+            ExecutorConfig::DockerSandbox {
+                command,
+                template,
+                cpus,
+                memory,
+            } => {
+                if command.trim().is_empty()
+                    || template.trim().is_empty()
+                    || memory.trim().is_empty()
+                {
+                    bail!("docker sandbox command, template, and memory cannot be empty");
+                }
+                if !(1..=64).contains(cpus) {
+                    bail!("docker sandbox cpus must be between 1 and 64");
+                }
+            }
+            ExecutorConfig::Local => {}
+        }
         if !(30..=86_400).contains(&self.lease_seconds) {
             bail!("lease_seconds must be between 30 and 86400");
         }
@@ -221,6 +288,7 @@ mod tests {
             codex_command: None,
             heartbeat_interval_seconds: 15,
             max_concurrency: 1,
+            executor: ExecutorConfig::Local,
             lease_seconds: 900,
             workspace_root: None,
             command_timeout_seconds: 1800,
@@ -239,5 +307,27 @@ mod tests {
                 .to_string()
                 .contains("only one")
         );
+    }
+
+    #[test]
+    fn rejects_concurrent_local_execution() {
+        let mut config: Config = serde_json::from_str(
+            r#"{"project_key":"RG","max_concurrency":2,"executor":{"kind":"local"}}"#,
+        )
+        .unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("local executor")
+        );
+        config.executor = ExecutorConfig::DockerSandbox {
+            command: "sbx".into(),
+            template: "test".into(),
+            cpus: 1,
+            memory: "1g".into(),
+        };
+        config.validate().unwrap();
     }
 }

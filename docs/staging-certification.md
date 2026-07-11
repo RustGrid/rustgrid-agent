@@ -8,8 +8,8 @@ satisfy this gate.
 
 - A dedicated staging tenant, project, linked GitHub App installation, and test repository.
 - A least-privilege worker API key stored by the deployment secret manager.
-- A per-run filesystem/container boundary with CPU, memory, process, disk, and network controls.
-- `RUSTGRID_AGENT_ISOLATION=per_run` set only inside that deployment boundary.
+- The Docker Sandbox executor with a separate microVM, filesystem, CPU, memory, process, and network boundary per run.
+- Successful `sbx version` and `sbx ls --json` readiness preflights on the worker host.
 - Required GitHub workflows enabled on the test repository.
 
 ## Required scenarios
@@ -30,7 +30,7 @@ satisfy this gate.
    credential variables.
 6. Produce excessive stdout, stderr, a single oversized line, a large file, and
    a workspace symlink. The run must fail within its configured limits without
-   escaping its fresh container boundary or affecting the next scheduled run.
+   escaping its sandbox boundary or affecting another concurrent run.
 7. Send SIGTERM and verify draining; send SIGINT to a separate run and verify
    immediate child-process-group cancellation.
 

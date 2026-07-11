@@ -1,6 +1,4 @@
-use std::{
-    cell::RefCell, collections::BTreeSet, path::Path, sync::atomic::AtomicBool, time::Duration,
-};
+use std::{cell::RefCell, collections::BTreeSet, sync::atomic::AtomicBool, time::Duration};
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -9,6 +7,7 @@ use crate::{
     api::{AgentRun, RustGridClient, Ticket},
     command,
     config::AppContext,
+    executor::{ExecutionHandle, Executor, RunCommand},
     git::Repo,
     lifecycle::{RunPhase, StepStatus},
     manifest::ExecutionManifest,
@@ -27,6 +26,8 @@ pub(crate) struct ImplementationContext<'a> {
     pub prompt: &'a str,
     pub running: &'a AtomicBool,
     pub manifest: &'a ExecutionManifest,
+    pub executor: &'a Executor,
+    pub executor_handle: &'a ExecutionHandle,
 }
 
 pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) -> Result<String> {
@@ -41,6 +42,8 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         prompt: generated_prompt,
         running,
         manifest,
+        executor,
+        executor_handle,
     } = implementation;
     let policy = manifest.policy()?;
     reporter.step(
@@ -50,18 +53,24 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         Some(json!({"characters": generated_prompt.len()})),
     )?;
     reporter.set_phase(RunPhase::Executing);
-    reporter.step("codex", StepStatus::Running, "Running Codex locally", None)?;
+    reporter.step(
+        "codex",
+        StepStatus::Running,
+        "Running Codex in the configured executor",
+        None,
+    )?;
     let blocked_action = RefCell::new(None);
     let codex_args = policy.codex_args();
-    let codex_status = command::streaming_args(
-        command::StreamingCommand {
+    let codex_status = executor.streaming(
+        executor_handle,
+        RunCommand {
             args: &codex_args,
             cwd: &repo.root,
             stdin_text: Some(generated_prompt),
             running,
             timeout: Duration::from_secs(policy.timeout_seconds),
             max_output_bytes: context.config.max_command_output_bytes as usize,
-            environment_allowlist: Some(&policy.codex.environment_allowlist),
+            environment_allowlist: &policy.codex.environment_allowlist,
             limits: Some(child_limits(
                 context,
                 Duration::from_secs(policy.timeout_seconds),
@@ -98,14 +107,22 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
             &format!("Running quality gate: {}", gate_policy.command),
             Some(json!({"gate_id": gate_policy.id, "required": gate_policy.required})),
         )?;
-        let gate = run_captured(
-            context,
+        let gate = executor.captured(
+            executor_handle,
             &gate_policy.command,
-            &repo.root,
-            running,
-            Duration::from_secs(gate_policy.timeout_seconds),
-            context.config.max_command_output_bytes as usize,
-            &policy.codex.environment_allowlist,
+            RunCommand {
+                args: &[],
+                cwd: &repo.root,
+                stdin_text: None,
+                running,
+                timeout: Duration::from_secs(gate_policy.timeout_seconds),
+                max_output_bytes: context.config.max_command_output_bytes as usize,
+                environment_allowlist: &policy.codex.environment_allowlist,
+                limits: Some(child_limits(
+                    context,
+                    Duration::from_secs(gate_policy.timeout_seconds),
+                )),
+            },
         )?;
         print_output(&gate.stdout, &gate.stderr);
         let gate_output = combine_output(&gate.stdout, &gate.stderr);
@@ -168,26 +185,6 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         Some(json!({"commit": commit})),
     )?;
     Ok(commit)
-}
-
-fn run_captured(
-    context: &AppContext,
-    command_text: &str,
-    cwd: &Path,
-    running: &AtomicBool,
-    timeout: Duration,
-    max_output_bytes: usize,
-    environment_allowlist: &[String],
-) -> Result<command::CommandOutput> {
-    command::capture_cancellable_with_environment(
-        command_text,
-        cwd,
-        running,
-        timeout,
-        max_output_bytes,
-        Some(environment_allowlist),
-        Some(child_limits(context, timeout)),
-    )
 }
 
 fn child_limits(context: &AppContext, timeout: Duration) -> command::ChildLimits {

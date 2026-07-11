@@ -1,6 +1,6 @@
 # Deployment examples
 
-The production-safe examples run `watch --once` in a fresh container or pod. The runtime creates the security boundary, processes at most one claimed run, and destroys the boundary when the command exits. Do not change these examples to a long-lived `serve` container while claiming per-run isolation.
+These container and Kubernetes manifests are legacy one-shot deployment examples, not the recommended production executor. Production `serve` uses Docker Sandboxes and currently requires a Docker Desktop host. The examples remain useful for CI and controlled single-run evaluation with `executor.kind=local`.
 
 ## Build
 
@@ -38,4 +38,4 @@ Apply an egress policy appropriate for the configured RustGrid endpoint, GitHub 
 
 ## Long-lived serve mode
 
-The included systemd unit is an operator reference, not proof of isolation. `serve` is appropriate only when an external platform creates and proves the required execution boundary. Until a dedicated remote executor exists, prefer fresh one-shot containers and horizontal scheduling.
+The included systemd unit is an operator reference. Configure the Docker Sandbox executor before starting `serve`; it refuses the local executor.

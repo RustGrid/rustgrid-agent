@@ -30,7 +30,6 @@ spec:
               imagePullPolicy: IfNotPresent
               args: ["--config", "/etc/rustgrid-agent/agent.json", "watch", "--once"]
               env:
-                - {name: RUSTGRID_AGENT_ISOLATION, value: per_run}
                 - {name: RUSTGRID_AGENT_LOG, value: json}
                 - name: RUSTGRID_API_KEY
                   valueFrom:

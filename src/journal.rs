@@ -22,6 +22,13 @@ pub enum RecoveryPlan {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExecutorCheckpoint {
+    pub kind: String,
+    pub id: String,
+    pub state: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RunJournal {
     pub schema_version: u8,
@@ -38,6 +45,8 @@ pub struct RunJournal {
     pub progress_sequence: u64,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub executor: Option<ExecutorCheckpoint>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -93,6 +102,7 @@ impl RunJournal {
             pull_request_number: None,
             progress_sequence: 0,
             last_error: None,
+            executor: None,
             path,
         };
         journal.persist()?;
@@ -128,6 +138,15 @@ impl RunJournal {
 
     pub fn record_error(&mut self, error: &str) -> Result<()> {
         self.last_error = Some(error.to_owned());
+        self.persist()
+    }
+
+    pub fn record_executor(&mut self, kind: &str, id: &str, state: &str) -> Result<()> {
+        self.executor = Some(ExecutorCheckpoint {
+            kind: kind.into(),
+            id: id.into(),
+            state: state.into(),
+        });
         self.persist()
     }
 
@@ -225,6 +244,26 @@ mod tests {
         let restored = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
         assert_eq!(restored.phase, RunPhase::Publishing);
         assert_eq!(restored.last_sequence, 7);
+    }
+
+    #[test]
+    fn persists_executor_identity_for_orphan_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        journal
+            .record_executor("docker_sandbox", "rustgrid-run-1", "created")
+            .unwrap();
+
+        let restored = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        assert_eq!(
+            restored.executor,
+            Some(ExecutorCheckpoint {
+                kind: "docker_sandbox".into(),
+                id: "rustgrid-run-1".into(),
+                state: "created".into(),
+            })
+        );
     }
 
     #[test]

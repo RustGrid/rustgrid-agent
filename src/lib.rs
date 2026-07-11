@@ -3,6 +3,7 @@ pub mod command;
 pub mod config;
 pub mod coordinator;
 mod execution;
+mod executor;
 mod finalization;
 pub mod git;
 pub mod github;

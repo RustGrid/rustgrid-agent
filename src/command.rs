@@ -615,7 +615,7 @@ fn terminate_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn add_codex_json_flag(parts: &mut Vec<String>) {
+pub(crate) fn add_codex_json_flag(parts: &mut Vec<String>) {
     let is_codex = Path::new(&parts[0])
         .file_name()
         .and_then(OsStr::to_str)
@@ -633,7 +633,13 @@ fn add_codex_json_flag(parts: &mut Vec<String>) {
 fn display_command(parts: &[String]) -> String {
     parts
         .iter()
-        .map(|part| {
+        .enumerate()
+        .map(|(index, part)| {
+            if index > 0 && parts[index - 1] == "-e" {
+                return part
+                    .split_once('=')
+                    .map_or_else(|| part.clone(), |(key, _)| format!("{key}=<redacted>"));
+            }
             if part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-._/:=".contains(c))

@@ -27,6 +27,7 @@ fn context(base_url: String) -> AppContext {
             codex_command: None,
             heartbeat_interval_seconds: 15,
             max_concurrency: 1,
+            executor: rustgrid_agent::config::ExecutorConfig::Local,
             lease_seconds: 900,
             workspace_root: None,
             command_timeout_seconds: 1800,

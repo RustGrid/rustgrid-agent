@@ -6,7 +6,7 @@
 
 - **Coordinator:** registers the worker, consumes the durable queue, pauses claims while degraded, and drains on shutdown.
 - **Supervisor:** renews the worker heartbeat and run lease independently of long-running child processes.
-- **Execution:** prepares a dedicated clone, runs Codex and required local gates with bounded resources and a sanitized environment, and commits only agent-created paths.
+- **Execution:** creates a Docker Sandbox microVM around a dedicated clone, runs Codex and required gates there, and commits only agent-created paths from the trusted coordinator.
 - **Publishing:** reconciles the branch, push, pull request, and required GitHub workflows.
 - **Reporting:** writes the durable journal and publishes sequenced events, steps, comments, ticket states, and run states.
 - **Finalization:** maps one typed terminal outcome to cleanup and external side effects.
@@ -15,7 +15,8 @@
 
 ```text
 queue claim -> manifest validation -> token issuance -> isolated clone
-     -> Codex -> local gates -> commit -> push -> pull request
+     -> sandbox create -> Codex -> sandbox gates -> sandbox destroy
+     -> commit -> push -> pull request
      -> required workflows -> awaiting_review -> cleanup
 ```
 
@@ -23,10 +24,10 @@ Every irreversible publication checkpoint is written atomically to `journal.json
 
 ## Trust boundaries
 
-RustGrid and GitHub are trusted external control planes. Ticket content, repository content, Codex output, child processes, and network responses are untrusted. The process-level sandbox and Unix limits are defense in depth. A container, microVM, or equivalent runtime boundary is required to contain repository-controlled code.
+RustGrid and GitHub are trusted external control planes. Ticket content, repository content, Codex output, child processes, and network responses are untrusted. Docker Sandbox provides the production microVM boundary. Only the disposable run clone is mounted; control-plane credentials and publication stay in the parent coordinator. Unix limits remain defense in depth for the local executor.
 
 The worker API key remains in the parent process. Child environments are rebuilt from an allowlist, while GitHub installation tokens are issued for the active run, validated against the manifest, held in memory, and refreshed before expiry.
 
 ## Ownership and concurrency
 
-Lease loss cancels the affected execution and suppresses stale terminal writes. ETags and semantic idempotency keys protect concurrent control-plane mutations. Production `serve` currently requires `max_concurrency=1`; scale by running multiple independently isolated worker instances with distinct worker identities and workspace volumes.
+Lease loss stops and destroys the affected sandbox and suppresses stale terminal writes. ETags and semantic idempotency keys protect concurrent control-plane mutations. Each active run has a unique sandbox and workspace, so `serve` may safely claim up to its configured capacity.

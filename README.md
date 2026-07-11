@@ -43,9 +43,8 @@ repository.
 - [Contributing](CONTRIBUTING.md) and [support](SUPPORT.md)
 - [Roadmap](ROADMAP.md) and [changelog](CHANGELOG.md)
 
-The binary does not create its own container or VM boundary. Production-safe
-examples run `watch --once` in a fresh container/pod and destroy that boundary
-after at most one claimed run.
+The production executor creates one Docker Sandbox microVM per run. The local
+executor remains available for single-run development and tests.
 
 ## Install
 
@@ -94,7 +93,14 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
     "name": "rustgrid-agent"
   },
   "default_base_branch": "main",
-  "max_concurrency": 1
+  "max_concurrency": 4,
+  "executor": {
+    "kind": "docker_sandbox",
+    "command": "sbx",
+    "template": "docker/sandbox-templates:codex",
+    "cpus": 4,
+    "memory": "8g"
+  }
 }
 ```
 
@@ -131,9 +137,8 @@ rustgrid-agent register
 `status` validates the configuration and command strings, locates the repository, reports whether the credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` registers the machine as a RustGrid worker and sends an initial heartbeat.
 
 Use `rustgrid-agent status --json` for machine-readable readiness data. It exits
-non-zero unless credentials exist, per-run isolation is declared,
-`max_concurrency` is 1, and RustGrid authentication plus project resolution
-succeeds.
+non-zero unless credentials exist, the configured Docker Sandbox executor is
+available, and RustGrid authentication plus project resolution succeeds.
 Interactive lifecycle output uses color when attached to a terminal; set the
 standard `NO_COLOR` environment variable to disable it. Set
 `RUSTGRID_AGENT_LOG=json` for newline-delimited structured lifecycle events.
@@ -179,7 +184,8 @@ rustgrid-agent --config path/to/agent.json status
 | `quality_gate_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
-| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100 for non-production experimentation. `serve` currently requires exactly 1 because this binary does not create a separate runtime boundary for concurrent runs. |
+| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. Values above 1 require the Docker Sandbox executor. |
+| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production `serve` requires `docker_sandbox`; its options are `command`, `template`, `cpus`, and `memory`. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
 | `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
@@ -202,7 +208,6 @@ Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridd
 | `RUSTGRID_API_KEY` | Yes | Authenticates RustGrid API requests. |
 | `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
-| `RUSTGRID_AGENT_ISOLATION` | Production | Must equal `per_run`; asserts that the deployment runtime isolates every run. `serve` fails closed without it. |
 
 The RustGrid API key needs these permissions:
 
@@ -217,6 +222,27 @@ The RustGrid API key needs these permissions:
 GitHub credentials are issued by RustGrid for the GitHub App installation in
 the claimed execution manifest. Tokens are held only in memory, refreshed before
 expiry, and scoped by the server to the claimed run and repository.
+
+## Sandbox security boundary
+
+Production execution uses one Docker Sandbox microVM per run. Only that run's
+disposable repository clone is mounted into the sandbox. Codex and all quality
+gates run inside it; RustGrid API calls, GitHub token acquisition, commits,
+pushes, and pull-request publication remain in the trusted coordinator. The
+sandbox receives only environment variables explicitly allowed by the signed
+execution policy, and command logging redacts their values.
+
+Sandbox names are deterministic and journaled. A restarted worker removes any
+orphan with the same name before recreating it, and every terminal path removes
+the sandbox with `sbx rm --force`. Cancellation or lease loss first stops the
+sandbox. Failed sandbox destruction changes an otherwise successful run into a
+failure so resource leaks are visible rather than silently accepted.
+
+Install and authenticate the standalone `sbx` CLI before starting production
+workers. `rustgrid-agent status` and `serve` verify both the `sbx` client and its
+daemon and fail closed if either is unavailable. Docker Sandboxes currently require
+Docker Desktop and are not supported on Linux hosts; choose production worker
+hosts accordingly.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 
@@ -260,7 +286,8 @@ rustgrid-agent watch --once
 Registers one worker, heartbeats it, and processes queued tickets serially. `--interval` controls the delay in seconds after each poll and defaults to 15. `--once` performs one poll and exits, which is useful for schedulers and smoke tests. A failed ticket is reported and watch mode continues to the next poll.
 
 Multiple worker processes must use distinct worker credentials and workspace
-roots. A single `serve` process claims and executes one run at a time.
+roots. A `serve` process can execute up to `max_concurrency` runs when each run
+uses its own Docker Sandbox.
 
 ### `serve`
 

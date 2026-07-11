@@ -30,6 +30,6 @@ be issued through the RustGrid broker.
 
 ## Production boundary
 
-The worker executes repository-controlled code. Production deployments must
-provide a genuine per-run filesystem and resource boundary and must not set
-`RUSTGRID_AGENT_ISOLATION=per_run` until that boundary exists.
+The worker executes repository-controlled code. Production `serve` therefore
+requires the Docker Sandbox executor and fails closed if `sbx` is unavailable.
+Do not use the local executor for untrusted repositories.

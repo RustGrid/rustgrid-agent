@@ -178,6 +178,12 @@ mod tests {
                 codex_command: None,
                 heartbeat_interval_seconds: 5,
                 max_concurrency: 2,
+                executor: crate::config::ExecutorConfig::DockerSandbox {
+                    command: "sbx".into(),
+                    template: "test".into(),
+                    cpus: 1,
+                    memory: "1g".into(),
+                },
                 lease_seconds: 30,
                 workspace_root: None,
                 command_timeout_seconds: 1800,

@@ -17,6 +17,7 @@ use crate::{
     config::AppContext,
     coordinator::CoordinatorHealth,
     execution::{ImplementationContext, implement_and_commit, short_sha},
+    executor::{ExecutionHandle, Executor},
     finalization::finalize,
     git::{Repo, branch_name},
     github::GitHubClient,
@@ -120,6 +121,8 @@ fn execute_claimed(
         },
     );
     let workspace = RefCell::new(None::<RunWorkspace>);
+    let executor = Executor::from_config(&context.config.executor);
+    let executor_handle = RefCell::new(None::<ExecutionHandle>);
 
     let result = (|| {
         let manifest_project_matches = context
@@ -153,6 +156,17 @@ fn execute_claimed(
             repo.ensure_safe(false)?
         };
         workspace.replace(Some(prepared));
+        let handle = executor.prepare(&run.id, &repo.root)?;
+        if let Some(id) = handle.id() {
+            reporter.record_executor(context.config.executor.kind(), id, "created")?;
+            reporter.step(
+                "sandbox_created",
+                StepStatus::Completed,
+                &format!("Created Docker Sandbox {id}"),
+                Some(json!({"executor": context.config.executor.kind(), "sandbox_id": id})),
+            )?;
+        }
+        executor_handle.replace(Some(handle.clone()));
         let required_gates = execution_policy
             .quality_gates
             .iter()
@@ -198,14 +212,31 @@ fn execute_claimed(
             prompt: generated_prompt,
             running: &running,
             manifest: &manifest,
+            executor: &executor,
+            executor_handle: &handle,
         })
     })();
-    let result = result.and_then(|summary| {
+    let mut result = result.and_then(|summary| {
         if let Some(workspace) = workspace.borrow().as_ref() {
             workspace.enforce_size_limit(context.config.max_workspace_bytes)?;
         }
         Ok(summary)
     });
+    if let Some(handle) = executor_handle.borrow().as_ref() {
+        if let Err(error) = executor.destroy(
+            handle,
+            workspace
+                .borrow()
+                .as_ref()
+                .map_or(&context.workspace_root, |item| &item.repo.root),
+        ) {
+            if result.is_ok() {
+                result = Err(error.context("run succeeded but sandbox cleanup failed"));
+            }
+        } else if let Some(id) = handle.id() {
+            let _ = reporter.record_executor(context.config.executor.kind(), id, "destroyed");
+        }
+    }
 
     let supervisor_healthy = supervisor.is_healthy();
     let lease_lost = supervisor.lease_lost();
@@ -232,6 +263,8 @@ struct ExecutionContext<'a> {
     prompt: String,
     running: &'a AtomicBool,
     manifest: &'a ExecutionManifest,
+    executor: &'a Executor,
+    executor_handle: &'a ExecutionHandle,
 }
 
 fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
@@ -246,6 +279,8 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         prompt: generated_prompt,
         running,
         manifest,
+        executor,
+        executor_handle,
     } = execution;
     let policy = manifest.policy()?;
     let gate_summary = policy
@@ -326,6 +361,8 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             prompt: &generated_prompt,
             running,
             manifest,
+            executor,
+            executor_handle,
         })?
     };
 
@@ -614,16 +651,12 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
 }
 
 pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
-    if std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() != Ok("per_run") {
+    if !context.config.executor.is_isolated() {
         bail!(
-            "serve requires RUSTGRID_AGENT_ISOLATION=per_run after the deployment runtime gives each run an isolated filesystem and resource boundary"
+            "serve requires executor.kind=docker_sandbox; the local executor is development-only"
         );
     }
-    if context.config.max_concurrency != 1 {
-        bail!(
-            "serve requires max_concurrency=1 until each run is launched in a separately enforced container or equivalent runtime boundary"
-        );
-    }
+    Executor::from_config(&context.config.executor).preflight(&context.workspace_root)?;
     watch(context, interval, false)
 }
 

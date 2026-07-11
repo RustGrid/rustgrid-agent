@@ -2,19 +2,17 @@
 
 ## Deployment
 
-The production-safe container examples under `deploy/` run `watch --once` in a
-fresh pod/container so the runtime boundary is destroyed after at most one run.
-This is the recommended deployment until a dedicated remote executor exists.
+Production uses the standalone Docker Sandboxes CLI. Install Docker Desktop and
+`sbx`, authenticate Codex through Docker's credential proxy, and configure
+`executor.kind` as `docker_sandbox`.
 
 Run one `serve` process per worker identity. The worker needs only its bound
 `RUSTGRID_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
 unprivileged OS account and a writable workspace root.
 
-Set `max_concurrency` to 1. The current in-process executor cannot establish a
-separate filesystem and process boundary for concurrent runs, so `serve` fails
-closed when a higher value is configured. Higher production concurrency requires
-an external executor that launches every run in its own container or equivalent
-runtime boundary; separate workspace directories alone are not isolation.
+Set `max_concurrency` from measured host capacity. Each claimed run receives its
+own microVM with configured CPU and memory limits. The local executor is limited
+to one run and is rejected by `serve`.
 
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:
@@ -22,22 +20,16 @@ The example systemd unit is in
 ```text
 RUSTGRID_API_KEY=rgk_...
 RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
-RUSTGRID_AGENT_ISOLATION=per_run
 ```
-
-`RUSTGRID_AGENT_ISOLATION=per_run` is a fail-closed deployment assertion, not
-a sandbox implementation. Set it only after the runtime gives every run its own
-filesystem boundary and CPU, memory, process, disk, and network controls.
-`serve` refuses to start without it.
 
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and
 interrupted workspaces are retained until `failed_workspace_retention_hours`.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
-container disk quota for enforcement while commands are actively writing.
+host disk quota for enforcement while commands are actively writing.
 The worker also applies Unix child limits for address space, individual file
 size, open files, CPU time, wall time, and captured output. These limits are
-defense in depth and do not replace per-run containers or host quotas.
+defense in depth for local development and do not replace host quotas.
 
 Use `rustgrid-agent status --json` from process-manager readiness checks. It
 reports configuration, credential presence, workspace location, and capacity
