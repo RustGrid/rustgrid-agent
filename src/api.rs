@@ -128,6 +128,11 @@ struct Page<T> {
 }
 
 #[derive(Debug, Deserialize)]
+struct AgentRunPage {
+    items: Vec<AgentRun>,
+}
+
+#[derive(Debug, Deserialize)]
 struct QualityGateRecord {
     status: String,
     #[serde(default)]
@@ -468,6 +473,22 @@ impl RustGridClient {
             }) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub fn active_runs(&self, project_id: &str, worker_id: &str) -> Result<Vec<AgentRun>> {
+        let page: AgentRunPage = self.send_json(
+            Method::GET,
+            &format!(
+                "{RUNS}?project_id={}&status=running&worker_id={}&page=1&size=100",
+                url_encode(project_id),
+                url_encode(worker_id)
+            ),
+            None,
+            None,
+            &[],
+            None,
+        )?;
+        Ok(page.items)
     }
 
     pub fn append_step(

@@ -18,10 +18,10 @@ fn context(base_url: String) -> AppContext {
         config: Config {
             project_id: None,
             project_key: Some("RG".into()),
-            repo: RepoConfig {
+            repo: Some(RepoConfig {
                 owner: "RustGrid".into(),
                 name: "example".into(),
-            },
+            }),
             default_base_branch: "main".into(),
             quality_gate_command: None,
             codex_command: None,
@@ -204,4 +204,28 @@ fn publishes_a_sequenced_progress_event() {
             .contains("idempotency-key: progress-run-1-4")
     );
     assert!(request.contains("\"event_type\":\"progress\""));
+}
+
+#[test]
+fn lists_assigned_active_runs_for_startup_recovery() {
+    let Some((url, request)) = server(json!({
+        "items": [{
+            "id": "run-1", "ticket_id": "ticket-1", "row_version": 3,
+            "status": "running", "attempt": 1, "input_prompt": "claimed",
+            "metadata": {}, "created_at": "2026-07-11T12:00:00Z",
+            "updated_at": "2026-07-11T12:00:00Z"
+        }],
+        "page": 1, "size": 100, "total": 1
+    })) else {
+        return;
+    };
+    let runs = RustGridClient::new(&context(url))
+        .unwrap()
+        .active_runs("project-1", "worker-1")
+        .unwrap();
+    assert_eq!(runs[0].id, "run-1");
+    let request = request.recv().unwrap();
+    assert!(request.starts_with(
+        "GET /agent-runs?project_id=project-1&status=running&worker_id=worker-1&page=1&size=100 HTTP/1.1"
+    ));
 }

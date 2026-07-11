@@ -40,6 +40,11 @@ claim for the same run, the agent restores client/server event sequences and
 reconciles the existing branch, commit, push, and open pull request. Never edit
 the journal manually while the worker is running.
 
+After a process restart, the worker first lists active runs assigned to its
+worker ID and resumes up to its configured concurrency before consuming new
+queue entries. Run cancellation is isolated: losing one lease stops only that
+run, while the worker and its other active runs continue heartbeating.
+
 Lease loss is fail-closed: local execution is cancelled and no terminal ticket
 or run update is attempted. The control plane decides whether to requeue or
 reassign the run.
@@ -52,7 +57,8 @@ Unix child process group. Captured output is bounded by
 
 1. Drain the worker by stopping new claims.
 2. Allow the current run to finish or cancel it explicitly.
-3. Replace the binary with the tagged release artifact and verify its published SHA-256 checksum.
+3. Replace the binary with the tagged release artifact; verify its published
+   SHA-256 checksum and GitHub artifact attestation, and retain the SPDX SBOM.
 4. Run `rustgrid-agent status`.
 5. Start `serve` and confirm registration, heartbeat, and an empty claim poll.
 

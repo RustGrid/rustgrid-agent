@@ -53,7 +53,10 @@ impl RunWorkspace {
                     ("GIT_CONFIG_COUNT", "1".to_owned()),
                     (
                         "GIT_CONFIG_KEY_0",
-                        "http.https://github.com/.extraheader".to_owned(),
+                        format!(
+                            "http.{}/.extraheader",
+                            manifest.web_base_url.trim_end_matches('/')
+                        ),
                     ),
                     (
                         "GIT_CONFIG_VALUE_0",

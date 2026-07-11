@@ -595,12 +595,12 @@ fn execute(
         &manifest.required_permissions,
     );
     let push_token = tokens.token()?;
-    repo.push(&branch, &push_token)?;
+    let pushed = repo.push(&branch, &commit, &push_token, &manifest.web_base_url)?;
     reporter.step(
         "push",
         "completed",
         &format!("Pushed branch {branch}"),
-        None,
+        Some(json!({"pushed": pushed, "commit": commit})),
     )?;
 
     reporter.step(
@@ -620,7 +620,7 @@ fn execute(
         crate::github::PullRequest { number, html_url }
     } else {
         let pr_token = tokens.token()?;
-        let github = GitHubClient::new(&pr_token)?;
+        let github = GitHubClient::new(&pr_token, &manifest.web_base_url)?;
         let repo_config = manifest.repo_config()?;
         if let Some(existing) = github.find_open_pull_request(&repo_config, &branch)? {
             existing
@@ -645,10 +645,13 @@ fn execute(
     if !manifest.required_workflows.is_empty() {
         wait_for_required_workflows(
             &tokens,
-            &manifest.repo_config()?,
-            &commit,
-            &manifest.required_workflows,
-            Duration::from_secs(policy.timeout_seconds),
+            WorkflowRequirements {
+                repo: &manifest.repo_config()?,
+                web_base_url: &manifest.web_base_url,
+                commit: &commit,
+                required: &manifest.required_workflows,
+                timeout: Duration::from_secs(policy.timeout_seconds),
+            },
             running,
             reporter,
         )?;
@@ -679,40 +682,45 @@ fn execute(
     Ok(summary)
 }
 
+struct WorkflowRequirements<'a> {
+    repo: &'a crate::config::RepoConfig,
+    web_base_url: &'a str,
+    commit: &'a str,
+    required: &'a [String],
+    timeout: Duration,
+}
+
 fn wait_for_required_workflows(
     tokens: &GitHubTokenManager<'_>,
-    repo: &crate::config::RepoConfig,
-    commit: &str,
-    required: &[String],
-    timeout: Duration,
+    requirements: WorkflowRequirements<'_>,
     running: &AtomicBool,
     reporter: &Reporter<'_>,
 ) -> Result<()> {
-    if required.is_empty() {
+    if requirements.required.is_empty() {
         return Ok(());
     }
     reporter.step(
         "required_workflows",
         "running",
         "Waiting for required GitHub workflows",
-        Some(json!({"required": required})),
+        Some(json!({"required": requirements.required})),
     )?;
     let started = std::time::Instant::now();
     loop {
         if !running.load(Ordering::SeqCst) {
             bail!("required workflow wait cancelled");
         }
-        if started.elapsed() >= timeout {
+        if started.elapsed() >= requirements.timeout {
             bail!(
                 "required GitHub workflows timed out after {} seconds",
-                timeout.as_secs()
+                requirements.timeout.as_secs()
             );
         }
         let token = tokens.token()?;
-        let github = GitHubClient::new(&token)?;
-        let checks = github.check_runs(repo, commit)?;
+        let github = GitHubClient::new(&token, requirements.web_base_url)?;
+        let checks = github.check_runs(requirements.repo, requirements.commit)?;
         let mut all_passed = true;
-        for name in required {
+        for name in requirements.required {
             let matching = checks.iter().find(|check| check.name == *name);
             match matching {
                 Some(check)
@@ -735,7 +743,7 @@ fn wait_for_required_workflows(
                 "required_workflows",
                 "completed",
                 "Required GitHub workflows passed",
-                Some(json!({"required": required})),
+                Some(json!({"required": requirements.required})),
             )?;
             return Ok(());
         }
@@ -885,6 +893,32 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     .context("could not install Ctrl-C handler")?;
 
     let mut tasks: Vec<thread::JoinHandle<()>> = Vec::new();
+    for run in api
+        .active_runs(&project_id, &worker.id)?
+        .into_iter()
+        .take(context.config.max_concurrency)
+    {
+        let ticket = api.fetch_ticket(&run.ticket_id)?;
+        println!(
+            "[ recovery] Resuming assigned run {} for {}",
+            run.id, ticket.key
+        );
+        let task_context = context.clone();
+        let task_api = api.clone();
+        let task_worker = worker.clone();
+        tasks.push(thread::spawn(move || {
+            if let Err(error) = execute_claimed(
+                &task_context,
+                &task_api,
+                &task_worker,
+                &run,
+                &ticket,
+                Arc::new(AtomicBool::new(true)),
+            ) {
+                eprintln!("[error] recovered ticket {} failed: {error:#}", ticket.key);
+            }
+        }));
+    }
     let mut queue_sequence = api.queue_events(&worker.id, 0)?.next_sequence;
     while running.load(Ordering::SeqCst) && !shutdown::requested() {
         let mut index = 0;
@@ -898,7 +932,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
                 index += 1;
             }
         }
-        api.heartbeat(&worker.id)?;
+        api.heartbeat_with_status(&worker.id, if tasks.is_empty() { "online" } else { "busy" })?;
         let available_slots = context.config.max_concurrency.saturating_sub(tasks.len());
         let mut claimed = 0usize;
         for _ in 0..available_slots {
@@ -909,7 +943,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
                     let task_context = context.clone();
                     let task_api = api.clone();
                     let task_worker = worker.clone();
-                    let task_running = Arc::clone(&running);
+                    let task_running = Arc::new(AtomicBool::new(true));
                     tasks.push(thread::spawn(move || {
                         if let Err(error) = execute_claimed(
                             &task_context,
@@ -988,8 +1022,13 @@ pub fn status(context: &AppContext) -> Result<()> {
     println!("  RustGrid API: {}", context.api_url);
     println!("  Project:      {project_kind}={project}");
     println!(
-        "  Repository:   {}/{}",
-        context.config.repo.owner, context.config.repo.name
+        "  Repository:   {}",
+        context
+            .config
+            .repo
+            .as_ref()
+            .map(|repo| format!("{}/{} (deprecated local hint)", repo.owner, repo.name))
+            .unwrap_or_else(|| "resolved from each run manifest".into())
     );
     println!("  Workspaces:   {}", context.workspace_root.display());
     if let Some(repo) = &local_repo {

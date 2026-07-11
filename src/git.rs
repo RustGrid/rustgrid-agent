@@ -137,29 +137,73 @@ impl Repo {
         command::checked("git", ["rev-parse", "HEAD"], &self.root)
     }
 
-    pub fn push(&self, branch: &str, github_token: &str) -> Result<()> {
+    pub fn push(
+        &self,
+        branch: &str,
+        expected_commit: &str,
+        github_token: &str,
+        web_base_url: &str,
+    ) -> Result<bool> {
         // Child-only dynamic Git config keeps the token out of argv and remote URLs.
         let authorization = STANDARD.encode(format!("x-access-token:{github_token}"));
+        let environment = [
+            ("GIT_CONFIG_COUNT", "1".to_owned()),
+            (
+                "GIT_CONFIG_KEY_0",
+                format!("http.{}/.extraheader", web_base_url.trim_end_matches('/')),
+            ),
+            (
+                "GIT_CONFIG_VALUE_0",
+                format!("AUTHORIZATION: basic {authorization}"),
+            ),
+        ];
+        if self
+            .remote_branch_commit(branch, environment.clone())?
+            .as_deref()
+            == Some(expected_commit)
+        {
+            return Ok(false);
+        }
         let output = command::capture_with_env(
             "git",
             ["push", "--set-upstream", "origin", branch],
             &self.root,
-            [
-                ("GIT_CONFIG_COUNT", "1".to_owned()),
-                (
-                    "GIT_CONFIG_KEY_0",
-                    "http.https://github.com/.extraheader".to_owned(),
-                ),
-                (
-                    "GIT_CONFIG_VALUE_0",
-                    format!("AUTHORIZATION: basic {authorization}"),
-                ),
-            ],
+            environment.clone(),
         )?;
         if !output.status.success() {
             bail!("git push exited with {}: {}", output.status, output.stderr);
         }
-        Ok(())
+        let remote = self.remote_branch_commit(branch, environment)?;
+        if remote.as_deref() != Some(expected_commit) {
+            bail!(
+                "remote branch {branch} resolved to {}, expected {expected_commit}",
+                remote.as_deref().unwrap_or("missing")
+            );
+        }
+        Ok(true)
+    }
+
+    fn remote_branch_commit<E, K, V>(&self, branch: &str, environment: E) -> Result<Option<String>>
+    where
+        E: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        let reference = format!("refs/heads/{branch}");
+        let output = command::capture_with_env(
+            "git",
+            ["ls-remote", "--heads", "origin", &reference],
+            &self.root,
+            environment,
+        )?;
+        if !output.status.success() {
+            bail!(
+                "git ls-remote exited with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+        Ok(output.stdout.split_whitespace().next().map(str::to_owned))
     }
 }
 
@@ -270,5 +314,46 @@ mod tests {
             command::checked("git", ["show", "--pretty=", "--name-only", "HEAD"], root).unwrap();
         assert_eq!(committed, "agent.txt");
         assert!(repo.dirty_paths().unwrap().contains("existing.txt"));
+    }
+
+    #[test]
+    fn push_reconciles_the_expected_remote_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = directory.path().join("remote.git");
+        let local = directory.path().join("local");
+        command::checked(
+            "git",
+            ["init", "--bare", remote.to_str().unwrap()],
+            directory.path(),
+        )
+        .unwrap();
+        command::checked(
+            "git",
+            ["init", "--initial-branch=main", local.to_str().unwrap()],
+            directory.path(),
+        )
+        .unwrap();
+        command::checked("git", ["config", "user.email", "agent@example.com"], &local).unwrap();
+        command::checked("git", ["config", "user.name", "Agent Test"], &local).unwrap();
+        std::fs::write(local.join("file.txt"), "content\n").unwrap();
+        command::checked("git", ["add", "file.txt"], &local).unwrap();
+        command::checked("git", ["commit", "-m", "initial"], &local).unwrap();
+        command::checked(
+            "git",
+            ["remote", "add", "origin", remote.to_str().unwrap()],
+            &local,
+        )
+        .unwrap();
+        let repo = Repo { root: local };
+        let commit = command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap();
+        assert!(
+            repo.push("main", &commit, "token", "https://github.com")
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .push("main", &commit, "token", "https://github.com")
+                .unwrap()
+        );
     }
 }

@@ -13,7 +13,8 @@ pub const DEFAULT_API_URL: &str = "https://app.rustgrid.com/api/v1";
 pub struct Config {
     pub project_id: Option<String>,
     pub project_key: Option<String>,
-    pub repo: RepoConfig,
+    #[serde(default)]
+    pub repo: Option<RepoConfig>,
     #[serde(default = "default_base_branch")]
     pub default_base_branch: String,
     #[serde(default)]
@@ -141,11 +142,7 @@ impl Config {
             }
             _ => {}
         }
-        for (name, value) in [
-            ("repo.owner", self.repo.owner.as_str()),
-            ("repo.name", self.repo.name.as_str()),
-            ("default_base_branch", self.default_base_branch.as_str()),
-        ] {
+        for (name, value) in [("default_base_branch", self.default_base_branch.as_str())] {
             if value.trim().is_empty() {
                 bail!("config value {name} cannot be empty");
             }
@@ -161,12 +158,6 @@ impl Config {
         }
         if self.heartbeat_interval_seconds.saturating_mul(3) >= self.lease_seconds {
             bail!("lease_seconds must exceed three heartbeat intervals");
-        }
-        if self.command_timeout_seconds < 30 {
-            bail!("command_timeout_seconds must be at least 30");
-        }
-        if self.run_timeout_seconds < self.command_timeout_seconds {
-            bail!("run_timeout_seconds must be at least command_timeout_seconds");
         }
         if self.failed_workspace_retention_hours > 24 * 30 {
             bail!("failed_workspace_retention_hours cannot exceed 720");
@@ -194,10 +185,10 @@ mod tests {
         let config = Config {
             project_id: Some("1".into()),
             project_key: Some("RG".into()),
-            repo: RepoConfig {
+            repo: Some(RepoConfig {
                 owner: "o".into(),
                 name: "r".into(),
-            },
+            }),
             default_base_branch: "main".into(),
             quality_gate_command: None,
             codex_command: None,

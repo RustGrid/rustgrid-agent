@@ -149,8 +149,8 @@ rustgrid-agent --config path/to/agent.json status
 | --- | --- | --- |
 | `project_key` | One project field | Human-readable RustGrid project key. Mutually exclusive with `project_id`. |
 | `project_id` | One project field | RustGrid project UUID. Mutually exclusive with `project_key`. |
-| `repo.owner` | Yes | GitHub organization or account that owns the target repository. |
-| `repo.name` | Yes | GitHub repository name. |
+| `repo.owner` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
+| `repo.name` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
 | `default_base_branch` | No | Bootstrap value used before a run is claimed. The execution manifest is authoritative for claimed runs. |
 | `quality_gate_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
@@ -257,6 +257,9 @@ child is terminated, the run becomes `cancelled`, and the ticket returns to
 
 Process managers should restart `serve` after an unexpected exit. SIGINT and
 SIGTERM both stop new claims and cancel active child process groups safely.
+At startup, `serve` queries RustGrid for runs already assigned to this worker
+and resumes them before claiming new work. Each run owns its cancellation token,
+so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
 
 ## Run lifecycle and recovery
 
@@ -267,6 +270,9 @@ Immediately after claim, the worker retrieves
 versions, mismatched run/ticket identities, incomplete repository data, and a
 local `origin` that does not match the claimed repository. GitHub tokens come
 from `POST /agent-runs/{run_id}/github-token` and are refreshed before expiry.
+The worker caches a valid token in memory until its refresh window, derives the
+API origin from the manifest for GitHub Enterprise Server, paginates check runs,
+and verifies the remote branch commit after every push.
 Manifest version 2 also owns the Codex command, structured quality gates,
 timeouts, environment allowlist, and sandbox policy. Local command settings are
 accepted only for configuration-file compatibility and are not used to execute
@@ -328,9 +334,11 @@ This section is for RustGrid maintainers. Homebrew distribution needs a versione
 2. Run the development checks listed below.
 3. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
 
-The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-cli.rb.in`](packaging/homebrew/rustgrid-cli.rb.in); and creates the GitHub release. The release contains both of these assets:
+The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-cli.rb.in`](packaging/homebrew/rustgrid-cli.rb.in); generates an SPDX JSON SBOM; creates a GitHub artifact attestation binding the package and SBOM; and creates the GitHub release. The release contains these assets:
 
 - `rustgrid-agent-X.Y.Z.crate`, the immutable source archive
+- `rustgrid-agent-X.Y.Z.crate.sha256`, its SHA-256 checksum
+- `rustgrid-agent.spdx.json`, the SPDX JSON software bill of materials
 - `rustgrid-cli.rb`, the formula with the release URL and checksum filled in
 
 The release URL will have this form:

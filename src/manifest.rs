@@ -131,6 +131,13 @@ impl ExecutionPolicy {
             .command
             .iter()
             .any(|value| value.trim().is_empty())
+            || self.codex.command.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    "--dangerously-bypass-approvals-and-sandbox"
+                        | "--dangerously-bypass-hook-trust"
+                )
+            })
             || self.quality_gates.iter().any(|gate| {
                 gate.id.trim().is_empty()
                     || gate.command.trim().is_empty()
@@ -158,8 +165,41 @@ impl ExecutionPolicy {
     }
 
     pub fn codex_command(&self) -> String {
-        self.codex
-            .command
+        let mut command = self.codex.command.clone();
+        let insertion = command
+            .iter()
+            .position(|part| part == "-")
+            .unwrap_or(command.len());
+        if !command
+            .iter()
+            .any(|part| part == "--sandbox" || part == "-s")
+        {
+            command.splice(
+                insertion..insertion,
+                ["--sandbox".into(), "workspace-write".into()],
+            );
+        }
+        let insertion = command
+            .iter()
+            .position(|part| part == "-")
+            .unwrap_or(command.len());
+        if !command
+            .iter()
+            .any(|part| part.starts_with("approval_policy="))
+        {
+            command.splice(
+                insertion..insertion,
+                ["-c".into(), "approval_policy=\"never\"".into()],
+            );
+        }
+        let insertion = command
+            .iter()
+            .position(|part| part == "-")
+            .unwrap_or(command.len());
+        if !command.iter().any(|part| part == "--ephemeral") {
+            command.insert(insertion, "--ephemeral".into());
+        }
+        command
             .iter()
             .map(|part| {
                 shlex::try_quote(part).map_or_else(|_| part.clone(), |quoted| quoted.into_owned())
@@ -216,5 +256,14 @@ mod tests {
         let mut future = manifest();
         future.manifest_version = 3;
         assert!(future.validate("run-1", "ticket-1").is_err());
+    }
+
+    #[test]
+    fn hardens_the_codex_command() {
+        let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
+        let command = policy.codex_command();
+        assert!(command.contains("--sandbox workspace-write"));
+        assert!(command.contains("approval_policy"));
+        assert!(command.contains("--ephemeral"));
     }
 }

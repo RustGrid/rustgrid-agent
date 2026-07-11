@@ -13,6 +13,7 @@ use crate::config::RepoConfig;
 pub struct GitHubClient {
     http: Client,
     token: String,
+    api_base_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,13 +35,20 @@ struct CheckRunsResponse {
 }
 
 impl GitHubClient {
-    pub fn new(token: &str) -> Result<Self> {
+    pub fn new(token: &str, web_base_url: &str) -> Result<Self> {
+        let web_base_url = web_base_url.trim_end_matches('/');
+        let api_base_url = if web_base_url == "https://github.com" {
+            "https://api.github.com".to_owned()
+        } else {
+            format!("{web_base_url}/api/v3")
+        };
         Ok(Self {
             http: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .user_agent(concat!("rustgrid-agent/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             token: token.to_owned(),
+            api_base_url,
         })
     }
 
@@ -53,8 +61,8 @@ impl GitHubClient {
         base: &str,
     ) -> Result<PullRequest> {
         let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls",
-            repo.owner, repo.name
+            "{}/repos/{}/{}/pulls",
+            self.api_base_url, repo.owner, repo.name
         );
         let payload = json!({"title": title, "body": body, "head": head, "base": base});
         let response = self.send_with_retry("create pull request", || {
@@ -83,7 +91,8 @@ impl GitHubClient {
     ) -> Result<Option<PullRequest>> {
         let head = format!("{}:{head}", repo.owner);
         let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls?state=open&head={}",
+            "{}/repos/{}/{}/pulls?state=open&head={}",
+            self.api_base_url,
             repo.owner,
             repo.name,
             url_encode(&head)
@@ -109,32 +118,41 @@ impl GitHubClient {
     }
 
     pub fn check_runs(&self, repo: &RepoConfig, reference: &str) -> Result<Vec<CheckRun>> {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/commits/{}/check-runs?per_page=100",
-            repo.owner,
-            repo.name,
-            url_encode(reference)
-        );
-        let response = self.send_with_retry("list check runs", || {
-            self.http
-                .get(&url)
-                .bearer_auth(&self.token)
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-        })?;
-        let status = response.status();
-        let text = response
-            .text()
-            .context("could not read GitHub check-runs response")?;
-        if !status.is_success() {
-            bail!(
-                "GitHub check-runs request returned {status}: {}",
-                truncate(&text, 2_000)
+        let mut all_checks = Vec::new();
+        for page in 1..=20 {
+            let url = format!(
+                "{}/repos/{}/{}/commits/{}/check-runs?per_page=100&page={page}",
+                self.api_base_url,
+                repo.owner,
+                repo.name,
+                url_encode(reference)
             );
+            let response = self.send_with_retry("list check runs", || {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&self.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+            })?;
+            let status = response.status();
+            let text = response
+                .text()
+                .context("could not read GitHub check-runs response")?;
+            if !status.is_success() {
+                bail!(
+                    "GitHub check-runs request returned {status}: {}",
+                    truncate(&text, 2_000)
+                );
+            }
+            let mut response: CheckRunsResponse =
+                serde_json::from_str(&text).context("GitHub returned invalid check-run results")?;
+            let page_len = response.check_runs.len();
+            all_checks.append(&mut response.check_runs);
+            if page_len < 100 {
+                return Ok(all_checks);
+            }
         }
-        let response: CheckRunsResponse =
-            serde_json::from_str(&text).context("GitHub returned invalid check-run results")?;
-        Ok(response.check_runs)
+        bail!("GitHub check-run pagination exceeded 2,000 results")
     }
 
     fn send_with_retry<F>(&self, operation: &str, mut build: F) -> Result<Response>
@@ -217,4 +235,25 @@ fn truncate(value: &str, max: usize) -> &str {
         end -= 1;
     }
     &value[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_dotcom_and_enterprise_api_origins() {
+        assert_eq!(
+            GitHubClient::new("token", "https://github.com")
+                .unwrap()
+                .api_base_url,
+            "https://api.github.com"
+        );
+        assert_eq!(
+            GitHubClient::new("token", "https://github.example.com/")
+                .unwrap()
+                .api_base_url,
+            "https://github.example.com/api/v3"
+        );
+    }
 }
