@@ -102,11 +102,21 @@ fn execute_claimed(
         ticket.row_version,
         journal,
     );
-    let manifest = api
-        .execution_manifest(&run.id)
-        .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
-    manifest.validate(&run.id, &ticket.id)?;
-    let execution_policy = manifest.policy()?;
+    let manifest_and_policy = (|| {
+        let manifest = api
+            .execution_manifest(&run.id)
+            .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
+        manifest.validate(&run.id, &ticket.id)?;
+        let policy = manifest.policy()?;
+        Ok::<_, anyhow::Error>((manifest, policy))
+    })();
+    let (manifest, execution_policy) = match manifest_and_policy {
+        Ok(value) => value,
+        Err(error) => {
+            reporter.fail(&error)?;
+            return Err(error);
+        }
+    };
 
     let supervisor = RunSupervisor::start(
         api.clone(),

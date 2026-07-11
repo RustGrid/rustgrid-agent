@@ -80,6 +80,9 @@ impl Executor {
 
     pub(crate) fn preflight(&self, cwd: &Path) -> Result<()> {
         if let Self::DockerSandbox { command, .. } = self {
+            fs::create_dir_all(cwd).with_context(|| {
+                format!("could not create executor workspace root {}", cwd.display())
+            })?;
             let output = command::capture_with_env(
                 command,
                 ["version"],

@@ -235,7 +235,7 @@ impl AppContext {
             config,
             config_path: path.to_path_buf(),
             api_url: env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into()),
-            api_key: nonempty_env("RUSTGRID_API_KEY"),
+            api_key: nonempty_env("RUSTGRID_WORKER_API_KEY"),
             workspace_root,
         })
     }
@@ -243,7 +243,7 @@ impl AppContext {
     pub fn require_api_key(&self) -> Result<&str> {
         self.api_key
             .as_deref()
-            .context("RUSTGRID_API_KEY is required")
+            .context("RUSTGRID_WORKER_API_KEY is required")
     }
 
     pub fn project_value(&self) -> (&'static str, &str) {

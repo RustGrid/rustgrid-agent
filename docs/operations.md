@@ -7,7 +7,7 @@ Production uses the standalone Docker Sandboxes CLI. Install Docker Desktop and
 `executor.kind` as `docker_sandbox`.
 
 Run one `serve` process per worker identity. The worker needs only its bound
-`RUSTGRID_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
+`RUSTGRID_WORKER_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
 unprivileged OS account and a writable workspace root.
 
 Set `max_concurrency` from measured host capacity. Each claimed run receives its
@@ -23,9 +23,13 @@ The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:
 
 ```text
-RUSTGRID_API_KEY=rgk_...
+RUSTGRID_WORKER_API_KEY=rgk_...
 RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
 ```
+
+Long-running workers must use `RUSTGRID_WORKER_API_KEY` with a credential
+bound to their registered worker identity. It is required for leased run events, manifests, and
+run-scoped GitHub token issuance.
 
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and

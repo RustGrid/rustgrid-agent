@@ -21,7 +21,7 @@ in the protected GitHub release environment.
 Copy `.rustgrid-agent.example.json` to `deploy/agent.json`, set `max_concurrency` to `1`, authenticate the `codex-home` volume using your secret-management/bootstrap process, then run:
 
 ```sh
-CODEX_VERSION=X.Y.Z RUSTGRID_API_KEY=rgk_... docker compose -f deploy/compose.yml up --build --abort-on-container-exit
+CODEX_VERSION=X.Y.Z RUSTGRID_WORKER_API_KEY=rgk_... docker compose -f deploy/compose.yml up --build --abort-on-container-exit
 ```
 
 Schedule a newly created container for each poll. Do not restart a stopped container in place and do not persist the workspace tmpfs.

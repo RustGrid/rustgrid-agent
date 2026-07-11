@@ -31,7 +31,7 @@ spec:
               args: ["--config", "/etc/rustgrid-agent/agent.json", "watch", "--once"]
               env:
                 - {name: RUSTGRID_AGENT_LOG, value: json}
-                - name: RUSTGRID_API_KEY
+                - name: RUSTGRID_WORKER_API_KEY
                   valueFrom:
                     secretKeyRef: {name: rustgrid-agent, key: api-key}
               securityContext:

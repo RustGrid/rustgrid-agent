@@ -51,7 +51,7 @@ fn status_can_emit_machine_readable_health() {
     });
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .env("RUSTGRID_API_URL", format!("http://{address}"))
         .args(["--config", config.to_str().unwrap(), "status", "--json"])
         .output()
@@ -79,7 +79,7 @@ fn serve_fails_closed_with_local_executor() {
     .expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "serve"])
         .output()
         .expect("rustgrid-agent serve should run");
@@ -98,7 +98,7 @@ fn local_executor_rejects_shared_process_concurrency() {
     .expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "serve"])
         .output()
         .expect("rustgrid-agent serve should run");
@@ -120,7 +120,7 @@ fn watch_once_fails_closed_with_multiple_run_capacity() {
     .expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_API_KEY", "test-key")
+        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "watch", "--once"])
         .output()
         .expect("rustgrid-agent watch should run");

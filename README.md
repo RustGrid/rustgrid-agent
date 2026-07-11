@@ -118,8 +118,11 @@ Exactly one of `project_id` and `project_key` is required:
 Export credentials in the shell or inject them through the process manager that starts the agent:
 
 ```sh
-export RUSTGRID_API_KEY=rg_...
+export RUSTGRID_WORKER_API_KEY=rgk_...
 ```
+
+Only a credential bound to the registered worker is accepted. Administrative
+and bootstrap credentials must remain outside the long-running worker.
 
 The production RustGrid API URL is used by default. Set `RUSTGRID_API_URL` only when targeting a different deployment:
 
@@ -207,7 +210,7 @@ Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridd
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `RUSTGRID_API_KEY` | Yes | Authenticates RustGrid API requests. |
+| `RUSTGRID_WORKER_API_KEY` | Yes | Credential bound to the registered worker identity. |
 | `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
 

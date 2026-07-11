@@ -16,7 +16,7 @@ services:
     mem_limit: 10g
     cpus: 4
     environment:
-      RUSTGRID_API_KEY: ${RUSTGRID_API_KEY:?set the worker API key}
+      RUSTGRID_WORKER_API_KEY: ${RUSTGRID_WORKER_API_KEY:?set the bound worker credential}
       RUSTGRID_API_URL: ${RUSTGRID_API_URL:-https://app.rustgrid.com/api/v1}
       RUSTGRID_AGENT_LOG: json
     volumes:

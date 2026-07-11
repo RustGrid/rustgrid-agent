@@ -565,7 +565,7 @@ fn terminate_process_tree(child: &mut std::process::Child) {
 }
 
 fn sanitize_child_environment(command: &mut Command) {
-    for name in ["RUSTGRID_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
+    for name in ["RUSTGRID_WORKER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
         command.env_remove(name);
     }
 }

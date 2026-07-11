@@ -223,6 +223,11 @@ impl<'a> Reporter<'a> {
     }
 
     pub(crate) fn set_ticket_status(&self, status: TicketStatus) -> Result<()> {
+        let fresh = self
+            .api
+            .fetch_ticket(self.ticket_id)
+            .context("could not refresh ticket ETag before status update")?;
+        self.ticket_row_version.set(fresh.row_version);
         let version = self.api.update_ticket_status(
             self.ticket_id,
             self.ticket_row_version.get(),
