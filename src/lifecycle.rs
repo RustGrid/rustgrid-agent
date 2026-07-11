@@ -3,6 +3,66 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+macro_rules! wire_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+    };
+}
+
+wire_enum!(StepStatus {
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+impl StepStatus {
+    pub const fn severity(self) -> &'static str {
+        match self {
+            Self::Failed => "error",
+            _ => "info",
+        }
+    }
+
+    pub const fn console_color(self) -> &'static str {
+        match self {
+            Self::Completed => "32",
+            Self::Failed => "31",
+            Self::Running => "36",
+            Self::Cancelled => "35",
+        }
+    }
+}
+
+wire_enum!(TicketStatus {
+    Todo => "todo",
+    InProgress => "in_progress",
+    AwaitingReview => "awaiting_review",
+    Blocked => "blocked",
+});
+
+wire_enum!(AgentRunStatus {
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+wire_enum!(WorkerStatus {
+    Online => "online",
+    Busy => "busy",
+});
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunPhase {
@@ -103,5 +163,9 @@ mod tests {
         assert_eq!(event.metadata()["phase"], "executing");
         assert!(!RunPhase::Executing.is_terminal());
         assert!(RunPhase::Succeeded.is_terminal());
+        assert_eq!(StepStatus::Failed.severity(), "error");
+        assert_eq!(TicketStatus::AwaitingReview.as_str(), "awaiting_review");
+        assert_eq!(AgentRunStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(WorkerStatus::Busy.as_str(), "busy");
     }
 }

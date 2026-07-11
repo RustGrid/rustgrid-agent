@@ -51,7 +51,7 @@ use crate::{
     git::{Repo, branch_name},
     github::GitHubClient,
     journal::RunJournal,
-    lifecycle::{LifecycleEvent, RunPhase},
+    lifecycle::{AgentRunStatus, LifecycleEvent, RunPhase, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
     prompt, shutdown,
     supervisor::{RunSupervisor, RunSupervisorConfig},
@@ -152,24 +152,19 @@ impl Reporter<'_> {
     fn step(
         &self,
         name: &str,
-        status: &str,
+        status: StepStatus,
         message: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<()> {
-        let color = match status {
-            "completed" => "32",
-            "failed" => "31",
-            "running" => "36",
-            _ => "35",
-        };
-        console_event(status, message, color);
+        let status_value = status.as_str();
+        console_event(status_value, message, status.console_color());
         let sequence = self.sequence.get() + 1;
         self.sequence.set(sequence);
         let mut event = LifecycleEvent::new(
             sequence,
             self.phase.get(),
-            format!("step.{name}.{status}"),
-            if status == "failed" { "error" } else { "info" },
+            format!("step.{name}.{status_value}"),
+            status.severity(),
             message,
             metadata,
         );
@@ -212,7 +207,7 @@ impl Reporter<'_> {
         self.journal.borrow_mut().record_pull_request(url, number)
     }
 
-    fn update_run(&self, status: &str, message: Option<&str>) -> Result<()> {
+    fn update_run(&self, status: AgentRunStatus, message: Option<&str>) -> Result<()> {
         let run = self.api.update_run(
             self.run_id,
             self.row_version.load(Ordering::SeqCst),
@@ -223,15 +218,19 @@ impl Reporter<'_> {
         Ok(())
     }
 
-    fn set_ticket_status(&self, status: &str) -> Result<()> {
+    fn set_ticket_status(&self, status: TicketStatus) -> Result<()> {
         let version = self.api.update_ticket_status(
             self.ticket_id,
             self.ticket_row_version.get(),
             status,
-            &format!("ticket-status-{}-{status}", self.run_id),
+            &format!("ticket-status-{}-{}", self.run_id, status.as_str()),
         )?;
         self.ticket_row_version.set(version);
-        console_event("status", &format!("Ticket is now {status}"), "34");
+        console_event(
+            "status",
+            &format!("Ticket is now {}", status.as_str()),
+            "34",
+        );
         Ok(())
     }
 
@@ -289,7 +288,7 @@ impl Reporter<'_> {
         if self.phase.get() != RunPhase::TimedOut {
             self.set_phase(RunPhase::Blocked);
         }
-        let step_result = self.step("run_failed", "failed", &message, None);
+        let step_result = self.step("run_failed", StepStatus::Failed, &message, None);
         let comment_result = self.api.create_comment(
             self.ticket_id,
             &format!(
@@ -297,8 +296,8 @@ impl Reporter<'_> {
             ),
             &format!("agent-comment-{}-blocked", self.run_id),
         );
-        let ticket_result = self.set_ticket_status("blocked");
-        let update_result = self.update_run("failed", Some(&message));
+        let ticket_result = self.set_ticket_status(TicketStatus::Blocked);
+        let update_result = self.update_run(AgentRunStatus::Failed, Some(&message));
         if let Err(report_error) = step_result {
             eprintln!("[warning] {report_error:#}");
         }
@@ -321,7 +320,7 @@ impl Reporter<'_> {
         self.set_phase(RunPhase::Cancelled);
         let step_result = self.step(
             "run_cancelled",
-            "cancelled",
+            StepStatus::Cancelled,
             "Agent run cancelled by operator",
             None,
         );
@@ -330,8 +329,9 @@ impl Reporter<'_> {
             "🛑 **RustGrid Agent stopped**\n\nThe run was cancelled by the worker operator and can be retried.",
             &format!("agent-comment-{}-cancelled", self.run_id),
         );
-        let ticket_result = self.set_ticket_status("todo");
-        let update_result = self.update_run("cancelled", Some("cancelled by operator"));
+        let ticket_result = self.set_ticket_status(TicketStatus::Todo);
+        let update_result =
+            self.update_run(AgentRunStatus::Cancelled, Some("cancelled by operator"));
         step_result?;
         comment_result?;
         ticket_result?;
@@ -472,29 +472,29 @@ fn execute_claimed(
             .collect::<Vec<_>>()
             .join(" && ");
         let generated_prompt = prompt::build(ticket, &repo.root, &required_gates)?;
-        reporter.set_ticket_status("in_progress")?;
+        reporter.set_ticket_status(TicketStatus::InProgress)?;
         reporter.set_phase(RunPhase::Preparing);
         reporter.step(
             "ticket_fetched",
-            "completed",
+            StepStatus::Completed,
             &format!("Fetched ticket {}", ticket.key),
             Some(json!({"ticket_id": ticket.id})),
         )?;
         reporter.step(
             "ticket_claimed",
-            "completed",
+            StepStatus::Completed,
             &format!("Claimed ticket {}", ticket.key),
             Some(json!({"worker_id": worker.id})),
         )?;
         reporter.step(
             "run_created",
-            "completed",
+            StepStatus::Completed,
             &format!("Created and claimed agent run {}", run.id),
             None,
         )?;
         reporter.step(
             "workspace_prepared",
-            "completed",
+            StepStatus::Completed,
             "Prepared isolated repository workspace",
             Some(json!({"bytes": workspace_bytes, "resumed": workspace_resumed})),
         )?;
@@ -546,7 +546,7 @@ fn execute_claimed(
                 eprintln!("[warning] supervisor connectivity was degraded during the run");
             }
             reporter.set_phase(RunPhase::Succeeded);
-            reporter.update_run("succeeded", Some(&summary.pull_request_url))?;
+            reporter.update_run(AgentRunStatus::Succeeded, Some(&summary.pull_request_url))?;
             if let Some(workspace) = workspace.borrow_mut().take() {
                 workspace.cleanup()?;
             }
@@ -599,7 +599,7 @@ fn execute(
     if !baseline.is_empty() {
         reporter.step(
             "working_tree_checked",
-            "completed",
+            StepStatus::Completed,
             &format!(
                 "Dirty tree allowed; excluding {} pre-existing path(s) from the commit",
                 baseline.len()
@@ -609,7 +609,7 @@ fn execute(
     } else {
         reporter.step(
             "working_tree_checked",
-            "completed",
+            StepStatus::Completed,
             "Git working tree is clean",
             None,
         )?;
@@ -618,7 +618,7 @@ fn execute(
     let branch = branch_name(&ticket.key, &ticket.title);
     reporter.step(
         "branch_create",
-        "running",
+        StepStatus::Running,
         &format!("Creating branch {branch}"),
         Some(json!({"base": base_branch})),
     )?;
@@ -626,7 +626,7 @@ fn execute(
     reporter.record_branch(&branch)?;
     reporter.step(
         "branch_create",
-        "completed",
+        StepStatus::Completed,
         &format!(
             "{} branch {branch}",
             if resumed_branch { "Resumed" } else { "Created" }
@@ -641,7 +641,7 @@ fn execute(
         }
         reporter.step(
             "recovery",
-            "completed",
+            StepStatus::Completed,
             &format!("Resuming from commit {}", short_sha(&commit)),
             Some(json!({"commit": commit})),
         )?;
@@ -661,7 +661,12 @@ fn execute(
         )?
     };
 
-    reporter.step("push", "running", &format!("Pushing branch {branch}"), None)?;
+    reporter.step(
+        "push",
+        StepStatus::Running,
+        &format!("Pushing branch {branch}"),
+        None,
+    )?;
     let tokens = GitHubTokenManager::new(
         api,
         &run.id,
@@ -672,14 +677,14 @@ fn execute(
     let pushed = repo.push(&branch, &commit, &push_token, &manifest.web_base_url)?;
     reporter.step(
         "push",
-        "completed",
+        StepStatus::Completed,
         &format!("Pushed branch {branch}"),
         Some(json!({"pushed": pushed, "commit": commit})),
     )?;
 
     reporter.step(
         "pull_request",
-        "running",
+        StepStatus::Running,
         "Opening GitHub pull request",
         None,
     )?;
@@ -711,7 +716,7 @@ fn execute(
     reporter.record_pull_request(&pr.html_url, pr.number)?;
     reporter.step(
         "pull_request",
-        "completed",
+        StepStatus::Completed,
         &format!("Opened pull request #{}", pr.number),
         Some(json!({"url": pr.html_url})),
     )?;
@@ -735,17 +740,17 @@ fn execute(
     reporter.set_phase(RunPhase::AwaitingReview);
     reporter.step(
         "rustgrid_attachment",
-        "completed",
+        StepStatus::Completed,
         "Attached pull request to RustGrid",
         Some(json!({"url": pr.html_url})),
     )?;
     reporter.step(
         "run_complete",
-        "completed",
+        StepStatus::Completed,
         "Agent run completed successfully",
         None,
     )?;
-    reporter.set_ticket_status("awaiting_review")?;
+    reporter.set_ticket_status(TicketStatus::AwaitingReview)?;
     let summary = RunSummary {
         ticket_key: ticket.key.clone(),
         branch,
@@ -775,7 +780,7 @@ fn wait_for_required_workflows(
     }
     reporter.step(
         "required_workflows",
-        "running",
+        StepStatus::Running,
         "Waiting for required GitHub workflows",
         Some(json!({"required": requirements.required})),
     )?;
@@ -812,7 +817,7 @@ fn wait_for_required_workflows(
         if all_passed {
             reporter.step(
                 "required_workflows",
-                "completed",
+                StepStatus::Completed,
                 "Required GitHub workflows passed",
                 Some(json!({"required": requirements.required})),
             )?;
@@ -865,12 +870,12 @@ fn implement_and_commit(
     let policy = manifest.policy()?;
     reporter.step(
         "prompt_built",
-        "completed",
+        StepStatus::Completed,
         "Built Codex prompt from ticket and repository context",
         Some(json!({"characters": generated_prompt.len()})),
     )?;
     reporter.set_phase(RunPhase::Executing);
-    reporter.step("codex", "running", "Running Codex locally", None)?;
+    reporter.step("codex", StepStatus::Running, "Running Codex locally", None)?;
     let blocked_action = RefCell::new(None);
     let codex_status = command::streaming_lines_cancellable_with_environment(
         &policy.codex_command(),
@@ -900,13 +905,18 @@ fn implement_and_commit(
     if !codex_status.success() {
         bail!("Codex exited with {codex_status}");
     }
-    reporter.step("codex", "completed", "Codex finished successfully", None)?;
+    reporter.step(
+        "codex",
+        StepStatus::Completed,
+        "Codex finished successfully",
+        None,
+    )?;
 
     reporter.set_phase(RunPhase::Verifying);
     for gate_policy in &policy.quality_gates {
         reporter.step(
             &gate_policy.id,
-            "running",
+            StepStatus::Running,
             &format!("Running quality gate: {}", gate_policy.command),
             Some(json!({"gate_id": gate_policy.id, "required": gate_policy.required})),
         )?;
@@ -933,7 +943,11 @@ fn implement_and_commit(
         )?;
         reporter.step(
             &gate_policy.id,
-            if passed { "completed" } else { "failed" },
+            if passed {
+                StepStatus::Completed
+            } else {
+                StepStatus::Failed
+            },
             if passed {
                 "Quality gate passed"
             } else {
@@ -957,16 +971,21 @@ fn implement_and_commit(
     }
     reporter.step(
         "changes_detected",
-        "completed",
+        StepStatus::Completed,
         &format!("Found {} agent-created changed path(s)", paths.len()),
         Some(json!({"paths": paths})),
     )?;
-    reporter.step("commit", "running", "Committing agent changes", None)?;
+    reporter.step(
+        "commit",
+        StepStatus::Running,
+        "Committing agent changes",
+        None,
+    )?;
     let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
     reporter.record_commit(&commit)?;
     reporter.step(
         "commit",
-        "completed",
+        StepStatus::Completed,
         &format!("Created commit {}", short_sha(&commit)),
         Some(json!({"commit": commit})),
     )?;
@@ -1043,7 +1062,12 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             console_event("drained", "All active runs finished", "33");
             break;
         }
-        api.heartbeat_with_status(&worker.id, if tasks.is_empty() { "online" } else { "busy" })?;
+        let worker_status = if tasks.is_empty() {
+            WorkerStatus::Online
+        } else {
+            WorkerStatus::Busy
+        };
+        api.heartbeat_with_status(&worker.id, worker_status)?;
         let available_slots = if shutdown::drain_requested() {
             0
         } else {

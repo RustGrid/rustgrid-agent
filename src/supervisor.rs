@@ -9,6 +9,7 @@ use std::{
 
 use crate::{
     api::{RustGridClient, is_lease_lost},
+    lifecycle::WorkerStatus,
     shutdown,
 };
 
@@ -64,7 +65,7 @@ impl RunSupervisor {
                     execution_running.store(false, Ordering::SeqCst);
                     break;
                 }
-                let heartbeat = api.heartbeat_with_status(&worker_id, "busy");
+                let heartbeat = api.heartbeat_with_status(&worker_id, WorkerStatus::Busy);
                 let lease = api.extend_lease(&run_id, &worker_id, lease_seconds);
                 let heartbeat_ok = heartbeat.is_ok();
                 if let Err(error) = heartbeat {

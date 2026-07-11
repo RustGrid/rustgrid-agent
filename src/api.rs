@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::config::AppContext;
-use crate::{lifecycle::LifecycleEvent, manifest::ExecutionManifest};
+use crate::{
+    lifecycle::{AgentRunStatus, LifecycleEvent, StepStatus, TicketStatus, WorkerStatus},
+    manifest::ExecutionManifest,
+};
 
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
@@ -173,14 +176,14 @@ impl RustGridClient {
     }
 
     pub fn heartbeat(&self, worker_id: &str) -> Result<()> {
-        self.heartbeat_with_status(worker_id, "online")
+        self.heartbeat_with_status(worker_id, WorkerStatus::Online)
     }
 
-    pub fn heartbeat_with_status(&self, worker_id: &str, status: &str) -> Result<()> {
+    pub fn heartbeat_with_status(&self, worker_id: &str, status: WorkerStatus) -> Result<()> {
         self.send_empty(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
-            Some(json!({"status": status, "max_concurrency": self.max_concurrency})),
+            Some(json!({"status": status.as_str(), "max_concurrency": self.max_concurrency})),
             None,
         )
     }
@@ -398,13 +401,13 @@ impl RustGridClient {
         &self,
         ticket_id: &str,
         row_version: i64,
-        status: &str,
+        status: TicketStatus,
         idempotency_key: &str,
     ) -> Result<i64> {
         let (_, etag) = self.send_value_with_etag(
             Method::PATCH,
             &format!("tickets/{ticket_id}"),
-            Some(json!({"status": status})),
+            Some(json!({"status": status.as_str()})),
             Some(idempotency_key),
             Some(&format!("\"tickets:{ticket_id}:{row_version}\"")),
         )?;
@@ -501,10 +504,11 @@ impl RustGridClient {
         &self,
         run_id: &str,
         name: &str,
-        status: &str,
+        status: StepStatus,
         message: &str,
         metadata: Option<Value>,
     ) -> Result<()> {
+        let status = status.as_str();
         let step_key = format!("{}-{status}", name.replace('_', "-"));
         self.send_empty(
             Method::POST,
@@ -524,9 +528,10 @@ impl RustGridClient {
         &self,
         run_id: &str,
         row_version: i64,
-        status: &str,
+        status: AgentRunStatus,
         message: Option<&str>,
     ) -> Result<AgentRun> {
+        let status = status.as_str();
         let message = message.map(|value| truncate(value, 20_000));
         let mut body = json!({"status": status});
         if status == "failed" {

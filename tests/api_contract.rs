@@ -250,7 +250,13 @@ fn lifecycle_side_effects_use_stable_idempotency_keys() {
     };
     RustGridClient::new(&context(url))
         .unwrap()
-        .append_step("run-1", "codex", "completed", "done", None)
+        .append_step(
+            "run-1",
+            "codex",
+            rustgrid_agent::lifecycle::StepStatus::Completed,
+            "done",
+            None,
+        )
         .unwrap();
     let request = request.recv().unwrap().to_ascii_lowercase();
     assert!(request.contains("idempotency-key: step-run-1-codex-completed"));
@@ -262,7 +268,12 @@ fn lifecycle_side_effects_use_stable_idempotency_keys() {
     };
     RustGridClient::new(&context(url))
         .unwrap()
-        .update_run("run-1", 3, "succeeded", Some("complete"))
+        .update_run(
+            "run-1",
+            3,
+            rustgrid_agent::lifecycle::AgentRunStatus::Succeeded,
+            Some("complete"),
+        )
         .unwrap();
     let request = request.recv().unwrap().to_ascii_lowercase();
     assert!(request.contains("idempotency-key: run-status-run-1-succeeded"));
