@@ -18,6 +18,55 @@ use crate::{
     manifest::ExecutionManifest,
 };
 
+macro_rules! remote_string_enum {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        pub enum $name {
+            $($variant),+,
+            Unknown(String),
+        }
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $value),+,
+                    Self::Unknown(value) => value,
+                }
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Ok(match String::deserialize(deserializer)?.as_str() {
+                    $($value => Self::$variant),+,
+                    value => Self::Unknown(value.to_owned()),
+                })
+            }
+        }
+    };
+}
+
+remote_string_enum!(RemoteWorkerStatus {
+    Online => "online",
+    Busy => "busy",
+    Offline => "offline",
+});
+
+remote_string_enum!(QueueEventKind {
+    WorkAvailable => "work_available",
+    TicketAvailable => "ticket.available",
+    RunClaimed => "run.claimed",
+    RunCancelled => "run.cancelled",
+});
+
+remote_string_enum!(QualityGateStatus {
+    Passed => "passed",
+    Failed => "failed",
+});
+
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
 
@@ -33,7 +82,7 @@ pub struct RustGridClient {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Worker {
     pub id: String,
-    pub status: String,
+    pub status: RemoteWorkerStatus,
     #[serde(default = "default_worker_capacity")]
     pub max_concurrency: usize,
     #[serde(default)]
@@ -111,7 +160,7 @@ pub struct AgentRunEvents {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AgentQueueEvent {
     pub sequence: u64,
-    pub event_type: String,
+    pub event_type: QueueEventKind,
     #[serde(default)]
     pub ticket_id: Option<String>,
     #[serde(default)]
@@ -137,7 +186,7 @@ struct AgentRunPage {
 
 #[derive(Debug, Deserialize)]
 struct QualityGateRecord {
-    status: String,
+    status: QualityGateStatus,
     #[serde(default)]
     checks: Value,
     #[serde(default)]
@@ -355,7 +404,7 @@ impl RustGridClient {
         ticket.previous_quality_gate_failures = self
             .ticket_pages::<QualityGateRecord>(ticket_id, "quality-gate-results")?
             .into_iter()
-            .filter(|gate| gate.status == "failed")
+            .filter(|gate| gate.status == QualityGateStatus::Failed)
             .map(|gate| QualityGateFailure {
                 command: None,
                 message: gate.summary.unwrap_or_else(|| gate.checks.to_string()),

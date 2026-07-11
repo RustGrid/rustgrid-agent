@@ -151,7 +151,7 @@ fn replays_the_durable_worker_queue_contract() {
         .unwrap();
     assert_eq!(queue.next_sequence, 7);
     assert_eq!(queue.worker.available_slots, 1);
-    assert_eq!(queue.items[0].event_type, "work_available");
+    assert_eq!(queue.items[0].event_type.as_str(), "work_available");
     assert!(
         request
             .recv()

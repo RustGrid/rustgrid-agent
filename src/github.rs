@@ -5,7 +5,7 @@ use reqwest::{
     StatusCode,
     blocking::{Client, RequestBuilder, Response},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
 use crate::config::RepoConfig;
@@ -26,12 +26,83 @@ pub struct PullRequest {
 pub struct CheckRun {
     pub id: u64,
     pub name: String,
-    pub status: String,
-    pub conclusion: Option<String>,
+    pub status: CheckStatus,
+    pub conclusion: Option<CheckConclusion>,
     #[serde(default)]
     pub started_at: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CheckStatus {
+    Queued,
+    InProgress,
+    Completed,
+    Unknown(String),
+}
+
+impl CheckStatus {
+    pub const fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "queued" => Self::Queued,
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            value => Self::Unknown(value.to_owned()),
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CheckConclusion {
+    Success,
+    Failure,
+    Cancelled,
+    Skipped,
+    TimedOut,
+    Unknown(String),
+}
+
+impl CheckConclusion {
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+            Self::TimedOut => "timed_out",
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CheckConclusion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "success" => Self::Success,
+            "failure" => Self::Failure,
+            "cancelled" => Self::Cancelled,
+            "skipped" => Self::Skipped,
+            "timed_out" => Self::TimedOut,
+            value => Self::Unknown(value.to_owned()),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]

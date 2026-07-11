@@ -193,7 +193,7 @@ impl ExecutionPolicy {
         Ok(())
     }
 
-    pub fn codex_command(&self) -> String {
+    pub fn codex_args(&self) -> Vec<String> {
         let mut command = self.codex.command.clone();
         let insertion = command
             .iter()
@@ -219,12 +219,6 @@ impl ExecutionPolicy {
             command.insert(insertion, "--ephemeral".into());
         }
         command
-            .iter()
-            .map(|part| {
-                shlex::try_quote(part).map_or_else(|_| part.clone(), |quoted| quoted.into_owned())
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
     }
 }
 
@@ -280,10 +274,13 @@ mod tests {
     #[test]
     fn hardens_the_codex_command() {
         let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
-        let command = policy.codex_command();
-        assert!(command.contains("--sandbox workspace-write"));
-        assert!(command.contains("approval_policy"));
-        assert!(command.contains("--ephemeral"));
+        let args = policy.codex_args();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--sandbox", "workspace-write"])
+        );
+        assert!(args.iter().any(|arg| arg.contains("approval_policy")));
+        assert!(args.iter().any(|arg| arg == "--ephemeral"));
     }
 
     #[test]

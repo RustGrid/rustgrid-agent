@@ -1,12 +1,18 @@
 pub mod api;
 pub mod command;
 pub mod config;
+pub mod coordinator;
 pub mod git;
 pub mod github;
+pub mod health;
 pub mod journal;
 pub mod lifecycle;
 pub mod manifest;
+pub mod outcome;
 pub mod prompt;
+mod publishing;
+mod reporting;
+pub mod run_error;
 pub mod runner;
 pub mod shutdown;
 pub mod supervisor;

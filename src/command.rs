@@ -31,6 +31,17 @@ pub struct ChildLimits {
     pub cpu_seconds: u64,
 }
 
+pub struct StreamingCommand<'a> {
+    pub args: &'a [String],
+    pub cwd: &'a Path,
+    pub stdin_text: Option<&'a str>,
+    pub running: &'a AtomicBool,
+    pub timeout: Duration,
+    pub max_output_bytes: usize,
+    pub environment_allowlist: Option<&'a [String]>,
+    pub limits: Option<ChildLimits>,
+}
+
 #[derive(Debug)]
 pub enum CommandFailure {
     Cancelled,
@@ -287,35 +298,40 @@ pub fn streaming_lines_cancellable<F>(
 where
     F: FnMut(&str) -> Result<()>,
 {
-    streaming_lines_cancellable_with_environment(
-        command,
+    let parts = parse(command)?;
+    streaming_args(
+        StreamingCommand {
+            args: &parts,
+            cwd,
+            stdin_text,
+            running,
+            timeout,
+            max_output_bytes,
+            environment_allowlist: None,
+            limits: None,
+        },
+        on_line,
+    )
+}
+
+pub fn streaming_args<F>(execution: StreamingCommand<'_>, mut on_line: F) -> Result<ExitStatus>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let StreamingCommand {
+        args,
         cwd,
         stdin_text,
         running,
         timeout,
         max_output_bytes,
-        None,
-        None,
-        on_line,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn streaming_lines_cancellable_with_environment<F>(
-    command: &str,
-    cwd: &Path,
-    stdin_text: Option<&str>,
-    running: &AtomicBool,
-    timeout: Duration,
-    max_output_bytes: usize,
-    environment_allowlist: Option<&[String]>,
-    limits: Option<ChildLimits>,
-    mut on_line: F,
-) -> Result<ExitStatus>
-where
-    F: FnMut(&str) -> Result<()>,
-{
-    let mut parts = parse(command)?;
+        environment_allowlist,
+        limits,
+    } = execution;
+    if args.is_empty() {
+        bail!("command cannot be empty");
+    }
+    let mut parts = args.to_vec();
     add_codex_json_flag(&mut parts);
     println!("  $ {}", display_command(&parts));
     let mut command = Command::new(&parts[0]);

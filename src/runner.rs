@@ -1,7 +1,6 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::BTreeSet,
-    io::IsTerminal,
     path::Path,
     sync::{
         Arc,
@@ -11,333 +10,31 @@ use std::{
     time::Duration,
 };
 
-fn console_event(label: &str, message: &str, color: &str) {
-    if std::env::var("RUSTGRID_AGENT_LOG").as_deref() == Ok("json") {
-        let timestamp_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        println!(
-            "{}",
-            json!({
-                "timestamp_unix_ms": timestamp_unix_ms,
-                "component": "rustgrid-agent",
-                "event": label.trim(),
-                "message": message
-            })
-        );
-        return;
-    }
-    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-        println!("\x1b[1;{color}m[{label:>9}]\x1b[0m {message}");
-    } else {
-        println!("[{label:>9}] {message}");
-    }
-}
-
-fn feedback_idempotency_key(run_id: &str, message: &str) -> String {
-    let digest = hex::encode(Sha256::digest(message.as_bytes()));
-    format!("agent-comment-{run_id}-{}", &digest[..16])
-}
-
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::{
-    api::{AgentRun, RustGridClient, Ticket, Worker, is_lease_lost},
+    api::{AgentRun, RustGridClient, Ticket, Worker},
     command,
     config::AppContext,
+    coordinator::CoordinatorHealth,
     git::{Repo, branch_name},
     github::GitHubClient,
-    journal::RunJournal,
-    lifecycle::{AgentRunStatus, LifecycleEvent, RunPhase, StepStatus, TicketStatus, WorkerStatus},
+    journal::{RecoveryPlan, RunJournal},
+    lifecycle::{AgentRunStatus, RunPhase, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
-    prompt, shutdown,
+    outcome::{RunOutcome, RunSummary},
+    prompt,
+    publishing::{
+        WorkflowRequirements, print_summary, pull_request_body, wait_for_required_workflows,
+    },
+    reporting::{Reporter, console_event},
+    run_error::RunFailure,
+    shutdown,
     supervisor::{RunSupervisor, RunSupervisorConfig},
     token::GitHubTokenManager,
     workspace::RunWorkspace,
 };
-
-#[derive(Debug)]
-pub struct RunSummary {
-    pub ticket_key: String,
-    pub branch: String,
-    pub commit: String,
-    pub pull_request_url: String,
-}
-
-#[derive(Debug)]
-enum RunFailure {
-    RequiredWorkflowsTimedOut { seconds: u64 },
-}
-
-impl std::fmt::Display for RunFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RequiredWorkflowsTimedOut { seconds } => write!(
-                formatter,
-                "required GitHub workflows timed out after {seconds} seconds"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RunFailure {}
-
-fn is_execution_timeout(error: &anyhow::Error) -> bool {
-    command::is_timeout(error)
-        || error
-            .downcast_ref::<RunFailure>()
-            .is_some_and(|failure| matches!(failure, RunFailure::RequiredWorkflowsTimedOut { .. }))
-}
-
-struct Reporter<'a> {
-    api: &'a RustGridClient,
-    run_id: &'a str,
-    row_version: Arc<AtomicI64>,
-    ticket_id: &'a str,
-    ticket_row_version: Cell<i64>,
-    phase: Cell<RunPhase>,
-    sequence: Cell<u64>,
-    journal: RefCell<RunJournal>,
-    progress_sequence: Cell<u64>,
-    run_started: std::time::Instant,
-    phase_started: RefCell<std::time::Instant>,
-}
-
-impl Reporter<'_> {
-    fn enrich_event(&self, event: &mut LifecycleEvent) {
-        if let Some(data) = event.data.as_object_mut() {
-            data.insert(
-                "run_elapsed_ms".into(),
-                json!(self.run_started.elapsed().as_millis()),
-            );
-            data.insert(
-                "phase_elapsed_ms".into(),
-                json!(self.phase_started.borrow().elapsed().as_millis()),
-            );
-        }
-    }
-
-    fn publish_event(&self, event_kind: &str, event: &LifecycleEvent) -> Result<()> {
-        let published_sequence = match self.api.publish_run_event(self.run_id, event_kind, event) {
-            Ok(published) => published.sequence,
-            Err(first_error) => {
-                if is_lease_lost(&first_error) {
-                    return Err(first_error);
-                }
-                if let Some(accepted_sequence) = self.api.find_event_by_client_sequence(
-                    self.run_id,
-                    self.progress_sequence.get(),
-                    event.sequence,
-                )? {
-                    accepted_sequence
-                } else {
-                    eprintln!(
-                        "[warning] event publish outcome was ambiguous; retrying once: {first_error:#}"
-                    );
-                    self.api
-                        .publish_run_event(self.run_id, event_kind, event)?
-                        .sequence
-                }
-            }
-        };
-        self.progress_sequence.set(published_sequence);
-        self.journal
-            .borrow_mut()
-            .record_progress_sequence(published_sequence)
-    }
-
-    fn step(
-        &self,
-        name: &str,
-        status: StepStatus,
-        message: &str,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<()> {
-        let status_value = status.as_str();
-        console_event(status_value, message, status.console_color());
-        let sequence = self.sequence.get() + 1;
-        self.sequence.set(sequence);
-        let mut event = LifecycleEvent::new(
-            sequence,
-            self.phase.get(),
-            format!("step.{name}.{status_value}"),
-            status.severity(),
-            message,
-            metadata,
-        );
-        self.enrich_event(&mut event);
-        if let Err(error) = self
-            .journal
-            .borrow_mut()
-            .checkpoint(self.phase.get(), sequence)
-        {
-            eprintln!("[warning] could not persist run checkpoint: {error:#}");
-        }
-        self.publish_event("progress", &event)?;
-        self.api
-            .append_step(self.run_id, name, status, message, Some(event.metadata()))
-            .with_context(|| format!("could not report step {name} to RustGrid"))
-    }
-
-    fn set_phase(&self, phase: RunPhase) {
-        self.phase.set(phase);
-        self.phase_started.replace(std::time::Instant::now());
-        console_event("phase", phase.as_str(), "35");
-        if let Err(error) = self
-            .journal
-            .borrow_mut()
-            .checkpoint(phase, self.sequence.get())
-        {
-            eprintln!("[warning] could not persist run phase: {error:#}");
-        }
-    }
-
-    fn record_branch(&self, branch: &str) -> Result<()> {
-        self.journal.borrow_mut().record_branch(branch)
-    }
-
-    fn record_commit(&self, commit: &str) -> Result<()> {
-        self.journal.borrow_mut().record_commit(commit)
-    }
-
-    fn record_pull_request(&self, url: &str, number: u64) -> Result<()> {
-        self.journal.borrow_mut().record_pull_request(url, number)
-    }
-
-    fn update_run(&self, status: AgentRunStatus, message: Option<&str>) -> Result<()> {
-        let run = self.api.update_run(
-            self.run_id,
-            self.row_version.load(Ordering::SeqCst),
-            status,
-            message,
-        )?;
-        self.row_version.store(run.row_version, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn set_ticket_status(&self, status: TicketStatus) -> Result<()> {
-        let version = self.api.update_ticket_status(
-            self.ticket_id,
-            self.ticket_row_version.get(),
-            status,
-            &format!("ticket-status-{}-{}", self.run_id, status.as_str()),
-        )?;
-        self.ticket_row_version.set(version);
-        console_event(
-            "status",
-            &format!("Ticket is now {}", status.as_str()),
-            "34",
-        );
-        Ok(())
-    }
-
-    fn feedback(&self, message: &str) -> Result<()> {
-        console_event("feedback", message, "36");
-        let sequence = self.sequence.get() + 1;
-        self.sequence.set(sequence);
-        let mut event = LifecycleEvent::new(
-            sequence,
-            self.phase.get(),
-            "agent.message",
-            "info",
-            message,
-            None,
-        );
-        self.enrich_event(&mut event);
-        self.journal
-            .borrow_mut()
-            .checkpoint(self.phase.get(), sequence)?;
-        self.publish_event("message", &event)?;
-        self.api.create_comment(
-            self.ticket_id,
-            &format!("🤖 **RustGrid Agent update**\n\n{message}"),
-            &feedback_idempotency_key(self.run_id, message),
-        )
-    }
-
-    fn log(&self, message: &str) -> Result<()> {
-        if message.trim().is_empty() {
-            return Ok(());
-        }
-        let sequence = self.sequence.get() + 1;
-        self.sequence.set(sequence);
-        let bounded = truncate(message, 16_000);
-        let mut event = LifecycleEvent::new(
-            sequence,
-            self.phase.get(),
-            "quality_gate.output",
-            "info",
-            "Quality gate produced output",
-            Some(json!({"output": bounded})),
-        );
-        self.enrich_event(&mut event);
-        self.journal
-            .borrow_mut()
-            .checkpoint(self.phase.get(), sequence)?;
-        self.publish_event("log", &event)
-    }
-
-    fn fail(&self, error: &anyhow::Error) -> Result<()> {
-        let message = format!("{error:#}");
-        if let Err(journal_error) = self.journal.borrow_mut().record_error(&message) {
-            eprintln!("[warning] could not retain failure diagnostic: {journal_error:#}");
-        }
-        if self.phase.get() != RunPhase::TimedOut {
-            self.set_phase(RunPhase::Blocked);
-        }
-        let step_result = self.step("run_failed", StepStatus::Failed, &message, None);
-        let comment_result = self.api.create_comment(
-            self.ticket_id,
-            &format!(
-                "⛔ **RustGrid Agent blocked**\n\n{message}\n\nHuman intervention is required before the agent can continue."
-            ),
-            &format!("agent-comment-{}-blocked", self.run_id),
-        );
-        let ticket_result = self.set_ticket_status(TicketStatus::Blocked);
-        let update_result = self.update_run(AgentRunStatus::Failed, Some(&message));
-        if let Err(report_error) = step_result {
-            eprintln!("[warning] {report_error:#}");
-        }
-        if let Err(report_error) = update_result {
-            eprintln!("[warning] could not mark RustGrid run failed: {report_error:#}");
-        }
-        if let Err(report_error) = comment_result {
-            eprintln!("[warning] could not append blocked ticket comment: {report_error:#}");
-        }
-        if let Err(report_error) = ticket_result {
-            eprintln!("[warning] could not mark ticket blocked: {report_error:#}");
-        }
-        Ok(())
-    }
-
-    fn cancel(&self) -> Result<()> {
-        self.journal
-            .borrow_mut()
-            .record_error("cancelled by operator")?;
-        self.set_phase(RunPhase::Cancelled);
-        let step_result = self.step(
-            "run_cancelled",
-            StepStatus::Cancelled,
-            "Agent run cancelled by operator",
-            None,
-        );
-        let comment_result = self.api.create_comment(
-            self.ticket_id,
-            "🛑 **RustGrid Agent stopped**\n\nThe run was cancelled by the worker operator and can be retried.",
-            &format!("agent-comment-{}-cancelled", self.run_id),
-        );
-        let ticket_result = self.set_ticket_status(TicketStatus::Todo);
-        let update_result =
-            self.update_run(AgentRunStatus::Cancelled, Some("cancelled by operator"));
-        step_result?;
-        comment_result?;
-        ticket_result?;
-        update_result
-    }
-}
 
 pub fn register(context: &AppContext) -> Result<()> {
     console_event("starting", "Registering RustGrid worker", "36");
@@ -346,7 +43,8 @@ pub fn register(context: &AppContext) -> Result<()> {
     api.heartbeat(&worker.id)?;
     println!(
         "[ complete] Worker {} is registered and healthy ({})",
-        worker.id, worker.status
+        worker.id,
+        worker.status.as_str()
     );
     Ok(())
 }
@@ -385,7 +83,6 @@ fn run_ticket_with_worker(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_claimed(
     context: &AppContext,
     api: &RustGridClient,
@@ -397,21 +94,14 @@ fn execute_claimed(
     let row_version = Arc::new(AtomicI64::new(run.row_version));
     let journal_path = RunWorkspace::journal_path(&context.workspace_root, &run.id)?;
     let journal = RunJournal::create(&journal_path, &run.id, &ticket.id)?;
-    let progress_sequence = journal.progress_sequence;
-    let last_sequence = journal.last_sequence;
-    let reporter = Reporter {
+    let reporter = Reporter::new(
         api,
-        run_id: &run.id,
-        row_version: Arc::clone(&row_version),
-        ticket_id: &ticket.id,
-        ticket_row_version: Cell::new(ticket.row_version),
-        phase: Cell::new(RunPhase::Claimed),
-        sequence: Cell::new(last_sequence),
-        journal: RefCell::new(journal),
-        progress_sequence: Cell::new(progress_sequence),
-        run_started: std::time::Instant::now(),
-        phase_started: RefCell::new(std::time::Instant::now()),
-    };
+        &run.id,
+        Arc::clone(&row_version),
+        &ticket.id,
+        ticket.row_version,
+        journal,
+    );
     let manifest = api
         .execution_manifest(&run.id)
         .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
@@ -498,18 +188,18 @@ fn execute_claimed(
             "Prepared isolated repository workspace",
             Some(json!({"bytes": workspace_bytes, "resumed": workspace_resumed})),
         )?;
-        execute(
-            context,
+        execute(ExecutionContext {
+            app: context,
             api,
             run,
             ticket,
-            &reporter,
+            reporter: &reporter,
             repo,
             baseline,
-            generated_prompt,
-            &running,
-            &manifest,
-        )
+            prompt: generated_prompt,
+            running: &running,
+            manifest: &manifest,
+        })
     })();
     let result = result.and_then(|summary| {
         if let Some(workspace) = workspace.borrow().as_ref() {
@@ -522,26 +212,15 @@ fn execute_claimed(
     let lease_lost = supervisor.lease_lost();
     let timed_out = supervisor.timed_out();
     drop(supervisor);
-    if lease_lost {
-        let _ = reporter
-            .journal
-            .borrow_mut()
-            .record_error("run lease ownership was lost");
-        bail!(
-            "run lease ownership was lost; stopped local execution without publishing terminal state"
-        );
-    }
-    if timed_out {
-        reporter.set_phase(RunPhase::TimedOut);
-        let timeout = anyhow::anyhow!(
-            "agent run timed out after {} seconds",
-            execution_policy.timeout_seconds
-        );
-        reporter.fail(&timeout)?;
-        return Err(timeout);
-    }
-    match result {
-        Ok(summary) => {
+    let outcome = RunOutcome::resolve(
+        result,
+        lease_lost,
+        timed_out,
+        running.load(Ordering::SeqCst),
+        execution_policy.timeout_seconds,
+    );
+    match outcome {
+        RunOutcome::Succeeded(summary) => {
             if !supervisor_healthy {
                 eprintln!("[warning] supervisor connectivity was degraded during the run");
             }
@@ -552,38 +231,52 @@ fn execute_claimed(
             }
             Ok(summary)
         }
-        Err(error) => {
-            if is_lease_lost(&error) {
-                return Err(
-                    error.context("run lease ownership was lost; skipped stale terminal updates")
-                );
-            }
-            if !running.load(Ordering::SeqCst) {
-                reporter.cancel()?;
-                return Err(error);
-            }
-            if is_execution_timeout(&error) {
-                reporter.set_phase(RunPhase::TimedOut);
-            }
+        RunOutcome::LeaseLost(error) => {
+            let _ = reporter.record_error("run lease ownership was lost");
+            Err(error.context("skipped stale terminal updates"))
+        }
+        RunOutcome::Cancelled(error) => {
+            reporter.cancel()?;
+            Err(error)
+        }
+        RunOutcome::TimedOut(error) => {
+            reporter.set_phase(RunPhase::TimedOut);
+            reporter.fail(&error)?;
+            Err(error)
+        }
+        RunOutcome::Blocked(error) | RunOutcome::Failed(error) => {
             reporter.fail(&error)?;
             Err(error)
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute(
-    context: &AppContext,
-    api: &RustGridClient,
-    run: &AgentRun,
-    ticket: &Ticket,
-    reporter: &Reporter<'_>,
+struct ExecutionContext<'a> {
+    app: &'a AppContext,
+    api: &'a RustGridClient,
+    run: &'a AgentRun,
+    ticket: &'a Ticket,
+    reporter: &'a Reporter<'a>,
     repo: Repo,
     baseline: BTreeSet<String>,
-    generated_prompt: String,
-    running: &AtomicBool,
-    manifest: &ExecutionManifest,
-) -> Result<RunSummary> {
+    prompt: String,
+    running: &'a AtomicBool,
+    manifest: &'a ExecutionManifest,
+}
+
+fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
+    let ExecutionContext {
+        app: context,
+        api,
+        run,
+        ticket,
+        reporter,
+        repo,
+        baseline,
+        prompt: generated_prompt,
+        running,
+        manifest,
+    } = execution;
     let policy = manifest.policy()?;
     let gate_summary = policy
         .quality_gates
@@ -634,7 +327,12 @@ fn execute(
         Some(json!({"resumed": resumed_branch})),
     )?;
 
-    let recovered_commit = reporter.journal.borrow().commit.clone();
+    let recovery = reporter.recovery_plan()?;
+    let recovered_commit = match &recovery {
+        RecoveryPlan::Fresh => None,
+        RecoveryPlan::ResumeFromCommit { commit }
+        | RecoveryPlan::ResumeFromPullRequest { commit, .. } => Some(commit.clone()),
+    };
     let commit = if let Some(commit) = recovered_commit {
         if !repo.has_commit(&commit)? {
             bail!("recovery journal commit {commit} is missing from the run workspace");
@@ -647,19 +345,23 @@ fn execute(
         )?;
         commit
     } else {
-        implement_and_commit(
-            context,
+        implement_and_commit(ImplementationContext {
+            app: context,
             api,
             run,
             ticket,
             reporter,
-            &repo,
-            &baseline,
-            &generated_prompt,
+            repo: &repo,
+            baseline: &baseline,
+            prompt: &generated_prompt,
             running,
             manifest,
-        )?
+        })?
     };
+
+    if reporter.phase() == RunPhase::Preparing {
+        reporter.set_phase(RunPhase::Publishing);
+    }
 
     reporter.step(
         "push",
@@ -688,12 +390,9 @@ fn execute(
         "Opening GitHub pull request",
         None,
     )?;
-    let recovered_pr = {
-        let journal = reporter.journal.borrow();
-        journal
-            .pull_request_url
-            .clone()
-            .zip(journal.pull_request_number)
+    let recovered_pr = match recovery {
+        RecoveryPlan::ResumeFromPullRequest { url, number, .. } => Some((url, number)),
+        RecoveryPlan::Fresh | RecoveryPlan::ResumeFromCommit { .. } => None,
     };
     let pr = if let Some((html_url, number)) = recovered_pr {
         crate::github::PullRequest { number, html_url }
@@ -761,112 +460,32 @@ fn execute(
     Ok(summary)
 }
 
-struct WorkflowRequirements<'a> {
-    repo: &'a crate::config::RepoConfig,
-    web_base_url: &'a str,
-    commit: &'a str,
-    required: &'a [String],
-    timeout: Duration,
+struct ImplementationContext<'a> {
+    app: &'a AppContext,
+    api: &'a RustGridClient,
+    run: &'a AgentRun,
+    ticket: &'a Ticket,
+    reporter: &'a Reporter<'a>,
+    repo: &'a Repo,
+    baseline: &'a BTreeSet<String>,
+    prompt: &'a str,
+    running: &'a AtomicBool,
+    manifest: &'a ExecutionManifest,
 }
 
-fn wait_for_required_workflows(
-    tokens: &GitHubTokenManager<'_>,
-    requirements: WorkflowRequirements<'_>,
-    running: &AtomicBool,
-    reporter: &Reporter<'_>,
-) -> Result<()> {
-    if requirements.required.is_empty() {
-        return Ok(());
-    }
-    reporter.step(
-        "required_workflows",
-        StepStatus::Running,
-        "Waiting for required GitHub workflows",
-        Some(json!({"required": requirements.required})),
-    )?;
-    let started = std::time::Instant::now();
-    loop {
-        if !running.load(Ordering::SeqCst) {
-            bail!("required workflow wait cancelled");
-        }
-        if started.elapsed() >= requirements.timeout {
-            return Err(RunFailure::RequiredWorkflowsTimedOut {
-                seconds: requirements.timeout.as_secs(),
-            }
-            .into());
-        }
-        let token = tokens.token()?;
-        let github = GitHubClient::new(&token, requirements.web_base_url)?;
-        let checks = github.check_runs(requirements.repo, requirements.commit)?;
-        let mut all_passed = true;
-        for name in requirements.required {
-            let matching = latest_check_run(&checks, name);
-            match matching {
-                Some(check)
-                    if check.status == "completed"
-                        && check.conclusion.as_deref() == Some("success") => {}
-                Some(check) if check.status == "completed" => {
-                    bail!(
-                        "required GitHub workflow {name} concluded as {}",
-                        check.conclusion.as_deref().unwrap_or("unknown")
-                    );
-                }
-                _ => all_passed = false,
-            }
-        }
-        if all_passed {
-            reporter.step(
-                "required_workflows",
-                StepStatus::Completed,
-                "Required GitHub workflows passed",
-                Some(json!({"required": requirements.required})),
-            )?;
-            return Ok(());
-        }
-        for _ in 0..20 {
-            if !running.load(Ordering::SeqCst) {
-                bail!("required workflow wait cancelled");
-            }
-            thread::sleep(Duration::from_millis(250));
-        }
-    }
-}
-
-fn latest_check_run<'a>(
-    checks: &'a [crate::github::CheckRun],
-    name: &str,
-) -> Option<&'a crate::github::CheckRun> {
-    checks
-        .iter()
-        .filter(|check| check.name == name)
-        .max_by(|a, b| {
-            let a_time = a
-                .completed_at
-                .as_deref()
-                .or(a.started_at.as_deref())
-                .unwrap_or("");
-            let b_time = b
-                .completed_at
-                .as_deref()
-                .or(b.started_at.as_deref())
-                .unwrap_or("");
-            (a_time, a.id).cmp(&(b_time, b.id))
-        })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn implement_and_commit(
-    context: &AppContext,
-    api: &RustGridClient,
-    run: &AgentRun,
-    ticket: &Ticket,
-    reporter: &Reporter<'_>,
-    repo: &Repo,
-    baseline: &BTreeSet<String>,
-    generated_prompt: &str,
-    running: &AtomicBool,
-    manifest: &ExecutionManifest,
-) -> Result<String> {
+fn implement_and_commit(implementation: ImplementationContext<'_>) -> Result<String> {
+    let ImplementationContext {
+        app: context,
+        api,
+        run,
+        ticket,
+        reporter,
+        repo,
+        baseline,
+        prompt: generated_prompt,
+        running,
+        manifest,
+    } = implementation;
     let policy = manifest.policy()?;
     reporter.step(
         "prompt_built",
@@ -877,18 +496,21 @@ fn implement_and_commit(
     reporter.set_phase(RunPhase::Executing);
     reporter.step("codex", StepStatus::Running, "Running Codex locally", None)?;
     let blocked_action = RefCell::new(None);
-    let codex_status = command::streaming_lines_cancellable_with_environment(
-        &policy.codex_command(),
-        &repo.root,
-        Some(generated_prompt),
-        running,
-        Duration::from_secs(policy.timeout_seconds),
-        context.config.max_command_output_bytes as usize,
-        Some(&policy.codex.environment_allowlist),
-        Some(child_limits(
-            context,
-            Duration::from_secs(policy.timeout_seconds),
-        )),
+    let codex_args = policy.codex_args();
+    let codex_status = command::streaming_args(
+        command::StreamingCommand {
+            args: &codex_args,
+            cwd: &repo.root,
+            stdin_text: Some(generated_prompt),
+            running,
+            timeout: Duration::from_secs(policy.timeout_seconds),
+            max_output_bytes: context.config.max_command_output_bytes as usize,
+            environment_allowlist: Some(&policy.codex.environment_allowlist),
+            limits: Some(child_limits(
+                context,
+                Duration::from_secs(policy.timeout_seconds),
+            )),
+        },
         |line| {
             if let Some(message) = feedback_from_output_line(line) {
                 if let Some(action) = blocked_action_from_feedback(&message) {
@@ -900,7 +522,7 @@ fn implement_and_commit(
         },
     )?;
     if let Some(action) = blocked_action.into_inner() {
-        bail!("human intervention required: {action}");
+        return Err(RunFailure::HumanIntervention { action }.into());
     }
     if !codex_status.success() {
         bail!("Codex exited with {codex_status}");
@@ -1002,6 +624,8 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         worker.id, context.config.max_concurrency
     );
     let running = Arc::new(AtomicBool::new(true));
+    let mut coordinator = CoordinatorHealth::starting();
+    coordinator.record_success();
     let signal = Arc::clone(&running);
     ctrlc::set_handler(move || {
         shutdown::request();
@@ -1062,12 +686,24 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             console_event("drained", "All active runs finished", "33");
             break;
         }
+        if shutdown::drain_requested() {
+            coordinator.start_draining();
+        }
         let worker_status = if tasks.is_empty() {
             WorkerStatus::Online
         } else {
             WorkerStatus::Busy
         };
-        api.heartbeat_with_status(&worker.id, worker_status)?;
+        if let Err(error) = api.heartbeat_with_status(&worker.id, worker_status) {
+            let delay = coordinator.record_transient_failure();
+            eprintln!(
+                "[warning] coordinator heartbeat failed; pausing claims for {}ms: {error:#}",
+                delay.as_millis()
+            );
+            thread::sleep(delay.min(interval));
+            continue;
+        }
+        coordinator.record_success();
         let available_slots = if shutdown::drain_requested() {
             0
         } else {
@@ -1075,8 +711,17 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         };
         let mut claimed = 0usize;
         for _ in 0..available_slots {
-            match api.claim_next(&worker.id, &project_id)? {
-                Some(run) => {
+            match api.claim_next(&worker.id, &project_id) {
+                Err(error) => {
+                    let delay = coordinator.record_transient_failure();
+                    eprintln!(
+                        "[warning] queue claim failed; coordinator is degraded for {}ms: {error:#}",
+                        delay.as_millis()
+                    );
+                    thread::sleep(delay.min(interval));
+                    break;
+                }
+                Ok(Some(run)) => {
                     let ticket = match api.fetch_ticket(&run.ticket_id) {
                         Ok(ticket) => ticket,
                         Err(error) => {
@@ -1106,7 +751,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
                     }));
                     claimed += 1;
                 }
-                None => break,
+                Ok(None) => break,
             }
         }
         if once {
@@ -1141,6 +786,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     for task in tasks {
         let _ = task.join();
     }
+    coordinator.stop();
     console_event("stopped", "Watcher stopped", "33");
     Ok(())
 }
@@ -1176,128 +822,7 @@ fn sweep_workspaces(context: &AppContext) -> Result<()> {
 }
 
 pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
-    let local_repo = Repo::discover().ok();
-    let dirty = local_repo
-        .as_ref()
-        .map(Repo::dirty_paths)
-        .transpose()?
-        .unwrap_or_default();
-    let (project_kind, project) = context.project_value();
-    let api_key_present = context
-        .api_key
-        .as_deref()
-        .is_some_and(|key| !key.trim().is_empty());
-    let per_run_isolation = std::env::var("RUSTGRID_AGENT_ISOLATION").as_deref() == Ok("per_run");
-    let production_safe_concurrency = context.config.max_concurrency == 1;
-    let remote_check = if api_key_present {
-        RustGridClient::new(context).and_then(|api| api.resolve_project_id(context).map(|_| ()))
-    } else {
-        Err(anyhow::anyhow!("RustGrid API key is missing"))
-    };
-    let rustgrid_reachable = remote_check.is_ok();
-    let remote_error = remote_check
-        .as_ref()
-        .err()
-        .map(|error| format!("{error:#}"));
-    let healthy =
-        api_key_present && per_run_isolation && production_safe_concurrency && rustgrid_reachable;
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "healthy": healthy,
-                "config": context.config_path,
-                "api_url": context.api_url,
-                "project": {"kind": project_kind, "value": project},
-                "repository": context.config.repo.as_ref().map(|repo| format!("{}/{}", repo.owner, repo.name)),
-                "workspace_root": context.workspace_root,
-                "local_repository_root": local_repo.as_ref().map(|repo| &repo.root),
-                "max_concurrency": context.config.max_concurrency,
-                "lease_seconds": context.config.lease_seconds,
-                "api_key_present": api_key_present,
-                "per_run_isolation": per_run_isolation,
-                "production_safe_concurrency": production_safe_concurrency,
-                "rustgrid_reachable": rustgrid_reachable,
-                "remote_error": remote_error,
-                "github_credentials": "brokered_per_run"
-            }))?
-        );
-        if healthy {
-            return Ok(());
-        }
-        bail!("status checks failed");
-    }
-    println!("RustGrid agent status\n");
-    println!("  Config:       {}", context.config_path.display());
-    println!("  RustGrid API: {}", context.api_url);
-    println!("  Project:      {project_kind}={project}");
-    println!(
-        "  Repository:   {}",
-        context
-            .config
-            .repo
-            .as_ref()
-            .map(|repo| format!("{}/{} (deprecated local hint)", repo.owner, repo.name))
-            .unwrap_or_else(|| "resolved from each run manifest".into())
-    );
-    println!("  Workspaces:   {}", context.workspace_root.display());
-    if let Some(repo) = &local_repo {
-        println!("  Local repo:   {}", repo.root.display());
-    }
-    println!("  Base branch:  {}", context.config.default_base_branch);
-    println!("  Execution:    command, gates, timeout, and sandbox are server-owned per run");
-    println!(
-        "  Heartbeat:    every {}s",
-        context.config.heartbeat_interval_seconds
-    );
-    println!("  Run lease:    {}s", context.config.lease_seconds);
-    println!("  API key:      {}", presence(context.api_key.as_deref()));
-    println!("  GitHub token: brokered per run by RustGrid");
-    println!(
-        "  RustGrid:     {}",
-        if rustgrid_reachable {
-            "authenticated and project resolved"
-        } else {
-            "unreachable or unauthorized"
-        }
-    );
-    println!(
-        "  Isolation:    {}",
-        if per_run_isolation {
-            "per-run deployment boundary declared"
-        } else {
-            "missing RUSTGRID_AGENT_ISOLATION=per_run"
-        }
-    );
-    println!(
-        "  Concurrency:  {}",
-        if production_safe_concurrency {
-            "one run per worker process"
-        } else {
-            "unsafe for serve; max_concurrency must be 1"
-        }
-    );
-    println!(
-        "  Working tree: {}",
-        if local_repo.is_none() {
-            "not applicable (isolated workspace mode)".into()
-        } else if dirty.is_empty() {
-            "clean".into()
-        } else {
-            format!("dirty ({} path(s))", dirty.len())
-        }
-    );
-    if context.api_key.is_none() {
-        bail!("status checks failed: required credentials are missing");
-    }
-    if !per_run_isolation {
-        bail!("status checks failed: per-run deployment isolation is not declared");
-    }
-    if !production_safe_concurrency {
-        bail!("status checks failed: max_concurrency must be 1 for production");
-    }
-    remote_check.context("status checks failed: RustGrid connectivity")?;
-    Ok(())
+    crate::health::status(context, json_output)
 }
 
 fn run_captured(
@@ -1389,44 +914,8 @@ fn blocked_action_from_feedback(message: &str) -> Option<String> {
         .or_else(|| Some("Codex reported that human intervention is required".to_owned()))
 }
 
-fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &str) -> String {
-    format!(
-        "Implements RustGrid ticket **{}**.\n\n{}\n\n### Verification\n\n- `{}`\n\nRustGrid agent run: `{}`\n",
-        ticket.key,
-        ticket
-            .description
-            .as_deref()
-            .unwrap_or("No description provided."),
-        quality_gate,
-        run_id
-    )
-}
-
-fn print_summary(summary: &RunSummary, gate: &str) {
-    println!("\nRun complete\n");
-    println!("  Ticket:       {}", summary.ticket_key);
-    println!("  Branch:       {}", summary.branch);
-    println!("  Commit:       {}", summary.commit);
-    println!("  Quality gate: passed ({gate})");
-    println!("  Pull request: {}", summary.pull_request_url);
-}
-
 fn short_sha(sha: &str) -> &str {
     sha.get(..sha.len().min(12)).unwrap_or(sha)
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        return value.to_owned();
-    }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &value[..end])
-}
-fn presence(value: Option<&str>) -> &'static str {
-    if value.is_some() { "set" } else { "missing" }
 }
 
 #[cfg(test)]
@@ -1452,40 +941,5 @@ mod tests {
             Some("Add the signing key.")
         );
         assert_eq!(blocked_action_from_feedback("Still working"), None);
-    }
-
-    #[test]
-    fn feedback_comment_keys_are_stable_and_message_specific() {
-        assert_eq!(
-            feedback_idempotency_key("run-1", "done"),
-            feedback_idempotency_key("run-1", "done")
-        );
-        assert_ne!(
-            feedback_idempotency_key("run-1", "done"),
-            feedback_idempotency_key("run-1", "blocked")
-        );
-    }
-
-    #[test]
-    fn required_workflow_reconciliation_uses_the_latest_run() {
-        let checks = vec![
-            crate::github::CheckRun {
-                id: 1,
-                name: "CI".into(),
-                status: "completed".into(),
-                conclusion: Some("failure".into()),
-                started_at: Some("2026-07-11T10:00:00Z".into()),
-                completed_at: Some("2026-07-11T10:01:00Z".into()),
-            },
-            crate::github::CheckRun {
-                id: 2,
-                name: "CI".into(),
-                status: "completed".into(),
-                conclusion: Some("success".into()),
-                started_at: Some("2026-07-11T10:02:00Z".into()),
-                completed_at: Some("2026-07-11T10:03:00Z".into()),
-            },
-        ];
-        assert_eq!(latest_check_run(&checks, "CI").unwrap().id, 2);
     }
 }

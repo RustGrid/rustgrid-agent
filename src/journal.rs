@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::RunPhase;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveryPlan {
+    Fresh,
+    ResumeFromCommit {
+        commit: String,
+    },
+    ResumeFromPullRequest {
+        commit: String,
+        url: String,
+        number: u64,
+    },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RunJournal {
     pub schema_version: u8,
@@ -30,6 +43,25 @@ pub struct RunJournal {
 }
 
 impl RunJournal {
+    pub fn recovery_plan(&self) -> Result<RecoveryPlan> {
+        match (
+            self.commit.as_ref(),
+            self.pull_request_url.as_ref(),
+            self.pull_request_number,
+        ) {
+            (None, None, None) => Ok(RecoveryPlan::Fresh),
+            (Some(commit), None, None) => Ok(RecoveryPlan::ResumeFromCommit {
+                commit: commit.clone(),
+            }),
+            (Some(commit), Some(url), Some(number)) => Ok(RecoveryPlan::ResumeFromPullRequest {
+                commit: commit.clone(),
+                url: url.clone(),
+                number,
+            }),
+            _ => anyhow::bail!("recovery journal contains an incomplete publication checkpoint"),
+        }
+    }
+
     pub fn create(path: &Path, run_id: &str, ticket_id: &str) -> Result<Self> {
         let path = path.to_path_buf();
         if path.is_file() {
@@ -161,5 +193,25 @@ mod tests {
         )
         .unwrap();
         assert!(RunJournal::create(&path, "run-1", "ticket-1").is_err());
+    }
+
+    #[test]
+    fn derives_recovery_plan_from_durable_checkpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        assert_eq!(journal.recovery_plan().unwrap(), RecoveryPlan::Fresh);
+        journal.record_commit("abc123").unwrap();
+        assert!(matches!(
+            journal.recovery_plan().unwrap(),
+            RecoveryPlan::ResumeFromCommit { .. }
+        ));
+        journal
+            .record_pull_request("https://github.com/o/r/pull/1", 1)
+            .unwrap();
+        assert!(matches!(
+            journal.recovery_plan().unwrap(),
+            RecoveryPlan::ResumeFromPullRequest { .. }
+        ));
     }
 }

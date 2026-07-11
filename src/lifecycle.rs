@@ -102,6 +102,26 @@ impl RunPhase {
             Self::Succeeded | Self::Blocked | Self::Failed | Self::Cancelled | Self::TimedOut
         )
     }
+
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        if self.is_terminal() {
+            return false;
+        }
+        matches!(
+            (self, next),
+            (Self::Claimed, Self::Preparing)
+                | (Self::Preparing, Self::Executing)
+                | (Self::Preparing, Self::Publishing)
+                | (Self::Executing, Self::Verifying)
+                | (Self::Verifying, Self::Publishing)
+                | (Self::Publishing, Self::AwaitingReview)
+                | (Self::AwaitingReview, Self::Succeeded)
+                | (
+                    _,
+                    Self::Blocked | Self::Failed | Self::Cancelled | Self::TimedOut
+                )
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -163,6 +183,10 @@ mod tests {
         assert_eq!(event.metadata()["phase"], "executing");
         assert!(!RunPhase::Executing.is_terminal());
         assert!(RunPhase::Succeeded.is_terminal());
+        assert!(RunPhase::Claimed.can_transition_to(RunPhase::Preparing));
+        assert!(RunPhase::Executing.can_transition_to(RunPhase::TimedOut));
+        assert!(!RunPhase::Succeeded.can_transition_to(RunPhase::Executing));
+        assert!(!RunPhase::Claimed.can_transition_to(RunPhase::Succeeded));
         assert_eq!(StepStatus::Failed.severity(), "error");
         assert_eq!(TicketStatus::AwaitingReview.as_str(), "awaiting_review");
         assert_eq!(AgentRunStatus::Cancelled.as_str(), "cancelled");
