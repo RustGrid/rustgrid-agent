@@ -1,0 +1,6 @@
+.git
+.github
+target
+.rustgrid-agent.json
+**/*.rs.bk
+**/mutants.out*

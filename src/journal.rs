@@ -226,4 +226,27 @@ mod tests {
         assert_eq!(restored.phase, RunPhase::Publishing);
         assert_eq!(restored.last_sequence, 7);
     }
+
+    #[test]
+    fn rejects_truncated_journal_without_overwriting_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        fs::write(&path, br#"{"schema_version":1,"run_id":"run-1""#).unwrap();
+
+        assert!(RunJournal::create(&path, "run-1", "ticket-1").is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"schema_version":1,"run_id":"run-1""#
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_publication_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        journal.pull_request_url = Some("https://github.com/o/r/pull/1".into());
+
+        assert!(journal.recovery_plan().is_err());
+    }
 }

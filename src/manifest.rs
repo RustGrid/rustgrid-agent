@@ -175,12 +175,12 @@ impl ExecutionPolicy {
         {
             bail!("execution policy contains an empty command, gate id, or timeout");
         }
-        if self.codex.environment_allowlist.iter().any(|name| {
-            matches!(
-                name.as_str(),
-                "RUSTGRID_API_KEY" | "GITHUB_TOKEN" | "GH_TOKEN"
-            )
-        }) {
+        if self
+            .codex
+            .environment_allowlist
+            .iter()
+            .any(|name| is_sensitive_environment_name(name))
+        {
             bail!("execution policy attempts to expose a protected credential variable");
         }
         if self.sandbox.mode != "workspace_write"
@@ -220,6 +220,17 @@ impl ExecutionPolicy {
         }
         command
     }
+}
+
+fn is_sensitive_environment_name(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_uppercase();
+    normalized == "SSH_AUTH_SOCK"
+        || normalized.contains("TOKEN")
+        || normalized.contains("SECRET")
+        || normalized.contains("PASSWORD")
+        || normalized.contains("CREDENTIAL")
+        || normalized.contains("PRIVATE_KEY")
+        || normalized.contains("API_KEY")
 }
 
 #[cfg(test)]
@@ -325,5 +336,25 @@ mod tests {
         value["sandbox"]["writable_roots"] = serde_json::json!([".", "/tmp"]);
         let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_sensitive_environment_aliases() {
+        for name in [
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "DATABASE_PASSWORD",
+            "DEPLOY_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "SSH_AUTH_SOCK",
+        ] {
+            let mut value = manifest().execution_policy;
+            value["codex"]["environment_allowlist"] = serde_json::json!(["PATH", name]);
+            let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
+            assert!(
+                policy.validate().is_err(),
+                "accepted sensitive variable {name}"
+            );
+        }
     }
 }

@@ -18,6 +18,7 @@ jobs:
   release:
     name: Package and publish
     runs-on: ubuntu-latest
+    environment: production-release
     steps:
       - name: Check out release tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -52,7 +53,7 @@ jobs:
       - name: Run release checks
         run: |
           cargo fmt --check
-          cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked
 
       - name: Package source archive
@@ -81,9 +82,9 @@ jobs:
           sed \
             -e "s/@VERSION@/${VERSION}/g" \
             -e "s/@SHA256@/${CHECKSUM}/g" \
-            packaging/homebrew/rustgrid-cli.rb.in \
-            > target/package/rustgrid-cli.rb
-          if grep -Eq '@(VERSION|SHA256)@' target/package/rustgrid-cli.rb; then
+            packaging/homebrew/rustgrid-agent.rb.in \
+            > target/package/rustgrid-agent.rb
+          if grep -Eq '@(VERSION|SHA256)@' target/package/rustgrid-agent.rb; then
             echo "Homebrew formula still contains an unresolved placeholder" >&2
             exit 1
           fi
@@ -114,7 +115,142 @@ jobs:
             "${ARCHIVE}" \
             "${CHECKSUM_FILE}#SHA-256 checksum" \
             "${SBOM}#SPDX JSON SBOM" \
-            "target/package/rustgrid-cli.rb#Homebrew formula" \
+            "target/package/rustgrid-agent.rb#Homebrew formula" \
             --verify-tag \
             --generate-notes \
             --title "rustgrid-agent ${GITHUB_REF_NAME}"
+
+  binaries:
+    name: Native binary (${{ matrix.name }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: linux-x86_64, os: ubuntu-latest}
+          - {name: macos-native, os: macos-latest}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Build locked release binary
+        run: cargo build --locked --release
+
+      - name: Archive and install-test binary
+        id: archive
+        shell: bash
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="rustgrid-agent-${version}-${NAME}.tar.gz"
+          staging="$(mktemp -d)"
+          install -m 0755 target/release/rustgrid-agent "${staging}/rustgrid-agent"
+          tar -C "${staging}" -czf "${archive}" rustgrid-agent
+          extracted="$(mktemp -d)"
+          tar -C "${extracted}" -xzf "${archive}"
+          "${extracted}/rustgrid-agent" --version | grep -F "${version}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest native binary archive
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: ${{ steps.archive.outputs.archive }}
+
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.archive.outputs.archive }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${ARCHIVE}" "${ARCHIVE}.sha256"
+
+  container:
+    name: Build and publish production container
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production-release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Require reviewed Codex version
+        env:
+          CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          RUST_BUILDER_IMAGE: ${{ vars.RUST_BUILDER_IMAGE }}
+          NODE_RUNTIME_IMAGE: ${{ vars.NODE_RUNTIME_IMAGE }}
+        run: |
+          test -n "${CODEX_VERSION}"
+          test -n "${RUST_BUILDER_IMAGE}"
+          test -n "${NODE_RUNTIME_IMAGE}"
+          [[ "${RUST_BUILDER_IMAGE}" == *@sha256:* ]]
+          [[ "${NODE_RUNTIME_IMAGE}" == *@sha256:* ]]
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Build and smoke-test image
+        id: local-image
+        env:
+          CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          RUST_BUILDER_IMAGE: ${{ vars.RUST_BUILDER_IMAGE }}
+          NODE_RUNTIME_IMAGE: ${{ vars.NODE_RUNTIME_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rustgrid-agent:${GITHUB_REF_NAME}"
+          docker build \
+            --build-arg "CODEX_VERSION=${CODEX_VERSION}" \
+            --build-arg "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}" \
+            --build-arg "NODE_RUNTIME_IMAGE=${NODE_RUNTIME_IMAGE}" \
+            --tag "${image}" .
+          docker run --rm --entrypoint rustgrid-agent "${image}" --version | grep -F "${GITHUB_REF_NAME#v}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+
+      - name: Scan container for high-severity vulnerabilities
+        uses: anchore/scan-action@f6601287cdb1efc985d6b765bbf99cb4c0ac29d8 # v7
+        with:
+          image: ${{ steps.local-image.outputs.image }}
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
+
+      - name: Push image and resolve digest
+        id: image
+        env:
+          IMAGE: ${{ steps.local-image.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${IMAGE}"
+          docker push "${image}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${image}" | cut -d@ -f2)"
+          test -n "${digest}"
+          echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rustgrid-agent" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest container provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true

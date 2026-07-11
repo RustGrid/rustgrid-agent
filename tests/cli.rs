@@ -110,3 +110,22 @@ fn serve_fails_closed_with_shared_process_concurrency() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("max_concurrency=1"));
 }
+
+#[test]
+fn watch_once_fails_closed_with_multiple_run_capacity() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let config = directory.path().join("agent.json");
+    fs::write(
+        &config,
+        r#"{"project_key":"RG","project_id":null,"max_concurrency":2}"#,
+    )
+    .expect("configuration should be written");
+    let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .current_dir(directory.path())
+        .env("RUSTGRID_API_KEY", "test-key")
+        .args(["--config", config.to_str().unwrap(), "watch", "--once"])
+        .output()
+        .expect("rustgrid-agent watch should run");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("max_concurrency=1"));
+}

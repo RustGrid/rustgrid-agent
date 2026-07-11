@@ -1,7 +1,7 @@
-class RustgridCli < Formula
+class RustgridAgent < Formula
   desc "Run Codex against RustGrid tickets and publish GitHub pull requests"
-  homepage "https://github.com/RustGrid/agent-runner-CLI"
-  url "https://github.com/RustGrid/agent-runner-CLI/releases/download/v@VERSION@/rustgrid-agent-@VERSION@.crate"
+  homepage "https://github.com/RustGrid/rustgrid-agent"
+  url "https://github.com/RustGrid/rustgrid-agent/releases/download/v@VERSION@/rustgrid-agent-@VERSION@.crate"
   sha256 "@SHA256@"
   license "MIT"
 

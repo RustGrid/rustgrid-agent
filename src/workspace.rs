@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -102,7 +103,11 @@ impl RunWorkspace {
         Ok(size)
     }
 
-    pub fn sweep_stale(workspace_root: &Path, retention: Duration) -> Result<usize> {
+    pub fn sweep_stale(
+        workspace_root: &Path,
+        retention: Duration,
+        protected_run_ids: &HashSet<String>,
+    ) -> Result<usize> {
         if !workspace_root.exists() {
             return Ok(0);
         }
@@ -117,6 +122,9 @@ impl RunWorkspace {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if validate_run_id(name).is_err() {
+                continue;
+            }
+            if protected_run_ids.contains(name) {
                 continue;
             }
             let modified = entry.metadata()?.modified()?;
@@ -241,5 +249,20 @@ mod tests {
         symlink(&outside, workspace.join("escape")).unwrap();
 
         assert!(directory_size(&workspace).unwrap() < 1024 * 1024);
+    }
+
+    #[test]
+    fn stale_sweep_never_removes_protected_active_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("workspaces");
+        fs::create_dir_all(root.join("active-run")).unwrap();
+        fs::create_dir_all(root.join("expired-run")).unwrap();
+        let protected = HashSet::from(["active-run".to_owned()]);
+
+        let removed = RunWorkspace::sweep_stale(&root, Duration::ZERO, &protected).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(root.join("active-run").is_dir());
+        assert!(!root.join("expired-run").exists());
     }
 }

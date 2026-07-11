@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible rustgrid-agent defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, tokens, private source, or vulnerability details. Use SECURITY.md for security reports."
+  - type: input
+    id: version
+    attributes:
+      label: Agent version
+      placeholder: "rustgrid-agent 0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options: [Container, systemd, Local CLI, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and reproduction
+      description: Include sanitized logs and the run phase where the problem occurred.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tokens, private source, and tenant data.
+          required: true

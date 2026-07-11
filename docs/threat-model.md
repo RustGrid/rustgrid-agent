@@ -41,3 +41,9 @@ The agent cannot create or prove its external container boundary, enforce
 GitHub repository rules unavailable on the current plan, or protect against a
 compromised RustGrid control plane. Credentialed staging and periodic isolation
 escape tests remain mandatory.
+
+Codex authentication state is a high-value deployment secret. Production
+containers must use a dedicated least-privilege Codex identity, make its state
+read-only where supported, avoid reusing developer credentials, and rotate it
+after suspected workspace escape. Staging certification must explicitly test
+that repository commands cannot read or publish that state.

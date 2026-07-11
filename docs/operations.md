@@ -2,6 +2,10 @@
 
 ## Deployment
 
+The production-safe container examples under `deploy/` run `watch --once` in a
+fresh pod/container so the runtime boundary is destroyed after at most one run.
+This is the recommended deployment until a dedicated remote executor exists.
+
 Run one `serve` process per worker identity. The worker needs only its bound
 `RUSTGRID_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
 unprivileged OS account and a writable workspace root.

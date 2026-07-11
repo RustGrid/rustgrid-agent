@@ -3,10 +3,16 @@
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability. Use GitHub private
-vulnerability reporting for `RustGrid/rustgrid-agent`, or contact the RustGrid
-maintainers through the private security channel published by the organization.
+vulnerability reporting for `RustGrid/rustgrid-agent`. If private reporting is
+unavailable, contact a listed repository maintainer without vulnerability
+details to establish a private channel; do not send sensitive evidence publicly.
 Include the affected version or commit, impact, reproduction steps, and any
 evidence that credentials or tenant data were exposed.
+
+RustGrid aims to acknowledge reports within three business days, provide an
+initial assessment within seven business days, and coordinate disclosure after
+a fix or mitigation is available. Complex issues may require a longer embargo;
+the reporter will receive status updates at least every fourteen days.
 
 ## Supported versions
 
@@ -27,4 +33,3 @@ be issued through the RustGrid broker.
 The worker executes repository-controlled code. Production deployments must
 provide a genuine per-run filesystem and resource boundary and must not set
 `RUSTGRID_AGENT_ISOLATION=per_run` until that boundary exists.
-

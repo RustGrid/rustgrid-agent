@@ -25,11 +25,27 @@ For each ticket, the agent:
 - A RustGrid project linked to a GitHub repository through the RustGrid GitHub App.
 - The server-selected Codex executable installed and authenticated on the worker host.
 - A Git author name and email configured for the commit the agent creates.
-- Rust 1.85 or newer when installing from source. A Homebrew installation does not require a separate Rust toolchain at runtime.
+- Rust 1.94 or newer when installing from source. A Homebrew installation does not require a separate Rust toolchain at runtime.
 
 The agent creates an isolated clone for every run from the repository in the
 RustGrid execution manifest. It does not need to start inside the target
 repository.
+
+## Project documentation
+
+- [Architecture and trust boundaries](docs/architecture.md)
+- [Compatibility policy](docs/compatibility.md)
+- [Production operations](docs/operations.md)
+- [Container deployment](deploy/README.md)
+- [Known limitations](docs/known-limitations.md)
+- [Telemetry and data handling](docs/telemetry.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md) and [support](SUPPORT.md)
+- [Roadmap](ROADMAP.md) and [changelog](CHANGELOG.md)
+
+The binary does not create its own container or VM boundary. Production-safe
+examples run `watch --once` in a fresh container/pod and destroy that boundary
+after at most one claimed run.
 
 ## Install
 
@@ -350,12 +366,17 @@ This section is for RustGrid maintainers. Homebrew distribution needs a versione
 2. Run the development checks listed below.
 3. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
 
-The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-cli.rb.in`](packaging/homebrew/rustgrid-cli.rb.in); generates an SPDX JSON SBOM; creates a GitHub artifact attestation binding the package and SBOM; and creates the GitHub release. The release contains these assets:
+The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-agent.rb.in`](packaging/homebrew/rustgrid-agent.rb.in); generates an SPDX JSON SBOM; creates a GitHub artifact attestation binding the package and SBOM; and creates the GitHub release. The release contains these assets:
 
 - `rustgrid-agent-X.Y.Z.crate`, the immutable source archive
 - `rustgrid-agent-X.Y.Z.crate.sha256`, its SHA-256 checksum
+- native Linux and macOS binary archives with SHA-256 checksums and attestations
 - `rustgrid-agent.spdx.json`, the SPDX JSON software bill of materials
-- `rustgrid-cli.rb`, the formula with the release URL and checksum filled in
+- `rustgrid-agent.rb`, the formula with the release URL and checksum filled in
+
+The protected release environment also publishes an attested container image to
+`ghcr.io/rustgrid/rustgrid-agent:vX.Y.Z`. Production deployments must pin its
+digest rather than the mutable tag.
 
 The release URL will have this form:
 
@@ -365,7 +386,7 @@ https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-age
 
 ### 2. Create the formula
 
-Download `rustgrid-cli.rb` from the GitHub release and add it as `Formula/rustgrid-cli.rb` in a public `RustGrid/homebrew-tap` repository. The generated formula has this shape:
+Download `rustgrid-agent.rb` from the GitHub release and add it as `Formula/rustgrid-agent.rb` in a public `RustGrid/homebrew-tap` repository. The generated formula has this shape:
 
 ```ruby
 class RustgridAgent < Formula
@@ -387,7 +408,7 @@ class RustgridAgent < Formula
 end
 ```
 
-The release workflow replaces both `X.Y.Z` values and the checksum. The formula is named `rustgrid-cli` because that is the requested Homebrew package name, while Cargo installs the existing `rustgrid-agent` executable.
+The release workflow replaces both `X.Y.Z` values and the checksum. The formula and executable are both named `rustgrid-agent`.
 
 Validate the formula in a clean Homebrew environment:
 
@@ -448,7 +469,7 @@ Create and claim requests use idempotency keys. Run updates use the backend's ve
 
 ## Development
 
-Rust 1.85 or newer is recommended.
+Rust 1.94 or newer is required.
 
 ```sh
 cargo fmt --check

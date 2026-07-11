@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -49,7 +49,7 @@ pub fn register(context: &AppContext) -> Result<()> {
 }
 
 pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
-    sweep_workspaces(context)?;
+    sweep_workspaces(context, &HashSet::new())?;
     let api = RustGridClient::new(context)?;
     console_event("starting", "Registering worker", "36");
     let worker = api.register()?;
@@ -431,7 +431,11 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
 }
 
 pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
-    sweep_workspaces(context)?;
+    if once && context.config.max_concurrency != 1 {
+        bail!(
+            "watch --once requires max_concurrency=1 so one runtime boundary owns at most one run"
+        );
+    }
     let api = RustGridClient::new(context)?;
     let worker = api.register()?;
     let project_id = api.resolve_project_id(context)?;
@@ -449,12 +453,14 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     })
     .context("could not install Ctrl-C handler")?;
 
+    let active_runs = api.active_runs(&project_id, &worker.id)?;
+    let protected_run_ids = active_runs
+        .iter()
+        .map(|run| run.id.clone())
+        .collect::<HashSet<_>>();
+    sweep_workspaces(context, &protected_run_ids)?;
     let mut tasks: Vec<thread::JoinHandle<()>> = Vec::new();
-    for run in api
-        .active_runs(&project_id, &worker.id)?
-        .into_iter()
-        .take(context.config.max_concurrency)
-    {
+    for run in active_runs.into_iter().take(context.config.max_concurrency) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -621,7 +627,7 @@ pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
     watch(context, interval, false)
 }
 
-fn sweep_workspaces(context: &AppContext) -> Result<()> {
+fn sweep_workspaces(context: &AppContext, protected_run_ids: &HashSet<String>) -> Result<()> {
     let removed = RunWorkspace::sweep_stale(
         &context.workspace_root,
         Duration::from_secs(
@@ -630,6 +636,7 @@ fn sweep_workspaces(context: &AppContext) -> Result<()> {
                 .failed_workspace_retention_hours
                 .saturating_mul(3600),
         ),
+        protected_run_ids,
     )?;
     if removed > 0 {
         println!("[  cleanup] Removed {removed} expired run workspace(s)");
