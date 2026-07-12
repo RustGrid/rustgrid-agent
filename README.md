@@ -239,6 +239,10 @@ execution policy. Values cross the boundary through a private, shell-quoted,
 short-lived file under `.git`, never command arguments; a controlled launcher
 exports them before replacing itself with the requested command, and the file is
 deleted when execution ends.
+Sandbox execution ignores allowlisted variables that can replace the template's
+command lookup, home directory, dynamic loader, shell startup, Git config, or
+language-runtime injection paths. This prevents host `PATH` and related values
+from breaking or hijacking commands inside the microVM.
 
 Sandbox names are deterministic, collision-resistant hashes and are journaled.
 Startup lists managed sandboxes and removes any not assigned to an active run;

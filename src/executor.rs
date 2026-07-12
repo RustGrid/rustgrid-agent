@@ -420,6 +420,7 @@ impl TemporaryEnvFile {
     fn create(cwd: &Path, allowlist: &[String]) -> Result<Option<Self>> {
         let values = allowlist
             .iter()
+            .filter(|key| !is_sandbox_environment_control(key))
             .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
             .collect::<Vec<_>>();
         if values.is_empty() {
@@ -458,6 +459,32 @@ impl TemporaryEnvFile {
         file.sync_all()?;
         Ok(Some(Self { path }))
     }
+}
+
+fn is_sandbox_environment_control(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_uppercase();
+    matches!(
+        normalized.as_str(),
+        "PATH"
+            | "HOME"
+            | "SHELL"
+            | "ENV"
+            | "BASH_ENV"
+            | "ZDOTDIR"
+            | "CDPATH"
+            | "IFS"
+            | "TMPDIR"
+            | "PYTHONPATH"
+            | "NODE_OPTIONS"
+            | "RUBYOPT"
+            | "PERL5OPT"
+            | "RUSTC_WRAPPER"
+            | "RUSTDOC_WRAPPER"
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+    ) || normalized.starts_with("LD_")
+        || normalized.starts_with("DYLD_")
+        || normalized.starts_with("GIT_CONFIG")
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -688,5 +715,22 @@ mod tests {
     #[test]
     fn shell_quotes_environment_values_without_interpolation() {
         assert_eq!(shell_single_quote("a'b;$HOME"), "'a'\"'\"'b;$HOME'");
+    }
+
+    #[test]
+    fn sandbox_environment_keeps_template_execution_paths() {
+        for name in [
+            "PATH",
+            "HOME",
+            "BASH_ENV",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_SYSTEM",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+        ] {
+            assert!(is_sandbox_environment_control(name), "accepted {name}");
+        }
+        assert!(!is_sandbox_environment_control("CI"));
     }
 }

@@ -53,9 +53,11 @@ impl Repo {
     pub fn verify_origin(&self, owner: &str, name: &str) -> Result<()> {
         let remote = command::checked("git", ["remote", "get-url", "origin"], &self.root)
             .context("repository does not have an origin remote")?;
-        let normalized = remote.trim_end_matches('/').trim_end_matches(".git");
         let expected = format!("{owner}/{name}");
-        if !normalized.ends_with(&expected) {
+        let matches = remote_repository(&remote).is_some_and(|(remote_owner, remote_name)| {
+            remote_owner.eq_ignore_ascii_case(owner) && remote_name.eq_ignore_ascii_case(name)
+        });
+        if !matches {
             bail!("claimed manifest repository {expected} does not match origin {remote}");
         }
         Ok(())
@@ -219,6 +221,13 @@ impl Repo {
     }
 }
 
+fn remote_repository(remote: &str) -> Option<(&str, &str)> {
+    let normalized = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let (prefix, name) = normalized.rsplit_once('/')?;
+    let owner = prefix.rsplit(['/', ':']).next()?;
+    (!owner.is_empty() && !name.is_empty()).then_some((owner, name))
+}
+
 fn hooks_disabled() -> &'static str {
     #[cfg(windows)]
     {
@@ -312,6 +321,22 @@ mod tests {
             paths.into_iter().collect::<Vec<_>>(),
             ["notes/a.txt", "src/main.rs"]
         );
+    }
+
+    #[test]
+    fn repository_identity_is_case_insensitive_and_component_based() {
+        assert_eq!(
+            remote_repository("https://github.com/RustGrid/rustgrid-agentops.git"),
+            Some(("RustGrid", "rustgrid-agentops"))
+        );
+        assert_eq!(
+            remote_repository("git@github.com:RustGrid/rustgrid-agentops.git"),
+            Some(("RustGrid", "rustgrid-agentops"))
+        );
+        let (owner, name) =
+            remote_repository("https://github.com/RustGrid/rustgrid-agentops.git").unwrap();
+        assert!(owner.eq_ignore_ascii_case("rustgrid"));
+        assert!(name.eq_ignore_ascii_case("RUSTGRID-AGENTOPS"));
     }
 
     #[test]
