@@ -503,18 +503,20 @@ fn spawn_bounded_line_reader<R: Read + Send + 'static>(
 #[cfg(unix)]
 fn configure_child(command: &mut Command, limits: Option<ChildLimits>) {
     use std::os::unix::process::CommandExt;
-    command.process_group(0);
-    if let Some(limits) = limits {
-        // SAFETY: pre_exec performs only async-signal-safe setrlimit syscalls.
-        unsafe {
-            command.pre_exec(move || {
+    // SAFETY: pre_exec performs only async-signal-safe setsid/setrlimit syscalls.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(limits) = limits {
                 set_limit(libc::RLIMIT_AS, limits.address_space_bytes)?;
                 set_limit(libc::RLIMIT_FSIZE, limits.file_bytes)?;
                 set_limit(libc::RLIMIT_NOFILE, limits.open_files)?;
                 set_limit(libc::RLIMIT_CPU, limits.cpu_seconds)?;
-                Ok(())
-            });
-        }
+            }
+            Ok(())
+        });
     }
 }
 
@@ -557,8 +559,8 @@ fn set_limit(resource: RlimitResource, value: u64) -> std::io::Result<()> {
 #[cfg(unix)]
 fn terminate_process_tree(child: &mut std::process::Child) {
     let process_group = -(child.id() as i32);
-    // SAFETY: the child was placed in its own process group immediately before
-    // spawn, and kill receives only that known process-group identifier.
+    // SAFETY: the child created its own session/process group immediately before
+    // exec, and kill receives only that known process-group identifier.
     unsafe {
         libc::kill(process_group, libc::SIGKILL);
     }
