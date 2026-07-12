@@ -58,9 +58,11 @@ a sandbox policy it cannot enforce.
 
 The heartbeat advertises `max_concurrency`. The worker resumes
 `GET /agent-workers/{worker_id}/queue/stream` with `Last-Event-ID`, replays gaps
-through `GET /agent-workers/{worker_id}/queue`, and claims concurrently only up
-to its advertised capacity. Polling remains a bounded fallback when the stream
-is temporarily unavailable.
+through `GET /agent-workers/{worker_id}/queue`, and reconciles only active runs
+whose `worker_id` matches the registered worker, up to its advertised capacity.
+The queue is a wake-up signal; RustGrid's assigned active-run collection is the
+source of truth. Production workers never call `claim-next`. Polling remains a
+bounded fallback when the stream is temporarily unavailable.
 
 ## GitHub installation token
 

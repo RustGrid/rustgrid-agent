@@ -507,32 +507,6 @@ impl RustGridClient {
         )
     }
 
-    pub fn claim_next(&self, worker_id: &str, project_id: &str) -> Result<Option<AgentRun>> {
-        let path = format!("{RUNS}/claim-next");
-        let body = json!({
-            "worker_id": worker_id,
-            "project_id": project_id,
-            "input_prompt": "Claimed by rustgrid-agent; detailed ticket prompt is generated locally.",
-            "metadata": {"runner": "rustgrid-agent"},
-            "lease_seconds": 3600,
-            "statuses": ["backlog", "todo"]
-        });
-        match self.send_value(
-            Method::POST,
-            &path,
-            Some(body),
-            Some(&format!("claim-next-{}", Uuid::new_v4())),
-            None,
-        ) {
-            Ok(value) => deserialize_envelope(value, &[]).map(Some),
-            Err(HttpFailure {
-                status: StatusCode::NOT_FOUND,
-                ..
-            }) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub fn active_runs(&self, project_id: &str, worker_id: &str) -> Result<Vec<AgentRun>> {
         let page: AgentRunPage = self.send_json(
             Method::GET,

@@ -1,6 +1,6 @@
 # rustgrid-agent
 
-`rustgrid-agent` turns queued RustGrid tickets into ready-to-review GitHub pull requests. It claims a ticket, gives the ticket and repository instructions to Codex, runs the repository's quality gate, commits the generated changes, opens a pull request, and records every major action in RustGrid.
+`rustgrid-agent` turns worker-assigned RustGrid runs into ready-to-review GitHub pull requests. RustGrid dispatches a ticket run to an announced worker; the worker gives the ticket and repository instructions to Codex, runs the repository's quality gate, commits the generated changes, opens a pull request, and records every major action in RustGrid.
 
 The Cargo package, executable, GitHub repository, and Homebrew formula all use the name `rustgrid-agent`.
 
@@ -9,7 +9,7 @@ The Cargo package, executable, GitHub repository, and Homebrew formula all use t
 For each ticket, the agent:
 
 1. Registers and heartbeats a worker with RustGrid.
-2. Fetches and claims the ticket and creates an agent run.
+2. Receives an agent run explicitly assigned by RustGrid and fetches its ticket.
 3. Checks the local Git repository and creates an `agent/<ticket-key>-<slug>` branch.
 4. Builds a Codex prompt from the ticket title, description, comments, custom fields, previous quality-gate failures, and root `AGENTS.md` and `README.md` files.
 5. Marks the ticket `in_progress`, runs Codex locally, and publishes each Codex agent update as one ticket comment.
@@ -156,7 +156,7 @@ Run a specific ticket by its RustGrid UUID:
 rustgrid-agent run <ticket-uuid>
 ```
 
-Or continuously claim queued tickets for the configured project:
+Or continuously execute runs assigned to this worker:
 
 ```sh
 rustgrid-agent watch
@@ -304,7 +304,7 @@ rustgrid-agent watch --interval 30
 rustgrid-agent watch --once
 ```
 
-Registers one worker, heartbeats it, and processes queued tickets serially. `--interval` controls the delay in seconds after each poll and defaults to 15. `--once` performs one poll and exits, which is useful for schedulers and smoke tests. A failed ticket is reported and watch mode continues to the next poll.
+Registers one worker, heartbeats it, and executes runs explicitly assigned to that worker. `--interval` controls the delay in seconds after each poll and defaults to 15. `--once` performs one assigned-run reconciliation and exits, which is useful for schedulers and smoke tests. A failed ticket is reported and watch mode continues to the next assignment.
 
 Multiple worker processes must use distinct worker credentials and workspace
 roots. A `serve` process can execute up to `max_concurrency` runs when each run
@@ -317,8 +317,8 @@ rustgrid-agent serve
 rustgrid-agent serve --interval 30
 ```
 
-`serve` is the production-oriented long-running worker entrypoint. It uses the
-same atomic queue claim as `watch`, and every active run gets an independent
+`serve` is the production-oriented long-running worker entrypoint. It consumes
+only runs already assigned by RustGrid, and every active run gets an independent
 supervisor that:
 
 - heartbeats the worker as `busy`;
@@ -335,7 +335,7 @@ Process managers should restart `serve` after an unexpected exit. SIGTERM
 drains: it stops new claims and waits for active runs to finish. SIGINT cancels
 active child process groups and exits safely.
 At startup, `serve` queries RustGrid for runs already assigned to this worker
-and resumes them before claiming new work. Each run owns its cancellation token,
+and resumes them before waiting for new assignments. Each run owns its cancellation token,
 so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
 
 ## Run lifecycle and recovery
@@ -507,7 +507,7 @@ The RustGrid base API is `/api/v1`. The endpoint and payload mappings in `src/ap
 | Publish agent feedback | `POST /tickets/{id}/comments` |
 | Update ticket progress | `PATCH /tickets/{id}` with `If-Match` |
 | Claim ticket and create run | `POST /tickets/{id}/agent-runs/claim` |
-| Claim next queued ticket | `POST /agent-runs/claim-next` |
+| List assigned active runs | `GET /agent-runs?project_id=…&status=running&worker_id=…` |
 | Update run | `PATCH /agent-runs/{id}` with `If-Match` |
 | Append step | `POST /agent-runs/{id}/steps` |
 | Report gate | `POST /tickets/{id}/quality-gate-results` |

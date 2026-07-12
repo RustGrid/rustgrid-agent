@@ -4,7 +4,7 @@
 
 ## Components
 
-- **Coordinator:** registers the worker, consumes the durable queue, pauses claims while degraded, and drains on shutdown.
+- **Coordinator:** registers the worker, consumes the durable assignment queue, reconciles runs assigned by RustGrid, and drains on shutdown.
 - **Supervisor:** renews the worker heartbeat and run lease independently of long-running child processes.
 - **Execution:** creates a Docker Sandbox microVM around a dedicated clone, runs Codex and required gates there, and commits only agent-created paths from the trusted coordinator.
 - **Publishing:** reconciles the branch, push, pull request, and required GitHub workflows.
@@ -14,7 +14,7 @@
 ## Run sequence
 
 ```text
-queue claim -> manifest validation -> token issuance -> isolated clone
+control-plane assignment -> manifest validation -> token issuance -> isolated clone
      -> sandbox create -> Codex -> sandbox gates -> sandbox destroy
      -> commit -> push -> pull request
      -> required workflows -> awaiting_review -> cleanup

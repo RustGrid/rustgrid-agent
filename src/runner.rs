@@ -515,7 +515,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         );
     }
     sweep_workspaces(context, &protected_run_ids)?;
-    let mut tasks: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut tasks: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
     for run in active_runs.into_iter().take(context.config.max_concurrency) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
             Ok(ticket) => ticket,
@@ -534,25 +534,29 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         let task_context = context.clone();
         let task_api = api.clone();
         let task_worker = worker.clone();
-        tasks.push(thread::spawn(move || {
-            if let Err(error) = execute_claimed(
-                &task_context,
-                &task_api,
-                &task_worker,
-                &run,
-                &ticket,
-                Arc::new(AtomicBool::new(true)),
-            ) {
-                eprintln!("[error] recovered ticket {} failed: {error:#}", ticket.key);
-            }
-        }));
+        let run_id = run.id.clone();
+        tasks.push((
+            run_id,
+            thread::spawn(move || {
+                if let Err(error) = execute_claimed(
+                    &task_context,
+                    &task_api,
+                    &task_worker,
+                    &run,
+                    &ticket,
+                    Arc::new(AtomicBool::new(true)),
+                ) {
+                    eprintln!("[error] recovered ticket {} failed: {error:#}", ticket.key);
+                }
+            }),
+        ));
     }
     let mut queue_sequence = api.queue_events(&worker.id, 0)?.next_sequence;
     while running.load(Ordering::SeqCst) && !shutdown::requested() {
         let mut index = 0;
         while index < tasks.len() {
-            if tasks[index].is_finished() {
-                let task = tasks.swap_remove(index);
+            if tasks[index].1.is_finished() {
+                let (_, task) = tasks.swap_remove(index);
                 if task.join().is_err() {
                     eprintln!("[error] worker execution thread panicked");
                 }
@@ -587,50 +591,50 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         } else {
             context.config.max_concurrency.saturating_sub(tasks.len())
         };
-        let mut claimed = 0usize;
-        for _ in 0..available_slots {
-            match api.claim_next(&worker.id, &project_id) {
+        let mut assigned = 0usize;
+        let executing_run_ids = tasks
+            .iter()
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<HashSet<_>>();
+        let assigned_runs = api.active_runs(&project_id, &worker.id)?;
+        for run in select_unstarted_assignments(assigned_runs, &executing_run_ids, available_slots)
+        {
+            let ticket = match api.fetch_ticket(&run.ticket_id) {
+                Ok(ticket) => ticket,
                 Err(error) => {
-                    let delay = coordinator.record_transient_failure();
                     eprintln!(
-                        "[warning] queue claim failed; coordinator is degraded for {}ms: {error:#}",
-                        delay.as_millis()
+                        "[warning] assigned run {} could not start because ticket {} was unavailable: {error:#}",
+                        run.id, run.ticket_id
                     );
-                    thread::sleep(delay.min(interval));
-                    break;
+                    continue;
                 }
-                Ok(Some(run)) => {
-                    let ticket = match api.fetch_ticket(&run.ticket_id) {
-                        Ok(ticket) => ticket,
-                        Err(error) => {
-                            eprintln!(
-                                "[warning] claimed run {} but ticket {} could not be fetched; the lease will expire for safe reconciliation: {error:#}",
-                                run.id, run.ticket_id
-                            );
-                            continue;
-                        }
-                    };
-                    console_event("claimed", &format!("Queue returned {}", ticket.key), "32");
-                    let task_context = context.clone();
-                    let task_api = api.clone();
-                    let task_worker = worker.clone();
-                    let task_running = Arc::new(AtomicBool::new(true));
-                    tasks.push(thread::spawn(move || {
-                        if let Err(error) = execute_claimed(
-                            &task_context,
-                            &task_api,
-                            &task_worker,
-                            &run,
-                            &ticket,
-                            task_running,
-                        ) {
-                            eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
-                        }
-                    }));
-                    claimed += 1;
-                }
-                Ok(None) => break,
-            }
+            };
+            console_event(
+                "assigned",
+                &format!("RustGrid assigned {}", ticket.key),
+                "32",
+            );
+            let run_id = run.id.clone();
+            let task_context = context.clone();
+            let task_api = api.clone();
+            let task_worker = worker.clone();
+            let task_running = Arc::new(AtomicBool::new(true));
+            tasks.push((
+                run_id,
+                thread::spawn(move || {
+                    if let Err(error) = execute_claimed(
+                        &task_context,
+                        &task_api,
+                        &task_worker,
+                        &run,
+                        &ticket,
+                        task_running,
+                    ) {
+                        eprintln!("[error] ticket {} failed: {error:#}", ticket.key);
+                    }
+                }),
+            ));
+            assigned += 1;
         }
         if once {
             break;
@@ -639,7 +643,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             thread::sleep(Duration::from_millis(250));
             continue;
         }
-        if claimed == 0 {
+        if assigned == 0 {
             match api.wait_for_queue_event(&worker.id, queue_sequence, interval) {
                 Ok(Some(sequence)) => queue_sequence = sequence,
                 Ok(None) => {}
@@ -661,12 +665,24 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             }
         }
     }
-    for task in tasks {
+    for (_, task) in tasks {
         let _ = task.join();
     }
     coordinator.stop();
     console_event("stopped", "Watcher stopped", "33");
     Ok(())
+}
+
+fn select_unstarted_assignments(
+    assigned_runs: Vec<AgentRun>,
+    executing_run_ids: &HashSet<String>,
+    available_slots: usize,
+) -> Vec<AgentRun> {
+    assigned_runs
+        .into_iter()
+        .filter(|run| !executing_run_ids.contains(&run.id))
+        .take(available_slots)
+        .collect()
 }
 
 pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
@@ -697,4 +713,31 @@ fn sweep_workspaces(context: &AppContext, protected_run_ids: &HashSet<String>) -
 
 pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     crate::health::status(context, json_output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(id: &str) -> AgentRun {
+        AgentRun {
+            id: id.into(),
+            ticket_id: format!("ticket-{id}"),
+            row_version: 0,
+        }
+    }
+
+    #[test]
+    fn assigned_run_selection_excludes_running_work_and_respects_capacity() {
+        let executing = HashSet::from(["run-1".to_owned()]);
+
+        let selected = select_unstarted_assignments(
+            vec![run("run-1"), run("run-2"), run("run-3")],
+            &executing,
+            1,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "run-2");
+    }
 }

@@ -14,7 +14,7 @@ satisfy this gate.
 
 ## Required scenarios
 
-1. Complete a normal ticket from queue claim through `awaiting_review` and verify
+1. Complete a normal ticket from explicit worker assignment through `awaiting_review` and verify
    every progress event, feedback comment, quality gate, branch, commit, pull
    request, and external link.
 2. Restart the worker after branch creation, commit, push, and pull-request
