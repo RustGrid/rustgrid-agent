@@ -248,7 +248,13 @@ impl Executor {
     {
         let mut args = request.args.to_vec();
         command::add_codex_json_flag(&mut args);
-        let wrapped = self.wrap(handle, request.cwd, &args, request.environment_allowlist)?;
+        let wrapped = self.wrap(
+            handle,
+            request.cwd,
+            &args,
+            request.environment_allowlist,
+            request.stdin_text.is_some(),
+        )?;
         let monitor = WorkspaceMonitor::start(
             self.clone(),
             handle.clone(),
@@ -291,7 +297,13 @@ impl Executor {
         request: RunCommand<'_>,
     ) -> Result<CommandOutput> {
         let args = command::parse(command_text)?;
-        let wrapped = self.wrap(handle, request.cwd, &args, request.environment_allowlist)?;
+        let wrapped = self.wrap(
+            handle,
+            request.cwd,
+            &args,
+            request.environment_allowlist,
+            false,
+        )?;
         let monitor = WorkspaceMonitor::start(
             self.clone(),
             handle.clone(),
@@ -370,6 +382,7 @@ impl Executor {
         cwd: &Path,
         args: &[String],
         allowlist: &[String],
+        interactive: bool,
     ) -> Result<PreparedCommand> {
         match (self, handle) {
             (Self::Local, ExecutionHandle::Local) => Ok(PreparedCommand {
@@ -377,13 +390,11 @@ impl Executor {
                 _env_file: None,
             }),
             (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) => {
-                let mut wrapped = vec![
-                    command.clone(),
-                    "exec".into(),
-                    "-i".into(),
-                    "-w".into(),
-                    cwd.display().to_string(),
-                ];
+                let mut wrapped = vec![command.clone(), "exec".into()];
+                if interactive {
+                    wrapped.push("-i".into());
+                }
+                wrapped.extend(["-w".into(), cwd.display().to_string()]);
                 wrapped.push(name.clone());
                 let env_file = TemporaryEnvFile::create(cwd, allowlist)?;
                 if let Some(file) = &env_file {
@@ -663,13 +674,30 @@ mod tests {
                 &workspace,
                 &["cargo".into(), "test".into()],
                 &[],
+                false,
             )
             .unwrap();
         assert_eq!(
-            command.args[0..5],
+            command.args[0..4],
+            ["sbx", "exec", "-w", workspace.to_str().unwrap()]
+        );
+        assert_eq!(command.args[4..], ["rustgrid-test", "cargo", "test"]);
+
+        let interactive = executor
+            .wrap(
+                &ExecutionHandle::DockerSandbox {
+                    name: "rustgrid-test".into(),
+                },
+                &workspace,
+                &["codex".into()],
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            interactive.args[0..5],
             ["sbx", "exec", "-i", "-w", workspace.to_str().unwrap()]
         );
-        assert_eq!(command.args[5..], ["rustgrid-test", "cargo", "test"]);
     }
 
     #[test]
