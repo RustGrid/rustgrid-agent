@@ -244,7 +244,7 @@ pub fn streaming(command: &str, cwd: &Path, stdin_text: Option<&str>) -> Result<
         .stdin(if stdin_text.is_some() {
             Stdio::piped()
         } else {
-            Stdio::inherit()
+            Stdio::null()
         })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -341,7 +341,7 @@ where
         .stdin(if stdin_text.is_some() {
             Stdio::piped()
         } else {
-            Stdio::inherit()
+            Stdio::null()
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
