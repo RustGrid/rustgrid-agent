@@ -401,6 +401,11 @@ where
                     return Err(error);
                 }
             }
+            Ok(StreamMessage::OversizedLine { bytes }) => {
+                eprintln!(
+                    "[warning] omitted oversized command output line ({bytes} bytes); continuing stream"
+                );
+            }
             Ok(StreamMessage::Failure(error)) => {
                 terminate_process_tree(&mut child);
                 let _ = child.wait();
@@ -434,6 +439,7 @@ where
 
 enum StreamMessage {
     Line(String),
+    OversizedLine { bytes: usize },
     Failure(String),
 }
 
@@ -446,6 +452,8 @@ fn spawn_bounded_line_reader<R: Read + Send + 'static>(
     thread::spawn(move || {
         let mut buffer = [0u8; 8 * 1024];
         let mut pending = Vec::new();
+        let mut current_line_bytes = 0usize;
+        let mut discarding_oversized_line = false;
         let mut total = 0usize;
         loop {
             let read = match reader.read(&mut buffer) {
@@ -458,7 +466,11 @@ fn spawn_bounded_line_reader<R: Read + Send + 'static>(
                 }
             };
             if read == 0 {
-                if !pending.is_empty() {
+                if discarding_oversized_line {
+                    let _ = sender.send(StreamMessage::OversizedLine {
+                        bytes: current_line_bytes,
+                    });
+                } else if !pending.is_empty() {
                     let line = String::from_utf8_lossy(&pending).into_owned();
                     let _ = sender.send(StreamMessage::Line(line));
                 }
@@ -478,22 +490,37 @@ fn spawn_bounded_line_reader<R: Read + Send + 'static>(
                 } else {
                     segment
                 };
-                pending.extend_from_slice(content);
-                if pending.len() > max_line_bytes {
-                    let _ = sender.send(StreamMessage::Failure(format!(
-                        "command output line exceeded {max_line_bytes} bytes"
-                    )));
-                    return;
+                current_line_bytes = current_line_bytes.saturating_add(content.len());
+                if !discarding_oversized_line {
+                    if pending.len().saturating_add(content.len()) > max_line_bytes {
+                        pending.clear();
+                        discarding_oversized_line = true;
+                    } else {
+                        pending.extend_from_slice(content);
+                    }
                 }
                 if terminated {
-                    if pending.last() == Some(&b'\r') {
-                        pending.pop();
-                    }
-                    let line = String::from_utf8_lossy(&pending).into_owned();
-                    if sender.send(StreamMessage::Line(line)).is_err() {
-                        return;
+                    if discarding_oversized_line {
+                        if sender
+                            .send(StreamMessage::OversizedLine {
+                                bytes: current_line_bytes,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        if pending.last() == Some(&b'\r') {
+                            pending.pop();
+                        }
+                        let line = String::from_utf8_lossy(&pending).into_owned();
+                        if sender.send(StreamMessage::Line(line)).is_err() {
+                            return;
+                        }
                     }
                     pending.clear();
+                    current_line_bytes = 0;
+                    discarding_oversized_line = false;
                 }
             }
         }
@@ -722,13 +749,20 @@ mod tests {
     }
 
     #[test]
-    fn streaming_reader_rejects_an_unbounded_line() {
-        let (sender, receiver) = mpsc::sync_channel(2);
-        let reader =
-            spawn_bounded_line_reader(std::io::Cursor::new(vec![b'x'; 1024]), 4096, 128, sender);
+    fn streaming_reader_omits_an_oversized_line_and_continues() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut output = vec![b'x'; 1024];
+        output.extend_from_slice(b"\nkept\n");
+        let reader = spawn_bounded_line_reader(std::io::Cursor::new(output), 4096, 128, sender);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            StreamMessage::OversizedLine { bytes: 1024 }
+        ));
         match receiver.recv().unwrap() {
-            StreamMessage::Failure(message) => assert!(message.contains("line exceeded")),
-            StreamMessage::Line(_) => panic!("oversized line should not be emitted"),
+            StreamMessage::Line(line) => assert_eq!(line, "kept"),
+            StreamMessage::OversizedLine { .. } | StreamMessage::Failure(_) => {
+                panic!("expected the line following oversized output")
+            }
         }
         reader.join().unwrap();
     }
