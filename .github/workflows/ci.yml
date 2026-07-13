@@ -95,6 +95,7 @@ jobs:
             '/api/v1/agent-runs/{run_id}/manifest' \
             '/api/v1/agent-workers/{id}/heartbeat' \
             '/api/v1/agent-workers/{id}/queue' \
-            '/api/v1/agent-workers/{id}/queue/stream'; do
+            '/api/v1/agent-workers/{id}/queue/stream' \
+            '/api/v1/agent-workers/{id}/runs'; do
             jq -e --arg path "${path}" '.paths[$path]' openapi.current.json >/dev/null
           done

@@ -10,7 +10,6 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .map(Repo::dirty_paths)
         .transpose()?
         .unwrap_or_default();
-    let (project_kind, project) = context.project_value();
     let api_key_present = context
         .api_key
         .as_deref()
@@ -37,7 +36,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     let remote_check = if api_key_present && worker_id_present {
         RustGridClient::new(context).and_then(|api| {
             api.heartbeat(context.require_worker_id()?)?;
-            api.resolve_project_id(context).map(|_| ())
+            api.active_runs(context.require_worker_id()?).map(|_| ())
         })
     } else {
         Err(anyhow::anyhow!(
@@ -63,7 +62,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "healthy": healthy,
                 "config": context.config_path,
                 "api_url": context.api_url,
-                "project": {"kind": project_kind, "value": project},
+                "scope": "tenant",
                 "repository": context.config.repo.as_ref().map(|repo| format!("{}/{}", repo.owner, repo.name)),
                 "workspace_root": context.workspace_root,
                 "local_repository_root": local_repo.as_ref().map(|repo| &repo.root),
@@ -92,7 +91,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     println!("RustGrid agent status\n");
     println!("  Config:       {}", context.config_path.display());
     println!("  RustGrid API: {}", context.api_url);
-    println!("  Project:      {project_kind}={project}");
+    println!("  Scope:        tenant (all control-plane-authorized projects)");
     println!(
         "  Repository:   {}",
         context

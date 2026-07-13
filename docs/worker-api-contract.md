@@ -64,10 +64,17 @@ worker using its runtime credential.
 The heartbeat advertises `max_concurrency`. The worker resumes
 `GET /agent-workers/{worker_id}/queue/stream` with `Last-Event-ID`, replays gaps
 through `GET /agent-workers/{worker_id}/queue`, and reconciles only active runs
-whose `worker_id` matches the registered worker, up to its advertised capacity.
-The queue is a wake-up signal; RustGrid's assigned active-run collection is the
-source of truth. Production workers never call `claim-next`. Polling remains a
-bounded fallback when the stream is temporarily unavailable.
+from `GET /agent-workers/{worker_id}/runs?status=running`. That recovery
+collection spans every project in the credential's tenant and returns only
+actively leased runs whose `worker_id` matches the registered worker, up to its
+advertised capacity. Queue events carry `run_id`, `ticket_id`, and `project_id`,
+but remain wake-up signals; the worker recovery collection is the source of
+truth. Production workers never call `claim-next`. Polling remains a bounded
+fallback when the stream is temporarily unavailable.
+
+The worker has no configured project lock. Each run manifest provides the
+project and repository context. RustGrid authorizes manifest access by tenant,
+assigned worker identity, and active lease.
 
 ## GitHub installation token
 

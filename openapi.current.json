@@ -995,6 +995,74 @@
         ],
         "type": "object"
       },
+      "AgentWorkerRunPageResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AgentWorkerRunResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "size": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "AgentWorkerRunResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "row_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "ticket_id",
+          "project_id",
+          "worker_id",
+          "status",
+          "row_version"
+        ],
+        "type": "object"
+      },
       "AgentWorkersResponse": {
         "properties": {
           "items": {
@@ -1889,9 +1957,17 @@
             "type": "integer"
           },
           "input_prompt": {
+            "default": "Execute the assigned ticket.",
             "maxLength": 20000,
             "minLength": 1,
             "type": "string"
+          },
+          "lease_seconds": {
+            "default": 900,
+            "format": "int64",
+            "maximum": 86400,
+            "minimum": 1,
+            "type": "integer"
           },
           "metadata": {
             "additionalProperties": true,
@@ -1934,9 +2010,6 @@
             ]
           }
         },
-        "required": [
-          "input_prompt"
-        ],
         "type": "object"
       },
       "CreateAgentRunStepRequest": {
@@ -4577,6 +4650,11 @@
           "priority": {
             "$ref": "#/components/schemas/PriorityLevel"
           },
+          "row_version": {
+            "description": "Optimistic-concurrency version. Clients may derive a strong ticket ETag when an intermediary does not expose the response header.",
+            "format": "int64",
+            "type": "integer"
+          },
           "status": {
             "$ref": "#/components/schemas/TicketStatus"
           },
@@ -4590,6 +4668,7 @@
           "title",
           "status",
           "priority",
+          "row_version",
           "created_at"
         ],
         "type": "object"
@@ -7013,6 +7092,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7024,7 +7114,15 @@
                 }
               }
             },
-            "description": "Project agent runs"
+            "description": "Project agent runs",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -7034,7 +7132,15 @@
                 }
               }
             },
-            "description": "Invalid query"
+            "description": "Invalid query",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -7044,7 +7150,15 @@
                 }
               }
             },
-            "description": "Authentication required"
+            "description": "Authentication required",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -7054,7 +7168,15 @@
                 }
               }
             },
-            "description": "Permission denied"
+            "description": "Permission denied",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -7064,7 +7186,61 @@
                 }
               }
             },
-            "description": "Project not found"
+            "description": "Project not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -7074,7 +7250,7 @@
         ],
         "summary": "List project agent runs",
         "tags": [
-          "agent-runs"
+          "agents"
         ]
       }
     },
@@ -7517,6 +7693,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7528,7 +7715,15 @@
                 }
               }
             },
-            "description": "Sequenced event replay"
+            "description": "Sequenced event replay",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -7538,7 +7733,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -7548,7 +7751,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -7558,7 +7769,61 @@
                 }
               }
             },
-            "description": "Run not found"
+            "description": "Run not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -7583,6 +7848,28 @@
               "format": "uuid",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -7604,7 +7891,15 @@
                 }
               }
             },
-            "description": "Durable progress event"
+            "description": "Durable progress event",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -7614,7 +7909,25 @@
                 }
               }
             },
-            "description": "Invalid event"
+            "description": "Invalid event",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
           },
           "403": {
             "content": {
@@ -7624,7 +7937,15 @@
                 }
               }
             },
-            "description": "Not a bound worker credential"
+            "description": "Not a bound worker credential",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -7634,7 +7955,61 @@
                 }
               }
             },
-            "description": "Run lease is not active"
+            "description": "Run lease is not active",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -7694,6 +8069,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7705,7 +8091,15 @@
                 }
               }
             },
-            "description": "Server-sent agent-run event stream"
+            "description": "Server-sent agent-run event stream",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -7715,7 +8109,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -7725,7 +8127,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -7735,7 +8145,61 @@
                 }
               }
             },
-            "description": "Run not found"
+            "description": "Run not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -7762,6 +8226,28 @@
               "format": "uuid",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -7780,6 +8266,12 @@
                   "example": "no-store",
                   "type": "string"
                 }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -7791,7 +8283,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -7801,7 +8301,15 @@
                 }
               }
             },
-            "description": "Not a bound worker credential"
+            "description": "Not a bound worker credential",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -7811,7 +8319,61 @@
                 }
               }
             },
-            "description": "Run lease is not active"
+            "description": "Run lease is not active",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "502": {
             "content": {
@@ -7821,7 +8383,15 @@
                 }
               }
             },
-            "description": "GitHub token issuance failed"
+            "description": "GitHub token issuance failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -8023,6 +8593,17 @@
               "format": "uuid",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -8034,7 +8615,15 @@
                 }
               }
             },
-            "description": "Worker execution manifest"
+            "description": "Worker execution manifest",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -8044,7 +8633,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -8054,7 +8651,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -8064,7 +8669,15 @@
                 }
               }
             },
-            "description": "Run or repository binding not found"
+            "description": "Run or repository binding not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -8074,7 +8687,61 @@
                 }
               }
             },
-            "description": "Repository binding is ambiguous"
+            "description": "Repository binding is ambiguous",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -8796,7 +9463,21 @@
     },
     "/api/v1/agent-workers": {
       "get": {
+        "description": "List agent worker capacity",
         "operationId": "listAgentWorkers",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -8806,7 +9487,81 @@
                 }
               }
             },
-            "description": "Tenant worker fleet with current capacity"
+            "description": "Tenant worker fleet with current capacity",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -9670,6 +10425,7 @@
     },
     "/api/v1/agent-workers/{id}/queue": {
       "get": {
+        "description": "Replay durable agent queue events",
         "operationId": "listAgentQueueEvents",
         "parameters": [
           {
@@ -9703,6 +10459,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -9714,7 +10481,81 @@
                 }
               }
             },
-            "description": "Queue events and current worker capacity"
+            "description": "Queue events and current worker capacity",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -9730,6 +10571,7 @@
     },
     "/api/v1/agent-workers/{id}/queue/stream": {
       "get": {
+        "description": "Stream durable agent queue events",
         "operationId": "streamAgentQueueEvents",
         "parameters": [
           {
@@ -9772,6 +10614,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -9783,7 +10636,81 @@
                 }
               }
             },
-            "description": "Replayable server-sent queue event stream"
+            "description": "Replayable server-sent queue event stream",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -9792,6 +10719,325 @@
           }
         ],
         "summary": "Stream durable agent queue events",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/{id}/retire": {
+      "post": {
+        "description": "Retire an agent worker without deleting its historical records. Retirement rejects active leases, disables capacity, and revokes all worker credentials atomically. Supports Idempotency-Key for safe retries.",
+        "operationId": "retireAgentWorker",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Provide to make this retirement request exactly-once.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "reason": {
+                    "maxLength": 500,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentWorkerResponse"
+                }
+              }
+            },
+            "description": "Worker retired or idempotent retirement replay",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing agents:workers:maintain",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker not found in tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker still owns active runs",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Retire agent worker",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/{id}/runs": {
+      "get": {
+        "description": "List actively leased running agent runs assigned to one worker across all projects in the current tenant.",
+        "operationId": "listAgentWorkerRuns",
+        "parameters": [
+          {
+            "description": "Worker identifier bound to the worker credential",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "default": "running",
+              "enum": [
+                "running"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentWorkerRunPageResponse"
+                }
+              }
+            },
+            "description": "Actively leased worker runs across the tenant"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker credential is not bound to this worker"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Recover active runs assigned to a worker",
         "tags": [
           "agents"
         ]
@@ -13893,16 +15139,145 @@
     },
     "/api/v1/integrations/github/app/webhook/sync": {
       "post": {
+        "description": "Reconcile the GitHub App webhook configuration",
         "operationId": "syncGithubAppWebhook",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "204": {
-            "description": "GitHub App webhook configuration reconciled"
+            "description": "GitHub App webhook configuration reconciled",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "GitHub App webhook configuration is incomplete"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub App webhook configuration is incomplete",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "502": {
-            "description": "GitHub API failure"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub API failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -13912,12 +15287,13 @@
         ],
         "summary": "Reconcile the GitHub App webhook configuration",
         "tags": [
-          "integrations"
+          "webhooks"
         ]
       }
     },
     "/api/v1/integrations/github/deliveries": {
       "get": {
+        "description": "List GitHub webhook delivery audit records",
         "operationId": "listGithubDeliveries",
         "parameters": [
           {
@@ -13933,11 +15309,96 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Tenant-scoped GitHub webhook delivery audit records"
+            "description": "Tenant-scoped GitHub webhook delivery audit records",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -13953,7 +15414,32 @@
     },
     "/api/v1/integrations/github/installations/setup": {
       "post": {
+        "description": "Begin tenant-bound GitHub App installation setup",
         "operationId": "beginGithubInstallationSetup",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -13977,10 +15463,99 @@
                 }
               }
             },
-            "description": "One-time tenant-bound GitHub App installation URL"
+            "description": "One-time tenant-bound GitHub App installation URL",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "GitHub App setup is not configured"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub App setup is not configured",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -13996,6 +15571,7 @@
     },
     "/api/v1/integrations/github/installations/{id}/repositories": {
       "get": {
+        "description": "List discovered GitHub installation repositories",
         "operationId": "listGithubInstallationRepositories",
         "parameters": [
           {
@@ -14006,11 +15582,96 @@
               "format": "int64",
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Discovered installation repositories"
+            "description": "Discovered installation repositories",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14026,6 +15687,7 @@
     },
     "/api/v1/integrations/github/installations/{id}/sync": {
       "post": {
+        "description": "Reconcile a GitHub App installation",
         "operationId": "syncGithubInstallation",
         "parameters": [
           {
@@ -14036,17 +15698,143 @@
               "format": "int64",
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Installation repositories reconciled"
+            "description": "Installation repositories reconciled",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "GitHub App configuration or permissions are incomplete"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub App configuration or permissions are incomplete",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "502": {
-            "description": "GitHub API failure"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub API failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14062,6 +15850,7 @@
     },
     "/api/v1/integrations/github/oauth/callback": {
       "get": {
+        "description": "Complete GitHub App installation user authorization",
         "operationId": "completeGithubInstallationOAuth",
         "parameters": [
           {
@@ -14079,23 +15868,158 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "303": {
-            "description": "User-authorized installation ownership verified; redirect to the frontend console"
+            "description": "User-authorized installation ownership verified; redirect to the frontend console",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
-            "description": "OAuth code or setup state is invalid or expired"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "OAuth code or setup state is invalid or expired",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
-            "description": "The authorized GitHub user cannot access the selected installation"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The authorized GitHub user cannot access the selected installation",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "Installation setup is not configured or is already owned by another tenant"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Installation setup is not configured or is already owned by another tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "502": {
-            "description": "GitHub OAuth or API verification failed"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub OAuth or API verification failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [],
@@ -14107,7 +16031,21 @@
     },
     "/api/v1/integrations/github/repositories": {
       "get": {
+        "description": "List GitHub repository bindings",
         "operationId": "listGithubRepositories",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -14120,7 +16058,81 @@
                 }
               }
             },
-            "description": "Tenant GitHub repository bindings"
+            "description": "Tenant GitHub repository bindings",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14134,6 +16146,7 @@
         ]
       },
       "post": {
+        "description": "Configure a GitHub repository binding",
         "operationId": "upsertGithubRepository",
         "parameters": [
           {
@@ -14146,6 +16159,17 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
             }
           }
         ],
@@ -14229,13 +16253,117 @@
         },
         "responses": {
           "201": {
-            "description": "Repository binding created or updated"
+            "description": "Repository binding created or updated",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
-            "description": "Invalid repository binding"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid repository binding",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "Repository belongs to another tenant"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Repository belongs to another tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14251,6 +16379,7 @@
     },
     "/api/v1/integrations/github/repositories/{id}": {
       "delete": {
+        "description": "Delete a GitHub repository binding",
         "operationId": "deleteGithubRepository",
         "parameters": [
           {
@@ -14270,14 +16399,125 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "204": {
-            "description": "Repository binding deleted"
+            "description": "Repository binding deleted",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "412": {
-            "description": "Stale or mismatched ETag"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stale or mismatched ETag",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14291,6 +16531,7 @@
         ]
       },
       "patch": {
+        "description": "Update a GitHub repository binding",
         "operationId": "updateGithubRepository",
         "parameters": [
           {
@@ -14308,6 +16549,28 @@
             "name": "If-Match",
             "required": true,
             "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
               "type": "string"
             }
           }
@@ -14364,10 +16627,99 @@
         },
         "responses": {
           "200": {
-            "description": "Repository binding updated"
+            "description": "Repository binding updated",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "412": {
-            "description": "Stale or mismatched ETag"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stale or mismatched ETag",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -14383,6 +16735,7 @@
     },
     "/api/v1/integrations/github/setup/callback": {
       "get": {
+        "description": "Begin GitHub App installation user authorization",
         "operationId": "completeGithubInstallationSetup",
         "parameters": [
           {
@@ -14412,20 +16765,150 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "303": {
-            "description": "Installation bound to setup state; redirect to GitHub user authorization"
+            "description": "Installation bound to setup state; redirect to GitHub user authorization",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
-            "description": "Setup state or installation ID is invalid or expired"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Setup state or installation ID is invalid or expired",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
           },
           "409": {
-            "description": "Setup state is bound to another installation or user authorization is not configured"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Setup state is bound to another installation or user authorization is not configured",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "502": {
-            "description": "GitHub API verification failed"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub API verification failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [],
@@ -14463,26 +16946,157 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "204": {
-            "description": "Event accepted"
+            "description": "Event accepted",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
-            "description": "Malformed event"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed event",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
-            "description": "Missing or invalid signature"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing or invalid signature",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "500": {
-            "description": "Integration is not configured"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Integration is not configured",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [],
         "summary": "Receive a GitHub webhook",
         "tags": [
-          "integrations"
+          "webhooks"
         ]
       }
     },
@@ -34933,10 +37547,6 @@
       "name": "agents"
     },
     {
-      "description": "Tenant-scoped source-control repository bindings and incoming provider webhooks.",
-      "name": "integrations"
-    },
-    {
       "description": "OpenAPI JSON and the interactive Redoc documentation surface.",
       "name": "docs"
     },
@@ -34987,8 +37597,7 @@
       "name": "Automation",
       "tags": [
         "agents",
-        "webhooks",
-        "integrations"
+        "webhooks"
       ]
     }
   ]

@@ -158,18 +158,8 @@ fn execute_claimed(
     let executor_handle = RefCell::new(None::<ExecutionHandle>);
 
     let result = (|| {
-        let manifest_project_matches = context
-            .config
-            .project_id
-            .as_deref()
-            .is_some_and(|id| id == manifest.project_id)
-            || context
-                .config
-                .project_key
-                .as_deref()
-                .is_some_and(|key| key.eq_ignore_ascii_case(&manifest.project_key));
-        if !manifest_project_matches || manifest.ticket_key != ticket.key {
-            bail!("execution manifest does not match the configured project and fetched ticket");
+        if manifest.ticket_key != ticket.key {
+            bail!("execution manifest does not match the fetched ticket");
         }
         let tokens = GitHubTokenManager::new(
             api,
@@ -509,9 +499,8 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     }
     let api = RustGridClient::new(context)?;
     let worker = connect_worker(context, &api)?;
-    let project_id = api.resolve_project_id(context)?;
     println!(
-        "[ watching] Worker {} is streaming RustGrid queue events with capacity {}",
+        "[ watching] Tenant worker {} is streaming RustGrid queue events with capacity {}",
         worker.id, context.config.max_concurrency
     );
     let running = Arc::new(AtomicBool::new(true));
@@ -524,7 +513,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     })
     .context("could not install Ctrl-C handler")?;
 
-    let active_runs = api.active_runs(&project_id, &worker.id)?;
+    let active_runs = api.active_runs(&worker.id)?;
     let protected_run_ids = active_runs
         .iter()
         .map(|run| run.id.clone())
@@ -617,7 +606,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             context.config.max_concurrency.saturating_sub(tasks.len())
         };
         let mut assigned = 0usize;
-        let assigned_runs = api.active_runs(&project_id, &worker.id)?;
+        let assigned_runs = api.active_runs(&worker.id)?;
         for run in select_unstarted_assignments(assigned_runs, &started_run_ids, available_slots) {
             let ticket = match api.fetch_ticket(&run.ticket_id) {
                 Ok(ticket) => ticket,

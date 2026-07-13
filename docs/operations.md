@@ -46,9 +46,9 @@ size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.
 
 Use `rustgrid-agent status --json` from process-manager readiness checks. It
-reports configuration, credential presence, workspace location, and capacity
-without exposing secrets. It also authenticates to RustGrid and resolves the
-configured project; unhealthy JSON output is still printed before the command
+reports configuration, credential presence, tenant scope, workspace location,
+and capacity without exposing secrets. It also authenticates to RustGrid and
+verifies access to the worker's active-run recovery collection; unhealthy JSON output is still printed before the command
 exits non-zero. Local interactive telemetry is colorized; set
 `NO_COLOR=1` for plain logs or `RUSTGRID_AGENT_LOG=json` for newline-delimited
 structured lifecycle events collected by a service manager.
@@ -83,10 +83,11 @@ claim for the same run, the agent restores client/server event sequences and
 reconciles the existing branch, commit, push, and open pull request. Never edit
 the journal manually while the worker is running.
 
-After a process restart, the worker first lists active runs assigned to its
-worker ID and resumes up to its configured concurrency before consuming new
-queue entries. Run cancellation is isolated: losing one lease stops only that
-run, while the worker and its other active runs continue heartbeating.
+After a process restart, the worker first lists actively leased runs assigned to
+its worker ID across every project in the tenant and resumes up to its configured
+concurrency before consuming new queue entries. Run cancellation is isolated:
+losing one lease stops only that run, while the worker and its other active runs
+continue heartbeating.
 
 Lease loss is fail-closed: local execution is cancelled and no terminal ticket
 or run update is attempted. The control plane decides whether to requeue or

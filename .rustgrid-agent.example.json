@@ -1,10 +1,4 @@
 {
-  "project_key": "RG",
-  "repo": {
-    "owner": "RustGrid",
-    "name": "rustgrid-agent"
-  },
-  "default_base_branch": "main",
   "heartbeat_interval_seconds": 15,
   "max_concurrency": 4,
   "executor": {

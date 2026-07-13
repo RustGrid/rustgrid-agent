@@ -11,7 +11,13 @@ pub const DEFAULT_API_URL: &str = "https://app.rustgrid.com/api/v1";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Deprecated compatibility hint. Tenant workers accept runs from every
+    /// project authorized by the control plane.
+    #[serde(default)]
     pub project_id: Option<String>,
+    /// Deprecated compatibility hint. Tenant workers accept runs from every
+    /// project authorized by the control plane.
+    #[serde(default)]
     pub project_key: Option<String>,
     #[serde(default)]
     pub repo: Option<RepoConfig>,
@@ -257,28 +263,10 @@ impl AppContext {
             .as_deref()
             .context("RUSTGRID_WORKER_ID is required")
     }
-
-    pub fn project_value(&self) -> (&'static str, &str) {
-        if let Some(id) = self.config.project_id.as_deref() {
-            ("project_id", id)
-        } else {
-            (
-                "project_key",
-                self.config.project_key.as_deref().expect("validated"),
-            )
-        }
-    }
 }
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        match (&self.project_id, &self.project_key) {
-            (None, None) => bail!("config must contain project_id or project_key"),
-            (Some(_), Some(_)) => {
-                bail!("config must contain only one of project_id or project_key")
-            }
-            _ => {}
-        }
         for (name, value) in [("default_base_branch", self.default_base_branch.as_str())] {
             if value.trim().is_empty() {
                 bail!("config value {name} cannot be empty");
@@ -357,10 +345,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_ambiguous_project() {
+    fn accepts_tenant_scoped_configuration_without_a_project() {
         let config = Config {
-            project_id: Some("1".into()),
-            project_key: Some("RG".into()),
+            project_id: None,
+            project_key: None,
             repo: Some(RepoConfig {
                 owner: "o".into(),
                 name: "r".into(),
@@ -382,13 +370,17 @@ mod tests {
             max_child_file_bytes: 1024 * 1024 * 1024,
             max_child_open_files: 1024,
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("only one")
-        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_project_selectors_do_not_lock_the_worker() {
+        let config: Config = serde_json::from_str(
+            r#"{"project_id":"legacy-id","project_key":"LEGACY","max_concurrency":1}"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
     }
 
     #[test]

@@ -81,18 +81,13 @@ Cargo installs the executable into `~/.cargo/bin` by default. Add that directory
 
 ## Quick start
 
-### 1. Configure a target repository
+### 1. Configure the worker
 
-In the repository that the agent will work on, copy [`.rustgrid-agent.example.json`](.rustgrid-agent.example.json) to `.rustgrid-agent.json` and update it:
+Copy [`.rustgrid-agent.example.json`](.rustgrid-agent.example.json) to the
+worker host and update its local capacity:
 
 ```json
 {
-  "project_key": "RG",
-  "repo": {
-    "owner": "RustGrid",
-    "name": "rustgrid-agent"
-  },
-  "default_base_branch": "main",
   "max_concurrency": 4,
   "executor": {
     "kind": "docker_sandbox",
@@ -106,12 +101,12 @@ In the repository that the agent will work on, copy [`.rustgrid-agent.example.js
 }
 ```
 
-Commit this file with the repository so every agent uses the same project and local capacity. Do not put secrets in it.
-
-Exactly one of `project_id` and `project_key` is required:
-
-- Use `project_key` for a human-readable RustGrid key such as `RG`. `watch` resolves it to the project ID through the RustGrid API.
-- Use `project_id` when the project UUID is already known.
+Manage this file as deployment configuration so every process on the worker
+uses the same local capacity. Do not put secrets in it. Workers are
+tenant-scoped: RustGrid assigns runs from any authorized project, and each run
+manifest supplies its project, repository, and execution policy. Legacy
+project/repository fields are accepted as ignored compatibility hints and
+should be removed from new configurations.
 
 ### 2. Set credentials
 
@@ -184,8 +179,8 @@ rustgrid-agent --config path/to/agent.json status
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `project_key` | One project field | Human-readable RustGrid project key. Mutually exclusive with `project_id`. |
-| `project_id` | One project field | RustGrid project UUID. Mutually exclusive with `project_key`. |
+| `project_key` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
+| `project_id` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
 | `repo.owner` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
 | `repo.name` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
 | `default_base_branch` | No | Bootstrap value used before a run is claimed. The execution manifest is authoritative for claimed runs. |
@@ -226,7 +221,6 @@ The RustGrid API key needs these permissions:
 - `agents:steps:create`
 - `agents:links:create`
 - `agents:quality_gates:read` and `agents:quality_gates:create`
-- `projects:read` when `watch` resolves a configured `project_key`
 
 GitHub credentials are issued by RustGrid for the GitHub App installation in
 the claimed execution manifest. Tokens are held only in memory, refreshed before
@@ -311,7 +305,11 @@ rustgrid-agent watch --interval 30
 rustgrid-agent watch --once
 ```
 
-Registers one worker, heartbeats it, and executes runs explicitly assigned to that worker. `--interval` controls the delay in seconds after each poll and defaults to 15. `--once` performs one assigned-run reconciliation and exits, which is useful for schedulers and smoke tests. A failed ticket is reported and watch mode continues to the next assignment.
+Connects one tenant-scoped worker, heartbeats it, and executes runs explicitly
+assigned to that worker across all tenant projects. `--interval` controls the
+delay in seconds after each poll and defaults to 15. `--once` performs one
+assigned-run reconciliation and exits, which is useful for schedulers and smoke
+tests. A failed ticket is reported and watch mode continues to the next assignment.
 
 Multiple worker processes must use distinct worker credentials and workspace
 roots. A `serve` process can execute up to `max_concurrency` runs when each run
@@ -341,8 +339,9 @@ child is terminated, the run becomes `cancelled`, and the ticket returns to
 Process managers should restart `serve` after an unexpected exit. SIGTERM
 drains: it stops new claims and waits for active runs to finish. SIGINT cancels
 active child process groups and exits safely.
-At startup, `serve` queries RustGrid for runs already assigned to this worker
-and resumes them before waiting for new assignments. Each run owns its cancellation token,
+At startup, `serve` queries RustGrid's tenant-wide worker recovery collection
+for actively leased runs assigned to this worker and resumes them before waiting
+for new assignments. Each run owns its cancellation token,
 so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
 
 ## Run lifecycle and recovery
@@ -514,7 +513,7 @@ The RustGrid base API is `/api/v1`. The endpoint and payload mappings in `src/ap
 | Publish agent feedback | `POST /tickets/{id}/comments` |
 | Update ticket progress | `PATCH /tickets/{id}` with `If-Match` |
 | Claim ticket and create run | `POST /tickets/{id}/agent-runs/claim` |
-| List assigned active runs | `GET /agent-runs?project_id=…&status=running&worker_id=…` |
+| List assigned active runs across the tenant | `GET /agent-workers/{id}/runs?status=running` |
 | Update run | `PATCH /agent-runs/{id}` with `If-Match` |
 | Append step | `POST /agent-runs/{id}/steps` |
 | Report gate | `POST /tickets/{id}/quality-gate-results` |

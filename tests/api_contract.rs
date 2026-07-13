@@ -17,7 +17,7 @@ fn context(base_url: String) -> AppContext {
     AppContext {
         config: Config {
             project_id: None,
-            project_key: Some("RG".into()),
+            project_key: None,
             repo: Some(RepoConfig {
                 owner: "RustGrid".into(),
                 name: "example".into(),
@@ -192,7 +192,16 @@ fn heartbeat_advertises_configured_capacity() {
 fn replays_the_durable_worker_queue_contract() {
     let Some((url, request)) = server(json!({
       "worker": {"id":"00000000-0000-4000-8000-000000000001","status":"online","max_concurrency":2,"active_runs":1,"available_slots":1},
-      "items": [{"sequence":7,"event_type":"work_available","ticket_id":"00000000-0000-4000-8000-000000000002","worker_id":null}],
+      "items": [{
+        "sequence":7,
+        "event_type":"work_claimed",
+        "run_id":"00000000-0000-4000-8000-000000000003",
+        "project_id":"00000000-0000-4000-8000-000000000004",
+        "ticket_id":"00000000-0000-4000-8000-000000000002",
+        "worker_id":"00000000-0000-4000-8000-000000000001",
+        "data":{},
+        "created_at":"2026-07-13T12:00:00Z"
+      }],
       "next_sequence": 7
     })) else {
         return;
@@ -203,7 +212,15 @@ fn replays_the_durable_worker_queue_contract() {
         .unwrap();
     assert_eq!(queue.next_sequence, 7);
     assert_eq!(queue.worker.available_slots, 1);
-    assert_eq!(queue.items[0].event_type.as_str(), "work_available");
+    assert_eq!(queue.items[0].event_type.as_str(), "work_claimed");
+    assert_eq!(
+        queue.items[0].run_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000003")
+    );
+    assert_eq!(
+        queue.items[0].project_id.as_deref(),
+        Some("00000000-0000-4000-8000-000000000004")
+    );
     assert!(
         request
             .recv()
@@ -283,13 +300,11 @@ fn publishes_a_sequenced_progress_event() {
 }
 
 #[test]
-fn lists_assigned_active_runs_for_startup_recovery() {
+fn lists_tenant_wide_assigned_runs_for_worker_recovery() {
     let Some((url, request)) = server(json!({
         "items": [{
-            "id": "run-1", "ticket_id": "ticket-1", "row_version": 3,
-            "status": "running", "attempt": 1, "input_prompt": "claimed",
-            "metadata": {}, "created_at": "2026-07-11T12:00:00Z",
-            "updated_at": "2026-07-11T12:00:00Z"
+            "id": "run-1", "ticket_id": "ticket-1", "project_id": "project-1",
+            "worker_id": "worker-1", "status": "running", "row_version": 3
         }],
         "page": 1, "size": 100, "total": 1
     })) else {
@@ -297,13 +312,34 @@ fn lists_assigned_active_runs_for_startup_recovery() {
     };
     let runs = RustGridClient::new(&context(url))
         .unwrap()
-        .active_runs("project-1", "worker-1")
+        .active_runs("worker-1")
         .unwrap();
     assert_eq!(runs[0].id, "run-1");
     let request = request.recv().unwrap();
-    assert!(request.starts_with(
-        "GET /agent-runs?project_id=project-1&status=running&worker_id=worker-1&page=1&size=100 HTTP/1.1"
-    ));
+    assert!(
+        request.starts_with(
+            "GET /agent-workers/worker-1/runs?status=running&page=1&size=100 HTTP/1.1"
+        )
+    );
+}
+
+#[test]
+fn rejects_worker_recovery_records_outside_the_bound_worker() {
+    let Some((url, _request)) = server(json!({
+        "items": [{
+            "id": "run-1", "ticket_id": "ticket-1", "project_id": "project-1",
+            "worker_id": "different-worker", "status": "running", "row_version": 3
+        }],
+        "page": 1, "size": 100, "total": 1
+    })) else {
+        return;
+    };
+
+    let error = RustGridClient::new(&context(url))
+        .unwrap()
+        .active_runs("worker-1")
+        .unwrap_err();
+    assert!(error.to_string().contains("outside worker worker-1"));
 }
 
 #[test]

@@ -57,6 +57,11 @@ remote_string_enum!(RemoteWorkerStatus {
 
 remote_string_enum!(QueueEventKind {
     WorkAvailable => "work_available",
+    WorkClaimed => "work_claimed",
+    WorkRequeued => "work_requeued",
+    CapacityAvailable => "capacity_available",
+    CapacityChanged => "capacity_changed",
+    // Compatibility with queue event names emitted by older control planes.
     TicketAvailable => "ticket.available",
     RunClaimed => "run.claimed",
     RunCancelled => "run.cancelled",
@@ -181,6 +186,10 @@ pub struct AgentQueueEvent {
     pub sequence: u64,
     pub event_type: QueueEventKind,
     #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
     pub ticket_id: Option<String>,
     #[serde(default)]
     pub worker_id: Option<String>,
@@ -199,8 +208,18 @@ struct Page<T> {
 }
 
 #[derive(Debug, Deserialize)]
-struct AgentRunPage {
-    items: Vec<AgentRun>,
+struct AgentWorkerRunPage {
+    items: Vec<AgentWorkerRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentWorkerRun {
+    id: String,
+    ticket_id: String,
+    project_id: String,
+    worker_id: String,
+    status: String,
+    row_version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -479,26 +498,6 @@ impl RustGridClient {
         )
     }
 
-    pub fn resolve_project_id(&self, context: &AppContext) -> Result<String> {
-        if let Some(id) = context.config.project_id.clone() {
-            return Ok(id);
-        }
-        #[derive(Deserialize)]
-        struct Project {
-            id: String,
-        }
-        let key = context.config.project_key.as_deref().expect("validated");
-        let project: Project = self.send_json(
-            Method::GET,
-            &format!("projects/key/{}", url_encode(key)),
-            None,
-            None,
-            &[],
-            None,
-        )?;
-        Ok(project.id)
-    }
-
     pub fn claim_ticket(&self, ticket_id: &str, worker_id: &str, prompt: &str) -> Result<AgentRun> {
         self.send_json(
             Method::POST,
@@ -518,12 +517,11 @@ impl RustGridClient {
         )
     }
 
-    pub fn active_runs(&self, project_id: &str, worker_id: &str) -> Result<Vec<AgentRun>> {
-        let page: AgentRunPage = self.send_json(
+    pub fn active_runs(&self, worker_id: &str) -> Result<Vec<AgentRun>> {
+        let page: AgentWorkerRunPage = self.send_json(
             Method::GET,
             &format!(
-                "{RUNS}?project_id={}&status=running&worker_id={}&page=1&size=100",
-                url_encode(project_id),
+                "{WORKERS}/{}/runs?status=running&page=1&size=100",
                 url_encode(worker_id)
             ),
             None,
@@ -531,7 +529,26 @@ impl RustGridClient {
             &[],
             None,
         )?;
-        Ok(page.items)
+        page.items
+            .into_iter()
+            .map(|run| {
+                if run.worker_id != worker_id || run.status != "running" {
+                    anyhow::bail!(
+                        "worker recovery returned run {} outside worker {}'s active scope",
+                        run.id,
+                        worker_id
+                    );
+                }
+                if run.project_id.trim().is_empty() {
+                    anyhow::bail!("worker recovery returned run {} without a project", run.id);
+                }
+                Ok(AgentRun {
+                    id: run.id,
+                    ticket_id: run.ticket_id,
+                    row_version: run.row_version,
+                })
+            })
+            .collect()
     }
 
     pub fn append_step(

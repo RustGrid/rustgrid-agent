@@ -25,11 +25,7 @@ fn version_reports_package_name_and_version() {
 fn status_can_emit_machine_readable_health() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
-    fs::write(
-        &config,
-        r#"{"project_key":"RG","project_id":null,"max_concurrency":1}"#,
-    )
-    .expect("configuration should be written");
+    fs::write(&config, r#"{"max_concurrency":1}"#).expect("configuration should be written");
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -39,7 +35,7 @@ fn status_can_emit_machine_readable_health() {
     let server = thread::spawn(move || {
         for body in [
             r#"{"id":"00000000-0000-4000-8000-000000000001","status":"online"}"#,
-            r#"{"id":"project-1"}"#,
+            r#"{"items":[],"page":1,"size":100,"total":0}"#,
         ] {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 4096];
@@ -71,17 +67,14 @@ fn status_can_emit_machine_readable_health() {
     assert_eq!(value["executor_ready"], true);
     assert_eq!(value["production_safe_concurrency"], true);
     assert_eq!(value["rustgrid_reachable"], true);
+    assert_eq!(value["scope"], "tenant");
 }
 
 #[test]
 fn serve_fails_closed_with_local_executor() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
-    fs::write(
-        &config,
-        r#"{"project_key":"RG","project_id":null,"max_concurrency":1}"#,
-    )
-    .expect("configuration should be written");
+    fs::write(&config, r#"{"max_concurrency":1}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_WORKER_API_KEY", "test-key")
@@ -96,11 +89,7 @@ fn serve_fails_closed_with_local_executor() {
 fn local_executor_rejects_shared_process_concurrency() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
-    std::fs::write(
-        &config,
-        r#"{"project_key":"RG","project_id":null,"max_concurrency":2}"#,
-    )
-    .expect("configuration should be written");
+    std::fs::write(&config, r#"{"max_concurrency":2}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_WORKER_API_KEY", "test-key")
@@ -118,11 +107,7 @@ fn local_executor_rejects_shared_process_concurrency() {
 fn watch_once_fails_closed_with_multiple_run_capacity() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
-    fs::write(
-        &config,
-        r#"{"project_key":"RG","project_id":null,"max_concurrency":2}"#,
-    )
-    .expect("configuration should be written");
+    fs::write(&config, r#"{"max_concurrency":2}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_WORKER_API_KEY", "test-key")
