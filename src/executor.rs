@@ -201,6 +201,48 @@ impl Executor {
                 memory,
             } => {
                 let name = sandbox_name(run_id);
+                if sandbox_exists(command, &name, workspace)? {
+                    console_event(
+                        "recovery",
+                        &format!("Reusing retained Docker Sandbox {name}"),
+                        "36",
+                    );
+                    if probe_npm_registry {
+                        let mut last_failure = String::new();
+                        for attempt in 1..=SANDBOX_NETWORK_ATTEMPTS {
+                            match probe_sandbox_network(command, &name, workspace) {
+                                Ok(()) => {
+                                    console_event(
+                                        "completed",
+                                        "Retained Docker Sandbox npm registry network preflight passed",
+                                        "32",
+                                    );
+                                    return Ok(ExecutionHandle::DockerSandbox { name });
+                                }
+                                Err(error) => last_failure = format!("{error:#}"),
+                            }
+                            let _ = stop_sandbox(command, &name, workspace);
+                            if attempt < SANDBOX_NETWORK_ATTEMPTS {
+                                let delay = Duration::from_secs(u64::from(attempt));
+                                eprintln!(
+                                    "[warning] retained Docker Sandbox network check failed; restarting attempt {} of {} in {}s: {}",
+                                    attempt + 1,
+                                    SANDBOX_NETWORK_ATTEMPTS,
+                                    delay.as_secs(),
+                                    last_failure
+                                );
+                                thread::sleep(delay);
+                            }
+                        }
+                        return Err(RunFailure::InfrastructureTransient {
+                            detail: format!(
+                                "retained Docker Sandbox network check failed after {SANDBOX_NETWORK_ATTEMPTS} attempts; sandbox preserved: {last_failure}"
+                            ),
+                        }
+                        .into());
+                    }
+                    return Ok(ExecutionHandle::DockerSandbox { name });
+                }
                 let args = vec![
                     "create".into(),
                     "--quiet".into(),
@@ -419,18 +461,28 @@ impl Executor {
         Ok(())
     }
 
+    pub(crate) fn retain(&self, handle: &ExecutionHandle, cwd: &Path) -> Result<()> {
+        let (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) =
+            (self, handle)
+        else {
+            return Ok(());
+        };
+        stop_sandbox(command, name, cwd)?;
+        console_event(
+            "retained",
+            &format!("Stopped and retained Docker Sandbox {name} for recovery"),
+            "33",
+        );
+        Ok(())
+    }
+
     fn stop(&self, handle: &ExecutionHandle, cwd: &Path) {
         let (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) =
             (self, handle)
         else {
             return;
         };
-        let _ = command::capture_with_env(
-            command,
-            ["stop", name],
-            cwd,
-            std::iter::empty::<(&str, &str)>(),
-        );
+        let _ = stop_sandbox(command, name, cwd);
     }
 
     fn wrap(
@@ -472,6 +524,42 @@ impl Executor {
             _ => bail!("executor handle does not match configured executor"),
         }
     }
+}
+
+fn sandbox_exists(command: &str, name: &str, cwd: &Path) -> Result<bool> {
+    let output = command::capture_with_env(
+        command,
+        ["ls", "--json"],
+        cwd,
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "could not inspect retained Docker Sandboxes: {}",
+            output.stderr.trim()
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&output.stdout).context("sbx ls --json returned invalid JSON")?;
+    Ok(sandbox_names(&value)
+        .iter()
+        .any(|candidate| candidate == name))
+}
+
+fn stop_sandbox(command: &str, name: &str, cwd: &Path) -> Result<()> {
+    let output = command::capture_with_env(
+        command,
+        ["stop", name],
+        cwd,
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "could not stop Docker Sandbox {name}: {}",
+            output.stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn sandbox_network_probe_args(name: &str, workspace: &Path) -> Vec<String> {

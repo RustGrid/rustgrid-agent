@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-use crate::{command, git::Repo, manifest::ExecutionManifest};
+use crate::{command, git::Repo, journal::RunJournal, manifest::ExecutionManifest};
 
 pub struct RunWorkspace {
     pub root: PathBuf,
@@ -134,6 +134,52 @@ impl RunWorkspace {
             }
         }
         Ok(removed)
+    }
+
+    pub fn recoverable_run_ids(
+        workspace_root: &Path,
+        retention: Duration,
+    ) -> Result<HashSet<String>> {
+        let mut recoverable = HashSet::new();
+        if !workspace_root.exists() {
+            return Ok(recoverable);
+        }
+        for entry in fs::read_dir(workspace_root)
+            .with_context(|| format!("could not scan {}", workspace_root.display()))?
+        {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(run_id) = name.to_str() else {
+                continue;
+            };
+            if validate_run_id(run_id).is_err() {
+                continue;
+            }
+            let journal_path = entry.path().join("journal.json");
+            let Ok(metadata) = journal_path.metadata() else {
+                continue;
+            };
+            if metadata.modified()?.elapsed().unwrap_or_default() >= retention {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&journal_path) else {
+                continue;
+            };
+            let Ok(journal) = serde_json::from_slice::<RunJournal>(&bytes) else {
+                continue;
+            };
+            if journal
+                .executor
+                .as_ref()
+                .is_some_and(|executor| executor.state != "destroyed")
+            {
+                recoverable.insert(run_id.to_owned());
+            }
+        }
+        Ok(recoverable)
     }
 }
 
@@ -264,5 +310,31 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(root.join("active-run").is_dir());
         assert!(!root.join("expired-run").exists());
+    }
+
+    #[test]
+    fn recent_retained_executor_is_protected_for_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let run_root = directory.path().join("run-1");
+        fs::create_dir_all(&run_root).unwrap();
+        let mut journal =
+            RunJournal::create(&run_root.join("journal.json"), "run-1", "ticket-1").unwrap();
+        journal
+            .record_executor("docker_sandbox", "rustgrid-run-1", "retained")
+            .unwrap();
+
+        assert_eq!(
+            RunWorkspace::recoverable_run_ids(directory.path(), Duration::from_secs(60)).unwrap(),
+            HashSet::from(["run-1".to_owned()])
+        );
+
+        journal
+            .record_executor("docker_sandbox", "rustgrid-run-1", "destroyed")
+            .unwrap();
+        assert!(
+            RunWorkspace::recoverable_run_ids(directory.path(), Duration::from_secs(60))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

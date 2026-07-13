@@ -17,7 +17,13 @@
 control-plane assignment -> manifest validation -> token issuance -> isolated clone
      -> sandbox create -> Codex -> sandbox gates -> sandbox destroy
      -> commit -> push -> pull request
-     -> required workflows -> awaiting_review -> cleanup
+     -> required workflows -> awaiting_review -> successful cleanup
+
+Failed, blocked, timed-out, cancelled, or lease-lost executions stop and retain
+their Docker Sandbox alongside the durable workspace journal. A retry of the
+same run ID reuses the deterministic sandbox. Startup protects recent retained
+sandboxes and removes them after the configured failed-workspace retention
+window.
 ```
 
 Every irreversible publication checkpoint is written atomically to `journal.json`. A restarted worker derives a recovery plan and reconciles existing Git and GitHub state rather than repeating side effects.

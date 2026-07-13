@@ -244,28 +244,12 @@ fn execute_claimed(
             executor_handle: &handle,
         })
     })();
-    let mut result = result.and_then(|summary| {
+    let result = result.and_then(|summary| {
         if let Some(workspace) = workspace.borrow().as_ref() {
             workspace.enforce_size_limit(context.config.max_workspace_bytes)?;
         }
         Ok(summary)
     });
-    if let Some(handle) = executor_handle.borrow().as_ref() {
-        if let Err(error) = executor.destroy(
-            handle,
-            workspace
-                .borrow()
-                .as_ref()
-                .map_or(&context.workspace_root, |item| &item.repo.root),
-        ) {
-            if result.is_ok() {
-                result = Err(error.context("run succeeded but sandbox cleanup failed"));
-            }
-        } else if let Some(id) = handle.id() {
-            let _ = reporter.record_executor(context.config.executor.kind(), id, "destroyed");
-        }
-    }
-
     let supervisor_healthy = supervisor.is_healthy();
     let lease_lost = supervisor.lease_lost();
     let timed_out = supervisor.timed_out();
@@ -277,7 +261,77 @@ fn execute_claimed(
         running.load(Ordering::SeqCst),
         execution_policy.timeout_seconds,
     );
-    finalize(outcome, &reporter, &workspace, supervisor_healthy)
+    if let Some(handle) = executor_handle.borrow().as_ref() {
+        let cwd = workspace.borrow().as_ref().map_or_else(
+            || context.workspace_root.clone(),
+            |item| item.repo.root.clone(),
+        );
+        if outcome.should_retain_sandbox() {
+            match executor.retain(handle, &cwd) {
+                Ok(()) => {
+                    if let Some(id) = handle.id() {
+                        let _ = reporter.record_executor(
+                            context.config.executor.kind(),
+                            id,
+                            "retained",
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[warning] could not stop retained sandbox: {error:#}");
+                    if let Some(id) = handle.id() {
+                        let _ = reporter.record_executor(
+                            context.config.executor.kind(),
+                            id,
+                            "retain_failed",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if outcome.should_retain_sandbox() {
+        return finalize(outcome, &reporter, supervisor_healthy);
+    }
+
+    let summary = match finalize(outcome, &reporter, supervisor_healthy) {
+        Ok(summary) => summary,
+        Err(error) => {
+            if let Some(handle) = executor_handle.borrow().as_ref() {
+                let cwd = workspace.borrow().as_ref().map_or_else(
+                    || context.workspace_root.clone(),
+                    |item| item.repo.root.clone(),
+                );
+                let _ = executor.retain(handle, &cwd);
+                if let Some(id) = handle.id() {
+                    let _ =
+                        reporter.record_executor(context.config.executor.kind(), id, "retained");
+                }
+            }
+            return Err(error);
+        }
+    };
+    if let Some(handle) = executor_handle.borrow().as_ref() {
+        let cwd = workspace.borrow().as_ref().map_or_else(
+            || context.workspace_root.clone(),
+            |item| item.repo.root.clone(),
+        );
+        if let Err(error) = executor.destroy(handle, &cwd) {
+            let cleanup_error = error.context("run completed but sandbox cleanup failed");
+            let _ = executor.retain(handle, &cwd);
+            if let Some(id) = handle.id() {
+                let _ = reporter.record_executor(context.config.executor.kind(), id, "retained");
+            }
+            return Err(cleanup_error);
+        }
+        if let Some(id) = handle.id() {
+            let _ = reporter.record_executor(context.config.executor.kind(), id, "destroyed");
+        }
+    }
+    if let Some(workspace) = workspace.borrow_mut().take() {
+        workspace.cleanup()?;
+    }
+    Ok(summary)
 }
 
 struct ExecutionContext<'a> {
@@ -519,12 +573,23 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     .context("could not install Ctrl-C handler")?;
 
     let active_runs = api.active_runs(&worker.id)?;
-    let protected_run_ids = active_runs
+    let active_run_ids = active_runs
         .iter()
         .map(|run| run.id.clone())
         .collect::<HashSet<_>>();
+    let retention = Duration::from_secs(
+        context
+            .config
+            .failed_workspace_retention_hours
+            .saturating_mul(3600),
+    );
+    let mut protected_sandbox_run_ids = active_run_ids.clone();
+    protected_sandbox_run_ids.extend(RunWorkspace::recoverable_run_ids(
+        &context.workspace_root,
+        retention,
+    )?);
     let removed_orphans = Executor::from_config(&context.config.executor)
-        .reconcile_orphans(&protected_run_ids, &context.workspace_root)?;
+        .reconcile_orphans(&protected_sandbox_run_ids, &context.workspace_root)?;
     if removed_orphans > 0 {
         console_event(
             "cleanup",
@@ -532,9 +597,9 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             "33",
         );
     }
-    sweep_workspaces(context, &protected_run_ids)?;
+    sweep_workspaces(context, &active_run_ids)?;
     let mut tasks: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
-    let mut started_run_ids = protected_run_ids.clone();
+    let mut started_run_ids = active_run_ids;
     for run in active_runs.into_iter().take(context.config.max_concurrency) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
             Ok(ticket) => ticket,

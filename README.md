@@ -193,7 +193,7 @@ rustgrid-agent --config path/to/agent.json status
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
 | `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
 | `run_timeout_seconds` | No | Deprecated compatibility field; the manifest owns total run timeout. |
-| `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces before startup cleanup. Defaults to 72. |
+| `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces and stopped Docker Sandboxes before startup cleanup. Defaults to 72. |
 | `max_command_output_bytes` | No | Combined in-memory output budget for captured commands. Defaults to 8 MiB. |
 | `max_workspace_bytes` | No | Maximum allowed run-workspace size. Defaults to 5 GiB. |
 | `max_child_memory_bytes` | No | Per-child address-space ceiling on Unix. Defaults to 8 GiB. |

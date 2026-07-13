@@ -36,6 +36,11 @@ run-scoped GitHub token issuance.
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and
 interrupted workspaces are retained until `failed_workspace_retention_hours`.
+Their Docker Sandboxes are stopped without being removed and journaled as
+recoverable. If RustGrid retries the same run ID, the worker restarts that
+sandbox through `sbx exec` and preserves its installed dependencies and internal
+filesystem state. Successful runs destroy the sandbox only after the terminal
+RustGrid update succeeds.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
 host disk quota for enforcement while commands are actively writing.
 The worker also monitors workspace growth while sandbox commands run and stops

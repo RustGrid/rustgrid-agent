@@ -1,18 +1,14 @@
-use std::cell::RefCell;
-
 use anyhow::Result;
 
 use crate::{
     lifecycle::{AgentRunStatus, RunPhase},
     outcome::{RunOutcome, RunSummary},
     reporting::Reporter,
-    workspace::RunWorkspace,
 };
 
 pub(crate) fn finalize(
     outcome: RunOutcome,
     reporter: &Reporter<'_>,
-    workspace: &RefCell<Option<RunWorkspace>>,
     supervisor_healthy: bool,
 ) -> Result<RunSummary> {
     match outcome {
@@ -22,9 +18,6 @@ pub(crate) fn finalize(
             }
             reporter.set_phase(RunPhase::Succeeded);
             reporter.update_run(AgentRunStatus::Succeeded, Some(&summary.pull_request_url))?;
-            if let Some(workspace) = workspace.borrow_mut().take() {
-                workspace.cleanup()?;
-            }
             Ok(summary)
         }
         RunOutcome::LeaseLost(error) => {

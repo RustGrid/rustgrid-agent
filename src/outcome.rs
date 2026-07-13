@@ -19,6 +19,10 @@ pub enum RunOutcome {
 }
 
 impl RunOutcome {
+    pub const fn should_retain_sandbox(&self) -> bool {
+        !matches!(self, Self::Succeeded(_))
+    }
+
     pub fn resolve(
         result: anyhow::Result<RunSummary>,
         lease_lost: bool,
@@ -88,5 +92,24 @@ mod tests {
             RunOutcome::resolve(result, false, false, true, 30),
             RunOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn retains_sandboxes_for_every_unsuccessful_terminal_outcome() {
+        let failure = || anyhow::anyhow!("failed");
+        assert!(RunOutcome::Blocked(failure()).should_retain_sandbox());
+        assert!(RunOutcome::Failed(failure()).should_retain_sandbox());
+        assert!(RunOutcome::TimedOut(failure()).should_retain_sandbox());
+        assert!(RunOutcome::Cancelled(failure()).should_retain_sandbox());
+        assert!(RunOutcome::LeaseLost(failure()).should_retain_sandbox());
+        assert!(
+            !RunOutcome::Succeeded(RunSummary {
+                ticket_key: "RG-1".into(),
+                branch: "agent/rg-1".into(),
+                commit: "abc".into(),
+                pull_request_url: "https://github.com/o/r/pull/1".into(),
+            })
+            .should_retain_sandbox()
+        );
     }
 }
