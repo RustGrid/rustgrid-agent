@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 use crate::config::RepoConfig;
 
@@ -104,6 +105,7 @@ impl ExecutionManifest {
         }
         self.policy()?.validate()?;
         self.repo_config()?;
+        self.normalized_required_workflows()?;
         Ok(())
     }
 
@@ -124,6 +126,30 @@ impl ExecutionManifest {
             owner: owner.to_owned(),
             name: name.to_owned(),
         })
+    }
+
+    pub fn normalized_required_workflows(&self) -> Result<Vec<String>> {
+        let mut workflows = Vec::new();
+        let mut seen = HashSet::new();
+        for configured in &self.required_workflows {
+            let expanded = serde_json::from_str::<Vec<String>>(configured)
+                .ok()
+                .filter(|_| configured.trim_start().starts_with('['))
+                .unwrap_or_else(|| vec![configured.clone()]);
+            for name in expanded {
+                let name = name.trim();
+                if name.is_empty() || name.len() > 200 {
+                    bail!("required workflow names must contain 1 to 200 characters");
+                }
+                if seen.insert(name.to_owned()) {
+                    workflows.push(name.to_owned());
+                }
+            }
+        }
+        if workflows.len() > 100 {
+            bail!("execution manifest cannot require more than 100 workflows");
+        }
+        Ok(workflows)
     }
 }
 
@@ -292,6 +318,22 @@ mod tests {
         );
         assert!(args.iter().any(|arg| arg.contains("approval_policy")));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
+    }
+
+    #[test]
+    fn normalizes_legacy_double_encoded_required_workflows() {
+        let mut value = manifest();
+        value.required_workflows = vec![r#"["Typecheck and build"]"#.into()];
+        assert_eq!(
+            value.normalized_required_workflows().unwrap(),
+            ["Typecheck and build"]
+        );
+
+        value.required_workflows = vec!["Typecheck and build".into()];
+        assert_eq!(
+            value.normalized_required_workflows().unwrap(),
+            ["Typecheck and build"]
+        );
     }
 
     #[test]

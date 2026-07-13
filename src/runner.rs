@@ -451,14 +451,15 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         Some(json!({"url": pr.html_url})),
     )?;
 
-    if !manifest.required_workflows.is_empty() {
+    let required_workflows = manifest.normalized_required_workflows()?;
+    if !required_workflows.is_empty() {
         wait_for_required_workflows(
             &tokens,
             WorkflowRequirements {
                 repo: &manifest.repo_config()?,
                 web_base_url: &manifest.web_base_url,
                 commit: &commit,
-                required: &manifest.required_workflows,
+                required: &required_workflows,
                 timeout: Duration::from_secs(policy.timeout_seconds),
             },
             running,
