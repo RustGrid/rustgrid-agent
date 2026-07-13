@@ -129,6 +129,9 @@ fn execute_claimed(
         Ok(value) => value,
         Err(error) => {
             match classify(&error) {
+                RunErrorKind::LeaseLost => {
+                    return Err(error.context("skipped stale terminal updates"));
+                }
                 RunErrorKind::Transient | RunErrorKind::Invariant => {
                     reporter.fail_retryable(&error)?;
                 }
@@ -537,6 +540,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     }
     sweep_workspaces(context, &protected_run_ids)?;
     let mut tasks: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
+    let mut started_run_ids = protected_run_ids.clone();
     for run in active_runs.into_iter().take(context.config.max_concurrency) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
             Ok(ticket) => ticket,
@@ -613,13 +617,8 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             context.config.max_concurrency.saturating_sub(tasks.len())
         };
         let mut assigned = 0usize;
-        let executing_run_ids = tasks
-            .iter()
-            .map(|(run_id, _)| run_id.clone())
-            .collect::<HashSet<_>>();
         let assigned_runs = api.active_runs(&project_id, &worker.id)?;
-        for run in select_unstarted_assignments(assigned_runs, &executing_run_ids, available_slots)
-        {
+        for run in select_unstarted_assignments(assigned_runs, &started_run_ids, available_slots) {
             let ticket = match api.fetch_ticket(&run.ticket_id) {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -636,6 +635,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
                 "32",
             );
             let run_id = run.id.clone();
+            started_run_ids.insert(run_id.clone());
             let task_context = context.clone();
             let task_api = api.clone();
             let task_worker = worker.clone();
@@ -696,12 +696,12 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
 
 fn select_unstarted_assignments(
     assigned_runs: Vec<AgentRun>,
-    executing_run_ids: &HashSet<String>,
+    started_run_ids: &HashSet<String>,
     available_slots: usize,
 ) -> Vec<AgentRun> {
     assigned_runs
         .into_iter()
-        .filter(|run| !executing_run_ids.contains(&run.id))
+        .filter(|run| !started_run_ids.contains(&run.id))
         .take(available_slots)
         .collect()
 }
@@ -749,12 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn assigned_run_selection_excludes_running_work_and_respects_capacity() {
-        let executing = HashSet::from(["run-1".to_owned()]);
+    fn assigned_run_selection_never_restarts_a_seen_run_and_respects_capacity() {
+        let started = HashSet::from(["run-1".to_owned()]);
 
         let selected = select_unstarted_assignments(
             vec![run("run-1"), run("run-2"), run("run-3")],
-            &executing,
+            &started,
             1,
         );
 

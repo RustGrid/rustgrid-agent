@@ -303,7 +303,11 @@ impl RustGridClient {
             anyhow::bail!("agent queue stream returned {}", response.status());
         }
         for line in BufReader::new(response).lines() {
-            let line = line.context("failed to read agent queue stream")?;
+            let line = match line {
+                Ok(line) => line,
+                Err(error) if is_idle_stream_timeout(&error) => return Ok(None),
+                Err(error) => return Err(error).context("failed to read agent queue stream"),
+            };
             if let Some(value) = line.strip_prefix("id:") {
                 return value
                     .trim()
@@ -822,9 +826,17 @@ pub fn is_lease_lost(error: &anyhow::Error) -> bool {
             || (failure.status == StatusCode::CONFLICT
                 && (failure.path.ends_with("/lease")
                     || ((failure.path.ends_with("/events")
+                        || failure.path.ends_with("/manifest")
                         || failure.path.ends_with("/github-token"))
                         && identifies_lease_loss)))
     })
+}
+
+fn is_idle_stream_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) || error.to_string().to_ascii_lowercase().contains("timed out")
 }
 
 #[derive(Debug)]
@@ -944,6 +956,14 @@ mod tests {
         });
         assert!(!is_lease_lost(&ambiguous_manifest));
 
+        let expired_manifest = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/manifest".into(),
+            request_id: None,
+            body: "agent run lease is not active for this worker".into(),
+        });
+        assert!(is_lease_lost(&expired_manifest));
+
         let github_permissions = anyhow::Error::new(HttpFailure {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/github-token".into(),
@@ -991,5 +1011,17 @@ mod tests {
             Duration::from_secs(30)
         );
         assert_eq!(GITHUB_TOKEN_RETRY_POLICY.max_attempts, 8);
+    }
+
+    #[test]
+    fn idle_stream_timeouts_are_not_reported_as_queue_failures() {
+        assert!(is_idle_stream_timeout(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "operation timed out",
+        )));
+        assert!(!is_idle_stream_timeout(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid event stream",
+        )));
     }
 }
