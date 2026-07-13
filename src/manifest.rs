@@ -68,6 +68,26 @@ pub struct SandboxPolicy {
     pub approval_policy: String,
 }
 
+impl ExecutionPolicy {
+    pub fn requires_npm_registry(&self) -> bool {
+        self.quality_gates.iter().any(|gate| {
+            gate.command.split_whitespace().any(|token| {
+                let executable = token
+                    .trim_matches(|character: char| {
+                        !character.is_ascii_alphanumeric()
+                            && character != '-'
+                            && character != '_'
+                            && character != '/'
+                    })
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                matches!(executable, "npm" | "npx" | "pnpm" | "yarn" | "bun")
+            })
+        })
+    }
+}
+
 impl ExecutionManifest {
     pub fn validate(&self, run_id: &str, ticket_id: &str) -> Result<()> {
         if self.manifest_version != 2 {
@@ -306,6 +326,18 @@ mod tests {
         let mut future = manifest();
         future.manifest_version = 3;
         assert!(future.validate("run-1", "ticket-1").is_err());
+    }
+
+    #[test]
+    fn detects_npm_family_registry_requirements_from_signed_gates() {
+        let mut policy = manifest().policy().unwrap();
+        assert!(!policy.requires_npm_registry());
+
+        policy.quality_gates[0].command = "npm ci && npm test".into();
+        assert!(policy.requires_npm_registry());
+
+        policy.quality_gates[0].command = "/usr/local/bin/pnpm test".into();
+        assert!(policy.requires_npm_registry());
     }
 
     #[test]

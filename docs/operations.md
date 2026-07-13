@@ -45,6 +45,14 @@ The worker also applies Unix child limits for address space, individual file
 size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.
 
+When the signed execution policy contains an npm-family quality gate, every
+newly created Docker Sandbox must pass an `npm ping` against the public registry
+before it is admitted for Codex or quality-gate execution. Failed admission
+destroys and recreates the sandbox up to three times with bounded backoff.
+Exhaustion is reported as transient worker infrastructure failure, not as a
+repository defect or human-action blocker. Non-JavaScript runs do not acquire
+an npm dependency merely because they share the worker.
+
 Use `rustgrid-agent status --json` from process-manager readiness checks. It
 reports configuration, credential presence, tenant scope, workspace location,
 and capacity without exposing secrets. It also authenticates to RustGrid and

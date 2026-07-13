@@ -16,6 +16,7 @@ pub enum RunErrorKind {
 #[derive(Debug)]
 pub enum RunFailure {
     RequiredWorkflowsTimedOut { seconds: u64 },
+    InfrastructureTransient { detail: String },
     HumanIntervention { action: String },
     PolicyViolation { detail: String },
     Invariant { detail: String },
@@ -28,6 +29,12 @@ impl std::fmt::Display for RunFailure {
                 formatter,
                 "required GitHub workflows timed out after {seconds} seconds"
             ),
+            Self::InfrastructureTransient { detail } => {
+                write!(
+                    formatter,
+                    "worker infrastructure temporarily unavailable: {detail}"
+                )
+            }
             Self::HumanIntervention { action } => {
                 write!(formatter, "human intervention required: {action}")
             }
@@ -53,6 +60,7 @@ pub fn classify(error: &anyhow::Error) -> RunErrorKind {
     if let Some(failure) = error.downcast_ref::<RunFailure>() {
         return match failure {
             RunFailure::RequiredWorkflowsTimedOut { .. } => RunErrorKind::TimedOut,
+            RunFailure::InfrastructureTransient { .. } => RunErrorKind::Transient,
             RunFailure::HumanIntervention { .. } => RunErrorKind::HumanBlocked,
             RunFailure::PolicyViolation { .. } => RunErrorKind::PolicyViolation,
             RunFailure::Invariant { .. } => RunErrorKind::Invariant,
@@ -81,6 +89,15 @@ mod tests {
 
     #[test]
     fn classifies_typed_failures_without_message_matching() {
+        assert_eq!(
+            classify(
+                &RunFailure::InfrastructureTransient {
+                    detail: "sandbox DNS failed".into()
+                }
+                .into()
+            ),
+            RunErrorKind::Transient
+        );
         assert_eq!(
             classify(
                 &RunFailure::HumanIntervention {

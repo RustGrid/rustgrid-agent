@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::{
     api::Ticket,
     config::RepoConfig,
-    github::{CheckRun, GitHubClient},
+    github::{CheckRun, GitHubClient, WorkflowRun},
     lifecycle::StepStatus,
     outcome::RunSummary,
     reporting::Reporter,
@@ -54,23 +54,32 @@ pub(crate) fn wait_for_required_workflows(
         }
         let token = tokens.token()?;
         let github = GitHubClient::new(&token, requirements.web_base_url)?;
-        let checks = github.check_runs(requirements.repo, requirements.commit)?;
+        let workflows = github.workflow_runs(requirements.repo, requirements.commit)?;
+        let needs_check_fallback = requirements
+            .required
+            .iter()
+            .any(|name| latest_workflow_run(&workflows, name).is_none());
+        let checks = if needs_check_fallback {
+            github.check_runs(requirements.repo, requirements.commit)?
+        } else {
+            Vec::new()
+        };
         let mut all_passed = true;
         for name in requirements.required {
-            match latest_check_run(&checks, name) {
-                Some(check)
-                    if check.status.is_completed()
-                        && check
-                            .conclusion
-                            .as_ref()
-                            .is_some_and(|value| value.is_success()) => {}
-                Some(check) if check.status.is_completed() => {
+            let state = latest_workflow_run(&workflows, name)
+                .map(|run| (&run.status, run.conclusion.as_ref()))
+                .or_else(|| {
+                    latest_check_run(&checks, name)
+                        .map(|check| (&check.status, check.conclusion.as_ref()))
+                });
+            match state {
+                Some((status, conclusion))
+                    if status.is_completed()
+                        && conclusion.is_some_and(|value| value.is_success()) => {}
+                Some((status, conclusion)) if status.is_completed() => {
                     bail!(
                         "required GitHub workflow {name} concluded as {}",
-                        check
-                            .conclusion
-                            .as_ref()
-                            .map_or("unknown", |value| value.as_str())
+                        conclusion.map_or("unknown", |value| value.as_str())
                     );
                 }
                 _ => all_passed = false,
@@ -97,7 +106,7 @@ pub(crate) fn wait_for_required_workflows(
 fn latest_check_run<'a>(checks: &'a [CheckRun], name: &str) -> Option<&'a CheckRun> {
     checks
         .iter()
-        .filter(|check| check.name == name)
+        .filter(|check| check.name.eq_ignore_ascii_case(name))
         .max_by(|a, b| {
             let a_time = a
                 .completed_at
@@ -111,6 +120,39 @@ fn latest_check_run<'a>(checks: &'a [CheckRun], name: &str) -> Option<&'a CheckR
                 .unwrap_or("");
             (a_time, a.id).cmp(&(b_time, b.id))
         })
+}
+
+fn latest_workflow_run<'a>(runs: &'a [WorkflowRun], requirement: &str) -> Option<&'a WorkflowRun> {
+    runs.iter()
+        .filter(|run| workflow_matches(run, requirement))
+        .max_by(|a, b| {
+            let a_time = a
+                .updated_at
+                .as_deref()
+                .or(a.created_at.as_deref())
+                .unwrap_or("");
+            let b_time = b
+                .updated_at
+                .as_deref()
+                .or(b.created_at.as_deref())
+                .unwrap_or("");
+            (a.run_attempt, a_time, a.id).cmp(&(b.run_attempt, b_time, b.id))
+        })
+}
+
+fn workflow_matches(run: &WorkflowRun, requirement: &str) -> bool {
+    let requirement = requirement.trim();
+    if run.name.eq_ignore_ascii_case(requirement) || run.path.eq_ignore_ascii_case(requirement) {
+        return true;
+    }
+    let path = std::path::Path::new(&run.path);
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(requirement))
+        || path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(requirement))
 }
 
 pub(crate) fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &str) -> String {
@@ -161,5 +203,23 @@ mod tests {
             },
         ];
         assert_eq!(latest_check_run(&checks, "CI").unwrap().id, 2);
+    }
+
+    #[test]
+    fn workflow_requirement_matches_display_name_path_filename_and_stem() {
+        let run = WorkflowRun {
+            id: 1,
+            name: "CI".into(),
+            path: ".github/workflows/ci.yml".into(),
+            status: CheckStatus::Completed,
+            conclusion: Some(CheckConclusion::Success),
+            run_attempt: 1,
+            created_at: None,
+            updated_at: None,
+        };
+
+        for requirement in ["CI", "ci", "ci.yml", ".github/workflows/ci.yml"] {
+            assert!(workflow_matches(&run, requirement));
+        }
     }
 }

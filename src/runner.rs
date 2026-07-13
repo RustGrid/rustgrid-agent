@@ -180,7 +180,11 @@ fn execute_claimed(
             repo.ensure_safe(false)?
         };
         workspace.replace(Some(prepared));
-        let handle = executor.prepare(&run.id, &repo.root)?;
+        let handle = executor.prepare(
+            &run.id,
+            &repo.root,
+            execution_policy.requires_npm_registry(),
+        )?;
         if let Some(id) = handle.id() {
             reporter.record_executor(context.config.executor.kind(), id, "created")?;
             reporter.step(

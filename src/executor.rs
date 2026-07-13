@@ -19,7 +19,11 @@ use crate::{
     command::{self, CommandOutput, StreamingCommand},
     config::ExecutorConfig,
     reporting::console_event,
+    run_error::RunFailure,
 };
+
+const SANDBOX_NETWORK_ATTEMPTS: u32 = 3;
+const NPM_REGISTRY: &str = "https://registry.npmjs.org";
 
 #[derive(Clone, Debug)]
 pub(crate) enum ExecutionHandle {
@@ -182,7 +186,12 @@ impl Executor {
         Ok(removed)
     }
 
-    pub(crate) fn prepare(&self, run_id: &str, workspace: &Path) -> Result<ExecutionHandle> {
+    pub(crate) fn prepare(
+        &self,
+        run_id: &str,
+        workspace: &Path,
+        probe_npm_registry: bool,
+    ) -> Result<ExecutionHandle> {
         match self {
             Self::Local => Ok(ExecutionHandle::Local),
             Self::DockerSandbox {
@@ -191,16 +200,7 @@ impl Executor {
                 cpus,
                 memory,
             } => {
-                let started = Instant::now();
                 let name = sandbox_name(run_id);
-                // The name is deterministic, so a coordinator restart can remove an
-                // orphan even if it crashed before persisting the create result.
-                let _ = command::capture_with_env(
-                    command,
-                    ["rm", "--force", &name],
-                    workspace,
-                    std::iter::empty::<(&str, &str)>(),
-                );
                 let args = vec![
                     "create".into(),
                     "--quiet".into(),
@@ -215,24 +215,81 @@ impl Executor {
                     "codex".into(),
                     workspace.display().to_string(),
                 ];
-                let output = command::capture_with_env(
-                    command,
-                    &args,
-                    workspace,
-                    std::iter::empty::<(&str, &str)>(),
-                )?;
-                if !output.status.success() {
-                    bail!(
-                        "could not create Docker Sandbox {name}: {}",
-                        output.stderr.trim()
+                let mut last_failure = String::new();
+                let attempts = if probe_npm_registry {
+                    SANDBOX_NETWORK_ATTEMPTS
+                } else {
+                    1
+                };
+                for attempt in 1..=attempts {
+                    let started = Instant::now();
+                    // The name is deterministic, so a coordinator restart can remove an
+                    // orphan even if it crashed before persisting the create result.
+                    let _ = command::capture_with_env(
+                        command,
+                        ["rm", "--force", &name],
+                        workspace,
+                        std::iter::empty::<(&str, &str)>(),
                     );
+                    let output = command::capture_with_env(
+                        command,
+                        &args,
+                        workspace,
+                        std::iter::empty::<(&str, &str)>(),
+                    )?;
+                    if output.status.success() {
+                        console_event(
+                            "sandbox",
+                            &format!("created {name} in {}ms", started.elapsed().as_millis()),
+                            "36",
+                        );
+                        if !probe_npm_registry {
+                            return Ok(ExecutionHandle::DockerSandbox { name });
+                        }
+                        match probe_sandbox_network(command, &name, workspace) {
+                            Ok(()) => {
+                                console_event(
+                                    "completed",
+                                    "Docker Sandbox npm registry network preflight passed",
+                                    "32",
+                                );
+                                return Ok(ExecutionHandle::DockerSandbox { name });
+                            }
+                            Err(error) => last_failure = format!("{error:#}"),
+                        }
+                    } else {
+                        last_failure = format!(
+                            "could not create Docker Sandbox {name}: {}",
+                            output.stderr.trim()
+                        );
+                    }
+                    let _ = command::capture_with_env(
+                        command,
+                        ["rm", "--force", &name],
+                        workspace,
+                        std::iter::empty::<(&str, &str)>(),
+                    );
+                    if attempt < attempts {
+                        let delay = Duration::from_secs(u64::from(attempt));
+                        eprintln!(
+                            "[warning] Docker Sandbox network admission failed; recreating attempt {} of {} in {}s: {}",
+                            attempt + 1,
+                            attempts,
+                            delay.as_secs(),
+                            last_failure
+                        );
+                        thread::sleep(delay);
+                    }
                 }
-                console_event(
-                    "sandbox",
-                    &format!("created {name} in {}ms", started.elapsed().as_millis()),
-                    "36",
-                );
-                Ok(ExecutionHandle::DockerSandbox { name })
+                if !probe_npm_registry {
+                    bail!(last_failure);
+                }
+                Err(RunFailure::InfrastructureTransient {
+                    detail: format!(
+                        "Docker Sandbox network admission failed after {SANDBOX_NETWORK_ATTEMPTS} attempts: {last_failure}"
+                    ),
+                }
+                .into())
             }
         }
     }
@@ -415,6 +472,39 @@ impl Executor {
             _ => bail!("executor handle does not match configured executor"),
         }
     }
+}
+
+fn sandbox_network_probe_args(name: &str, workspace: &Path) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "-w".into(),
+        workspace.display().to_string(),
+        name.into(),
+        "npm".into(),
+        "ping".into(),
+        format!("--registry={NPM_REGISTRY}"),
+        "--fetch-retries=0".into(),
+        "--fetch-timeout=10000".into(),
+    ]
+}
+
+fn probe_sandbox_network(command: &str, name: &str, workspace: &Path) -> Result<()> {
+    let args = sandbox_network_probe_args(name, workspace);
+    let output = command::capture_with_env(
+        command,
+        &args,
+        workspace,
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    if !output.status.success() {
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        bail!("npm registry network probe failed in Docker Sandbox {name}: {detail}");
+    }
+    Ok(())
 }
 
 struct PreparedCommand {
@@ -698,6 +788,26 @@ mod tests {
             interactive.args[0..5],
             ["sbx", "exec", "-i", "-w", workspace.to_str().unwrap()]
         );
+    }
+
+    #[test]
+    fn npm_network_probe_uses_bounded_retries_and_the_public_registry() {
+        let workspace = Path::new("/tmp/repo");
+        assert_eq!(
+            sandbox_network_probe_args("rustgrid-test", workspace),
+            [
+                "exec",
+                "-w",
+                "/tmp/repo",
+                "rustgrid-test",
+                "npm",
+                "ping",
+                "--registry=https://registry.npmjs.org",
+                "--fetch-retries=0",
+                "--fetch-timeout=10000",
+            ]
+        );
+        assert_eq!(SANDBOX_NETWORK_ATTEMPTS, 3);
     }
 
     #[test]

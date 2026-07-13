@@ -34,6 +34,21 @@ pub struct CheckRun {
     pub completed_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRun {
+    pub id: u64,
+    pub name: String,
+    pub path: String,
+    pub status: CheckStatus,
+    pub conclusion: Option<CheckConclusion>,
+    #[serde(default)]
+    pub run_attempt: u64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum CheckStatus {
     Queued,
@@ -108,6 +123,11 @@ impl<'de> Deserialize<'de> for CheckConclusion {
 #[derive(Debug, Deserialize)]
 struct CheckRunsResponse {
     check_runs: Vec<CheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunsResponse {
+    workflow_runs: Vec<WorkflowRun>,
 }
 
 impl GitHubClient {
@@ -229,6 +249,44 @@ impl GitHubClient {
             }
         }
         bail!("GitHub check-run pagination exceeded 2,000 results")
+    }
+
+    pub fn workflow_runs(&self, repo: &RepoConfig, commit: &str) -> Result<Vec<WorkflowRun>> {
+        let mut all_runs = Vec::new();
+        for page in 1..=20 {
+            let url = format!(
+                "{}/repos/{}/{}/actions/runs?head_sha={}&per_page=100&page={page}",
+                self.api_base_url,
+                repo.owner,
+                repo.name,
+                url_encode(commit)
+            );
+            let response = self.send_with_retry("list workflow runs", || {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&self.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+            })?;
+            let status = response.status();
+            let text = response
+                .text()
+                .context("could not read GitHub workflow-runs response")?;
+            if !status.is_success() {
+                bail!(
+                    "GitHub workflow-runs request returned {status}: {}",
+                    truncate(&text, 2_000)
+                );
+            }
+            let mut response: WorkflowRunsResponse = serde_json::from_str(&text)
+                .context("GitHub returned invalid workflow-run results")?;
+            let page_len = response.workflow_runs.len();
+            all_runs.append(&mut response.workflow_runs);
+            if page_len < 100 {
+                return Ok(all_runs);
+            }
+        }
+        bail!("GitHub workflow-run pagination exceeded 2,000 results")
     }
 
     fn send_with_retry<F>(&self, operation: &str, mut build: F) -> Result<Response>
