@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::BTreeSet, sync::atomic::AtomicBool, time::Duration};
+use std::{cell::RefCell, collections::BTreeSet, sync::atomic::AtomicBool, thread, time::Duration};
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -88,7 +88,18 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         },
     )?;
     if let Some(action) = blocked_action.into_inner() {
-        return Err(RunFailure::HumanIntervention { action }.into());
+        if is_validation_only_blocker(&action)
+            && policy.quality_gates.iter().any(|gate| gate.required)
+        {
+            reporter.step(
+                "codex_validation_handoff",
+                StepStatus::Completed,
+                "Codex could not complete local validation; continuing with runner-owned quality gates",
+                Some(json!({"reported_action": action})),
+            )?;
+        } else {
+            return Err(RunFailure::HumanIntervention { action }.into());
+        }
     }
     if !codex_status.success() {
         bail!("Codex exited with {codex_status}");
@@ -108,24 +119,41 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
             &format!("Running quality gate: {}", gate_policy.command),
             Some(json!({"gate_id": gate_policy.id, "required": gate_policy.required})),
         )?;
-        let gate = executor.captured(
-            executor_handle,
-            &gate_policy.command,
-            RunCommand {
-                args: &[],
-                cwd: &repo.root,
-                stdin_text: None,
-                running,
-                timeout: Duration::from_secs(gate_policy.timeout_seconds),
-                max_output_bytes: context.config.max_command_output_bytes as usize,
-                environment_allowlist: &policy.codex.environment_allowlist,
-                limits: Some(child_limits(
-                    context,
-                    Duration::from_secs(gate_policy.timeout_seconds),
-                )),
-                max_workspace_bytes: context.config.max_workspace_bytes,
-            },
-        )?;
+        let mut gate_attempt = 1u32;
+        let gate = loop {
+            let gate = executor.captured(
+                executor_handle,
+                &gate_policy.command,
+                RunCommand {
+                    args: &[],
+                    cwd: &repo.root,
+                    stdin_text: None,
+                    running,
+                    timeout: Duration::from_secs(gate_policy.timeout_seconds),
+                    max_output_bytes: context.config.max_command_output_bytes as usize,
+                    environment_allowlist: &policy.codex.environment_allowlist,
+                    limits: Some(child_limits(
+                        context,
+                        Duration::from_secs(gate_policy.timeout_seconds),
+                    )),
+                    max_workspace_bytes: context.config.max_workspace_bytes,
+                },
+            )?;
+            let output = combine_output(&gate.stdout, &gate.stderr);
+            if gate.status.success() || gate_attempt >= 3 || !is_transient_gate_failure(&output) {
+                break gate;
+            }
+            let delay = Duration::from_secs(u64::from(gate_attempt) * 2);
+            let message = format!(
+                "Quality gate hit a transient network failure; retrying attempt {} of 3 in {}s",
+                gate_attempt + 1,
+                delay.as_secs()
+            );
+            eprintln!("[warning] {message}");
+            reporter.log(&format!("{message}\n{output}"))?;
+            thread::sleep(delay);
+            gate_attempt += 1;
+        };
         print_output(&gate.stdout, &gate.stderr);
         let gate_output = combine_output(&gate.stdout, &gate.stderr);
         reporter.log(&gate_output)?;
@@ -258,6 +286,63 @@ fn blocked_action_from_feedback(message: &str) -> Option<String> {
         .or_else(|| Some("Codex reported that human intervention is required".to_owned()))
 }
 
+fn is_validation_only_blocker(action: &str) -> bool {
+    let action = action.to_ascii_lowercase();
+    let mentions_validation = [
+        "test",
+        "build",
+        "lint",
+        "typecheck",
+        "type check",
+        "visual inspection",
+        "screenshot",
+        "dependencies",
+        "dependency install",
+    ]
+    .iter()
+    .any(|term| action.contains(term));
+    let mentions_validation_infrastructure = [
+        "network",
+        "registry",
+        "dependencies",
+        "dependency",
+        "browser",
+        "dev server",
+        "dev-server",
+        "tool",
+    ]
+    .iter()
+    .any(|term| action.contains(term));
+    let mentions_implementation_blocker = [
+        "credential",
+        "secret",
+        "permission",
+        "approval",
+        "decision",
+        "requirement",
+        "production access",
+    ]
+    .iter()
+    .any(|term| action.contains(term));
+
+    mentions_validation && mentions_validation_infrastructure && !mentions_implementation_blocker
+}
+
+fn is_transient_gate_failure(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    [
+        "eai_again",
+        "econnreset",
+        "etimedout",
+        "temporary failure in name resolution",
+        "could not resolve host",
+        "network is unreachable",
+        "request or response body error: operation timed out",
+    ]
+    .iter()
+    .any(|signature| output.contains(signature))
+}
+
 pub(crate) fn short_sha(sha: &str) -> &str {
     sha.get(..sha.len().min(12)).unwrap_or(sha)
 }
@@ -285,5 +370,31 @@ mod tests {
             Some("Add the signing key.")
         );
         assert_eq!(blocked_action_from_feedback("Still working"), None);
+    }
+
+    #[test]
+    fn distinguishes_validation_handoffs_from_real_human_blockers() {
+        assert!(is_validation_only_blocker(
+            "Provide npm registry/network access so dependencies can install, then run npm test, npm run build, and visual inspection."
+        ));
+        assert!(!is_validation_only_blocker(
+            "Provide the production credential and approve access."
+        ));
+        assert!(!is_validation_only_blocker(
+            "Provide network access to implement the external API integration."
+        ));
+    }
+
+    #[test]
+    fn retries_only_recognized_transient_gate_failures() {
+        assert!(is_transient_gate_failure(
+            "npm error code EAI_AGAIN gateway.docker.internal"
+        ));
+        assert!(is_transient_gate_failure(
+            "curl: could not resolve host: registry.npmjs.org"
+        ));
+        assert!(!is_transient_gate_failure(
+            "FAIL src/theme.test.ts expected dark but received light"
+        ));
     }
 }

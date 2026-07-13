@@ -17,7 +17,9 @@ Work carefully and finish the implementation. Inspect the repository before edit
 
 Send concise progress updates at meaningful milestones while you work. The runner publishes each agent update as a separate RustGrid ticket comment, so make every update useful to a human reviewer and do not repeat yourself.
 
-If you cannot continue without a human decision, missing credential, unavailable external system, or permission change, stop safely instead of guessing. End your final update with exactly:
+The runner, not Codex, owns final validation and publication. Attempt repository-requested dependency installation, tests, builds, linting, typechecking, dev-server startup, screenshots, or visual inspection when useful, and report exact failures. However, inability to perform those validation activities because of transient network, registry, dependency, tool, browser, or dev-server availability is not by itself a human blocker. If the requested code implementation is complete, finish with `RUSTGRID_AGENT_STATUS: COMPLETED`; the runner will independently execute every required quality gate below and will prevent publication if validation still fails.
+
+Use `BLOCKED` only when the code implementation itself cannot continue without a human decision, missing credential, required permission change, or required external-system state change. End your final update with exactly:
 RUSTGRID_AGENT_STATUS: BLOCKED
 HUMAN_ACTION_REQUIRED: <the specific action a human must take>
 
@@ -121,6 +123,9 @@ mod tests {
             "severity",
             "one failed",
             "Use small modules.",
+            "transient network",
+            "RUSTGRID_AGENT_STATUS: COMPLETED",
+            "runner will independently execute every required quality gate",
         ] {
             assert!(value.contains(expected));
         }
