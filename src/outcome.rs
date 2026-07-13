@@ -78,4 +78,15 @@ mod tests {
             RunOutcome::Blocked(_)
         ));
     }
+
+    #[test]
+    fn resolves_gateway_outages_as_retryable_failures() {
+        let result = Err(anyhow::anyhow!(
+            "RustGrid github-token returned 504 Gateway Timeout"
+        ));
+        assert!(matches!(
+            RunOutcome::resolve(result, false, false, true, 30),
+            RunOutcome::Failed(_)
+        ));
+    }
 }

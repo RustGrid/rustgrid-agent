@@ -40,8 +40,12 @@ pub(crate) fn finalize(
             reporter.fail(&error)?;
             Err(error)
         }
-        RunOutcome::Blocked(error) | RunOutcome::Failed(error) => {
+        RunOutcome::Blocked(error) => {
             reporter.fail(&error)?;
+            Err(error)
+        }
+        RunOutcome::Failed(error) => {
+            reporter.fail_retryable(&error)?;
             Err(error)
         }
     }

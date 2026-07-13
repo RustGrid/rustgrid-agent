@@ -90,6 +90,56 @@ fn server(response_body: serde_json::Value) -> Option<(String, mpsc::Receiver<St
     Some((format!("http://{address}"), receiver))
 }
 
+fn retrying_server(
+    response_body: serde_json::Value,
+) -> Option<(String, mpsc::Receiver<Vec<String>>)> {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("could not bind retry contract-test server: {error}"),
+    };
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if String::from_utf8_lossy(&bytes).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            requests.push(String::from_utf8_lossy(&bytes).into_owned());
+            if attempt == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            } else {
+                let body = response_body.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        }
+        sender.send(requests).unwrap();
+    });
+    Some((format!("http://{address}"), receiver))
+}
+
+fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
 #[test]
 fn retrieves_the_run_manifest_contract() {
     let Some((url, request)) = server(json!({
@@ -178,6 +228,27 @@ fn issues_a_bodyless_github_token_request() {
     let request = request.recv().unwrap();
     assert!(request.starts_with("POST /agent-runs/run-1/github-token HTTP/1.1"));
     assert!(!request.to_ascii_lowercase().contains("content-length:"));
+}
+
+#[test]
+fn retries_github_token_gateway_timeouts_with_one_idempotency_key() {
+    let Some((url, requests)) = retrying_server(json!({
+        "token": "ghs_secret", "expires_at": "2026-07-11T12:00:00Z",
+        "repository": "RustGrid/example", "permissions": {"contents": "write"}
+    })) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .issue_github_token("run-1")
+        .unwrap();
+    let requests = requests.recv().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        header_value(&requests[1], "idempotency-key")
+    );
+    assert!(header_value(&requests[0], "idempotency-key").is_some());
 }
 
 #[test]

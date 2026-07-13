@@ -320,6 +320,35 @@ impl<'a> Reporter<'a> {
         Ok(())
     }
 
+    pub(crate) fn fail_retryable(&self, error: &anyhow::Error) -> Result<()> {
+        let message = format!("{error:#}");
+        if let Err(journal_error) = self.record_error(&message) {
+            eprintln!("[warning] could not retain failure diagnostic: {journal_error:#}");
+        }
+        self.set_phase(RunPhase::Failed);
+        let step_result = self.step("run_failed", StepStatus::Failed, &message, None);
+        let comment_result = self.api.create_comment(
+            self.ticket_id,
+            &format!(
+                "⚠️ **RustGrid Agent run failed**\n\n{message}\n\nThis was classified as a temporary or internal failure. The ticket has been returned to todo and can be retried."
+            ),
+            &format!("agent-comment-{}-failed", self.run_id),
+        );
+        let ticket_result = self.set_ticket_status(TicketStatus::Todo);
+        let update_result = self.update_run(AgentRunStatus::Failed, Some(&message));
+        for (context, result) in [
+            ("report failed step", step_result),
+            ("mark RustGrid run failed", update_result),
+            ("append retryable failure comment", comment_result),
+            ("return ticket to todo", ticket_result),
+        ] {
+            if let Err(error) = result {
+                eprintln!("[warning] could not {context}: {error:#}");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn cancel(&self) -> Result<()> {
         self.record_error("cancelled by operator")?;
         self.set_phase(RunPhase::Cancelled);

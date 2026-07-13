@@ -30,6 +30,7 @@ use crate::{
         WorkflowRequirements, print_summary, pull_request_body, wait_for_required_workflows,
     },
     reporting::{Reporter, console_event},
+    run_error::{RunErrorKind, classify},
     shutdown,
     supervisor::{RunSupervisor, RunSupervisorConfig},
     token::GitHubTokenManager,
@@ -127,7 +128,12 @@ fn execute_claimed(
     let (manifest, execution_policy) = match manifest_and_policy {
         Ok(value) => value,
         Err(error) => {
-            reporter.fail(&error)?;
+            match classify(&error) {
+                RunErrorKind::Transient | RunErrorKind::Invariant => {
+                    reporter.fail_retryable(&error)?;
+                }
+                _ => reporter.fail(&error)?,
+            }
             return Err(error);
         }
     };

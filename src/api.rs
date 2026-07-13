@@ -69,6 +69,25 @@ remote_string_enum!(QualityGateStatus {
 
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
+const STANDARD_RETRY_POLICY: RetryPolicy = RetryPolicy::new(3, 250, 30_000);
+const GITHUB_TOKEN_RETRY_POLICY: RetryPolicy = RetryPolicy::new(8, 1_000, 30_000);
+
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    max_attempts: u32,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+}
+
+impl RetryPolicy {
+    const fn new(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {
+        Self {
+            max_attempts,
+            base_delay_ms,
+            max_delay_ms,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RustGridClient {
@@ -297,13 +316,18 @@ impl RustGridClient {
     }
 
     pub fn issue_github_token(&self, run_id: &str) -> Result<GitHubAccessToken> {
-        let token: GitHubAccessToken = self.send_json(
-            Method::POST,
-            &format!("{RUNS}/{run_id}/github-token"),
-            None,
-            Some(&format!("github-token-{run_id}-{}", Uuid::new_v4())),
+        let path = format!("{RUNS}/{run_id}/github-token");
+        let idempotency_key = format!("github-token-{run_id}-{}", Uuid::new_v4());
+        let token: GitHubAccessToken = deserialize_envelope(
+            self.send_value_with_policy(
+                Method::POST,
+                &path,
+                None,
+                Some(&idempotency_key),
+                None,
+                GITHUB_TOKEN_RETRY_POLICY,
+            )?,
             &[],
-            None,
         )?;
         if token.token.trim().is_empty()
             || token.expires_at.trim().is_empty()
@@ -607,7 +631,27 @@ impl RustGridClient {
         idempotency: Option<&str>,
         if_match: Option<&str>,
     ) -> std::result::Result<Value, HttpFailure> {
-        self.send_value_with_etag(method, path, body, idempotency, if_match)
+        self.send_value_with_etag_policy(
+            method,
+            path,
+            body,
+            idempotency,
+            if_match,
+            STANDARD_RETRY_POLICY,
+        )
+        .map(|(value, _)| value)
+    }
+
+    fn send_value_with_policy(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        idempotency: Option<&str>,
+        if_match: Option<&str>,
+        retry_policy: RetryPolicy,
+    ) -> std::result::Result<Value, HttpFailure> {
+        self.send_value_with_etag_policy(method, path, body, idempotency, if_match, retry_policy)
             .map(|(value, _)| value)
     }
 
@@ -619,8 +663,27 @@ impl RustGridClient {
         idempotency: Option<&str>,
         if_match: Option<&str>,
     ) -> std::result::Result<(Value, Option<String>), HttpFailure> {
+        self.send_value_with_etag_policy(
+            method,
+            path,
+            body,
+            idempotency,
+            if_match,
+            STANDARD_RETRY_POLICY,
+        )
+    }
+
+    fn send_value_with_etag_policy(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        idempotency: Option<&str>,
+        if_match: Option<&str>,
+        retry_policy: RetryPolicy,
+    ) -> std::result::Result<(Value, Option<String>), HttpFailure> {
         let retry_safe = method == Method::GET || idempotency.is_some();
-        for attempt in 0..3u32 {
+        for attempt in 0..retry_policy.max_attempts {
             let mut request = self.request(method.clone(), path);
             if let Some(body) = body.as_ref() {
                 request = request.json(body);
@@ -633,9 +696,15 @@ impl RustGridClient {
             }
             let response = match request.send() {
                 Ok(response) => response,
-                Err(error) if retry_safe && attempt < 2 => {
-                    retry_delay(attempt, self.session_id);
-                    eprintln!("[warning] retrying RustGrid {path} after transport error: {error}");
+                Err(error) if retry_safe && attempt + 1 < retry_policy.max_attempts => {
+                    let delay = retry_delay(attempt, self.session_id, retry_policy);
+                    eprintln!(
+                        "[warning] RustGrid {path} transport error; retrying attempt {} of {} in {}ms: {error}",
+                        attempt + 2,
+                        retry_policy.max_attempts,
+                        delay.as_millis()
+                    );
+                    std::thread::sleep(delay);
                     continue;
                 }
                 Err(error) => return Err(HttpFailure::transport(path, error)),
@@ -661,14 +730,22 @@ impl RustGridClient {
                 .map_err(|error| HttpFailure::transport(path, error))?;
             if !status.is_success() {
                 if retry_safe
-                    && attempt < 2
+                    && attempt + 1 < retry_policy.max_attempts
                     && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
                 {
-                    if let Some(seconds) = retry_after {
-                        std::thread::sleep(Duration::from_secs(seconds.min(30)));
+                    let delay = if let Some(seconds) = retry_after {
+                        Duration::from_secs(seconds)
+                            .min(Duration::from_millis(retry_policy.max_delay_ms))
                     } else {
-                        retry_delay(attempt, self.session_id);
-                    }
+                        retry_delay(attempt, self.session_id, retry_policy)
+                    };
+                    eprintln!(
+                        "[warning] RustGrid {path} returned {status}; retrying attempt {} of {} in {}ms",
+                        attempt + 2,
+                        retry_policy.max_attempts,
+                        delay.as_millis()
+                    );
+                    std::thread::sleep(delay);
                     continue;
                 }
                 return Err(HttpFailure {
@@ -726,10 +803,13 @@ pub fn is_conflict(error: &anyhow::Error) -> bool {
         .is_some_and(|failure| failure.status == StatusCode::CONFLICT)
 }
 
-fn retry_delay(attempt: u32, session_id: Uuid) {
-    let backoff_ms = 250u64.saturating_mul(1u64 << attempt.min(6));
+fn retry_delay(attempt: u32, session_id: Uuid, policy: RetryPolicy) -> Duration {
+    let backoff_ms = policy
+        .base_delay_ms
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(policy.max_delay_ms);
     let jitter_ms = (session_id.as_u128() % 101) as u64;
-    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
+    Duration::from_millis(backoff_ms.saturating_add(jitter_ms))
 }
 
 pub fn is_lease_lost(error: &anyhow::Error) -> bool {
@@ -897,5 +977,19 @@ mod tests {
         assert_eq!(truncate("abcdef", 5), "ab…");
         assert!(truncate("éééé", 7).len() <= 7);
         assert_eq!(truncate("abc", 2), "");
+    }
+
+    #[test]
+    fn github_token_retries_use_bounded_production_backoff() {
+        let session = Uuid::nil();
+        assert_eq!(
+            retry_delay(0, session, GITHUB_TOKEN_RETRY_POLICY),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            retry_delay(6, session, GITHUB_TOKEN_RETRY_POLICY),
+            Duration::from_secs(30)
+        );
+        assert_eq!(GITHUB_TOKEN_RETRY_POLICY.max_attempts, 8);
     }
 }
