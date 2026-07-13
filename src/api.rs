@@ -207,17 +207,15 @@ impl RustGridClient {
         })
     }
 
-    pub fn heartbeat(&self, worker_id: &str) -> Result<Worker> {
+    pub fn heartbeat(&self, worker_id: &str) -> Result<()> {
         self.heartbeat_with_status(worker_id, WorkerStatus::Online)
     }
 
-    pub fn heartbeat_with_status(&self, worker_id: &str, status: WorkerStatus) -> Result<Worker> {
-        self.send_json(
+    pub fn heartbeat_with_status(&self, worker_id: &str, status: WorkerStatus) -> Result<()> {
+        self.send_empty(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
             Some(json!({"status": status.as_str(), "max_concurrency": self.max_concurrency})),
-            None,
-            &[],
             None,
         )
     }

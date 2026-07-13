@@ -62,6 +62,13 @@ fn connect_worker(context: &AppContext, api: &RustGridClient) -> Result<Worker> 
         format!(
             "could not connect to announced worker {worker_id}; verify RUSTGRID_WORKER_ID and that RUSTGRID_WORKER_API_KEY is bound to it"
         )
+    })?;
+    Ok(Worker {
+        id: worker_id.to_owned(),
+        status: crate::api::RemoteWorkerStatus::Online,
+        max_concurrency: context.config.max_concurrency,
+        active_runs: 0,
+        available_slots: context.config.max_concurrency,
     })
 }
 
