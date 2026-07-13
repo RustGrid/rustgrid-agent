@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use rustgrid_agent::{
@@ -227,6 +228,37 @@ fn replays_the_durable_worker_queue_contract() {
             .unwrap()
             .starts_with("GET /agent-workers/worker-1/queue?after_sequence=3&limit=500 HTTP/1.1")
     );
+}
+
+#[test]
+fn queue_stream_keepalive_wakes_the_coordinator_without_an_error() {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("could not bind keepalive contract-test server: {error}"),
+    };
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        let body = ": keepalive\n\n";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let event = RustGridClient::new(&context(format!("http://{address}")))
+        .unwrap()
+        .wait_for_queue_event("worker-1", 0, Duration::from_secs(1))
+        .unwrap();
+
+    server.join().unwrap();
+    assert_eq!(event, None);
 }
 
 #[test]

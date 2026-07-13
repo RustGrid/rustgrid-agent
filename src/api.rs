@@ -327,6 +327,9 @@ impl RustGridClient {
                 Err(error) if is_idle_stream_timeout(&error) => return Ok(None),
                 Err(error) => return Err(error).context("failed to read agent queue stream"),
             };
+            if line.trim() == ": keepalive" {
+                return Ok(None);
+            }
             if let Some(value) = line.strip_prefix("id:") {
                 return value
                     .trim()
