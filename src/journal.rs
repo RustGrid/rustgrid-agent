@@ -115,6 +115,15 @@ impl RunJournal {
         self.persist()
     }
 
+    pub fn resume_active_run(&mut self) -> Result<()> {
+        if self.phase.is_terminal() {
+            self.phase = RunPhase::Claimed;
+            self.last_error = None;
+            self.persist()?;
+        }
+        Ok(())
+    }
+
     pub fn record_branch(&mut self, branch: &str) -> Result<()> {
         self.branch = Some(branch.to_owned());
         self.persist()
@@ -232,6 +241,21 @@ mod tests {
             journal.recovery_plan().unwrap(),
             RecoveryPlan::ResumeFromPullRequest { .. }
         ));
+    }
+
+    #[test]
+    fn active_recovery_reopens_a_terminal_local_phase_without_losing_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut journal = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        journal.checkpoint(RunPhase::Cancelled, 17).unwrap();
+        journal.record_commit("abc123").unwrap();
+
+        journal.resume_active_run().unwrap();
+
+        assert_eq!(journal.phase, RunPhase::Claimed);
+        assert_eq!(journal.last_sequence, 17);
+        assert_eq!(journal.commit.as_deref(), Some("abc123"));
     }
 
     #[test]

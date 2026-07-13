@@ -10,6 +10,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::AppContext;
@@ -557,6 +558,7 @@ impl RustGridClient {
     pub fn append_step(
         &self,
         run_id: &str,
+        client_sequence: u64,
         name: &str,
         status: StepStatus,
         message: &str,
@@ -574,7 +576,7 @@ impl RustGridClient {
                 "summary": truncate(message, 5000),
                 "metadata": metadata.unwrap_or_else(|| json!({}))
             })),
-            Some(&format!("step-{run_id}-{step_key}")),
+            Some(&format!("step-{run_id}-{client_sequence}")),
         )
     }
 
@@ -597,7 +599,7 @@ impl RustGridClient {
             Method::PATCH,
             &format!("{RUNS}/{run_id}"),
             Some(body),
-            Some(&format!("run-status-{run_id}-{status}")),
+            Some(&format!("run-status-{run_id}-{status}-{row_version}")),
             &[],
             Some(&format!("\"agent-runs:{run_id}:{row_version}\"")),
         )
@@ -612,31 +614,35 @@ impl RustGridClient {
         passed: bool,
         output: &str,
     ) -> Result<()> {
+        let body = json!({
+            "run_id": run_id,
+            "status": if passed { "passed" } else { "failed" },
+            "checks": [{"id": gate_id, "name": command, "status": if passed { "passed" } else { "failed" }, "summary": truncate(output, 16000)}],
+            "summary": truncate(if passed { "Local quality gate passed" } else { output }, 5000)
+        });
+        let fingerprint = payload_fingerprint(&body);
         self.send_empty(
             Method::POST,
             &format!("tickets/{ticket_id}/quality-gate-results"),
-            Some(json!({
-                "run_id": run_id,
-                "status": if passed { "passed" } else { "failed" },
-                "checks": [{"id": gate_id, "name": command, "status": if passed { "passed" } else { "failed" }, "summary": truncate(output, 16000)}],
-                "summary": truncate(if passed { "Local quality gate passed" } else { output }, 5000)
-            })),
-            Some(&format!("gate-{run_id}-{gate_id}")),
+            Some(body),
+            Some(&format!("gate-{run_id}-{fingerprint}")),
         )
     }
 
     pub fn attach_pr(&self, ticket_id: &str, run_id: &str, url: &str, number: u64) -> Result<()> {
+        let body = json!({
+            "kind": "github_pr",
+            "label": format!("GitHub PR #{number}"),
+            "url": url,
+            "external_id": number.to_string(),
+            "metadata": {"agent_run_id": run_id}
+        });
+        let fingerprint = payload_fingerprint(&body);
         self.send_empty(
             Method::POST,
             &format!("tickets/{ticket_id}/external-links"),
-            Some(json!({
-                "kind": "github_pr",
-                "label": format!("GitHub PR #{number}"),
-                "url": url,
-                "external_id": number.to_string(),
-                "metadata": {"agent_run_id": run_id}
-            })),
-            Some(&format!("pr-link-{run_id}")),
+            Some(body),
+            Some(&format!("pr-link-{run_id}-{fingerprint}")),
         )
     }
 
@@ -904,6 +910,11 @@ fn deserialize_envelope<T: DeserializeOwned>(mut value: Value, keys: &[&str]) ->
         }
     }
     serde_json::from_value(value).context("RustGrid response did not match the expected schema")
+}
+
+fn payload_fingerprint(value: &Value) -> String {
+    let digest = hex::encode(Sha256::digest(value.to_string().as_bytes()));
+    digest[..16].to_owned()
 }
 
 fn truncate(value: &str, max: usize) -> String {

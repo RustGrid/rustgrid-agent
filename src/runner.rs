@@ -108,7 +108,8 @@ fn execute_claimed(
 ) -> Result<RunSummary> {
     let row_version = Arc::new(AtomicI64::new(run.row_version));
     let journal_path = RunWorkspace::journal_path(&context.workspace_root, &run.id)?;
-    let journal = RunJournal::create(&journal_path, &run.id, &ticket.id)?;
+    let mut journal = RunJournal::create(&journal_path, &run.id, &ticket.id)?;
+    journal.resume_active_run()?;
     let reporter = Reporter::new(
         api,
         &run.id,

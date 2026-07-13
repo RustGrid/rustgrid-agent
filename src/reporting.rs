@@ -158,7 +158,14 @@ impl<'a> Reporter<'a> {
         }
         self.publish_event("progress", &event)?;
         self.api
-            .append_step(self.run_id, name, status, message, Some(event.metadata()))
+            .append_step(
+                self.run_id,
+                sequence,
+                name,
+                status,
+                message,
+                Some(event.metadata()),
+            )
             .with_context(|| format!("could not report step {name} to RustGrid"))
     }
 
@@ -228,11 +235,16 @@ impl<'a> Reporter<'a> {
             .fetch_ticket(self.ticket_id)
             .context("could not refresh ticket ETag before status update")?;
         self.ticket_row_version.set(fresh.row_version);
+        let row_version = self.ticket_row_version.get();
         let version = self.api.update_ticket_status(
             self.ticket_id,
-            self.ticket_row_version.get(),
+            row_version,
             status,
-            &format!("ticket-status-{}-{}", self.run_id, status.as_str()),
+            &format!(
+                "ticket-status-{}-{}-{row_version}",
+                self.run_id,
+                status.as_str()
+            ),
         )?;
         self.ticket_row_version.set(version);
         console_event(
