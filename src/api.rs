@@ -207,32 +207,17 @@ impl RustGridClient {
         })
     }
 
-    pub fn register(&self) -> Result<Worker> {
-        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "local-worker".into());
-        self.send_json(
-            Method::POST,
-            &format!("{WORKERS}/register"),
-            Some(json!({
-                "name": hostname,
-                "kind": "codex",
-                "capabilities": ["codex", "git", "github"],
-                "status": "online"
-            })),
-            Some(&format!("rustgrid-agent-worker-{hostname}")),
-            &[],
-            None,
-        )
-    }
-
-    pub fn heartbeat(&self, worker_id: &str) -> Result<()> {
+    pub fn heartbeat(&self, worker_id: &str) -> Result<Worker> {
         self.heartbeat_with_status(worker_id, WorkerStatus::Online)
     }
 
-    pub fn heartbeat_with_status(&self, worker_id: &str, status: WorkerStatus) -> Result<()> {
-        self.send_empty(
+    pub fn heartbeat_with_status(&self, worker_id: &str, status: WorkerStatus) -> Result<Worker> {
+        self.send_json(
             Method::POST,
             &format!("{WORKERS}/{worker_id}/heartbeat"),
             Some(json!({"status": status.as_str(), "max_concurrency": self.max_concurrency})),
+            None,
+            &[],
             None,
         )
     }

@@ -119,9 +119,12 @@ Export credentials in the shell or inject them through the process manager that 
 
 ```sh
 export RUSTGRID_WORKER_API_KEY=rgk_...
+export RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
 ```
 
-Only a credential bound to the registered worker is accepted. Administrative
+Announce the worker and create its credential in the RustGrid control plane
+before starting the process. `RUSTGRID_WORKER_ID` is the announced worker UUID,
+and only a credential bound to that exact worker is accepted. Administrative
 and bootstrap credentials must remain outside the long-running worker.
 
 The production RustGrid API URL is used by default. Set `RUSTGRID_API_URL` only when targeting a different deployment:
@@ -139,7 +142,7 @@ rustgrid-agent status
 rustgrid-agent register
 ```
 
-`status` validates the configuration and command strings, locates the repository, reports whether the credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` registers the machine as a RustGrid worker and sends an initial heartbeat.
+`status` validates the configuration and command strings, locates the repository, reports whether the worker identity and credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` is a compatibility command that connects to the pre-announced worker and sends an initial heartbeat; it does not create a worker record.
 
 Use `rustgrid-agent status --json` for machine-readable readiness data. It exits
 non-zero unless credentials exist, the configured Docker Sandbox executor is
@@ -211,6 +214,7 @@ Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridd
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `RUSTGRID_WORKER_API_KEY` | Yes | Credential bound to the registered worker identity. |
+| `RUSTGRID_WORKER_ID` | Yes | UUID of the pre-announced worker bound to the credential. |
 | `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
 
@@ -275,7 +279,10 @@ For HTTPS remotes, the token is passed to the child `git push` process through t
 rustgrid-agent register
 ```
 
-Registers the current machine as a worker and immediately heartbeats it. Use this to verify RustGrid connectivity before starting a run.
+Connects the current machine to its pre-announced worker and immediately
+heartbeats it. The command fails if `RUSTGRID_WORKER_ID` does not match the
+worker bound to `RUSTGRID_WORKER_API_KEY`. Use it to verify connectivity before
+starting a run.
 
 ### `status`
 

@@ -200,6 +200,7 @@ mod tests {
             config_path: PathBuf::from("test.json"),
             api_url: format!("http://{address}"),
             api_key: Some("test-key".into()),
+            worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
             workspace_root: PathBuf::from("/tmp/rustgrid-agent-supervisor-test"),
         };
         let execution = Arc::new(AtomicBool::new(true));

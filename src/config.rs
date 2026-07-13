@@ -125,6 +125,7 @@ pub struct AppContext {
     pub config_path: PathBuf,
     pub api_url: String,
     pub api_key: Option<String>,
+    pub worker_id: Option<String>,
     pub workspace_root: PathBuf,
 }
 
@@ -231,11 +232,16 @@ impl AppContext {
                 .join("rustgrid-agent")
                 .join("workspaces")
         });
+        let worker_id = nonempty_env("RUSTGRID_WORKER_ID");
+        if let Some(worker_id) = worker_id.as_deref() {
+            uuid::Uuid::parse_str(worker_id).context("RUSTGRID_WORKER_ID must be a valid UUID")?;
+        }
         Ok(Self {
             config,
             config_path: path.to_path_buf(),
             api_url: env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into()),
             api_key: nonempty_env("RUSTGRID_WORKER_API_KEY"),
+            worker_id,
             workspace_root,
         })
     }
@@ -244,6 +250,12 @@ impl AppContext {
         self.api_key
             .as_deref()
             .context("RUSTGRID_WORKER_API_KEY is required")
+    }
+
+    pub fn require_worker_id(&self) -> Result<&str> {
+        self.worker_id
+            .as_deref()
+            .context("RUSTGRID_WORKER_ID is required")
     }
 
     pub fn project_value(&self) -> (&'static str, &str) {

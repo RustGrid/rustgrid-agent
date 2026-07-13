@@ -24,11 +24,13 @@ The example systemd unit is in
 
 ```text
 RUSTGRID_WORKER_API_KEY=rgk_...
+RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
 RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
 ```
 
 Long-running workers must use `RUSTGRID_WORKER_API_KEY` with a credential
-bound to their registered worker identity. It is required for leased run events, manifests, and
+bound to the exact pre-announced identity in `RUSTGRID_WORKER_ID`. Startup
+heartbeats that worker and fails closed when the binding does not match. The credential is required for leased run events, manifests, and
 run-scoped GitHub token issuance.
 
 The configuration file should set `workspace_root` to durable local storage.

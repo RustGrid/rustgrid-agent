@@ -56,6 +56,11 @@ a sandbox policy it cannot enforce.
 
 ## Queue and capacity
 
+The control plane announces the worker and issues its bound credential before
+the process starts. The process receives both the worker UUID and credential,
+then proves the binding by heartbeating that UUID. It never registers a new
+worker using its runtime credential.
+
 The heartbeat advertises `max_concurrency`. The worker resumes
 `GET /agent-workers/{worker_id}/queue/stream` with `Last-Event-ID`, replays gaps
 through `GET /agent-workers/{worker_id}/queue`, and reconciles only active runs

@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Register this machine as a RustGrid worker.
+    /// Connect this machine to its pre-announced RustGrid worker.
     Register,
     /// Run one RustGrid ticket in the current Git repository.
     Run { ticket_id: String },

@@ -15,6 +15,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .api_key
         .as_deref()
         .is_some_and(|key| !key.trim().is_empty());
+    let worker_id_present = context.worker_id.is_some();
     let per_run_isolation = context.config.executor.is_isolated();
     let production_config = context
         .config
@@ -33,10 +34,15 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .err()
         .map(|error| format!("{error:#}"));
     let production_safe_concurrency = per_run_isolation || context.config.max_concurrency == 1;
-    let remote_check = if api_key_present {
-        RustGridClient::new(context).and_then(|api| api.resolve_project_id(context).map(|_| ()))
+    let remote_check = if api_key_present && worker_id_present {
+        RustGridClient::new(context).and_then(|api| {
+            api.heartbeat(context.require_worker_id()?)?;
+            api.resolve_project_id(context).map(|_| ())
+        })
     } else {
-        Err(anyhow::anyhow!("RustGrid API key is missing"))
+        Err(anyhow::anyhow!(
+            "RUSTGRID_WORKER_API_KEY and RUSTGRID_WORKER_ID are required"
+        ))
     };
     let rustgrid_reachable = remote_check.is_ok();
     let remote_error = remote_check
@@ -44,6 +50,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         .err()
         .map(|error| format!("{error:#}"));
     let healthy = api_key_present
+        && worker_id_present
         && per_run_isolation
         && executor_ready
         && production_config_ready
@@ -63,6 +70,8 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
                 "max_concurrency": context.config.max_concurrency,
                 "lease_seconds": context.config.lease_seconds,
                 "api_key_present": api_key_present,
+                "worker_id": context.worker_id,
+                "worker_id_present": worker_id_present,
                 "per_run_isolation": per_run_isolation,
                 "executor": context.config.executor.kind(),
                 "executor_ready": executor_ready,
@@ -104,6 +113,10 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         context.config.heartbeat_interval_seconds
     );
     println!("  Run lease:    {}s", context.config.lease_seconds);
+    println!(
+        "  Worker ID:    {}",
+        context.worker_id.as_deref().unwrap_or("missing")
+    );
     println!(
         "  API key:      {}",
         if context.api_key.is_some() {
@@ -147,8 +160,8 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
             format!("dirty ({} path(s))", dirty.len())
         }
     );
-    if context.api_key.is_none() {
-        bail!("status checks failed: required credentials are missing");
+    if context.api_key.is_none() || context.worker_id.is_none() {
+        bail!("status checks failed: worker identity or credentials are missing");
     }
     if !per_run_isolation {
         bail!("status checks failed: executor.kind=docker_sandbox is required for production");

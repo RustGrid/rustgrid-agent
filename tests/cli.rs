@@ -37,21 +37,26 @@ fn status_can_emit_machine_readable_health() {
     };
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request).unwrap();
-        let body = r#"{"id":"project-1"}"#;
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
+        for body in [
+            r#"{"id":"00000000-0000-4000-8000-000000000001","status":"online"}"#,
+            r#"{"id":"project-1"}"#,
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
     });
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_WORKER_API_KEY", "test-key")
+        .env("RUSTGRID_WORKER_ID", "00000000-0000-4000-8000-000000000001")
         .env("RUSTGRID_API_URL", format!("http://{address}"))
         .args(["--config", config.to_str().unwrap(), "status", "--json"])
         .output()

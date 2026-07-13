@@ -37,12 +37,11 @@ use crate::{
 };
 
 pub fn register(context: &AppContext) -> Result<()> {
-    console_event("starting", "Registering RustGrid worker", "36");
+    console_event("starting", "Connecting to announced RustGrid worker", "36");
     let api = RustGridClient::new(context)?;
-    let worker = api.register()?;
-    api.heartbeat(&worker.id)?;
+    let worker = connect_worker(context, &api)?;
     println!(
-        "[ complete] Worker {} is registered and healthy ({})",
+        "[ complete] Worker {} is connected and healthy ({})",
         worker.id,
         worker.status.as_str()
     );
@@ -52,10 +51,18 @@ pub fn register(context: &AppContext) -> Result<()> {
 pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
     sweep_workspaces(context, &HashSet::new())?;
     let api = RustGridClient::new(context)?;
-    console_event("starting", "Registering worker", "36");
-    let worker = api.register()?;
-    api.heartbeat(&worker.id)?;
+    console_event("starting", "Connecting to announced worker", "36");
+    let worker = connect_worker(context, &api)?;
     run_ticket_with_worker(context, &api, &worker, ticket_id)
+}
+
+fn connect_worker(context: &AppContext, api: &RustGridClient) -> Result<Worker> {
+    let worker_id = context.require_worker_id()?;
+    api.heartbeat(worker_id).with_context(|| {
+        format!(
+            "could not connect to announced worker {worker_id}; verify RUSTGRID_WORKER_ID and that RUSTGRID_WORKER_API_KEY is bound to it"
+        )
+    })
 }
 
 fn run_ticket_with_worker(
@@ -484,7 +491,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         );
     }
     let api = RustGridClient::new(context)?;
-    let worker = api.register()?;
+    let worker = connect_worker(context, &api)?;
     let project_id = api.resolve_project_id(context)?;
     println!(
         "[ watching] Worker {} is streaming RustGrid queue events with capacity {}",
