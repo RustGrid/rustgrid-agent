@@ -38,6 +38,7 @@ pub struct StreamingCommand<'a> {
     pub running: &'a AtomicBool,
     pub timeout: Duration,
     pub idle_timeout: Option<Duration>,
+    pub output_is_activity: Option<fn(&str) -> bool>,
     pub max_output_bytes: usize,
     pub environment_allowlist: Option<&'a [String]>,
     pub limits: Option<ChildLimits>,
@@ -326,6 +327,7 @@ where
             running,
             timeout,
             idle_timeout: None,
+            output_is_activity: None,
             max_output_bytes,
             environment_allowlist: None,
             limits: None,
@@ -345,6 +347,7 @@ where
         running,
         timeout,
         idle_timeout,
+        output_is_activity,
         max_output_bytes,
         environment_allowlist,
         limits,
@@ -425,7 +428,9 @@ where
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(StreamMessage::Line(line)) => {
-                last_activity = std::time::Instant::now();
+                if output_is_activity.is_none_or(|filter| filter(&line)) {
+                    last_activity = std::time::Instant::now();
+                }
                 if let Err(error) = on_line(&line) {
                     terminate_process_tree(&mut child);
                     let _ = child.wait();
@@ -792,6 +797,7 @@ mod tests {
                 running: &running,
                 timeout: Duration::from_secs(5),
                 idle_timeout: Some(Duration::from_millis(100)),
+                output_is_activity: None,
                 max_output_bytes: 1024 * 1024,
                 environment_allowlist: None,
                 limits: None,

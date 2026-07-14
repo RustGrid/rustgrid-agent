@@ -59,7 +59,10 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         "codex",
         StepStatus::Running,
         "Running Codex in the configured executor",
-        None,
+        Some(json!({
+            "idle_timeout_seconds": policy.codex_idle_timeout().as_secs(),
+            "max_idle_attempts": CODEX_IDLE_ATTEMPTS
+        })),
     )?;
     let blocked_action = RefCell::new(None);
     let codex_args = policy.codex_args();
@@ -74,6 +77,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                 running,
                 timeout: Duration::from_secs(policy.timeout_seconds),
                 idle_timeout: Some(policy.codex_idle_timeout()),
+                output_is_activity: Some(codex_output_is_meaningful_activity),
                 max_output_bytes: context.config.max_command_output_bytes as usize,
                 environment_allowlist: &policy.codex.environment_allowlist,
                 limits: Some(child_limits(
@@ -163,6 +167,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                     running,
                     timeout: Duration::from_secs(gate_policy.timeout_seconds),
                     idle_timeout: None,
+                    output_is_activity: None,
                     max_output_bytes: context.config.max_command_output_bytes as usize,
                     environment_allowlist: &policy.codex.environment_allowlist,
                     limits: Some(child_limits(
@@ -265,6 +270,26 @@ fn combine_output(stdout: &str, stderr: &str) -> String {
         (false, true) => stdout.to_owned(),
         (true, false) => stderr.to_owned(),
         (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn codex_output_is_meaningful_activity(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return true;
+    };
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("item.started" | "item.updated" | "item.completed") => {
+            event
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("reasoning")
+        }
+        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed" | "error") => {
+            true
+        }
+        Some(_) => false,
+        None => true,
     }
 }
 
@@ -393,6 +418,22 @@ mod tests {
         );
         let command = r#"{"type":"item.completed","item":{"id":"2","type":"command_execution","command":"cargo test"}}"#;
         assert_eq!(feedback_from_output_line(command), None);
+    }
+
+    #[test]
+    fn reasoning_protocol_frames_do_not_mask_codex_inactivity() {
+        assert!(!codex_output_is_meaningful_activity(
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#
+        ));
+        assert!(codex_output_is_meaningful_activity(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"working"}}"#
+        ));
+        assert!(codex_output_is_meaningful_activity(
+            r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#
+        ));
+        assert!(!codex_output_is_meaningful_activity(
+            r#"{"type":"response.keepalive"}"#
+        ));
     }
 
     #[test]
