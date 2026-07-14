@@ -57,6 +57,7 @@ pub(crate) struct RunCommand<'a> {
     pub stdin_text: Option<&'a str>,
     pub running: &'a AtomicBool,
     pub timeout: Duration,
+    pub idle_timeout: Option<Duration>,
     pub max_output_bytes: usize,
     pub environment_allowlist: &'a [String],
     pub limits: Option<command::ChildLimits>,
@@ -371,6 +372,7 @@ impl Executor {
                 stdin_text: request.stdin_text,
                 running: request.running,
                 timeout: request.timeout,
+                idle_timeout: request.idle_timeout,
                 max_output_bytes: request.max_output_bytes,
                 environment_allowlist: matches!(self, Self::Local)
                     .then_some(request.environment_allowlist),

@@ -58,6 +58,8 @@ pub struct ExecutionPolicy {
 pub struct CodexPolicy {
     pub command: Vec<String>,
     pub environment_allowlist: Vec<String>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +79,14 @@ pub struct SandboxPolicy {
 }
 
 impl ExecutionPolicy {
+    pub fn codex_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.codex
+                .idle_timeout_seconds
+                .unwrap_or(self.timeout_seconds.min(600)),
+        )
+    }
+
     pub fn requires_npm_registry(&self) -> bool {
         self.quality_gates.iter().any(|gate| {
             gate.command.split_whitespace().any(|token| {
@@ -242,6 +252,10 @@ impl ExecutionPolicy {
                     || lower.contains("approval_policy")
                     || lower.contains("sandbox_mode")
             })
+            || self
+                .codex
+                .idle_timeout_seconds
+                .is_some_and(|seconds| seconds == 0 || seconds > self.timeout_seconds)
             || self.quality_gates.iter().any(|gate| {
                 gate.id.trim().is_empty()
                     || gate.command.trim().is_empty()
@@ -385,6 +399,26 @@ mod tests {
 
         policy.quality_gates[0].command = "/usr/local/bin/pnpm test".into();
         assert!(policy.requires_npm_registry());
+    }
+
+    #[test]
+    fn codex_idle_timeout_is_bounded_by_the_signed_run_policy() {
+        let policy = manifest().policy().unwrap();
+        assert_eq!(
+            policy.codex_idle_timeout(),
+            std::time::Duration::from_secs(600)
+        );
+
+        let mut configured = manifest().policy().unwrap();
+        configured.codex.idle_timeout_seconds = Some(120);
+        assert_eq!(
+            configured.codex_idle_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+        assert!(configured.validate().is_ok());
+
+        configured.codex.idle_timeout_seconds = Some(configured.timeout_seconds + 1);
+        assert!(configured.validate().is_err());
     }
 
     #[test]

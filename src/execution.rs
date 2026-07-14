@@ -69,6 +69,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
             stdin_text: Some(generated_prompt),
             running,
             timeout: Duration::from_secs(policy.timeout_seconds),
+            idle_timeout: Some(policy.codex_idle_timeout()),
             max_output_bytes: context.config.max_command_output_bytes as usize,
             environment_allowlist: &policy.codex.environment_allowlist,
             limits: Some(child_limits(
@@ -130,6 +131,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                     stdin_text: None,
                     running,
                     timeout: Duration::from_secs(gate_policy.timeout_seconds),
+                    idle_timeout: None,
                     max_output_bytes: context.config.max_command_output_bytes as usize,
                     environment_allowlist: &policy.codex.environment_allowlist,
                     limits: Some(child_limits(

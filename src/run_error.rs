@@ -53,7 +53,9 @@ pub fn classify(error: &anyhow::Error) -> RunErrorKind {
     if let Some(failure) = error.downcast_ref::<CommandFailure>() {
         return match failure {
             CommandFailure::Cancelled => RunErrorKind::Cancelled,
-            CommandFailure::TimedOut { .. } => RunErrorKind::TimedOut,
+            CommandFailure::TimedOut { .. } | CommandFailure::IdleTimedOut { .. } => {
+                RunErrorKind::TimedOut
+            }
             CommandFailure::OutputLimit { .. } => RunErrorKind::PolicyViolation,
         };
     }

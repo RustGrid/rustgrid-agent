@@ -30,7 +30,8 @@ contains `/api/v1`.
     "policy_version": 1,
     "codex": {
       "command": ["codex", "exec", "--json"],
-      "environment_allowlist": ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"]
+      "environment_allowlist": ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"],
+      "idle_timeout_seconds": 600
     },
     "quality_gates": [
       {"id": "gate-1", "command": "cargo test", "timeout_seconds": 900, "required": true}

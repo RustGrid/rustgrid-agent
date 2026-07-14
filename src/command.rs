@@ -37,6 +37,7 @@ pub struct StreamingCommand<'a> {
     pub stdin_text: Option<&'a str>,
     pub running: &'a AtomicBool,
     pub timeout: Duration,
+    pub idle_timeout: Option<Duration>,
     pub max_output_bytes: usize,
     pub environment_allowlist: Option<&'a [String]>,
     pub limits: Option<ChildLimits>,
@@ -46,6 +47,7 @@ pub struct StreamingCommand<'a> {
 pub enum CommandFailure {
     Cancelled,
     TimedOut { seconds: u64 },
+    IdleTimedOut { seconds: u64 },
     OutputLimit { detail: String },
 }
 
@@ -55,6 +57,12 @@ impl std::fmt::Display for CommandFailure {
             Self::Cancelled => write!(formatter, "command cancelled"),
             Self::TimedOut { seconds } => {
                 write!(formatter, "command timed out after {seconds} seconds")
+            }
+            Self::IdleTimedOut { seconds } => {
+                write!(
+                    formatter,
+                    "command produced no output for {seconds} seconds"
+                )
             }
             Self::OutputLimit { detail } => formatter.write_str(detail),
         }
@@ -66,7 +74,12 @@ impl std::error::Error for CommandFailure {}
 pub fn is_timeout(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<CommandFailure>()
-        .is_some_and(|failure| matches!(failure, CommandFailure::TimedOut { .. }))
+        .is_some_and(|failure| {
+            matches!(
+                failure,
+                CommandFailure::TimedOut { .. } | CommandFailure::IdleTimedOut { .. }
+            )
+        })
 }
 
 pub fn parse(command: &str) -> Result<Vec<String>> {
@@ -306,6 +319,7 @@ where
             stdin_text,
             running,
             timeout,
+            idle_timeout: None,
             max_output_bytes,
             environment_allowlist: None,
             limits: None,
@@ -324,6 +338,7 @@ where
         stdin_text,
         running,
         timeout,
+        idle_timeout,
         max_output_bytes,
         environment_allowlist,
         limits,
@@ -370,6 +385,7 @@ where
     let reader = spawn_bounded_line_reader(stdout, stream_limit, 64 * 1024, sender);
     let stderr_reader = thread::spawn(move || read_bounded(&mut stderr, stream_limit));
     let started = std::time::Instant::now();
+    let mut last_activity = started;
     loop {
         if !running.load(Ordering::SeqCst) || shutdown::requested() {
             terminate_process_tree(&mut child);
@@ -390,8 +406,20 @@ where
             }
             .into());
         }
+        if idle_timeout.is_some_and(|limit| last_activity.elapsed() >= limit) {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+            drop(receiver);
+            let _ = reader.join();
+            let _ = stderr_reader.join();
+            return Err(CommandFailure::IdleTimedOut {
+                seconds: idle_timeout.unwrap_or_default().as_secs(),
+            }
+            .into());
+        }
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(StreamMessage::Line(line)) => {
+                last_activity = std::time::Instant::now();
                 if let Err(error) = on_line(&line) {
                     terminate_process_tree(&mut child);
                     let _ = child.wait();
@@ -402,6 +430,7 @@ where
                 }
             }
             Ok(StreamMessage::OversizedLine { bytes }) => {
+                last_activity = std::time::Instant::now();
                 eprintln!(
                     "[warning] omitted oversized command output line ({bytes} bytes); continuing stream"
                 );
@@ -737,6 +766,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_timeout(&error));
+    }
+
+    #[test]
+    fn streaming_commands_time_out_after_output_goes_idle() {
+        let running = AtomicBool::new(true);
+        let args = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'started\\n'; sleep 5".to_owned(),
+        ];
+        let started = std::time::Instant::now();
+        let error = streaming_args(
+            StreamingCommand {
+                args: &args,
+                cwd: Path::new("."),
+                stdin_text: None,
+                running: &running,
+                timeout: Duration::from_secs(5),
+                idle_timeout: Some(Duration::from_millis(100)),
+                max_output_bytes: 1024 * 1024,
+                environment_allowlist: None,
+                limits: None,
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(is_timeout(&error));
+        assert!(matches!(
+            error.downcast_ref::<CommandFailure>(),
+            Some(CommandFailure::IdleTimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

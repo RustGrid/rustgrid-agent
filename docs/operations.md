@@ -65,6 +65,11 @@ as defense against races and writes outside the polling interval.
 The worker also applies Unix child limits for address space, individual file
 size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.
+Codex additionally has an output-inactivity watchdog. The signed execution
+policy may set `codex.idle_timeout_seconds`; when omitted, the worker uses the
+smaller of 600 seconds and the total run timeout. Crossing that deadline kills
+the command process tree, stops and retains the sandbox, and reports a timed-out
+run so its workspace can be recovered by a later attempt.
 
 When the signed execution policy contains an npm-family quality gate, every
 newly created Docker Sandbox must pass an `npm ping` against the public registry
