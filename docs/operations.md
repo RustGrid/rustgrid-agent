@@ -39,8 +39,24 @@ interrupted workspaces are retained until `failed_workspace_retention_hours`.
 Their Docker Sandboxes are stopped without being removed and journaled as
 recoverable. If RustGrid retries the same run ID, the worker restarts that
 sandbox through `sbx exec` and preserves its installed dependencies and internal
-filesystem state. Successful runs destroy the sandbox only after the terminal
-RustGrid update succeeds.
+filesystem state. A new run can adopt the retained work from an earlier attempt
+when its execution manifest contains an explicit lineage marker:
+
+```json
+{
+  "run": {
+    "attempt": 2,
+    "metadata": { "resume_from_run_id": "<failed-run-uuid>" }
+  }
+}
+```
+
+The source must belong to the same ticket, be unsuccessful and terminal, and
+have a successfully retained executor. Adoption atomically transfers ownership
+of the workspace to the new run, reuses the stopped sandbox, preserves Git and
+publication checkpoints, and resets run-scoped event and step sequences. The
+worker never guesses a recovery source from ticket history. Successful runs
+destroy the sandbox only after the terminal RustGrid update succeeds.
 Set `max_workspace_bytes` below the host disk alert threshold and use an OS or
 host disk quota for enforcement while commands are actively writing.
 The worker also monitors workspace growth while sandbox commands run and stops

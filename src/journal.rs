@@ -47,6 +47,8 @@ pub struct RunJournal {
     pub last_error: Option<String>,
     #[serde(default)]
     pub executor: Option<ExecutorCheckpoint>,
+    #[serde(default)]
+    pub recovery_source_run_id: Option<String>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -103,6 +105,7 @@ impl RunJournal {
             progress_sequence: 0,
             last_error: None,
             executor: None,
+            recovery_source_run_id: None,
             path,
         };
         journal.persist()?;
@@ -122,6 +125,56 @@ impl RunJournal {
             self.persist()?;
         }
         Ok(())
+    }
+
+    pub fn adopt_recovery(
+        path: &Path,
+        run_id: &str,
+        ticket_id: &str,
+        source_run_id: &str,
+    ) -> Result<Self> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("could not read recovery journal {}", path.display()))?;
+        let mut journal: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid recovery journal {}", path.display()))?;
+        if journal.schema_version != 1 || journal.ticket_id != ticket_id {
+            anyhow::bail!("recovery journal identity does not match the retrying run");
+        }
+        if journal.run_id == run_id
+            && journal.recovery_source_run_id.as_deref() == Some(source_run_id)
+        {
+            journal.path = path.to_path_buf();
+            return Ok(journal);
+        }
+        if journal.run_id != source_run_id {
+            anyhow::bail!("recovery journal does not belong to the requested source run");
+        }
+        if !journal.phase.is_terminal() || journal.phase == RunPhase::Succeeded {
+            anyhow::bail!("recovery source run is not an unsuccessful terminal run");
+        }
+        if journal
+            .executor
+            .as_ref()
+            .is_none_or(|executor| executor.state != "retained")
+        {
+            anyhow::bail!("recovery source run has no successfully retained executor");
+        }
+        journal.run_id = run_id.to_owned();
+        journal.phase = RunPhase::Claimed;
+        journal.last_sequence = 0;
+        journal.progress_sequence = 0;
+        journal.last_error = None;
+        journal.recovery_source_run_id = Some(source_run_id.to_owned());
+        journal.path = path.to_path_buf();
+        journal.persist()?;
+        Ok(journal)
+    }
+
+    pub fn recoverable_executor_id(&self) -> Option<&str> {
+        self.executor
+            .as_ref()
+            .filter(|executor| executor.state != "destroyed")
+            .map(|executor| executor.id.as_str())
     }
 
     pub fn record_branch(&mut self, branch: &str) -> Result<()> {
@@ -256,6 +309,57 @@ mod tests {
         assert_eq!(journal.phase, RunPhase::Claimed);
         assert_eq!(journal.last_sequence, 17);
         assert_eq!(journal.commit.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn cross_attempt_adoption_resets_attempt_state_and_preserves_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut source = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        source.checkpoint(RunPhase::Failed, 17).unwrap();
+        source.record_progress_sequence(23).unwrap();
+        source.record_branch("agent/rg-1").unwrap();
+        source.record_commit("abc123").unwrap();
+        source
+            .record_executor(
+                "docker_sandbox",
+                "rustgrid-0123456789abcdef0123456789abcdef",
+                "retained",
+            )
+            .unwrap();
+
+        let adopted = RunJournal::adopt_recovery(&path, "run-2", "ticket-1", "run-1").unwrap();
+
+        assert_eq!(adopted.run_id, "run-2");
+        assert_eq!(adopted.recovery_source_run_id.as_deref(), Some("run-1"));
+        assert_eq!(adopted.phase, RunPhase::Claimed);
+        assert_eq!(adopted.last_sequence, 0);
+        assert_eq!(adopted.progress_sequence, 0);
+        assert_eq!(adopted.branch.as_deref(), Some("agent/rg-1"));
+        assert_eq!(adopted.commit.as_deref(), Some("abc123"));
+        assert_eq!(
+            adopted.recoverable_executor_id(),
+            Some("rustgrid-0123456789abcdef0123456789abcdef")
+        );
+        assert!(RunJournal::adopt_recovery(&path, "run-2", "ticket-1", "run-1").is_ok());
+    }
+
+    #[test]
+    fn cross_attempt_adoption_rejects_live_or_unretained_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.json");
+        let mut source = RunJournal::create(&path, "run-1", "ticket-1").unwrap();
+        source
+            .record_executor(
+                "docker_sandbox",
+                "rustgrid-0123456789abcdef0123456789abcdef",
+                "created",
+            )
+            .unwrap();
+        assert!(RunJournal::adopt_recovery(&path, "run-2", "ticket-1", "run-1").is_err());
+
+        source.checkpoint(RunPhase::Failed, 1).unwrap();
+        assert!(RunJournal::adopt_recovery(&path, "run-2", "ticket-1", "run-1").is_err());
     }
 
     #[test]

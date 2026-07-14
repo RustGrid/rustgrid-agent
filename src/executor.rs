@@ -64,6 +64,10 @@ pub(crate) struct RunCommand<'a> {
 }
 
 impl Executor {
+    pub(crate) fn sandbox_name_for_run(run_id: &str) -> String {
+        sandbox_name(run_id)
+    }
+
     pub(crate) fn from_config(config: &ExecutorConfig) -> Self {
         match config {
             ExecutorConfig::Local => Self::Local,
@@ -143,7 +147,7 @@ impl Executor {
 
     pub(crate) fn reconcile_orphans(
         &self,
-        active_run_ids: &HashSet<String>,
+        protected_sandbox_names: &HashSet<String>,
         cwd: &Path,
     ) -> Result<usize> {
         let Self::DockerSandbox { command, .. } = self else {
@@ -163,12 +167,8 @@ impl Executor {
         }
         let value: serde_json::Value =
             serde_json::from_str(&output.stdout).context("sbx ls --json returned invalid JSON")?;
-        let active_names = active_run_ids
-            .iter()
-            .map(|id| sandbox_name(id))
-            .collect::<HashSet<_>>();
         let mut removed = 0;
-        for name in orphan_sandbox_names(&value, &active_names) {
+        for name in orphan_sandbox_names(&value, protected_sandbox_names) {
             let cleanup = command::capture_with_env(
                 command,
                 ["rm", "--force", &name],
@@ -191,6 +191,7 @@ impl Executor {
         run_id: &str,
         workspace: &Path,
         probe_npm_registry: bool,
+        retained_sandbox_name: Option<&str>,
     ) -> Result<ExecutionHandle> {
         match self {
             Self::Local => Ok(ExecutionHandle::Local),
@@ -200,7 +201,10 @@ impl Executor {
                 cpus,
                 memory,
             } => {
-                let name = sandbox_name(run_id);
+                let name = retained_sandbox_name
+                    .map(validate_managed_sandbox_name)
+                    .transpose()?
+                    .map_or_else(|| sandbox_name(run_id), str::to_owned);
                 if sandbox_exists(command, &name, workspace)? {
                     console_event(
                         "recovery",
@@ -753,6 +757,15 @@ fn sandbox_name(run_id: &str) -> String {
     format!("rustgrid-{}", &digest[..32])
 }
 
+fn validate_managed_sandbox_name(name: &str) -> Result<&str> {
+    let digest = name
+        .strip_prefix("rustgrid-")
+        .filter(|digest| digest.len() == 32 && digest.chars().all(|c| c.is_ascii_hexdigit()))
+        .context("recovery journal contains an invalid managed sandbox name")?;
+    let _ = digest;
+    Ok(name)
+}
+
 fn sandbox_names(value: &serde_json::Value) -> Vec<String> {
     fn collect(value: &serde_json::Value, names: &mut Vec<String>) {
         match value {
@@ -809,6 +822,13 @@ mod tests {
         assert_eq!(sandbox_name("run/123?").len(), 41);
         assert_eq!(sandbox_name("run/123?"), sandbox_name("run/123?"));
         assert_ne!(sandbox_name("run/123?"), sandbox_name("run-123"));
+    }
+
+    #[test]
+    fn validates_recovery_sandbox_names_before_reuse() {
+        assert!(validate_managed_sandbox_name("rustgrid-0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_managed_sandbox_name("developer-box").is_err());
+        assert!(validate_managed_sandbox_name("rustgrid-../../escape").is_err());
     }
 
     #[test]

@@ -204,6 +204,11 @@ Unknown JSON fields and empty required values are rejected. Command strings supp
 
 Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridden locally; RustGrid snapshots them into each execution manifest.
 
+Retries can reuse retained work across distinct run IDs when RustGrid creates a
+later attempt with `metadata.resume_from_run_id` naming the unsuccessful source
+run. The worker validates and atomically adopts that explicit lineage; it never
+selects a previous run implicitly.
+
 ## Credentials
 
 | Variable | Required | Purpose |

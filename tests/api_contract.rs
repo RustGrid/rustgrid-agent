@@ -145,7 +145,10 @@ fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
 fn retrieves_the_run_manifest_contract() {
     let Some((url, request)) = server(json!({
         "manifest_version": 2,
-        "run": {"id": "run-1", "ticket_id": "ticket-1"},
+        "run": {
+            "id": "run-1", "ticket_id": "ticket-1", "attempt": 2,
+            "metadata": {"resume_from_run_id": "run-previous"}
+        },
         "project_id": "project-1", "project_key": "RG", "project_name": "RustGrid",
         "ticket_id": "ticket-1", "ticket_key": "RG-1", "ticket_title": "Task",
         "repository_id": 7, "repository": "RustGrid/example",
@@ -167,6 +170,7 @@ fn retrieves_the_run_manifest_contract() {
         .execution_manifest("run-1")
         .unwrap();
     assert_eq!(manifest.repository, "RustGrid/example");
+    assert_eq!(manifest.resume_from_run_id().unwrap(), Some("run-previous"));
     assert!(
         request
             .recv()

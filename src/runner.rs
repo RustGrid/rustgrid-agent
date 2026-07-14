@@ -108,7 +108,55 @@ fn execute_claimed(
 ) -> Result<RunSummary> {
     let row_version = Arc::new(AtomicI64::new(run.row_version));
     let journal_path = RunWorkspace::journal_path(&context.workspace_root, &run.id)?;
-    let mut journal = RunJournal::create(&journal_path, &run.id, &ticket.id)?;
+    let manifest_and_policy = (|| {
+        let manifest = api
+            .execution_manifest(&run.id)
+            .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
+        manifest.validate(&run.id, &ticket.id)?;
+        let policy = manifest.policy()?;
+        let recovery_source = manifest.resume_from_run_id()?.map(str::to_owned);
+        Ok::<_, anyhow::Error>((manifest, policy, recovery_source))
+    })();
+    let (manifest, execution_policy, recovery_source) = match manifest_and_policy {
+        Ok(value) => value,
+        Err(error) => {
+            report_preparation_failure(
+                api,
+                run,
+                ticket,
+                Arc::clone(&row_version),
+                &journal_path,
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+    let recovery = match recovery_source.as_deref() {
+        Some(source_run_id) => RunWorkspace::adopt_recovery(
+            &context.workspace_root,
+            &run.id,
+            &ticket.id,
+            source_run_id,
+        )
+        .map(|recovery| (recovery.journal, recovery.workspace_id)),
+        None => RunJournal::create(&journal_path, &run.id, &ticket.id)
+            .map(|journal| (journal, run.id.clone())),
+    };
+    let (mut journal, workspace_id) = match recovery {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            report_preparation_failure(
+                api,
+                run,
+                ticket,
+                Arc::clone(&row_version),
+                &journal_path,
+                &error,
+            )?;
+            return Err(error.context("could not adopt requested recovery work"));
+        }
+    };
+    let retained_executor_id = journal.recoverable_executor_id().map(str::to_owned);
     journal.resume_active_run()?;
     let reporter = Reporter::new(
         api,
@@ -118,29 +166,6 @@ fn execute_claimed(
         ticket.row_version,
         journal,
     );
-    let manifest_and_policy = (|| {
-        let manifest = api
-            .execution_manifest(&run.id)
-            .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
-        manifest.validate(&run.id, &ticket.id)?;
-        let policy = manifest.policy()?;
-        Ok::<_, anyhow::Error>((manifest, policy))
-    })();
-    let (manifest, execution_policy) = match manifest_and_policy {
-        Ok(value) => value,
-        Err(error) => {
-            match classify(&error) {
-                RunErrorKind::LeaseLost => {
-                    return Err(error.context("skipped stale terminal updates"));
-                }
-                RunErrorKind::Transient | RunErrorKind::Invariant => {
-                    reporter.fail_retryable(&error)?;
-                }
-                _ => reporter.fail(&error)?,
-            }
-            return Err(error);
-        }
-    };
 
     let supervisor = RunSupervisor::start(
         api.clone(),
@@ -169,8 +194,12 @@ fn execute_claimed(
             &manifest.required_permissions,
         );
         let clone_token = tokens.token()?;
-        let prepared =
-            RunWorkspace::prepare(&context.workspace_root, &run.id, &manifest, &clone_token)?;
+        let prepared = RunWorkspace::prepare(
+            &context.workspace_root,
+            &workspace_id,
+            &manifest,
+            &clone_token,
+        )?;
         let workspace_bytes = prepared.enforce_size_limit(context.config.max_workspace_bytes)?;
         let workspace_resumed = prepared.resumed();
         let repo = prepared.repo.clone();
@@ -184,7 +213,12 @@ fn execute_claimed(
             &run.id,
             &repo.root,
             execution_policy.requires_npm_registry(),
+            retained_executor_id.as_deref(),
         )?;
+        // Adopt the executor immediately after it is prepared. Everything below this
+        // point may fail (including local journaling and remote step reporting), and
+        // the outcome handler must still be able to retain the sandbox for recovery.
+        executor_handle.replace(Some(handle.clone()));
         if let Some(id) = handle.id() {
             reporter.record_executor(context.config.executor.kind(), id, "created")?;
             reporter.step(
@@ -194,7 +228,6 @@ fn execute_claimed(
                 Some(json!({"executor": context.config.executor.kind(), "sandbox_id": id})),
             )?;
         }
-        executor_handle.replace(Some(handle.clone()));
         let required_gates = execution_policy
             .quality_gates
             .iter()
@@ -226,8 +259,16 @@ fn execute_claimed(
         reporter.step(
             "workspace_prepared",
             StepStatus::Completed,
-            "Prepared isolated repository workspace",
-            Some(json!({"bytes": workspace_bytes, "resumed": workspace_resumed})),
+            if recovery_source.is_some() {
+                "Adopted retained repository workspace from the previous attempt"
+            } else {
+                "Prepared isolated repository workspace"
+            },
+            Some(json!({
+                "bytes": workspace_bytes,
+                "resumed": workspace_resumed,
+                "recovery_source_run_id": recovery_source
+            })),
         )?;
         execute(ExecutionContext {
             app: context,
@@ -332,6 +373,32 @@ fn execute_claimed(
         workspace.cleanup()?;
     }
     Ok(summary)
+}
+
+fn report_preparation_failure(
+    api: &RustGridClient,
+    run: &AgentRun,
+    ticket: &Ticket,
+    row_version: Arc<AtomicI64>,
+    journal_path: &std::path::Path,
+    error: &anyhow::Error,
+) -> Result<()> {
+    if classify(error) == RunErrorKind::LeaseLost {
+        return Err(anyhow::anyhow!("{error:#}").context("skipped stale terminal updates"));
+    }
+    let journal = RunJournal::create(journal_path, &run.id, &ticket.id)?;
+    let reporter = Reporter::new(
+        api,
+        &run.id,
+        row_version,
+        &ticket.id,
+        ticket.row_version,
+        journal,
+    );
+    match classify(error) {
+        RunErrorKind::Transient | RunErrorKind::Invariant => reporter.fail_retryable(error),
+        _ => reporter.fail(error),
+    }
 }
 
 struct ExecutionContext<'a> {
@@ -583,13 +650,16 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             .failed_workspace_retention_hours
             .saturating_mul(3600),
     );
-    let mut protected_sandbox_run_ids = active_run_ids.clone();
-    protected_sandbox_run_ids.extend(RunWorkspace::recoverable_run_ids(
+    let mut protected_sandbox_names = active_run_ids
+        .iter()
+        .map(|run_id| Executor::sandbox_name_for_run(run_id))
+        .collect::<HashSet<_>>();
+    protected_sandbox_names.extend(RunWorkspace::recoverable_sandbox_names(
         &context.workspace_root,
         retention,
     )?);
     let removed_orphans = Executor::from_config(&context.config.executor)
-        .reconcile_orphans(&protected_sandbox_run_ids, &context.workspace_root)?;
+        .reconcile_orphans(&protected_sandbox_names, &context.workspace_root)?;
     if removed_orphans > 0 {
         console_event(
             "cleanup",

@@ -35,6 +35,14 @@ pub struct ExecutionManifest {
 pub struct ManifestRun {
     pub id: String,
     pub ticket_id: String,
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+fn default_attempt() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,6 +97,23 @@ impl ExecutionPolicy {
 }
 
 impl ExecutionManifest {
+    pub fn resume_from_run_id(&self) -> Result<Option<&str>> {
+        let Some(value) = self.run.metadata.get("resume_from_run_id") else {
+            return Ok(None);
+        };
+        let source_run_id = value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .context("execution manifest metadata.resume_from_run_id must be a non-empty string")?;
+        if self.run.attempt <= 1 {
+            bail!("execution manifest cannot resume recovery work on the first attempt");
+        }
+        if source_run_id == self.run.id {
+            bail!("execution manifest cannot resume a run from itself");
+        }
+        Ok(Some(source_run_id))
+    }
+
     pub fn validate(&self, run_id: &str, ticket_id: &str) -> Result<()> {
         if self.manifest_version != 2 {
             bail!(
@@ -99,6 +124,10 @@ impl ExecutionManifest {
         if self.run.id != run_id || self.run.ticket_id != ticket_id || self.ticket_id != ticket_id {
             bail!("execution manifest identity does not match the claimed run");
         }
+        if self.run.attempt == 0 {
+            bail!("execution manifest run attempt must be at least 1");
+        }
+        self.resume_from_run_id()?;
         for (name, value) in [
             ("project_id", self.project_id.as_str()),
             ("project_key", self.project_key.as_str()),
@@ -289,6 +318,8 @@ mod tests {
             run: ManifestRun {
                 id: "run-1".into(),
                 ticket_id: "ticket-1".into(),
+                attempt: 1,
+                metadata: serde_json::json!({}),
             },
             project_id: "project-1".into(),
             project_key: "RG".into(),
@@ -326,6 +357,22 @@ mod tests {
         let mut future = manifest();
         future.manifest_version = 3;
         assert!(future.validate("run-1", "ticket-1").is_err());
+    }
+
+    #[test]
+    fn accepts_only_explicit_later_attempt_recovery_lineage() {
+        let mut retry = manifest();
+        retry.run.attempt = 2;
+        retry.run.metadata = serde_json::json!({"resume_from_run_id": "run-previous"});
+        assert_eq!(retry.resume_from_run_id().unwrap(), Some("run-previous"));
+
+        retry.run.attempt = 1;
+        assert!(retry.resume_from_run_id().is_err());
+        retry.run.attempt = 2;
+        retry.run.metadata = serde_json::json!({"resume_from_run_id": "run-1"});
+        assert!(retry.resume_from_run_id().is_err());
+        retry.run.metadata = serde_json::json!({"resume_from_run_id": 7});
+        assert!(retry.resume_from_run_id().is_err());
     }
 
     #[test]
