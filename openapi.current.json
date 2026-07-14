@@ -411,6 +411,39 @@
         ],
         "type": "object"
       },
+      "AgentPullRequestMergeResponse": {
+        "properties": {
+          "merged": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "pull_request_number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pull_request_url": {
+            "format": "uri",
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "sha": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_request_number",
+          "pull_request_url",
+          "sha",
+          "merged",
+          "message"
+        ],
+        "type": "object"
+      },
       "AgentQualityGatePolicyResponse": {
         "properties": {
           "command": {
@@ -7657,6 +7690,210 @@
         ]
       }
     },
+    "/api/v1/agent-runs/{run_id}/accept-pull-request": {
+      "post": {
+        "description": "Merge the open GitHub pull request associated with a succeeded agent run using the tenant-owned GitHub App installation.",
+        "operationId": "acceptAgentRunPullRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentPullRequestMergeResponse"
+                }
+              }
+            },
+            "description": "Pull request merged",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing run-update or GitHub-management permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run, repository binding, or associated open pull request not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run is not succeeded, association is ambiguous, or App permissions are insufficient",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub merge failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Accept and merge an agent-run pull request",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-runs/{run_id}/events": {
       "get": {
         "description": "Replay durable agent-run events in ascending sequence order.",
@@ -7927,7 +8164,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -9505,7 +9750,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -9515,7 +9768,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -10499,7 +10760,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -10509,7 +10778,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -10654,7 +10931,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -10664,7 +10949,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -10978,6 +11271,17 @@
               "minimum": 1,
               "type": "integer"
             }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -10989,7 +11293,15 @@
                 }
               }
             },
-            "description": "Actively leased worker runs across the tenant"
+            "description": "Actively leased worker runs across the tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -10999,7 +11311,15 @@
                 }
               }
             },
-            "description": "Invalid query"
+            "description": "Invalid query",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "401": {
             "content": {
@@ -11009,7 +11329,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -11019,7 +11347,15 @@
                 }
               }
             },
-            "description": "Worker credential is not bound to this worker"
+            "description": "Worker credential is not bound to this worker",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "404": {
             "content": {
@@ -11029,7 +11365,61 @@
                 }
               }
             },
-            "description": "Worker not found"
+            "description": "Worker not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -15185,7 +15575,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -15195,7 +15593,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -15342,7 +15748,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -15352,7 +15766,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -15481,7 +15903,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -15491,7 +15921,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -15615,7 +16053,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -15625,7 +16071,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -15742,7 +16196,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -15752,7 +16214,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -15937,7 +16407,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -16076,7 +16554,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -16086,7 +16572,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {
@@ -16289,7 +16783,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -16299,7 +16801,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -16443,7 +16953,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -16453,7 +16971,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "412": {
             "content": {
@@ -16645,7 +17171,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -16655,7 +17189,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "412": {
             "content": {
@@ -16816,7 +17358,15 @@
                 }
               }
             },
-            "description": "Unauthorized"
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "403": {
             "content": {
@@ -16826,7 +17376,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "409": {
             "content": {
@@ -17026,7 +17584,15 @@
                 }
               }
             },
-            "description": "Forbidden"
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {

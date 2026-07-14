@@ -273,7 +273,9 @@ exact configured Codex CLI version, then checks `codex --version` before
 admitting the run. Retained sandboxes are upgraded with the same kit before
 reuse. Template digest pinning and Codex version pinning are independent: a new
 template is not trusted to contain the requested CLI version without the
-runtime check.
+runtime check. The same kit explicitly allows `registry.npmjs.org` and gives
+npm five bounded fetch attempts, so transient Docker proxy DNS failures after
+the admission probe do not immediately abort Codex-owned dependency installs.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 

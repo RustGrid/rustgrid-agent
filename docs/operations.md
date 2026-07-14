@@ -26,7 +26,10 @@ configured version. Sandbox admission then requires `codex --version` to match
 exactly. A retained sandbox with another version receives the kit through
 `sbx kit add` before reuse; failed upgrades preserve the sandbox and fail the
 run as transient infrastructure. Worker startup also fails closed unless
-`kit.allowLocalKits` is enabled.
+`kit.allowLocalKits` is enabled. The kit explicitly allows the npm registry and
+sets bounded fetch retry/backoff variables for every sandbox process. This
+covers transient `gateway.docker.internal` DNS failures that occur after the
+initial `npm ping` admission probe.
 
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:

@@ -599,6 +599,16 @@ kind: mixin
 name: rustgrid-codex-{name}
 displayName: RustGrid Codex {version}
 description: Pins the Codex CLI used by rustgrid-agent sandboxes
+caps:
+  network:
+    allow:
+      - registry.npmjs.org
+environment:
+  variables:
+    NPM_CONFIG_FETCH_RETRIES: "5"
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "2000"
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "30000"
+    NPM_CONFIG_FETCH_TIMEOUT: "120000"
 commands:
   install:
     - command: "npm install --global --no-audit --no-fund @openai/codex@{version}"
@@ -1147,6 +1157,16 @@ kind: mixin
 name: rustgrid-codex-0-144-4
 displayName: RustGrid Codex 0.144.4
 description: Pins the Codex CLI used by rustgrid-agent sandboxes
+caps:
+  network:
+    allow:
+      - registry.npmjs.org
+environment:
+  variables:
+    NPM_CONFIG_FETCH_RETRIES: "5"
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "2000"
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "30000"
+    NPM_CONFIG_FETCH_TIMEOUT: "120000"
 commands:
   install:
     - command: "npm install --global --no-audit --no-fund @openai/codex@0.144.4"
@@ -1163,7 +1183,7 @@ commands:
         assert!(
             fs::read_to_string(kit.join("spec.yaml"))
                 .unwrap()
-                .contains("  install:\n    - command:")
+                .contains("NPM_CONFIG_FETCH_RETRIES: \"5\"")
         );
     }
 }
