@@ -46,6 +46,7 @@ pub(crate) enum Executor {
     DockerSandbox {
         command: String,
         template: String,
+        codex_version: String,
         cpus: u16,
         memory: String,
     },
@@ -76,12 +77,14 @@ impl Executor {
             ExecutorConfig::DockerSandbox {
                 command,
                 template,
+                codex_version,
                 cpus,
                 memory,
                 ..
             } => Self::DockerSandbox {
                 command: command.clone(),
                 template: template.clone(),
+                codex_version: codex_version.clone(),
                 cpus: *cpus,
                 memory: memory.clone(),
             },
@@ -143,6 +146,18 @@ impl Executor {
             {
                 bail!("Docker Sandbox has no inspectable effective network policy");
             }
+            let local_kits = command::capture_with_env(
+                command,
+                ["settings", "get", "kit.allowLocalKits"],
+                cwd,
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .context("could not inspect Docker Sandbox local-kit policy")?;
+            if !local_kits.status.success() || local_kits.stdout.trim() != "true" {
+                bail!(
+                    "Docker Sandbox local kits must be enabled to enforce the pinned Codex version"
+                );
+            }
         }
         Ok(())
     }
@@ -200,9 +215,11 @@ impl Executor {
             Self::DockerSandbox {
                 command,
                 template,
+                codex_version,
                 cpus,
                 memory,
             } => {
+                let codex_kit = ensure_codex_version_kit(workspace, codex_version)?;
                 let name = retained_sandbox_name
                     .map(validate_managed_sandbox_name)
                     .transpose()?
@@ -213,6 +230,20 @@ impl Executor {
                         &format!("Reusing retained Docker Sandbox {name}"),
                         "36",
                     );
+                    if let Err(error) = ensure_sandbox_codex_version(
+                        command,
+                        &name,
+                        workspace,
+                        codex_version,
+                        &codex_kit,
+                    ) {
+                        return Err(RunFailure::InfrastructureTransient {
+                            detail: format!(
+                                "retained Docker Sandbox Codex upgrade failed; sandbox preserved: {error:#}"
+                            ),
+                        }
+                        .into());
+                    }
                     if probe_npm_registry {
                         let mut last_failure = String::new();
                         for attempt in 1..=SANDBOX_NETWORK_ATTEMPTS {
@@ -256,6 +287,8 @@ impl Executor {
                     name.clone(),
                     "--template".into(),
                     template.clone(),
+                    "--kit".into(),
+                    codex_kit.display().to_string(),
                     "--cpus".into(),
                     cpus.to_string(),
                     "--memory".into(),
@@ -264,11 +297,7 @@ impl Executor {
                     workspace.display().to_string(),
                 ];
                 let mut last_failure = String::new();
-                let attempts = if probe_npm_registry {
-                    SANDBOX_NETWORK_ATTEMPTS
-                } else {
-                    1
-                };
+                let attempts = SANDBOX_NETWORK_ATTEMPTS;
                 for attempt in 1..=attempts {
                     let started = Instant::now();
                     // The name is deterministic, so a coordinator restart can remove an
@@ -291,19 +320,25 @@ impl Executor {
                             &format!("created {name} in {}ms", started.elapsed().as_millis()),
                             "36",
                         );
-                        if !probe_npm_registry {
-                            return Ok(ExecutionHandle::DockerSandbox { name });
-                        }
-                        match probe_sandbox_network(command, &name, workspace) {
-                            Ok(()) => {
-                                console_event(
-                                    "completed",
-                                    "Docker Sandbox npm registry network preflight passed",
-                                    "32",
-                                );
+                        match verify_sandbox_codex_version(command, &name, workspace, codex_version)
+                        {
+                            Ok(()) if !probe_npm_registry => {
                                 return Ok(ExecutionHandle::DockerSandbox { name });
                             }
-                            Err(error) => last_failure = format!("{error:#}"),
+                            Ok(()) => match probe_sandbox_network(command, &name, workspace) {
+                                Ok(()) => {
+                                    console_event(
+                                        "completed",
+                                        "Docker Sandbox npm registry network preflight passed",
+                                        "32",
+                                    );
+                                    return Ok(ExecutionHandle::DockerSandbox { name });
+                                }
+                                Err(error) => last_failure = format!("{error:#}"),
+                            },
+                            Err(error) => {
+                                last_failure = format!("{error:#}");
+                            }
                         }
                     } else {
                         last_failure = format!(
@@ -329,12 +364,9 @@ impl Executor {
                         thread::sleep(delay);
                     }
                 }
-                if !probe_npm_registry {
-                    bail!(last_failure);
-                }
                 Err(RunFailure::InfrastructureTransient {
                     detail: format!(
-                        "Docker Sandbox network admission failed after {SANDBOX_NETWORK_ATTEMPTS} attempts: {last_failure}"
+                        "Docker Sandbox Codex/network admission failed after {SANDBOX_NETWORK_ATTEMPTS} attempts: {last_failure}"
                     ),
                 }
                 .into())
@@ -552,6 +584,113 @@ fn sandbox_exists(command: &str, name: &str, cwd: &Path) -> Result<bool> {
     Ok(sandbox_names(&value)
         .iter()
         .any(|candidate| candidate == name))
+}
+
+fn ensure_codex_version_kit(workspace: &Path, version: &str) -> Result<PathBuf> {
+    let run_root = workspace
+        .parent()
+        .context("sandbox workspace has no run directory")?;
+    let kit_dir = run_root.join(format!("codex-{version}-kit"));
+    fs::create_dir_all(&kit_dir)
+        .with_context(|| format!("could not create Codex version kit {}", kit_dir.display()))?;
+    let spec = format!(
+        "schemaVersion: \"1\"\n\
+kind: mixin\n\
+name: rustgrid-codex-{name}\n\
+displayName: RustGrid Codex {version}\n\
+description: Pins the Codex CLI used by rustgrid-agent sandboxes\n\
+commands:\n\
+  install:\n\
+    - command: \"npm install --global --no-audit --no-fund @openai/codex@{version}\"\n\
+      user: \"0\"\n\
+      description: Install Codex CLI {version}\n",
+        name = version.replace('.', "-")
+    );
+    let path = kit_dir.join("spec.yaml");
+    if path.is_file() {
+        let existing = fs::read_to_string(&path)
+            .with_context(|| format!("could not read Codex version kit {}", path.display()))?;
+        if existing == spec {
+            return Ok(kit_dir);
+        }
+        bail!(
+            "Codex version kit {} does not match the pinned runtime specification",
+            path.display()
+        );
+    }
+    let temporary = kit_dir.join(format!(".spec-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "could not create temporary Codex kit {}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(spec.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("could not publish Codex version kit {}", path.display()))?;
+    Ok(kit_dir)
+}
+
+fn verify_sandbox_codex_version(
+    command: &str,
+    name: &str,
+    workspace: &Path,
+    expected: &str,
+) -> Result<()> {
+    let output = command::capture_with_env(
+        command,
+        ["exec", name, "codex", "--version"],
+        workspace,
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "could not verify Codex in Docker Sandbox {name}: {}",
+            output.stderr.trim()
+        );
+    }
+    let actual = output.stdout.trim();
+    let required = format!("codex-cli {expected}");
+    if actual != required {
+        bail!("Docker Sandbox {name} has {actual}, required {required}");
+    }
+    Ok(())
+}
+
+fn ensure_sandbox_codex_version(
+    command: &str,
+    name: &str,
+    workspace: &Path,
+    expected: &str,
+    kit: &Path,
+) -> Result<()> {
+    if verify_sandbox_codex_version(command, name, workspace, expected).is_ok() {
+        return Ok(());
+    }
+    let output = command::capture_with_env(
+        command,
+        ["kit", "add", name, kit.to_string_lossy().as_ref()],
+        workspace,
+        std::iter::empty::<(&str, &str)>(),
+    )?;
+    if !output.status.success() {
+        bail!(
+            "could not upgrade retained Docker Sandbox {name} to Codex {expected}: {}",
+            output.stderr.trim()
+        );
+    }
+    verify_sandbox_codex_version(command, name, workspace, expected)?;
+    console_event(
+        "completed",
+        &format!("Upgraded retained Docker Sandbox to Codex {expected}"),
+        "32",
+    );
+    Ok(())
 }
 
 fn stop_sandbox(command: &str, name: &str, cwd: &Path) -> Result<()> {
@@ -861,6 +1000,7 @@ mod tests {
         let executor = Executor::DockerSandbox {
             command: "sbx".into(),
             template: "unused".into(),
+            codex_version: "0.144.4".into(),
             cpus: 1,
             memory: "1g".into(),
         };
@@ -982,5 +1122,23 @@ mod tests {
             assert!(is_sandbox_environment_control(name), "accepted {name}");
         }
         assert!(!is_sandbox_environment_control("CI"));
+    }
+
+    #[test]
+    fn codex_version_kit_is_exact_and_outside_the_agent_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("run/repo");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let kit = ensure_codex_version_kit(&workspace, "0.144.4").unwrap();
+        assert_eq!(kit.parent(), workspace.parent());
+        assert!(!kit.starts_with(&workspace));
+        let spec = fs::read_to_string(kit.join("spec.yaml")).unwrap();
+        assert!(spec.contains("@openai/codex@0.144.4"));
+        assert!(!spec.contains("@latest"));
+        assert_eq!(
+            ensure_codex_version_kit(&workspace, "0.144.4").unwrap(),
+            kit
+        );
     }
 }

@@ -65,6 +65,8 @@ pub enum ExecutorConfig {
         command: String,
         #[serde(default = "default_sandbox_template")]
         template: String,
+        #[serde(default = "default_codex_version")]
+        codex_version: String,
         #[serde(default = "default_sandbox_cpus")]
         cpus: u16,
         #[serde(default = "default_sandbox_memory")]
@@ -91,6 +93,7 @@ impl ExecutorConfig {
     pub(crate) fn validate_production(&self, max_concurrency: usize) -> Result<()> {
         let Self::DockerSandbox {
             template,
+            codex_version,
             cpus,
             memory,
             capacity_cpus,
@@ -106,6 +109,7 @@ impl ExecutorConfig {
         {
             bail!("production sandbox template must be pinned by a 64-character sha256 digest");
         }
+        validate_codex_version(codex_version)?;
         let required_cpus = usize::from(*cpus).saturating_mul(max_concurrency);
         if required_cpus > usize::from(*capacity_cpus) {
             bail!("sandbox CPU allocation exceeds configured host capacity");
@@ -153,6 +157,9 @@ fn default_sbx_command() -> String {
 fn default_sandbox_template() -> String {
     "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97".into()
 }
+fn default_codex_version() -> String {
+    "0.144.4".into()
+}
 fn default_sandbox_cpus() -> u16 {
     4
 }
@@ -187,6 +194,18 @@ fn parse_binary_size(value: &str) -> Result<u64> {
     number
         .checked_mul(multiplier)
         .context("memory size overflow")
+}
+
+fn validate_codex_version(value: &str) -> Result<()> {
+    let components = value.split('.').collect::<Vec<_>>();
+    if components.len() != 3
+        || components
+            .iter()
+            .any(|component| component.is_empty() || !component.chars().all(|c| c.is_ascii_digit()))
+    {
+        bail!("docker sandbox codex_version must be an exact numeric version such as 0.144.4");
+    }
+    Ok(())
 }
 
 fn default_lease_seconds() -> u64 {
@@ -285,6 +304,7 @@ impl Config {
             ExecutorConfig::DockerSandbox {
                 command,
                 template,
+                codex_version,
                 cpus,
                 memory,
                 capacity_cpus,
@@ -292,11 +312,13 @@ impl Config {
             } => {
                 if command.trim().is_empty()
                     || template.trim().is_empty()
+                    || codex_version.trim().is_empty()
                     || memory.trim().is_empty()
                     || capacity_memory.trim().is_empty()
                 {
                     bail!("docker sandbox command, template, and memory cannot be empty");
                 }
+                validate_codex_version(codex_version)?;
                 if !(1..=64).contains(cpus) {
                     bail!("docker sandbox cpus must be between 1 and 64");
                 }
@@ -399,6 +421,7 @@ mod tests {
         config.executor = ExecutorConfig::DockerSandbox {
             command: "sbx".into(),
             template: "test".into(),
+            codex_version: "0.144.4".into(),
             cpus: 1,
             memory: "1g".into(),
             capacity_cpus: 2,
@@ -412,6 +435,7 @@ mod tests {
         let mutable = ExecutorConfig::DockerSandbox {
             command: "sbx".into(),
             template: "example:latest".into(),
+            codex_version: "0.144.4".into(),
             cpus: 4,
             memory: "8g".into(),
             capacity_cpus: 8,
@@ -421,6 +445,7 @@ mod tests {
         let pinned = ExecutorConfig::DockerSandbox {
             command: "sbx".into(),
             template: format!("example@sha256:{}", "a".repeat(64)),
+            codex_version: "0.144.4".into(),
             cpus: 4,
             memory: "8g".into(),
             capacity_cpus: 8,
@@ -428,5 +453,19 @@ mod tests {
         };
         pinned.validate_production(2).unwrap();
         assert!(pinned.validate_production(3).is_err());
+    }
+
+    #[test]
+    fn docker_sandbox_defaults_to_the_pinned_codex_release() {
+        let executor: ExecutorConfig = serde_json::from_str(
+            r#"{"kind":"docker_sandbox","template":"example","cpus":1,"memory":"1g","capacity_cpus":1,"capacity_memory":"1g"}"#,
+        )
+        .unwrap();
+        let ExecutorConfig::DockerSandbox { codex_version, .. } = executor else {
+            panic!("expected Docker Sandbox executor");
+        };
+        assert_eq!(codex_version, "0.144.4");
+        assert!(validate_codex_version("0.144").is_err());
+        assert!(validate_codex_version("latest").is_err());
     }
 }

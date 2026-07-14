@@ -93,6 +93,7 @@ worker host and update its local capacity:
     "kind": "docker_sandbox",
     "command": "sbx",
     "template": "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97",
+    "codex_version": "0.144.4",
     "cpus": 4,
     "memory": "8g",
     "capacity_cpus": 16,
@@ -188,7 +189,7 @@ rustgrid-agent --config path/to/agent.json status
 | `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
 | `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
 | `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. Values above 1 require the Docker Sandbox executor. |
-| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production requires `docker_sandbox`, a template pinned by SHA-256, per-run `cpus`/`memory`, and aggregate `capacity_cpus`/`capacity_memory`. |
+| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production requires `docker_sandbox`, a template pinned by SHA-256, an exact numeric `codex_version` (default `0.144.4`), per-run `cpus`/`memory`, and aggregate `capacity_cpus`/`capacity_memory`. |
 | `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
 | `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
 | `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
@@ -267,6 +268,12 @@ worker continuously measures the mounted workspace during Codex and gate
 execution and stops the sandbox when `max_workspace_bytes` is exceeded.
 Review and intentionally update the pinned template digest during upgrades; do
 not replace it with a mutable tag.
+The coordinator applies a creation-time Docker Sandbox kit that installs the
+exact configured Codex CLI version, then checks `codex --version` before
+admitting the run. Retained sandboxes are upgraded with the same kit before
+reuse. Template digest pinning and Codex version pinning are independent: a new
+template is not trusted to contain the requested CLI version without the
+runtime check.
 
 For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
 

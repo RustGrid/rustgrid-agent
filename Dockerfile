@@ -9,7 +9,7 @@ COPY README.md LICENSE ./
 RUN cargo build --locked --release
 
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
-ARG CODEX_VERSION
+ARG CODEX_VERSION=0.144.4
 RUN test -n "${CODEX_VERSION}" \
     && apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates git tini \

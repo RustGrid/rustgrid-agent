@@ -17,7 +17,16 @@ to one run and is rejected by `serve`.
 Set `capacity_cpus` and `capacity_memory` to the capacity reserved for this
 worker. Startup rejects configurations where concurrent sandbox allocations can
 exceed either ceiling. Pin `template` by verified `@sha256:` digest; tags are
-rejected by production readiness. Use `sbx` 0.34.0 or newer.
+rejected by production readiness. Pin `codex_version` to an exact numeric
+release. Use `sbx` 0.34.0 or newer.
+
+At sandbox creation, the coordinator materializes a coordinator-owned local mixin kit
+outside the mounted repository. The kit installs `@openai/codex` at the exact
+configured version. Sandbox admission then requires `codex --version` to match
+exactly. A retained sandbox with another version receives the kit through
+`sbx kit add` before reuse; failed upgrades preserve the sandbox and fail the
+run as transient infrastructure. Worker startup also fails closed unless
+`kit.allowLocalKits` is enabled.
 
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:

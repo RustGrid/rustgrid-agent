@@ -181,6 +181,7 @@ mod tests {
                 executor: crate::config::ExecutorConfig::DockerSandbox {
                     command: "sbx".into(),
                     template: "test".into(),
+                    codex_version: "0.144.4".into(),
                     cpus: 1,
                     memory: "1g".into(),
                     capacity_cpus: 2,

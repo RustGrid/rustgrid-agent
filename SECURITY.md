@@ -34,9 +34,13 @@ The worker executes repository-controlled code. Production `serve` therefore
 requires the Docker Sandbox executor and fails closed if `sbx` is unavailable.
 Do not use the local executor for untrusted repositories.
 
-Production configuration must pin the sandbox template by SHA-256 digest and
-fit aggregate run allocations within declared host capacity. Allowlisted child
-environment values are shell-quoted into a mode-0600 temporary file under the
+Production configuration must pin the sandbox template by SHA-256 digest, pin
+the Codex CLI by an exact numeric version, and fit aggregate run allocations
+within declared host capacity. The coordinator materializes the
+version kit outside the agent-mounted repository and verifies the installed
+CLI before sandbox admission. It never trusts the template tag or bundled CLI
+version implicitly.
+Allowlisted child environment values are shell-quoted into a mode-0600 temporary file under the
 run clone's `.git` directory, exported by a fixed launcher, and removed
 immediately. Values never appear in host process arguments or committable paths.
 Review the effective Docker Sandbox network policy before enabling a worker.

@@ -5,6 +5,7 @@
     "kind": "docker_sandbox",
     "command": "sbx",
     "template": "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97",
+    "codex_version": "0.144.4",
     "cpus": 4,
     "memory": "8g",
     "capacity_cpus": 16,
