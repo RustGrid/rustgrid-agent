@@ -594,16 +594,17 @@ fn ensure_codex_version_kit(workspace: &Path, version: &str) -> Result<PathBuf> 
     fs::create_dir_all(&kit_dir)
         .with_context(|| format!("could not create Codex version kit {}", kit_dir.display()))?;
     let spec = format!(
-        "schemaVersion: \"1\"\n\
-kind: mixin\n\
-name: rustgrid-codex-{name}\n\
-displayName: RustGrid Codex {version}\n\
-description: Pins the Codex CLI used by rustgrid-agent sandboxes\n\
-commands:\n\
-  install:\n\
-    - command: \"npm install --global --no-audit --no-fund @openai/codex@{version}\"\n\
-      user: \"0\"\n\
-      description: Install Codex CLI {version}\n",
+        r#"schemaVersion: "1"
+kind: mixin
+name: rustgrid-codex-{name}
+displayName: RustGrid Codex {version}
+description: Pins the Codex CLI used by rustgrid-agent sandboxes
+commands:
+  install:
+    - command: "npm install --global --no-audit --no-fund @openai/codex@{version}"
+      user: "0"
+      description: Install Codex CLI {version}
+"#,
         name = version.replace('.', "-")
     );
     let path = kit_dir.join("spec.yaml");
@@ -613,10 +614,6 @@ commands:\n\
         if existing == spec {
             return Ok(kit_dir);
         }
-        bail!(
-            "Codex version kit {} does not match the pinned runtime specification",
-            path.display()
-        );
     }
     let temporary = kit_dir.join(format!(".spec-{}.tmp", uuid::Uuid::new_v4().simple()));
     let mut file = OpenOptions::new()
@@ -631,6 +628,15 @@ commands:\n\
         })?;
     file.write_all(spec.as_bytes())?;
     file.sync_all()?;
+    #[cfg(windows)]
+    if path.is_file() {
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "could not replace stale Codex version kit {}",
+                path.display()
+            )
+        })?;
+    }
     fs::rename(&temporary, &path)
         .with_context(|| format!("could not publish Codex version kit {}", path.display()))?;
     Ok(kit_dir)
@@ -1134,11 +1140,30 @@ mod tests {
         assert_eq!(kit.parent(), workspace.parent());
         assert!(!kit.starts_with(&workspace));
         let spec = fs::read_to_string(kit.join("spec.yaml")).unwrap();
-        assert!(spec.contains("@openai/codex@0.144.4"));
-        assert!(!spec.contains("@latest"));
+        assert_eq!(
+            spec,
+            r#"schemaVersion: "1"
+kind: mixin
+name: rustgrid-codex-0-144-4
+displayName: RustGrid Codex 0.144.4
+description: Pins the Codex CLI used by rustgrid-agent sandboxes
+commands:
+  install:
+    - command: "npm install --global --no-audit --no-fund @openai/codex@0.144.4"
+      user: "0"
+      description: Install Codex CLI 0.144.4
+"#
+        );
         assert_eq!(
             ensure_codex_version_kit(&workspace, "0.144.4").unwrap(),
             kit
+        );
+        fs::write(kit.join("spec.yaml"), "invalid: stale\n").unwrap();
+        ensure_codex_version_kit(&workspace, "0.144.4").unwrap();
+        assert!(
+            fs::read_to_string(kit.join("spec.yaml"))
+                .unwrap()
+                .contains("  install:\n    - command:")
         );
     }
 }
