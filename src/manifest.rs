@@ -83,7 +83,7 @@ impl ExecutionPolicy {
         std::time::Duration::from_secs(
             self.codex
                 .idle_timeout_seconds
-                .unwrap_or(self.timeout_seconds.min(600)),
+                .unwrap_or(self.timeout_seconds.min(300)),
         )
     }
 
@@ -406,7 +406,7 @@ mod tests {
         let policy = manifest().policy().unwrap();
         assert_eq!(
             policy.codex_idle_timeout(),
-            std::time::Duration::from_secs(600)
+            std::time::Duration::from_secs(300)
         );
 
         let mut configured = manifest().policy().unwrap();

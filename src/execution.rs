@@ -15,6 +15,8 @@ use crate::{
     run_error::RunFailure,
 };
 
+const CODEX_IDLE_ATTEMPTS: u32 = 3;
+
 pub(crate) struct ImplementationContext<'a> {
     pub app: &'a AppContext,
     pub api: &'a RustGridClient,
@@ -61,33 +63,62 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
     )?;
     let blocked_action = RefCell::new(None);
     let codex_args = policy.codex_args();
-    let codex_status = executor.streaming(
-        executor_handle,
-        RunCommand {
-            args: &codex_args,
-            cwd: &repo.root,
-            stdin_text: Some(generated_prompt),
-            running,
-            timeout: Duration::from_secs(policy.timeout_seconds),
-            idle_timeout: Some(policy.codex_idle_timeout()),
-            max_output_bytes: context.config.max_command_output_bytes as usize,
-            environment_allowlist: &policy.codex.environment_allowlist,
-            limits: Some(child_limits(
-                context,
-                Duration::from_secs(policy.timeout_seconds),
-            )),
-            max_workspace_bytes: context.config.max_workspace_bytes,
-        },
-        |line| {
-            if let Some(message) = feedback_from_output_line(line) {
-                if let Some(action) = blocked_action_from_feedback(&message) {
-                    blocked_action.replace(Some(action));
+    let mut codex_attempt = 1u32;
+    let codex_status = loop {
+        let result = executor.streaming(
+            executor_handle,
+            RunCommand {
+                args: &codex_args,
+                cwd: &repo.root,
+                stdin_text: Some(generated_prompt),
+                running,
+                timeout: Duration::from_secs(policy.timeout_seconds),
+                idle_timeout: Some(policy.codex_idle_timeout()),
+                max_output_bytes: context.config.max_command_output_bytes as usize,
+                environment_allowlist: &policy.codex.environment_allowlist,
+                limits: Some(child_limits(
+                    context,
+                    Duration::from_secs(policy.timeout_seconds),
+                )),
+                max_workspace_bytes: context.config.max_workspace_bytes,
+            },
+            |line| {
+                if let Some(message) = feedback_from_output_line(line) {
+                    if let Some(action) = blocked_action_from_feedback(&message) {
+                        blocked_action.replace(Some(action));
+                    }
+                    reporter.feedback(&message)?;
                 }
-                reporter.feedback(&message)?;
+                Ok(())
+            },
+        );
+        match result {
+            Ok(status) => break status,
+            Err(error)
+                if command::is_idle_timeout(&error) && codex_attempt < CODEX_IDLE_ATTEMPTS =>
+            {
+                let delay = Duration::from_secs(u64::from(codex_attempt) * 2);
+                reporter.step(
+                    "codex_idle_retry",
+                    StepStatus::Running,
+                    &format!(
+                        "Codex stopped producing output; restarting ephemeral attempt {} of {} in {}s",
+                        codex_attempt + 1,
+                        CODEX_IDLE_ATTEMPTS,
+                        delay.as_secs()
+                    ),
+                    Some(json!({
+                        "attempt": codex_attempt + 1,
+                        "max_attempts": CODEX_IDLE_ATTEMPTS,
+                        "idle_timeout_seconds": policy.codex_idle_timeout().as_secs()
+                    })),
+                )?;
+                thread::sleep(delay);
+                codex_attempt += 1;
             }
-            Ok(())
-        },
-    )?;
+            Err(error) => return Err(error),
+        }
+    };
     if let Some(action) = blocked_action.into_inner() {
         if is_validation_only_blocker(&action)
             && policy.quality_gates.iter().any(|gate| gate.required)

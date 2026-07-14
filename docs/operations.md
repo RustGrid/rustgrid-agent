@@ -67,9 +67,10 @@ size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.
 Codex additionally has an output-inactivity watchdog. The signed execution
 policy may set `codex.idle_timeout_seconds`; when omitted, the worker uses the
-smaller of 600 seconds and the total run timeout. Crossing that deadline kills
-the command process tree, stops and retains the sandbox, and reports a timed-out
-run so its workspace can be recovered by a later attempt.
+smaller of 300 seconds and the total run timeout. Crossing that deadline kills
+the command process tree and restarts a fresh ephemeral Codex process against
+the same retained workspace, up to three attempts. Exhaustion reports a
+timed-out run and leaves the sandbox recoverable by a later run attempt.
 
 When the signed execution policy contains an npm-family quality gate, every
 newly created Docker Sandbox must pass an `npm ping` against the public registry

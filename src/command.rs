@@ -82,6 +82,12 @@ pub fn is_timeout(error: &anyhow::Error) -> bool {
         })
 }
 
+pub fn is_idle_timeout(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<CommandFailure>()
+        .is_some_and(|failure| matches!(failure, CommandFailure::IdleTimedOut { .. }))
+}
+
 pub fn parse(command: &str) -> Result<Vec<String>> {
     let parts = shlex::split(command).context("command contains invalid shell quoting")?;
     if parts.is_empty() {
@@ -766,6 +772,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_timeout(&error));
+        assert!(!is_idle_timeout(&error));
     }
 
     #[test]
@@ -794,6 +801,7 @@ mod tests {
         .unwrap_err();
 
         assert!(is_timeout(&error));
+        assert!(is_idle_timeout(&error));
         assert!(matches!(
             error.downcast_ref::<CommandFailure>(),
             Some(CommandFailure::IdleTimedOut { .. })
