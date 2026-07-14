@@ -32,6 +32,19 @@ pub(crate) struct ImplementationContext<'a> {
     pub executor_handle: &'a ExecutionHandle,
 }
 
+pub(crate) struct QualityGateContext<'a> {
+    pub app: &'a AppContext,
+    pub api: &'a RustGridClient,
+    pub run: &'a AgentRun,
+    pub ticket: &'a Ticket,
+    pub reporter: &'a Reporter<'a>,
+    pub repo: &'a Repo,
+    pub running: &'a AtomicBool,
+    pub manifest: &'a ExecutionManifest,
+    pub executor: &'a Executor,
+    pub executor_handle: &'a ExecutionHandle,
+}
+
 pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) -> Result<String> {
     let ImplementationContext {
         app: context,
@@ -147,6 +160,61 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         None,
     )?;
 
+    run_quality_gates(QualityGateContext {
+        app: context,
+        api,
+        run,
+        ticket,
+        reporter,
+        repo,
+        running,
+        manifest,
+        executor,
+        executor_handle,
+    })?;
+
+    reporter.set_phase(RunPhase::Publishing);
+    let paths = repo.new_agent_paths(baseline)?;
+    if paths.is_empty() {
+        bail!("Codex produced no committable changes");
+    }
+    reporter.step(
+        "changes_detected",
+        StepStatus::Completed,
+        &format!("Found {} agent-created changed path(s)", paths.len()),
+        Some(json!({"paths": paths})),
+    )?;
+    reporter.step(
+        "commit",
+        StepStatus::Running,
+        "Committing agent changes",
+        None,
+    )?;
+    let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
+    reporter.record_commit(&commit)?;
+    reporter.step(
+        "commit",
+        StepStatus::Completed,
+        &format!("Created commit {}", short_sha(&commit)),
+        Some(json!({"commit": commit})),
+    )?;
+    Ok(commit)
+}
+
+pub(crate) fn run_quality_gates(context: QualityGateContext<'_>) -> Result<()> {
+    let QualityGateContext {
+        app,
+        api,
+        run,
+        ticket,
+        reporter,
+        repo,
+        running,
+        manifest,
+        executor,
+        executor_handle,
+    } = context;
+    let policy = manifest.policy()?;
     reporter.set_phase(RunPhase::Verifying);
     for gate_policy in &policy.quality_gates {
         reporter.step(
@@ -168,13 +236,13 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
                     timeout: Duration::from_secs(gate_policy.timeout_seconds),
                     idle_timeout: None,
                     output_is_activity: None,
-                    max_output_bytes: context.config.max_command_output_bytes as usize,
+                    max_output_bytes: app.config.max_command_output_bytes as usize,
                     environment_allowlist: &policy.codex.environment_allowlist,
                     limits: Some(child_limits(
-                        context,
+                        app,
                         Duration::from_secs(gate_policy.timeout_seconds),
                     )),
-                    max_workspace_bytes: context.config.max_workspace_bytes,
+                    max_workspace_bytes: app.config.max_workspace_bytes,
                 },
             )?;
             let output = combine_output(&gate.stdout, &gate.stderr);
@@ -228,31 +296,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
     }
 
     reporter.set_phase(RunPhase::Publishing);
-    let paths = repo.new_agent_paths(baseline)?;
-    if paths.is_empty() {
-        bail!("Codex produced no committable changes");
-    }
-    reporter.step(
-        "changes_detected",
-        StepStatus::Completed,
-        &format!("Found {} agent-created changed path(s)", paths.len()),
-        Some(json!({"paths": paths})),
-    )?;
-    reporter.step(
-        "commit",
-        StepStatus::Running,
-        "Committing agent changes",
-        None,
-    )?;
-    let commit = repo.commit_paths(&paths, &format!("{}: {}", ticket.key, ticket.title))?;
-    reporter.record_commit(&commit)?;
-    reporter.step(
-        "commit",
-        StepStatus::Completed,
-        &format!("Created commit {}", short_sha(&commit)),
-        Some(json!({"commit": commit})),
-    )?;
-    Ok(commit)
+    Ok(())
 }
 
 fn child_limits(context: &AppContext, timeout: Duration) -> command::ChildLimits {

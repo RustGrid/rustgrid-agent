@@ -118,6 +118,14 @@ claim for the same run, the agent restores client/server event sequences and
 reconciles the existing branch, commit, push, and open pull request. Never edit
 the journal manually while the worker is running.
 
+Publication also reconciles concurrent updates to the generated remote branch.
+If the remote is ahead of the agent commit, the local branch fast-forwards. If
+the histories diverge, the coordinator rebases only the runner-owned commit onto
+the fetched remote head, reruns all quality gates, atomically checkpoints the new
+commit, and retries a normal push up to three times. It never force-pushes. A
+conflict aborts the rebase and retains the clean pre-rebase workspace for a
+human-assisted retry.
+
 After a process restart, the worker first lists actively leased runs assigned to
 its worker ID across every project in the tenant and resumes up to its configured
 concurrency before consuming new queue entries. Run cancellation is isolated:

@@ -16,10 +16,13 @@ use crate::{
     api::{AgentRun, RustGridClient, Ticket, Worker},
     config::AppContext,
     coordinator::CoordinatorHealth,
-    execution::{ImplementationContext, implement_and_commit, short_sha},
+    execution::{
+        ImplementationContext, QualityGateContext, implement_and_commit, run_quality_gates,
+        short_sha,
+    },
     executor::{ExecutionHandle, Executor},
     finalization::finalize,
-    git::{Repo, branch_name},
+    git::{ReconciliationKind, RemoteBranchMoved, Repo, branch_name},
     github::GitHubClient,
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
@@ -487,7 +490,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         RecoveryPlan::ResumeFromCommit { commit }
         | RecoveryPlan::ResumeFromPullRequest { commit, .. } => Some(commit.clone()),
     };
-    let commit = if let Some(commit) = recovered_commit {
+    let mut commit = if let Some(commit) = recovered_commit {
         if !repo.has_commit(&commit)? {
             bail!("recovery journal commit {commit} is missing from the run workspace");
         }
@@ -531,8 +534,79 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         &manifest.repository,
         &manifest.required_permissions,
     );
-    let push_token = tokens.token()?;
-    let pushed = repo.push(&branch, &commit, &push_token, &manifest.web_base_url)?;
+    let mut pushed = false;
+    for publish_attempt in 1..=3u32 {
+        let reconcile_token = tokens.token()?;
+        let reconciled = repo.reconcile_remote_branch(
+            &branch,
+            &commit,
+            &reconcile_token,
+            &manifest.web_base_url,
+        )?;
+        if reconciled.requires_validation() {
+            let reconciliation = match reconciled.kind {
+                ReconciliationKind::RemoteAdvanced => {
+                    "accepted remote commits after the agent commit"
+                }
+                ReconciliationKind::Rebased => {
+                    "rebased the agent commit onto concurrent remote work"
+                }
+                ReconciliationKind::Unchanged => {
+                    unreachable!("validation requires a changed commit")
+                }
+            };
+            commit = reconciled.commit;
+            reporter.record_commit(&commit)?;
+            reporter.step(
+                "push_reconciliation",
+                StepStatus::Completed,
+                &format!("Reconciled branch {branch}: {reconciliation}"),
+                Some(json!({
+                    "commit": commit,
+                    "strategy": match reconciled.kind {
+                        ReconciliationKind::RemoteAdvanced => "remote_advanced",
+                        ReconciliationKind::Rebased => "rebase",
+                        ReconciliationKind::Unchanged => "unchanged",
+                    }
+                })),
+            )?;
+            run_quality_gates(QualityGateContext {
+                app: context,
+                api,
+                run,
+                ticket,
+                reporter,
+                repo: &repo,
+                running,
+                manifest,
+                executor,
+                executor_handle,
+            })?;
+        }
+
+        let push_token = tokens.token()?;
+        match repo.push(&branch, &commit, &push_token, &manifest.web_base_url) {
+            Ok(did_push) => {
+                pushed |= did_push;
+                break;
+            }
+            Err(error)
+                if publish_attempt < 3 && error.downcast_ref::<RemoteBranchMoved>().is_some() =>
+            {
+                reporter.step(
+                    "push_race_retry",
+                    StepStatus::Running,
+                    &format!(
+                        "Remote branch changed during publication; reconciling attempt {} of 3",
+                        publish_attempt + 1
+                    ),
+                    Some(json!({"attempt": publish_attempt + 1})),
+                )?;
+                eprintln!("[warning] git push race on attempt {publish_attempt}: {error:#}");
+            }
+            Err(error) => return Err(error),
+        }
+    }
     reporter.step(
         "push",
         StepStatus::Completed,

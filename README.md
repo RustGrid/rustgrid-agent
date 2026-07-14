@@ -390,7 +390,7 @@ Codex is instructed to emit concise progress updates. With Codex JSONL output, e
 
 When Codex cannot proceed without a decision, credential, permission, or external-system change, it emits `RUSTGRID_AGENT_STATUS: BLOCKED` and a specific `HUMAN_ACTION_REQUIRED`. The runner stops safely, adds a blocked comment, marks the ticket `blocked`, and fails the agent run. Other terminal automation failures use the same blocked handoff because a human must resolve the failed run before it can continue.
 
-If Codex, the quality gate, Git push, or pull-request creation fails, the agent reports the error to RustGrid when a run exists and exits without resetting or deleting the work. The generated branch and worktree remain available for inspection. Resolve the underlying problem before retrying. If the same generated branch already exists, rename or remove it only after preserving any useful work; the agent will not overwrite it.
+If Codex, the quality gate, Git push, or pull-request creation fails, the agent reports the error to RustGrid when a run exists and exits without resetting or deleting the work. The generated branch and worktree remain available for inspection. Before pushing, the coordinator fetches the generated remote branch. A remote fast-forward is accepted; divergent concurrent work is preserved by rebasing the runner's single commit onto the remote head and rerunning every quality gate. Push races are reconciled at most three times, and the coordinator never force-pushes. A rebase conflict aborts cleanly and retains the workspace for manual resolution.
 
 Common checks:
 
@@ -398,7 +398,7 @@ Common checks:
 - **Base branch is missing:** fetch it and create or switch to the locally configured `default_base_branch` before running the agent.
 - **Codex cannot start:** confirm the Codex CLI is installed, authenticated, and available on `PATH`; then inspect `rustgrid-agent status`.
 - **Quality gate fails:** run the exact configured command locally. Shell syntax is not interpreted.
-- **Push or pull-request creation fails:** verify the `origin` remote, repository fields, token permissions, organization policy, and base branch.
+- **Push or pull-request creation fails:** non-conflicting remote branch movement is reconciled automatically. For a retained rebase conflict, resolve the generated branch in its isolated workspace and retry; otherwise verify the `origin` remote, repository fields, token permissions, organization policy, and base branch.
 - **Execution manifest fails:** verify that the project has an enabled GitHub App repository binding and that the run manifest matches the local `origin`.
 - **Progress cursor conflict:** the agent automatically resynchronizes once; repeated conflicts stop the run to preserve ordered telemetry.
 - **Lease ownership is lost:** local execution stops without publishing a terminal state because another worker or the control plane is authoritative.

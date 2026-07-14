@@ -60,7 +60,6 @@ pub enum CheckStatus {
 impl CheckStatus {
     pub const fn is_completed(&self) -> bool {
         matches!(self, Self::Completed)
-        
     }
 }
 

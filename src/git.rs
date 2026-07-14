@@ -13,6 +13,42 @@ pub struct Repo {
     pub root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReconciliationKind {
+    Unchanged,
+    RemoteAdvanced,
+    Rebased,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReconciledCommit {
+    pub commit: String,
+    pub kind: ReconciliationKind,
+}
+
+#[derive(Debug)]
+pub struct RemoteBranchMoved {
+    branch: String,
+}
+
+impl std::fmt::Display for RemoteBranchMoved {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "remote branch {} changed during publication",
+            self.branch
+        )
+    }
+}
+
+impl std::error::Error for RemoteBranchMoved {}
+
+impl ReconciledCommit {
+    pub const fn requires_validation(&self) -> bool {
+        !matches!(self.kind, ReconciliationKind::Unchanged)
+    }
+}
+
 impl Repo {
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir().context("could not determine current directory")?;
@@ -171,11 +207,8 @@ impl Repo {
                 format!("AUTHORIZATION: basic {authorization}"),
             ),
         ];
-        if self
-            .remote_branch_commit(branch, environment.clone())?
-            .as_deref()
-            == Some(expected_commit)
-        {
+        let remote_before = self.remote_branch_commit(branch, environment.clone())?;
+        if remote_before.as_deref() == Some(expected_commit) {
             return Ok(false);
         }
         let output = command::capture_with_env(
@@ -185,16 +218,156 @@ impl Repo {
             environment.clone(),
         )?;
         if !output.status.success() {
+            let remote_after = self.remote_branch_commit(branch, environment.clone())?;
+            if remote_after != remote_before {
+                return Err(RemoteBranchMoved {
+                    branch: branch.to_owned(),
+                }
+                .into());
+            }
             bail!("git push exited with {}: {}", output.status, output.stderr);
         }
         let remote = self.remote_branch_commit(branch, environment)?;
         if remote.as_deref() != Some(expected_commit) {
-            bail!(
-                "remote branch {branch} resolved to {}, expected {expected_commit}",
-                remote.as_deref().unwrap_or("missing")
-            );
+            return Err(RemoteBranchMoved {
+                branch: branch.to_owned(),
+            }
+            .into());
         }
         Ok(true)
+    }
+
+    pub fn reconcile_remote_branch(
+        &self,
+        branch: &str,
+        expected_commit: &str,
+        github_token: &str,
+        web_base_url: &str,
+    ) -> Result<ReconciledCommit> {
+        let environment = github_environment(github_token, web_base_url);
+        let Some(remote_commit) = self.remote_branch_commit(branch, environment.clone())? else {
+            return Ok(ReconciledCommit {
+                commit: expected_commit.to_owned(),
+                kind: ReconciliationKind::Unchanged,
+            });
+        };
+        if remote_commit == expected_commit {
+            return Ok(ReconciledCommit {
+                commit: expected_commit.to_owned(),
+                kind: ReconciliationKind::Unchanged,
+            });
+        }
+
+        let remote_ref = format!("refs/rustgrid-agent/remotes/{branch}");
+        let fetch_spec = format!("+refs/heads/{branch}:{remote_ref}");
+        let fetch = command::capture_with_env(
+            "git",
+            ["fetch", "--no-tags", "origin", &fetch_spec],
+            &self.root,
+            environment,
+        )?;
+        if !fetch.status.success() {
+            bail!("git fetch exited with {}: {}", fetch.status, fetch.stderr);
+        }
+        let fetched_commit = command::checked("git", ["rev-parse", &remote_ref], &self.root)?;
+        if fetched_commit != remote_commit {
+            bail!("remote branch {branch} moved while it was being fetched; retry publication");
+        }
+
+        if self.is_ancestor(&remote_commit, expected_commit)? {
+            return Ok(ReconciledCommit {
+                commit: expected_commit.to_owned(),
+                kind: ReconciliationKind::Unchanged,
+            });
+        }
+
+        let head = command::checked("git", ["rev-parse", "HEAD"], &self.root)?;
+        if head != expected_commit {
+            bail!(
+                "local branch {branch} resolved to {head}, expected publication commit {expected_commit}"
+            );
+        }
+
+        if self.is_ancestor(expected_commit, &remote_commit)? {
+            command::checked(
+                "git",
+                ["-c", hooks_disabled(), "merge", "--ff-only", &remote_ref],
+                &self.root,
+            )?;
+            return Ok(ReconciledCommit {
+                commit: remote_commit,
+                kind: ReconciliationKind::RemoteAdvanced,
+            });
+        }
+
+        let parents = command::checked(
+            "git",
+            ["rev-list", "--parents", "-n", "1", expected_commit],
+            &self.root,
+        )?;
+        let parents = parents.split_whitespace().collect::<Vec<_>>();
+        if parents.len() != 2 {
+            bail!(
+                "cannot safely reconcile publication commit {expected_commit}: expected one parent"
+            );
+        }
+        let merge_base = command::capture(
+            "git",
+            ["merge-base", expected_commit, &remote_commit],
+            &self.root,
+        )?;
+        if !merge_base.status.success() {
+            bail!(
+                "cannot safely reconcile branch {branch}: local and remote histories are unrelated"
+            );
+        }
+
+        let rebase = command::capture(
+            "git",
+            [
+                "-c",
+                hooks_disabled(),
+                "rebase",
+                "--onto",
+                &remote_ref,
+                parents[1],
+                branch,
+            ],
+            &self.root,
+        )?;
+        if !rebase.status.success() {
+            let _ = command::capture(
+                "git",
+                ["-c", hooks_disabled(), "rebase", "--abort"],
+                &self.root,
+            );
+            bail!(
+                "concurrent changes on branch {branch} conflict with the agent commit; retained workspace requires manual reconciliation: {}",
+                rebase.stderr
+            );
+        }
+        let commit = command::checked("git", ["rev-parse", "HEAD"], &self.root)?;
+        Ok(ReconciledCommit {
+            commit,
+            kind: ReconciliationKind::Rebased,
+        })
+    }
+
+    fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let output = command::capture(
+            "git",
+            ["merge-base", "--is-ancestor", ancestor, descendant],
+            &self.root,
+        )?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => bail!(
+                "git merge-base exited with {}: {}",
+                output.status,
+                output.stderr
+            ),
+        }
     }
 
     fn remote_branch_commit<E, K, V>(&self, branch: &str, environment: E) -> Result<Option<String>>
@@ -219,6 +392,21 @@ impl Repo {
         }
         Ok(output.stdout.split_whitespace().next().map(str::to_owned))
     }
+}
+
+fn github_environment(github_token: &str, web_base_url: &str) -> [(&'static str, String); 3] {
+    let authorization = STANDARD.encode(format!("x-access-token:{github_token}"));
+    [
+        ("GIT_CONFIG_COUNT", "1".to_owned()),
+        (
+            "GIT_CONFIG_KEY_0",
+            format!("http.{}/.extraheader", web_base_url.trim_end_matches('/')),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0",
+            format!("AUTHORIZATION: basic {authorization}"),
+        ),
+    ]
 }
 
 fn remote_repository(remote: &str) -> Option<(&str, &str)> {
@@ -426,5 +614,152 @@ mod tests {
                 .push("main", &commit, "token", "https://github.com")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn reconciliation_rebases_the_agent_commit_onto_concurrent_remote_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        std::fs::write(repo.root.join("agent.txt"), "agent work\n").unwrap();
+        let agent_commit = commit_all(&repo.root, "agent commit");
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("human.txt"), "human work\n").unwrap();
+        let human_commit = commit_all(&collaborator, "human commit");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let reconciled = repo
+            .reconcile_remote_branch("main", &agent_commit, "token", "https://github.com")
+            .unwrap();
+        assert_eq!(reconciled.kind, ReconciliationKind::Rebased);
+        assert_ne!(reconciled.commit, agent_commit);
+        assert!(repo.is_ancestor(&human_commit, &reconciled.commit).unwrap());
+        assert_eq!(
+            command::checked("git", ["rev-parse", "main"], &repo.root).unwrap(),
+            reconciled.commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("agent.txt")).unwrap(),
+            "agent work\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("human.txt")).unwrap(),
+            "human work\n"
+        );
+        assert!(
+            repo.push("main", &reconciled.commit, "token", "https://github.com")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reconciliation_accepts_remote_commits_after_the_agent_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        std::fs::write(repo.root.join("agent.txt"), "agent work\n").unwrap();
+        let agent_commit = commit_all(&repo.root, "agent commit");
+        repo.push("main", &agent_commit, "token", "https://github.com")
+            .unwrap();
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("human.txt"), "human work\n").unwrap();
+        let human_commit = commit_all(&collaborator, "human commit");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let reconciled = repo
+            .reconcile_remote_branch("main", &agent_commit, "token", "https://github.com")
+            .unwrap();
+        assert_eq!(reconciled.kind, ReconciliationKind::RemoteAdvanced);
+        assert_eq!(reconciled.commit, human_commit);
+        assert_eq!(
+            command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
+            human_commit
+        );
+        assert!(
+            !repo
+                .push("main", &human_commit, "token", "https://github.com")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reconciliation_aborts_cleanly_when_concurrent_changes_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        std::fs::write(repo.root.join("file.txt"), "agent work\n").unwrap();
+        let agent_commit = commit_all(&repo.root, "agent commit");
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("file.txt"), "human work\n").unwrap();
+        commit_all(&collaborator, "human commit");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let error = repo
+            .reconcile_remote_branch("main", &agent_commit, "token", "https://github.com")
+            .unwrap_err();
+        assert!(error.to_string().contains("requires manual reconciliation"));
+        assert_eq!(
+            command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
+            agent_commit
+        );
+        assert!(repo.dirty_paths().unwrap().is_empty());
+    }
+
+    fn initialized_repository(directory: &Path) -> (Repo, PathBuf) {
+        let remote = directory.join("remote.git");
+        let local = directory.join("local");
+        command::checked(
+            "git",
+            ["init", "--bare", remote.to_str().unwrap()],
+            directory,
+        )
+        .unwrap();
+        command::checked(
+            "git",
+            ["init", "--initial-branch=main", local.to_str().unwrap()],
+            directory,
+        )
+        .unwrap();
+        configure_identity(&local);
+        std::fs::write(local.join("file.txt"), "initial\n").unwrap();
+        commit_all(&local, "initial");
+        command::checked(
+            "git",
+            ["remote", "add", "origin", remote.to_str().unwrap()],
+            &local,
+        )
+        .unwrap();
+        command::checked("git", ["push", "-u", "origin", "main"], &local).unwrap();
+        (Repo { root: local }, remote)
+    }
+
+    fn clone_branch(remote: &Path, target: &Path) {
+        command::checked(
+            "git",
+            [
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ],
+            target.parent().unwrap(),
+        )
+        .unwrap();
+        configure_identity(target);
+    }
+
+    fn configure_identity(root: &Path) {
+        command::checked("git", ["config", "user.email", "agent@example.com"], root).unwrap();
+        command::checked("git", ["config", "user.name", "Agent Test"], root).unwrap();
+    }
+
+    fn commit_all(root: &Path, message: &str) -> String {
+        command::checked("git", ["add", "--all"], root).unwrap();
+        command::checked("git", ["commit", "-m", message], root).unwrap();
+        command::checked("git", ["rev-parse", "HEAD"], root).unwrap()
     }
 }
