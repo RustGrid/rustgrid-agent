@@ -16,6 +16,7 @@ use crate::{
 };
 
 const CODEX_IDLE_ATTEMPTS: u32 = 3;
+const DEPENDENCY_INSTALL_ATTEMPTS: u32 = 3;
 pub(crate) const VALIDATION_REPAIR_ATTEMPTS: u32 = 3;
 
 pub(crate) struct ImplementationContext<'a> {
@@ -164,6 +165,123 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         Some(json!({"commit": commit})),
     )?;
     Ok(commit)
+}
+
+pub(crate) fn bootstrap_dependencies(
+    app: &AppContext,
+    reporter: &Reporter<'_>,
+    repo: &Repo,
+    running: &AtomicBool,
+    manifest: &ExecutionManifest,
+    executor: &Executor,
+    executor_handle: &ExecutionHandle,
+) -> Result<()> {
+    let Some((manager, command_text)) = dependency_bootstrap_command(&repo.root) else {
+        return Ok(());
+    };
+    let policy = manifest.policy()?;
+    reporter.step(
+        "dependency_bootstrap",
+        StepStatus::Running,
+        &format!("Installing locked {manager} dependencies before Codex execution"),
+        Some(json!({"manager": manager, "command": command_text})),
+    )?;
+    for attempt in 1..=DEPENDENCY_INSTALL_ATTEMPTS {
+        let install = executor.captured(
+            executor_handle,
+            command_text,
+            RunCommand {
+                args: &[],
+                cwd: &repo.root,
+                stdin_text: None,
+                running,
+                timeout: Duration::from_secs(policy.timeout_seconds.min(1_800)),
+                idle_timeout: None,
+                output_is_activity: None,
+                max_output_bytes: app.config.max_command_output_bytes as usize,
+                environment_allowlist: &policy.codex.environment_allowlist,
+                limits: Some(child_limits(
+                    app,
+                    Duration::from_secs(policy.timeout_seconds.min(1_800)),
+                )),
+                max_workspace_bytes: app.config.max_workspace_bytes,
+            },
+        )?;
+        let output = combine_output(&install.stdout, &install.stderr);
+        if install.status.success() {
+            reporter.step(
+                "dependency_bootstrap",
+                StepStatus::Completed,
+                &format!("Installed locked {manager} dependencies"),
+                Some(json!({"manager": manager, "attempt": attempt})),
+            )?;
+            return Ok(());
+        }
+        if !is_transient_gate_failure(&output) {
+            reporter.step(
+                "dependency_bootstrap",
+                StepStatus::Failed,
+                "Dependency bootstrap failed for a repository-specific reason; Codex will inspect and repair it",
+                Some(json!({
+                    "manager": manager,
+                    "attempt": attempt,
+                    "output": truncate_text(&output, 8_000)
+                })),
+            )?;
+            return Ok(());
+        }
+        if attempt < DEPENDENCY_INSTALL_ATTEMPTS {
+            let delay = Duration::from_secs(u64::from(attempt) * 2);
+            reporter.step(
+                "dependency_bootstrap_retry",
+                StepStatus::Running,
+                &format!(
+                    "Dependency registry request failed transiently; retrying attempt {} of {} in {}s",
+                    attempt + 1,
+                    DEPENDENCY_INSTALL_ATTEMPTS,
+                    delay.as_secs()
+                ),
+                Some(json!({"manager": manager, "attempt": attempt + 1})),
+            )?;
+            thread::sleep(delay);
+            continue;
+        }
+        return Err(RunFailure::InfrastructureTransient {
+            detail: format!(
+                "locked {manager} dependency installation remained unavailable after {DEPENDENCY_INSTALL_ATTEMPTS} attempts: {}",
+                truncate_text(&output, 8_000)
+            ),
+        }
+        .into());
+    }
+    unreachable!("bounded dependency bootstrap loop always returns")
+}
+
+fn dependency_bootstrap_command(root: &std::path::Path) -> Option<(&'static str, &'static str)> {
+    if !root.join("package.json").is_file() {
+        return None;
+    }
+    if root.join("pnpm-lock.yaml").is_file() {
+        Some((
+            "pnpm",
+            "pnpm install --frozen-lockfile --prefer-offline --ignore-scripts",
+        ))
+    } else if root.join("yarn.lock").is_file() {
+        Some((
+            "yarn",
+            "yarn install --frozen-lockfile --prefer-offline --ignore-scripts",
+        ))
+    } else if root.join("bun.lock").is_file() || root.join("bun.lockb").is_file() {
+        Some(("bun", "bun install --frozen-lockfile --ignore-scripts"))
+    } else if root.join("package-lock.json").is_file() || root.join("npm-shrinkwrap.json").is_file()
+    {
+        Some((
+            "npm",
+            "npm ci --ignore-scripts --no-audit --no-fund --prefer-offline",
+        ))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn run_codex_prompt(
@@ -658,5 +776,30 @@ mod tests {
         let diagnostics = outcome.diagnostics();
         assert!(diagnostics.contains("Gate test (`npm test`)"));
         assert!(diagnostics.contains("Gate lint (`npm run lint`)"));
+    }
+
+    #[test]
+    fn selects_locked_dependency_bootstrap_without_lifecycle_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("package.json"), "{}").unwrap();
+        assert_eq!(dependency_bootstrap_command(directory.path()), None);
+
+        std::fs::write(directory.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(
+            dependency_bootstrap_command(directory.path()),
+            Some((
+                "npm",
+                "npm ci --ignore-scripts --no-audit --no-fund --prefer-offline"
+            ))
+        );
+
+        std::fs::write(directory.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            dependency_bootstrap_command(directory.path()),
+            Some((
+                "pnpm",
+                "pnpm install --frozen-lockfile --prefer-offline --ignore-scripts"
+            ))
+        );
     }
 }

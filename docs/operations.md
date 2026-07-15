@@ -26,10 +26,15 @@ configured version. Sandbox admission then requires `codex --version` to match
 exactly. A retained sandbox with another version receives the kit through
 `sbx kit add` before reuse; failed upgrades preserve the sandbox and fail the
 run as transient infrastructure. Worker startup also fails closed unless
-`kit.allowLocalKits` is enabled. The kit explicitly allows the npm registry and
-sets bounded fetch retry/backoff variables for every sandbox process. This
-covers transient `gateway.docker.internal` DNS failures that occur after the
-initial `npm ping` admission probe.
+`kit.allowLocalKits` is enabled. The kit explicitly allows the npm registry,
+bounds npm socket concurrency, prefers cached artifacts, and sets fetch
+retry/backoff variables for every sandbox process. JavaScript workspaces always
+receive registry admission, including when signed gates invoke npm indirectly.
+Before Codex starts, a detected npm, pnpm, Yarn, or Bun lockfile is hydrated
+without lifecycle scripts. Transient `gateway.docker.internal` DNS, proxy,
+timeout, and connection failures retry the whole install up to three times;
+exhaustion is classified as transient worker infrastructure instead of letting
+Codex proceed with missing dependencies.
 
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Configure:
@@ -84,8 +89,9 @@ the command process tree and restarts a fresh ephemeral Codex process against
 the same retained workspace, up to three attempts. Exhaustion reports a
 timed-out run and leaves the sandbox recoverable by a later run attempt.
 
-When the signed execution policy contains an npm-family quality gate, every
-newly created Docker Sandbox must pass an `npm ping` against the public registry
+When the repository is a JavaScript workspace or the signed execution policy
+contains an npm-family quality gate, every newly created Docker Sandbox must
+pass an `npm ping` against the public registry
 before it is admitted for Codex or quality-gate execution. Failed admission
 destroys and recreates the sandbox up to three times with bounded backoff.
 Exhaustion is reported as transient worker infrastructure failure, not as a

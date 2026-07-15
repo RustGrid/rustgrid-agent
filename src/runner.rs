@@ -17,8 +17,8 @@ use crate::{
     config::AppContext,
     coordinator::CoordinatorHealth,
     execution::{
-        CodexContext, ImplementationContext, QualityGateContext, implement_and_commit,
-        run_codex_prompt, run_gates_with_repairs, short_sha,
+        CodexContext, ImplementationContext, QualityGateContext, bootstrap_dependencies,
+        implement_and_commit, run_codex_prompt, run_gates_with_repairs, short_sha,
     },
     executor::{ExecutionHandle, Executor},
     finalization::finalize,
@@ -221,7 +221,7 @@ fn execute_claimed(
         let handle = executor.prepare(
             &run.id,
             &repo.root,
-            execution_policy.requires_npm_registry(),
+            execution_policy.requires_npm_registry() || repo.root.join("package.json").is_file(),
             retained_executor_id.as_deref(),
         )?;
         // Adopt the executor immediately after it is prepared. Everything below this
@@ -698,6 +698,16 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             if resumed_branch { "Resumed" } else { "Created" }
         ),
         Some(json!({"resumed": resumed_branch})),
+    )?;
+
+    bootstrap_dependencies(
+        context,
+        reporter,
+        &repo,
+        running,
+        manifest,
+        executor,
+        executor_handle,
     )?;
 
     let recovery = reporter.recovery_plan()?;

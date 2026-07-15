@@ -609,6 +609,10 @@ environment:
     NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "2000"
     NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "30000"
     NPM_CONFIG_FETCH_TIMEOUT: "120000"
+    NPM_CONFIG_MAXSOCKETS: "8"
+    NPM_CONFIG_PREFER_OFFLINE: "true"
+    NPM_CONFIG_AUDIT: "false"
+    NPM_CONFIG_FUND: "false"
 commands:
   install:
     - command: "npm install --global --no-audit --no-fund @openai/codex@{version}"
@@ -1167,6 +1171,10 @@ environment:
     NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: "2000"
     NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: "30000"
     NPM_CONFIG_FETCH_TIMEOUT: "120000"
+    NPM_CONFIG_MAXSOCKETS: "8"
+    NPM_CONFIG_PREFER_OFFLINE: "true"
+    NPM_CONFIG_AUDIT: "false"
+    NPM_CONFIG_FUND: "false"
 commands:
   install:
     - command: "npm install --global --no-audit --no-fund @openai/codex@0.144.4"
