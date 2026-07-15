@@ -22,7 +22,10 @@ use crate::{
     },
     executor::{ExecutionHandle, Executor},
     finalization::finalize,
-    git::{ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, branch_name},
+    git::{
+        ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, branch_name,
+        fresh_branch_name,
+    },
     github::GitHubClient,
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
@@ -674,7 +677,11 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         )?;
     }
 
-    let branch = branch_name(&ticket.key, &ticket.title);
+    let branch = if manifest.fresh_start()? {
+        fresh_branch_name(&ticket.key, &ticket.title, &run.id)
+    } else {
+        branch_name(&ticket.key, &ticket.title)
+    };
     reporter.step(
         "branch_create",
         StepStatus::Running,

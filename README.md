@@ -212,7 +212,9 @@ selects a previous run implicitly.
 
 A run with `metadata.fresh_start: true` cannot include recovery lineage. It uses
 the new run ID's isolated checkout and executor, so no retained repository state
-or agent context from an earlier run is adopted.
+or agent context from an earlier run is adopted. It also publishes to a
+run-specific branch, preventing a discarded run's remote branch history from
+being reconciled into the fresh result.
 
 ## Credentials
 

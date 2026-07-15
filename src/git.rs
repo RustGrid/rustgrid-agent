@@ -587,6 +587,13 @@ pub fn branch_name(key: &str, title: &str) -> String {
         .to_owned()
 }
 
+pub fn fresh_branch_name(key: &str, title: &str, run_id: &str) -> String {
+    let run_id = slug(run_id);
+    format!("{}-{run_id}", branch_name(key, title))
+        .trim_end_matches('-')
+        .to_owned()
+}
+
 pub fn read_repo_instructions(root: &Path) -> Result<Vec<(String, String)>> {
     let mut result = Vec::new();
     for name in ["AGENTS.md", "README.md"] {
@@ -609,6 +616,25 @@ mod tests {
         assert_eq!(
             branch_name("RG-42", "Fix the Café / API!"),
             "agent/rg-42-fix-the-caf-api"
+        );
+    }
+
+    #[test]
+    fn fresh_branch_names_are_isolated_by_run() {
+        let first = fresh_branch_name(
+            "AOPS-102",
+            "Production verification and security hardening",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let second = fresh_branch_name(
+            "AOPS-102",
+            "Production verification and security hardening",
+            "22222222-2222-4222-8222-222222222222",
+        );
+
+        assert_ne!(first, second);
+        assert!(
+            first.starts_with("agent/aops-102-production-verification-and-security-hardening-")
         );
     }
 
