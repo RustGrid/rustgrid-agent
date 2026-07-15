@@ -30,6 +30,13 @@ and removes them after the configured failed-workspace retention window.
 
 Every irreversible publication checkpoint is written atomically to `journal.json`. A restarted worker derives a recovery plan and reconciles existing Git and GitHub state rather than repeating side effects.
 
+Immediately before each initial or repair publication, the worker reconciles
+the remote agent branch and rebases the complete agent commit range onto the
+latest remote base branch. Rewritten existing agent branches use an exact
+force-with-lease bound to the observed remote SHA, so another worker's movement
+causes a safe stop instead of an overwrite. Changed commits always pass local
+validation again before publication.
+
 Required local gates aggregate failures and return them to Codex for a bounded
 repair loop. Required GitHub workflow failures are resolved to the latest run,
 failed jobs and steps, and bounded job-log tails. Each CI repair is locally

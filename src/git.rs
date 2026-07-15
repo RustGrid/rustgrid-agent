@@ -194,6 +194,17 @@ impl Repo {
         github_token: &str,
         web_base_url: &str,
     ) -> Result<bool> {
+        self.push_with_lease(branch, expected_commit, None, github_token, web_base_url)
+    }
+
+    pub fn push_with_lease(
+        &self,
+        branch: &str,
+        expected_commit: &str,
+        expected_remote: Option<&str>,
+        github_token: &str,
+        web_base_url: &str,
+    ) -> Result<bool> {
         // Child-only dynamic Git config keeps the token out of argv and remote URLs.
         let authorization = STANDARD.encode(format!("x-access-token:{github_token}"));
         let environment = [
@@ -211,12 +222,20 @@ impl Repo {
         if remote_before.as_deref() == Some(expected_commit) {
             return Ok(false);
         }
-        let output = command::capture_with_env(
-            "git",
-            ["push", "--set-upstream", "origin", branch],
-            &self.root,
-            environment.clone(),
-        )?;
+        if expected_remote.is_some() && remote_before.as_deref() != expected_remote {
+            return Err(RemoteBranchMoved {
+                branch: branch.to_owned(),
+            }
+            .into());
+        }
+        let mut push_args = vec!["push".to_owned(), "--set-upstream".to_owned()];
+        if let Some(expected_remote) = expected_remote {
+            push_args.push(format!(
+                "--force-with-lease=refs/heads/{branch}:{expected_remote}"
+            ));
+        }
+        push_args.extend(["origin".to_owned(), branch.to_owned()]);
+        let output = command::capture_with_env("git", push_args, &self.root, environment.clone())?;
         if !output.status.success() {
             let remote_after = self.remote_branch_commit(branch, environment.clone())?;
             if remote_after != remote_before {
@@ -235,6 +254,15 @@ impl Repo {
             .into());
         }
         Ok(true)
+    }
+
+    pub fn remote_branch_head(
+        &self,
+        branch: &str,
+        github_token: &str,
+        web_base_url: &str,
+    ) -> Result<Option<String>> {
+        self.remote_branch_commit(branch, github_environment(github_token, web_base_url))
     }
 
     pub fn reconcile_remote_branch(
@@ -343,6 +371,88 @@ impl Repo {
             );
             bail!(
                 "concurrent changes on branch {branch} conflict with the agent commit; retained workspace requires manual reconciliation: {}",
+                rebase.stderr
+            );
+        }
+        let commit = command::checked("git", ["rev-parse", "HEAD"], &self.root)?;
+        Ok(ReconciledCommit {
+            commit,
+            kind: ReconciliationKind::Rebased,
+        })
+    }
+
+    pub fn rebase_onto_remote_base(
+        &self,
+        branch: &str,
+        base_branch: &str,
+        expected_commit: &str,
+        github_token: &str,
+        web_base_url: &str,
+    ) -> Result<ReconciledCommit> {
+        let head = command::checked("git", ["rev-parse", "HEAD"], &self.root)?;
+        if head != expected_commit {
+            bail!(
+                "local branch {branch} resolved to {head}, expected publication commit {expected_commit}"
+            );
+        }
+        let remote_ref = format!("refs/rustgrid-agent/bases/{base_branch}");
+        let fetch_spec = format!("+refs/heads/{base_branch}:{remote_ref}");
+        let fetch = command::capture_with_env(
+            "git",
+            ["fetch", "--no-tags", "origin", &fetch_spec],
+            &self.root,
+            github_environment(github_token, web_base_url),
+        )?;
+        if !fetch.status.success() {
+            bail!(
+                "could not fetch latest base branch {base_branch}: git fetch exited with {}: {}",
+                fetch.status,
+                fetch.stderr
+            );
+        }
+        let base_commit = command::checked("git", ["rev-parse", &remote_ref], &self.root)?;
+        if self.is_ancestor(&base_commit, expected_commit)? {
+            return Ok(ReconciledCommit {
+                commit: expected_commit.to_owned(),
+                kind: ReconciliationKind::Unchanged,
+            });
+        }
+        let merge_base = command::capture(
+            "git",
+            ["merge-base", expected_commit, &base_commit],
+            &self.root,
+        )?;
+        if !merge_base.status.success() {
+            bail!("cannot rebase branch {branch} onto {base_branch}: histories are unrelated");
+        }
+        let merge_base = merge_base.stdout.trim();
+        if merge_base == expected_commit {
+            bail!(
+                "branch {branch} has no unpublished commits after latest base {base_branch}; refusing to create an empty pull request"
+            );
+        }
+        let rebase = command::capture(
+            "git",
+            [
+                "-c",
+                hooks_disabled(),
+                "rebase",
+                "--autostash",
+                "--onto",
+                &remote_ref,
+                merge_base,
+                branch,
+            ],
+            &self.root,
+        )?;
+        if !rebase.status.success() {
+            let _ = command::capture(
+                "git",
+                ["-c", hooks_disabled(), "rebase", "--abort"],
+                &self.root,
+            );
+            bail!(
+                "agent changes conflict with latest base branch {base_branch}; automatic rebase was attempted and aborted cleanly: {}",
                 rebase.stderr
             );
         }
@@ -701,6 +811,181 @@ mod tests {
             .reconcile_remote_branch("main", &agent_commit, "token", "https://github.com")
             .unwrap_err();
         assert!(error.to_string().contains("requires manual reconciliation"));
+        assert_eq!(
+            command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
+            agent_commit
+        );
+        assert!(repo.dirty_paths().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rebases_all_agent_commits_onto_the_latest_remote_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        command::checked("git", ["switch", "-c", "agent/work"], &repo.root).unwrap();
+        std::fs::write(repo.root.join("agent-one.txt"), "one\n").unwrap();
+        commit_all(&repo.root, "agent one");
+        std::fs::write(repo.root.join("agent-two.txt"), "two\n").unwrap();
+        let agent_commit = commit_all(&repo.root, "agent two");
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("merged-pr.txt"), "merged\n").unwrap();
+        let latest_base = commit_all(&collaborator, "merged pull request");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let reconciled = repo
+            .rebase_onto_remote_base(
+                "agent/work",
+                "main",
+                &agent_commit,
+                "token",
+                "https://github.com",
+            )
+            .unwrap();
+        assert_eq!(reconciled.kind, ReconciliationKind::Rebased);
+        assert!(repo.is_ancestor(&latest_base, &reconciled.commit).unwrap());
+        assert_eq!(
+            command::checked(
+                "git",
+                [
+                    "rev-list",
+                    "--count",
+                    &format!("{latest_base}..{}", reconciled.commit)
+                ],
+                &repo.root,
+            )
+            .unwrap(),
+            "2"
+        );
+    }
+
+    #[test]
+    fn safely_replaces_an_existing_agent_branch_after_base_rebase() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        command::checked("git", ["switch", "-c", "agent/work"], &repo.root).unwrap();
+        std::fs::write(repo.root.join("agent.txt"), "agent\n").unwrap();
+        let old_agent_commit = commit_all(&repo.root, "agent work");
+        repo.push(
+            "agent/work",
+            &old_agent_commit,
+            "token",
+            "https://github.com",
+        )
+        .unwrap();
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("merged-pr.txt"), "merged\n").unwrap();
+        let latest_base = commit_all(&collaborator, "merged pull request");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let reconciled = repo
+            .rebase_onto_remote_base(
+                "agent/work",
+                "main",
+                &old_agent_commit,
+                "token",
+                "https://github.com",
+            )
+            .unwrap();
+        assert!(
+            repo.push_with_lease(
+                "agent/work",
+                &reconciled.commit,
+                Some(&old_agent_commit),
+                "token",
+                "https://github.com",
+            )
+            .unwrap()
+        );
+        assert!(repo.is_ancestor(&latest_base, &reconciled.commit).unwrap());
+        assert_eq!(
+            repo.remote_branch_head("agent/work", "token", "https://github.com")
+                .unwrap()
+                .as_deref(),
+            Some(reconciled.commit.as_str())
+        );
+    }
+
+    #[test]
+    fn stale_force_with_lease_never_overwrites_concurrent_agent_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        command::checked("git", ["switch", "-c", "agent/work"], &repo.root).unwrap();
+        std::fs::write(repo.root.join("agent.txt"), "agent\n").unwrap();
+        let observed_remote = commit_all(&repo.root, "agent work");
+        repo.push(
+            "agent/work",
+            &observed_remote,
+            "token",
+            "https://github.com",
+        )
+        .unwrap();
+        std::fs::write(repo.root.join("repair.txt"), "repair\n").unwrap();
+        let local_repair = commit_all(&repo.root, "local repair");
+
+        let concurrent = directory.path().join("concurrent");
+        command::checked(
+            "git",
+            [
+                "clone",
+                "--branch",
+                "agent/work",
+                remote.to_str().unwrap(),
+                concurrent.to_str().unwrap(),
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        configure_identity(&concurrent);
+        std::fs::write(concurrent.join("concurrent.txt"), "concurrent\n").unwrap();
+        let concurrent_commit = commit_all(&concurrent, "concurrent work");
+        command::checked("git", ["push", "origin", "agent/work"], &concurrent).unwrap();
+
+        let error = repo
+            .push_with_lease(
+                "agent/work",
+                &local_repair,
+                Some(&observed_remote),
+                "token",
+                "https://github.com",
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<RemoteBranchMoved>().is_some());
+        assert_eq!(
+            repo.remote_branch_head("agent/work", "token", "https://github.com")
+                .unwrap()
+                .as_deref(),
+            Some(concurrent_commit.as_str())
+        );
+    }
+
+    #[test]
+    fn base_rebase_conflict_is_attempted_and_aborted_cleanly() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, remote) = initialized_repository(directory.path());
+        command::checked("git", ["switch", "-c", "agent/work"], &repo.root).unwrap();
+        std::fs::write(repo.root.join("file.txt"), "agent\n").unwrap();
+        let agent_commit = commit_all(&repo.root, "agent work");
+
+        let collaborator = directory.path().join("collaborator");
+        clone_branch(&remote, &collaborator);
+        std::fs::write(collaborator.join("file.txt"), "merged\n").unwrap();
+        commit_all(&collaborator, "merged pull request");
+        command::checked("git", ["push", "origin", "main"], &collaborator).unwrap();
+
+        let error = repo
+            .rebase_onto_remote_base(
+                "agent/work",
+                "main",
+                &agent_commit,
+                "token",
+                "https://github.com",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("automatic rebase was attempted"));
         assert_eq!(
             command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
             agent_commit

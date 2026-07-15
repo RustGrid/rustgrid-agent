@@ -22,7 +22,7 @@ use crate::{
     },
     executor::{ExecutionHandle, Executor},
     finalization::finalize,
-    git::{ReconciliationKind, RemoteBranchMoved, Repo, branch_name},
+    git::{ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, branch_name},
     github::GitHubClient,
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
@@ -429,10 +429,85 @@ struct PublicationContext<'a> {
     reporter: &'a Reporter<'a>,
     repo: &'a Repo,
     baseline: &'a BTreeSet<String>,
+    base_branch: &'a str,
     running: &'a AtomicBool,
     manifest: &'a ExecutionManifest,
     executor: &'a Executor,
     executor_handle: &'a ExecutionHandle,
+}
+
+fn validate_reconciled_commit(
+    context: &PublicationContext<'_>,
+    step_id: &str,
+    branch: &str,
+    commit: &mut String,
+    reconciled: ReconciledCommit,
+    message: &str,
+) -> Result<()> {
+    if !reconciled.requires_validation() {
+        return Ok(());
+    }
+    *commit = reconciled.commit;
+    context.reporter.record_commit(commit)?;
+    context.reporter.step(
+        step_id,
+        StepStatus::Completed,
+        message,
+        Some(json!({
+            "commit": commit,
+            "strategy": match reconciled.kind {
+                ReconciliationKind::RemoteAdvanced => "remote_advanced",
+                ReconciliationKind::Rebased => "rebase",
+                ReconciliationKind::Unchanged => "unchanged",
+            }
+        })),
+    )?;
+    let codex = CodexContext {
+        app: context.app,
+        reporter: context.reporter,
+        repo: context.repo,
+        running: context.running,
+        manifest: context.manifest,
+        executor: context.executor,
+        executor_handle: context.executor_handle,
+    };
+    run_gates_with_repairs(
+        &codex,
+        QualityGateContext {
+            app: context.app,
+            api: context.api,
+            run: context.run,
+            ticket: context.ticket,
+            reporter: context.reporter,
+            repo: context.repo,
+            running: context.running,
+            manifest: context.manifest,
+            executor: context.executor,
+            executor_handle: context.executor_handle,
+        },
+        "post-reconciliation quality gates",
+    )?;
+    let repair_paths = context.repo.new_agent_paths(context.baseline)?;
+    if !repair_paths.is_empty() {
+        *commit = context.repo.commit_paths(
+            &repair_paths,
+            &format!(
+                "{}: {} (post-reconciliation repair)",
+                context.ticket.key, context.ticket.title
+            ),
+        )?;
+        context.reporter.record_commit(commit)?;
+        context.reporter.step(
+            &format!("{step_id}_repair"),
+            StepStatus::Completed,
+            &format!(
+                "Committed post-reconciliation repair {} on {branch}",
+                short_sha(commit)
+            ),
+            Some(json!({"commit": commit, "paths": repair_paths})),
+        )?;
+    }
+    Ok(())
 }
 
 fn publish_commit(
@@ -465,88 +540,66 @@ fn publish_commit(
             &reconcile_token,
             &context.manifest.web_base_url,
         )?;
-        if reconciled.requires_validation() {
-            let reconciliation = match reconciled.kind {
-                ReconciliationKind::RemoteAdvanced => {
-                    "accepted remote commits after the agent commit"
-                }
-                ReconciliationKind::Rebased => {
-                    "rebased the agent commit onto concurrent remote work"
-                }
-                ReconciliationKind::Unchanged => {
-                    unreachable!("validation requires a changed commit")
-                }
-            };
-            *commit = reconciled.commit;
-            context.reporter.record_commit(commit)?;
-            context.reporter.step(
-                &format!("{step_id}_reconciliation"),
-                StepStatus::Completed,
-                &format!("Reconciled branch {branch}: {reconciliation}"),
-                Some(json!({
-                    "commit": commit,
-                    "strategy": match reconciled.kind {
-                        ReconciliationKind::RemoteAdvanced => "remote_advanced",
-                        ReconciliationKind::Rebased => "rebase",
-                        ReconciliationKind::Unchanged => "unchanged",
-                    }
-                })),
-            )?;
-            let codex = CodexContext {
-                app: context.app,
-                reporter: context.reporter,
-                repo: context.repo,
-                running: context.running,
-                manifest: context.manifest,
-                executor: context.executor,
-                executor_handle: context.executor_handle,
-            };
-            run_gates_with_repairs(
-                &codex,
-                QualityGateContext {
-                    app: context.app,
-                    api: context.api,
-                    run: context.run,
-                    ticket: context.ticket,
-                    reporter: context.reporter,
-                    repo: context.repo,
-                    running: context.running,
-                    manifest: context.manifest,
-                    executor: context.executor,
-                    executor_handle: context.executor_handle,
-                },
-                "post-reconciliation quality gates",
-            )?;
-            let repair_paths = context.repo.new_agent_paths(context.baseline)?;
-            if !repair_paths.is_empty() {
-                *commit = context.repo.commit_paths(
-                    &repair_paths,
-                    &format!(
-                        "{}: {} (post-reconciliation repair)",
-                        context.ticket.key, context.ticket.title
-                    ),
-                )?;
-                context.reporter.record_commit(commit)?;
-                context.reporter.step(
-                    &format!("{step_id}_reconciliation_repair"),
-                    StepStatus::Completed,
-                    &format!("Committed post-reconciliation repair {}", short_sha(commit)),
-                    Some(json!({"commit": commit, "paths": repair_paths})),
-                )?;
-            }
-        }
+        let reconciliation = match reconciled.kind {
+            ReconciliationKind::RemoteAdvanced => "accepted remote commits after the agent commit",
+            ReconciliationKind::Rebased => "rebased the agent commit onto concurrent remote work",
+            ReconciliationKind::Unchanged => "remote branch was unchanged",
+        };
+        validate_reconciled_commit(
+            &context,
+            &format!("{step_id}_reconciliation"),
+            branch,
+            commit,
+            reconciled,
+            &format!("Reconciled branch {branch}: {reconciliation}"),
+        )?;
+
+        let base_token = tokens.token()?;
+        let base_lease =
+            context
+                .repo
+                .remote_branch_head(branch, &base_token, &context.manifest.web_base_url)?;
+        let base_reconciled = context.repo.rebase_onto_remote_base(
+            branch,
+            context.base_branch,
+            commit,
+            &base_token,
+            &context.manifest.web_base_url,
+        )?;
+        let base_changed = base_reconciled.requires_validation();
+        validate_reconciled_commit(
+            &context,
+            &format!("{step_id}_base_reconciliation"),
+            branch,
+            commit,
+            base_reconciled,
+            &format!(
+                "Rebased all agent commits onto latest remote base {}",
+                context.base_branch
+            ),
+        )?;
 
         let push_token = tokens.token()?;
-        match context
-            .repo
-            .push(branch, commit, &push_token, &context.manifest.web_base_url)
-        {
+        let expected_remote = if base_changed {
+            base_lease.as_deref()
+        } else {
+            None
+        };
+        match context.repo.push_with_lease(
+            branch,
+            commit,
+            expected_remote,
+            &push_token,
+            &context.manifest.web_base_url,
+        ) {
             Ok(did_push) => {
                 pushed |= did_push;
                 break;
             }
             Err(error)
-                if publish_attempt < 3 && error.downcast_ref::<RemoteBranchMoved>().is_some() =>
+                if !base_changed
+                    && publish_attempt < 3
+                    && error.downcast_ref::<RemoteBranchMoved>().is_some() =>
             {
                 context.reporter.step(
                     &format!("{step_id}_race_retry"),
@@ -689,6 +742,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             reporter,
             repo: &repo,
             baseline: &baseline,
+            base_branch,
             running,
             manifest,
             executor,
@@ -851,6 +905,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                     reporter,
                     repo: &repo,
                     baseline: &baseline,
+                    base_branch,
                     running,
                     manifest,
                     executor,

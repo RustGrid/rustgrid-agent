@@ -132,11 +132,17 @@ the journal manually while the worker is running.
 
 Publication also reconciles concurrent updates to the generated remote branch.
 If the remote is ahead of the agent commit, the local branch fast-forwards. If
-the histories diverge, the coordinator rebases only the runner-owned commit onto
-the fetched remote head, reruns all quality gates, atomically checkpoints the new
-commit, and retries a normal push up to three times. It never force-pushes. A
-conflict aborts the rebase and retains the clean pre-rebase workspace for a
-human-assisted retry.
+the histories diverge, the coordinator rebases the runner-owned commit onto the
+fetched remote head, reruns all quality gates, atomically checkpoints the new
+commit, and retries a normal push up to three times. A conflict aborts the
+rebase and retains the clean pre-rebase workspace for a human-assisted retry.
+
+Publication also fetches the manifest-selected remote base branch immediately
+before every initial or CI-repair push and rebases the complete agent commit
+range when the base advanced. If the agent branch already exists, the rewritten
+history is pushed only with an exact force-with-lease for the previously
+observed SHA. A stale lease is a concurrency signal and must not be bypassed
+with an unconditional force push.
 
 Required validation is iterative. Local quality gates collect all required
 failures before returning diagnostics to Codex, with three total validation
