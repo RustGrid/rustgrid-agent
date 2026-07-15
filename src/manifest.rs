@@ -107,10 +107,21 @@ impl ExecutionPolicy {
 }
 
 impl ExecutionManifest {
+    pub fn fresh_start(&self) -> Result<bool> {
+        match self.run.metadata.get("fresh_start") {
+            None => Ok(false),
+            Some(serde_json::Value::Bool(value)) => Ok(*value),
+            Some(_) => bail!("execution manifest metadata.fresh_start must be a boolean"),
+        }
+    }
+
     pub fn resume_from_run_id(&self) -> Result<Option<&str>> {
         let Some(value) = self.run.metadata.get("resume_from_run_id") else {
             return Ok(None);
         };
+        if self.fresh_start()? {
+            bail!("execution manifest cannot combine fresh_start with resume_from_run_id");
+        }
         let source_run_id = value
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -137,6 +148,7 @@ impl ExecutionManifest {
         if self.run.attempt == 0 {
             bail!("execution manifest run attempt must be at least 1");
         }
+        self.fresh_start()?;
         self.resume_from_run_id()?;
         for (name, value) in [
             ("project_id", self.project_id.as_str()),
@@ -387,6 +399,24 @@ mod tests {
         assert!(retry.resume_from_run_id().is_err());
         retry.run.metadata = serde_json::json!({"resume_from_run_id": 7});
         assert!(retry.resume_from_run_id().is_err());
+    }
+
+    #[test]
+    fn validates_fresh_start_metadata_and_rejects_recovery_lineage() {
+        let mut fresh = manifest();
+        fresh.run.attempt = 2;
+        fresh.run.metadata = serde_json::json!({"fresh_start": true});
+        assert!(fresh.fresh_start().unwrap());
+        assert_eq!(fresh.resume_from_run_id().unwrap(), None);
+
+        fresh.run.metadata = serde_json::json!({"fresh_start": "yes"});
+        assert!(fresh.fresh_start().is_err());
+
+        fresh.run.metadata = serde_json::json!({
+            "fresh_start": true,
+            "resume_from_run_id": "run-previous"
+        });
+        assert!(fresh.resume_from_run_id().is_err());
     }
 
     #[test]

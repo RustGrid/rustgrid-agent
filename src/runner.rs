@@ -119,10 +119,11 @@ fn execute_claimed(
             .with_context(|| format!("could not retrieve execution manifest for run {}", run.id))?;
         manifest.validate(&run.id, &ticket.id)?;
         let policy = manifest.policy()?;
+        let fresh_start = manifest.fresh_start()?;
         let recovery_source = manifest.resume_from_run_id()?.map(str::to_owned);
-        Ok::<_, anyhow::Error>((manifest, policy, recovery_source))
+        Ok::<_, anyhow::Error>((manifest, policy, fresh_start, recovery_source))
     })();
-    let (manifest, execution_policy, recovery_source) = match manifest_and_policy {
+    let (manifest, execution_policy, fresh_start, recovery_source) = match manifest_and_policy {
         Ok(value) => value,
         Err(error) => {
             report_preparation_failure(
@@ -264,7 +265,9 @@ fn execute_claimed(
         reporter.step(
             "workspace_prepared",
             StepStatus::Completed,
-            if recovery_source.is_some() {
+            if fresh_start {
+                "Prepared a fresh isolated repository workspace with no recovery context"
+            } else if recovery_source.is_some() {
                 "Adopted retained repository workspace from the previous attempt"
             } else {
                 "Prepared isolated repository workspace"
@@ -272,6 +275,7 @@ fn execute_claimed(
             Some(json!({
                 "bytes": workspace_bytes,
                 "resumed": workspace_resumed,
+                "fresh_start": fresh_start,
                 "recovery_source_run_id": recovery_source
             })),
         )?;

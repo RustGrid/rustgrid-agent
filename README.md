@@ -210,6 +210,10 @@ later attempt with `metadata.resume_from_run_id` naming the unsuccessful source
 run. The worker validates and atomically adopts that explicit lineage; it never
 selects a previous run implicitly.
 
+A run with `metadata.fresh_start: true` cannot include recovery lineage. It uses
+the new run ID's isolated checkout and executor, so no retained repository state
+or agent context from an earlier run is adopted.
+
 ## Credentials
 
 | Variable | Required | Purpose |
