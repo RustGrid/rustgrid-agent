@@ -16,6 +16,7 @@ use crate::{
 };
 
 const CODEX_IDLE_ATTEMPTS: u32 = 3;
+pub(crate) const VALIDATION_REPAIR_ATTEMPTS: u32 = 3;
 
 pub(crate) struct ImplementationContext<'a> {
     pub app: &'a AppContext,
@@ -32,6 +33,7 @@ pub(crate) struct ImplementationContext<'a> {
     pub executor_handle: &'a ExecutionHandle,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct QualityGateContext<'a> {
     pub app: &'a AppContext,
     pub api: &'a RustGridClient,
@@ -43,6 +45,49 @@ pub(crate) struct QualityGateContext<'a> {
     pub manifest: &'a ExecutionManifest,
     pub executor: &'a Executor,
     pub executor_handle: &'a ExecutionHandle,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CodexContext<'a> {
+    pub app: &'a AppContext,
+    pub reporter: &'a Reporter<'a>,
+    pub repo: &'a Repo,
+    pub running: &'a AtomicBool,
+    pub manifest: &'a ExecutionManifest,
+    pub executor: &'a Executor,
+    pub executor_handle: &'a ExecutionHandle,
+}
+
+#[derive(Debug)]
+pub(crate) struct QualityGateFailure {
+    pub gate_id: String,
+    pub command: String,
+    pub status: String,
+    pub output: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct QualityGateOutcome {
+    pub failures: Vec<QualityGateFailure>,
+}
+
+impl QualityGateOutcome {
+    pub fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn diagnostics(&self) -> String {
+        self.failures
+            .iter()
+            .map(|failure| {
+                format!(
+                    "Gate {} (`{}`) failed with {}:\n{}",
+                    failure.gate_id, failure.command, failure.status, failure.output
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) -> Result<String> {
@@ -60,118 +105,38 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor,
         executor_handle,
     } = implementation;
-    let policy = manifest.policy()?;
     reporter.step(
         "prompt_built",
         StepStatus::Completed,
         "Built Codex prompt from ticket and repository context",
         Some(json!({"characters": generated_prompt.len()})),
     )?;
-    reporter.set_phase(RunPhase::Executing);
-    reporter.step(
-        "codex",
-        StepStatus::Running,
-        "Running Codex in the configured executor",
-        Some(json!({
-            "idle_timeout_seconds": policy.codex_idle_timeout().as_secs(),
-            "max_idle_attempts": CODEX_IDLE_ATTEMPTS
-        })),
-    )?;
-    let blocked_action = RefCell::new(None);
-    let codex_args = policy.codex_args();
-    let mut codex_attempt = 1u32;
-    let codex_status = loop {
-        let result = executor.streaming(
-            executor_handle,
-            RunCommand {
-                args: &codex_args,
-                cwd: &repo.root,
-                stdin_text: Some(generated_prompt),
-                running,
-                timeout: Duration::from_secs(policy.timeout_seconds),
-                idle_timeout: Some(policy.codex_idle_timeout()),
-                output_is_activity: Some(codex_output_is_meaningful_activity),
-                max_output_bytes: context.config.max_command_output_bytes as usize,
-                environment_allowlist: &policy.codex.environment_allowlist,
-                limits: Some(child_limits(
-                    context,
-                    Duration::from_secs(policy.timeout_seconds),
-                )),
-                max_workspace_bytes: context.config.max_workspace_bytes,
-            },
-            |line| {
-                if let Some(message) = feedback_from_output_line(line) {
-                    if let Some(action) = blocked_action_from_feedback(&message) {
-                        blocked_action.replace(Some(action));
-                    }
-                    reporter.feedback(&message)?;
-                }
-                Ok(())
-            },
-        );
-        match result {
-            Ok(status) => break status,
-            Err(error)
-                if command::is_idle_timeout(&error) && codex_attempt < CODEX_IDLE_ATTEMPTS =>
-            {
-                let delay = Duration::from_secs(u64::from(codex_attempt) * 2);
-                reporter.step(
-                    "codex_idle_retry",
-                    StepStatus::Running,
-                    &format!(
-                        "Codex stopped producing output; restarting ephemeral attempt {} of {} in {}s",
-                        codex_attempt + 1,
-                        CODEX_IDLE_ATTEMPTS,
-                        delay.as_secs()
-                    ),
-                    Some(json!({
-                        "attempt": codex_attempt + 1,
-                        "max_attempts": CODEX_IDLE_ATTEMPTS,
-                        "idle_timeout_seconds": policy.codex_idle_timeout().as_secs()
-                    })),
-                )?;
-                thread::sleep(delay);
-                codex_attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    if let Some(action) = blocked_action.into_inner() {
-        if is_validation_only_blocker(&action)
-            && policy.quality_gates.iter().any(|gate| gate.required)
-        {
-            reporter.step(
-                "codex_validation_handoff",
-                StepStatus::Completed,
-                "Codex could not complete local validation; continuing with runner-owned quality gates",
-                Some(json!({"reported_action": action})),
-            )?;
-        } else {
-            return Err(RunFailure::HumanIntervention { action }.into());
-        }
-    }
-    if !codex_status.success() {
-        bail!("Codex exited with {codex_status}");
-    }
-    reporter.step(
-        "codex",
-        StepStatus::Completed,
-        "Codex finished successfully",
-        None,
-    )?;
-
-    run_quality_gates(QualityGateContext {
+    let codex_context = CodexContext {
         app: context,
-        api,
-        run,
-        ticket,
         reporter,
         repo,
         running,
         manifest,
         executor,
         executor_handle,
-    })?;
+    };
+    run_codex_prompt(&codex_context, generated_prompt, "codex", "Running Codex")?;
+    run_gates_with_repairs(
+        &codex_context,
+        QualityGateContext {
+            app: context,
+            api,
+            run,
+            ticket,
+            reporter,
+            repo,
+            running,
+            manifest,
+            executor,
+            executor_handle,
+        },
+        "local quality gates",
+    )?;
 
     reporter.set_phase(RunPhase::Publishing);
     let paths = repo.new_agent_paths(baseline)?;
@@ -201,7 +166,150 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
     Ok(commit)
 }
 
-pub(crate) fn run_quality_gates(context: QualityGateContext<'_>) -> Result<()> {
+pub(crate) fn run_codex_prompt(
+    context: &CodexContext<'_>,
+    prompt: &str,
+    step_id: &str,
+    message: &str,
+) -> Result<()> {
+    let policy = context.manifest.policy()?;
+    context.reporter.set_phase(RunPhase::Executing);
+    context.reporter.step(
+        step_id,
+        StepStatus::Running,
+        message,
+        Some(json!({
+            "idle_timeout_seconds": policy.codex_idle_timeout().as_secs(),
+            "max_idle_attempts": CODEX_IDLE_ATTEMPTS
+        })),
+    )?;
+    let blocked_action = RefCell::new(None);
+    let codex_args = policy.codex_args();
+    let mut codex_attempt = 1u32;
+    let codex_status = loop {
+        let result = context.executor.streaming(
+            context.executor_handle,
+            RunCommand {
+                args: &codex_args,
+                cwd: &context.repo.root,
+                stdin_text: Some(prompt),
+                running: context.running,
+                timeout: Duration::from_secs(policy.timeout_seconds),
+                idle_timeout: Some(policy.codex_idle_timeout()),
+                output_is_activity: Some(codex_output_is_meaningful_activity),
+                max_output_bytes: context.app.config.max_command_output_bytes as usize,
+                environment_allowlist: &policy.codex.environment_allowlist,
+                limits: Some(child_limits(
+                    context.app,
+                    Duration::from_secs(policy.timeout_seconds),
+                )),
+                max_workspace_bytes: context.app.config.max_workspace_bytes,
+            },
+            |line| {
+                if let Some(message) = feedback_from_output_line(line) {
+                    if let Some(action) = blocked_action_from_feedback(&message) {
+                        blocked_action.replace(Some(action));
+                    }
+                    context.reporter.feedback(&message)?;
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Ok(status) => break status,
+            Err(error)
+                if command::is_idle_timeout(&error) && codex_attempt < CODEX_IDLE_ATTEMPTS =>
+            {
+                let delay = Duration::from_secs(u64::from(codex_attempt) * 2);
+                context.reporter.step(
+                    &format!("{step_id}_idle_retry"),
+                    StepStatus::Running,
+                    &format!(
+                        "Codex stopped producing output; restarting ephemeral attempt {} of {} in {}s",
+                        codex_attempt + 1,
+                        CODEX_IDLE_ATTEMPTS,
+                        delay.as_secs()
+                    ),
+                    Some(json!({
+                        "attempt": codex_attempt + 1,
+                        "max_attempts": CODEX_IDLE_ATTEMPTS,
+                        "idle_timeout_seconds": policy.codex_idle_timeout().as_secs()
+                    })),
+                )?;
+                thread::sleep(delay);
+                codex_attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    if let Some(action) = blocked_action.into_inner() {
+        if is_validation_only_blocker(&action)
+            && policy.quality_gates.iter().any(|gate| gate.required)
+        {
+            context.reporter.step(
+                &format!("{step_id}_validation_handoff"),
+                StepStatus::Completed,
+                "Codex could not complete local validation; continuing with runner-owned quality gates",
+                Some(json!({"reported_action": action})),
+            )?;
+        } else {
+            return Err(RunFailure::HumanIntervention { action }.into());
+        }
+    }
+    if !codex_status.success() {
+        bail!("Codex exited with {codex_status}");
+    }
+    context.reporter.step(
+        step_id,
+        StepStatus::Completed,
+        "Codex iteration finished successfully",
+        None,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn run_gates_with_repairs(
+    codex: &CodexContext<'_>,
+    gates: QualityGateContext<'_>,
+    source: &str,
+) -> Result<()> {
+    for attempt in 1..=VALIDATION_REPAIR_ATTEMPTS {
+        let outcome = run_quality_gates(gates)?;
+        if outcome.passed() {
+            return Ok(());
+        }
+        let diagnostics = outcome.diagnostics();
+        if attempt == VALIDATION_REPAIR_ATTEMPTS {
+            return Err(RunFailure::ValidationRepairsExhausted {
+                attempts: VALIDATION_REPAIR_ATTEMPTS,
+                diagnostics: truncate_text(&diagnostics, 20_000),
+            }
+            .into());
+        }
+        let repair_attempt = attempt + 1;
+        codex.reporter.step(
+            &format!("validation_repair_{repair_attempt}"),
+            StepStatus::Running,
+            &format!(
+                "{source} failed; asking Codex to repair attempt {repair_attempt} of {VALIDATION_REPAIR_ATTEMPTS}"
+            ),
+            Some(json!({"attempt": repair_attempt, "source": source})),
+        )?;
+        let prompt = format!(
+            "The implementation is not complete because required validation failed. Inspect the current workspace and fix the underlying code or configuration. Do not commit, push, or open a pull request. Re-run relevant checks while working. Treat these failures as real blockers and continue until they are resolved.\n\nValidation source: {source}\n\n{}",
+            truncate_text(&diagnostics, 20_000)
+        );
+        run_codex_prompt(
+            codex,
+            &prompt,
+            &format!("validation_repair_{repair_attempt}_codex"),
+            "Running Codex validation repair",
+        )?;
+    }
+    unreachable!("bounded validation repair loop always returns")
+}
+
+pub(crate) fn run_quality_gates(context: QualityGateContext<'_>) -> Result<QualityGateOutcome> {
     let QualityGateContext {
         app,
         api,
@@ -216,6 +324,7 @@ pub(crate) fn run_quality_gates(context: QualityGateContext<'_>) -> Result<()> {
     } = context;
     let policy = manifest.policy()?;
     reporter.set_phase(RunPhase::Verifying);
+    let mut outcome = QualityGateOutcome::default();
     for gate_policy in &policy.quality_gates {
         reporter.step(
             &gate_policy.id,
@@ -287,16 +396,28 @@ pub(crate) fn run_quality_gates(context: QualityGateContext<'_>) -> Result<()> {
             Some(json!({"gate_id": gate_policy.id, "exit_code": gate.status.code()})),
         )?;
         if gate_policy.required && !passed {
-            bail!(
-                "required quality gate {} failed with {}",
-                gate_policy.id,
-                gate.status
-            );
+            outcome.failures.push(QualityGateFailure {
+                gate_id: gate_policy.id.clone(),
+                command: gate_policy.command.clone(),
+                status: gate.status.to_string(),
+                output: truncate_text(&gate_output, 16_000),
+            });
         }
     }
 
     reporter.set_phase(RunPhase::Publishing);
-    Ok(())
+    Ok(outcome)
+}
+
+fn truncate_text(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n...[truncated]", &value[..end])
 }
 
 fn child_limits(context: &AppContext, timeout: Duration) -> command::ChildLimits {
@@ -514,5 +635,28 @@ mod tests {
         assert!(!is_transient_gate_failure(
             "FAIL src/theme.test.ts expected dark but received light"
         ));
+    }
+
+    #[test]
+    fn required_gate_diagnostics_include_each_failure() {
+        let outcome = QualityGateOutcome {
+            failures: vec![
+                QualityGateFailure {
+                    gate_id: "test".into(),
+                    command: "npm test".into(),
+                    status: "exit status: 1".into(),
+                    output: "one failed".into(),
+                },
+                QualityGateFailure {
+                    gate_id: "lint".into(),
+                    command: "npm run lint".into(),
+                    status: "exit status: 2".into(),
+                    output: "lint failed".into(),
+                },
+            ],
+        };
+        let diagnostics = outcome.diagnostics();
+        assert!(diagnostics.contains("Gate test (`npm test`)"));
+        assert!(diagnostics.contains("Gate lint (`npm run lint`)"));
     }
 }

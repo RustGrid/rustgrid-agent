@@ -66,21 +66,34 @@ pub(crate) fn wait_for_required_workflows(
         };
         let mut all_passed = true;
         for name in requirements.required {
-            let state = latest_workflow_run(&workflows, name)
+            let workflow = latest_workflow_run(&workflows, name);
+            let check = latest_check_run(&checks, name);
+            let state = workflow
                 .map(|run| (&run.status, run.conclusion.as_ref()))
-                .or_else(|| {
-                    latest_check_run(&checks, name)
-                        .map(|check| (&check.status, check.conclusion.as_ref()))
-                });
+                .or_else(|| check.map(|check| (&check.status, check.conclusion.as_ref())));
             match state {
                 Some((status, conclusion))
                     if status.is_completed()
                         && conclusion.is_some_and(|value| value.is_success()) => {}
                 Some((status, conclusion)) if status.is_completed() => {
-                    bail!(
-                        "required GitHub workflow {name} concluded as {}",
+                    let fallback = format!(
+                        "Required GitHub workflow {name} concluded as {}.",
                         conclusion.map_or("unknown", |value| value.as_str())
                     );
+                    let diagnostics = if let Some(workflow) = workflow {
+                        github
+                            .workflow_failure_diagnostics(requirements.repo, workflow)
+                            .unwrap_or(fallback)
+                    } else if let Some(check) = check {
+                        format!("{fallback} Check run id: {}.", check.id)
+                    } else {
+                        fallback
+                    };
+                    return Err(RunFailure::RequiredWorkflowFailed {
+                        diagnostics,
+                        repairable: conclusion.is_some_and(|value| value.is_repairable_failure()),
+                    }
+                    .into());
                 }
                 _ => all_passed = false,
             }

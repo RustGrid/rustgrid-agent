@@ -15,9 +15,9 @@
 
 ```text
 control-plane assignment -> manifest validation -> token issuance -> isolated clone
-     -> sandbox create -> Codex -> sandbox gates -> sandbox destroy
+     -> sandbox create -> Codex <-> sandbox gates
      -> commit -> push -> pull request
-     -> required workflows -> awaiting_review -> successful cleanup
+     -> required workflows <-> Codex CI repair -> awaiting_review -> successful cleanup
 
 Failed, blocked, timed-out, cancelled, or lease-lost executions stop and retain
 their Docker Sandbox alongside the durable workspace journal. The same run ID
@@ -29,6 +29,13 @@ and removes them after the configured failed-workspace retention window.
 ```
 
 Every irreversible publication checkpoint is written atomically to `journal.json`. A restarted worker derives a recovery plan and reconciles existing Git and GitHub state rather than repeating side effects.
+
+Required local gates aggregate failures and return them to Codex for a bounded
+repair loop. Required GitHub workflow failures are resolved to the latest run,
+failed jobs and steps, and bounded job-log tails. Each CI repair is locally
+validated and pushed as a new commit to the existing pull request. Three
+unsuccessful repair iterations produce a blocked handoff and retain the isolated
+execution state.
 
 ## Trust boundaries
 

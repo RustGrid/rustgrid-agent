@@ -17,8 +17,8 @@ use crate::{
     config::AppContext,
     coordinator::CoordinatorHealth,
     execution::{
-        ImplementationContext, QualityGateContext, implement_and_commit, run_quality_gates,
-        short_sha,
+        CodexContext, ImplementationContext, QualityGateContext, implement_and_commit,
+        run_codex_prompt, run_gates_with_repairs, short_sha,
     },
     executor::{ExecutionHandle, Executor},
     finalization::finalize,
@@ -33,12 +33,14 @@ use crate::{
         WorkflowRequirements, print_summary, pull_request_body, wait_for_required_workflows,
     },
     reporting::{Reporter, console_event},
-    run_error::{RunErrorKind, classify},
+    run_error::{RunErrorKind, RunFailure, classify},
     shutdown,
     supervisor::{RunSupervisor, RunSupervisorConfig},
     token::GitHubTokenManager,
     workspace::RunWorkspace,
 };
+
+const CI_REPAIR_ATTEMPTS: u32 = 3;
 
 pub fn register(context: &AppContext) -> Result<()> {
     console_event("starting", "Connecting to announced RustGrid worker", "36");
@@ -419,6 +421,156 @@ struct ExecutionContext<'a> {
     executor_handle: &'a ExecutionHandle,
 }
 
+struct PublicationContext<'a> {
+    app: &'a AppContext,
+    api: &'a RustGridClient,
+    run: &'a AgentRun,
+    ticket: &'a Ticket,
+    reporter: &'a Reporter<'a>,
+    repo: &'a Repo,
+    baseline: &'a BTreeSet<String>,
+    running: &'a AtomicBool,
+    manifest: &'a ExecutionManifest,
+    executor: &'a Executor,
+    executor_handle: &'a ExecutionHandle,
+}
+
+fn publish_commit(
+    context: PublicationContext<'_>,
+    tokens: &GitHubTokenManager<'_>,
+    branch: &str,
+    commit: &mut String,
+    cycle: u32,
+) -> Result<bool> {
+    let step_id = if cycle == 0 {
+        "push".to_owned()
+    } else {
+        format!("push_ci_repair_{cycle}")
+    };
+    if context.reporter.phase() != RunPhase::Publishing {
+        context.reporter.set_phase(RunPhase::Publishing);
+    }
+    context.reporter.step(
+        &step_id,
+        StepStatus::Running,
+        &format!("Pushing branch {branch}"),
+        Some(json!({"cycle": cycle})),
+    )?;
+    let mut pushed = false;
+    for publish_attempt in 1..=3u32 {
+        let reconcile_token = tokens.token()?;
+        let reconciled = context.repo.reconcile_remote_branch(
+            branch,
+            commit,
+            &reconcile_token,
+            &context.manifest.web_base_url,
+        )?;
+        if reconciled.requires_validation() {
+            let reconciliation = match reconciled.kind {
+                ReconciliationKind::RemoteAdvanced => {
+                    "accepted remote commits after the agent commit"
+                }
+                ReconciliationKind::Rebased => {
+                    "rebased the agent commit onto concurrent remote work"
+                }
+                ReconciliationKind::Unchanged => {
+                    unreachable!("validation requires a changed commit")
+                }
+            };
+            *commit = reconciled.commit;
+            context.reporter.record_commit(commit)?;
+            context.reporter.step(
+                &format!("{step_id}_reconciliation"),
+                StepStatus::Completed,
+                &format!("Reconciled branch {branch}: {reconciliation}"),
+                Some(json!({
+                    "commit": commit,
+                    "strategy": match reconciled.kind {
+                        ReconciliationKind::RemoteAdvanced => "remote_advanced",
+                        ReconciliationKind::Rebased => "rebase",
+                        ReconciliationKind::Unchanged => "unchanged",
+                    }
+                })),
+            )?;
+            let codex = CodexContext {
+                app: context.app,
+                reporter: context.reporter,
+                repo: context.repo,
+                running: context.running,
+                manifest: context.manifest,
+                executor: context.executor,
+                executor_handle: context.executor_handle,
+            };
+            run_gates_with_repairs(
+                &codex,
+                QualityGateContext {
+                    app: context.app,
+                    api: context.api,
+                    run: context.run,
+                    ticket: context.ticket,
+                    reporter: context.reporter,
+                    repo: context.repo,
+                    running: context.running,
+                    manifest: context.manifest,
+                    executor: context.executor,
+                    executor_handle: context.executor_handle,
+                },
+                "post-reconciliation quality gates",
+            )?;
+            let repair_paths = context.repo.new_agent_paths(context.baseline)?;
+            if !repair_paths.is_empty() {
+                *commit = context.repo.commit_paths(
+                    &repair_paths,
+                    &format!(
+                        "{}: {} (post-reconciliation repair)",
+                        context.ticket.key, context.ticket.title
+                    ),
+                )?;
+                context.reporter.record_commit(commit)?;
+                context.reporter.step(
+                    &format!("{step_id}_reconciliation_repair"),
+                    StepStatus::Completed,
+                    &format!("Committed post-reconciliation repair {}", short_sha(commit)),
+                    Some(json!({"commit": commit, "paths": repair_paths})),
+                )?;
+            }
+        }
+
+        let push_token = tokens.token()?;
+        match context
+            .repo
+            .push(branch, commit, &push_token, &context.manifest.web_base_url)
+        {
+            Ok(did_push) => {
+                pushed |= did_push;
+                break;
+            }
+            Err(error)
+                if publish_attempt < 3 && error.downcast_ref::<RemoteBranchMoved>().is_some() =>
+            {
+                context.reporter.step(
+                    &format!("{step_id}_race_retry"),
+                    StepStatus::Running,
+                    &format!(
+                        "Remote branch changed during publication; reconciling attempt {} of 3",
+                        publish_attempt + 1
+                    ),
+                    Some(json!({"attempt": publish_attempt + 1})),
+                )?;
+                eprintln!("[warning] git push race on attempt {publish_attempt}: {error:#}");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    context.reporter.step(
+        &step_id,
+        StepStatus::Completed,
+        &format!("Pushed branch {branch}"),
+        Some(json!({"pushed": pushed, "commit": commit})),
+    )?;
+    Ok(pushed)
+}
+
 fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
     let ExecutionContext {
         app: context,
@@ -522,96 +674,30 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         reporter.set_phase(RunPhase::Publishing);
     }
 
-    reporter.step(
-        "push",
-        StepStatus::Running,
-        &format!("Pushing branch {branch}"),
-        None,
-    )?;
     let tokens = GitHubTokenManager::new(
         api,
         &run.id,
         &manifest.repository,
         &manifest.required_permissions,
     );
-    let mut pushed = false;
-    for publish_attempt in 1..=3u32 {
-        let reconcile_token = tokens.token()?;
-        let reconciled = repo.reconcile_remote_branch(
-            &branch,
-            &commit,
-            &reconcile_token,
-            &manifest.web_base_url,
-        )?;
-        if reconciled.requires_validation() {
-            let reconciliation = match reconciled.kind {
-                ReconciliationKind::RemoteAdvanced => {
-                    "accepted remote commits after the agent commit"
-                }
-                ReconciliationKind::Rebased => {
-                    "rebased the agent commit onto concurrent remote work"
-                }
-                ReconciliationKind::Unchanged => {
-                    unreachable!("validation requires a changed commit")
-                }
-            };
-            commit = reconciled.commit;
-            reporter.record_commit(&commit)?;
-            reporter.step(
-                "push_reconciliation",
-                StepStatus::Completed,
-                &format!("Reconciled branch {branch}: {reconciliation}"),
-                Some(json!({
-                    "commit": commit,
-                    "strategy": match reconciled.kind {
-                        ReconciliationKind::RemoteAdvanced => "remote_advanced",
-                        ReconciliationKind::Rebased => "rebase",
-                        ReconciliationKind::Unchanged => "unchanged",
-                    }
-                })),
-            )?;
-            run_quality_gates(QualityGateContext {
-                app: context,
-                api,
-                run,
-                ticket,
-                reporter,
-                repo: &repo,
-                running,
-                manifest,
-                executor,
-                executor_handle,
-            })?;
-        }
-
-        let push_token = tokens.token()?;
-        match repo.push(&branch, &commit, &push_token, &manifest.web_base_url) {
-            Ok(did_push) => {
-                pushed |= did_push;
-                break;
-            }
-            Err(error)
-                if publish_attempt < 3 && error.downcast_ref::<RemoteBranchMoved>().is_some() =>
-            {
-                reporter.step(
-                    "push_race_retry",
-                    StepStatus::Running,
-                    &format!(
-                        "Remote branch changed during publication; reconciling attempt {} of 3",
-                        publish_attempt + 1
-                    ),
-                    Some(json!({"attempt": publish_attempt + 1})),
-                )?;
-                eprintln!("[warning] git push race on attempt {publish_attempt}: {error:#}");
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    reporter.step(
-        "push",
-        StepStatus::Completed,
-        &format!("Pushed branch {branch}"),
-        Some(json!({"pushed": pushed, "commit": commit})),
+    publish_commit(
+        PublicationContext {
+            app: context,
+            api,
+            run,
+            ticket,
+            reporter,
+            repo: &repo,
+            baseline: &baseline,
+            running,
+            manifest,
+            executor,
+            executor_handle,
+        },
+        &tokens,
+        &branch,
+        &mut commit,
+        0,
     )?;
 
     reporter.step(
@@ -652,18 +738,136 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
 
     let required_workflows = manifest.normalized_required_workflows()?;
     if !required_workflows.is_empty() {
-        wait_for_required_workflows(
-            &tokens,
-            WorkflowRequirements {
-                repo: &manifest.repo_config()?,
-                web_base_url: &manifest.web_base_url,
-                commit: &commit,
-                required: &required_workflows,
-                timeout: Duration::from_secs(policy.timeout_seconds),
-            },
-            running,
-            reporter,
-        )?;
+        let repo_config = manifest.repo_config()?;
+        let mut repair_attempt = 0u32;
+        loop {
+            let failure = match wait_for_required_workflows(
+                &tokens,
+                WorkflowRequirements {
+                    repo: &repo_config,
+                    web_base_url: &manifest.web_base_url,
+                    commit: &commit,
+                    required: &required_workflows,
+                    timeout: Duration::from_secs(policy.timeout_seconds),
+                },
+                running,
+                reporter,
+            ) {
+                Ok(()) => break,
+                Err(error) => match error.downcast_ref::<RunFailure>() {
+                    Some(RunFailure::RequiredWorkflowFailed {
+                        diagnostics,
+                        repairable: true,
+                    }) => diagnostics.clone(),
+                    _ => return Err(error),
+                },
+            };
+            if repair_attempt == CI_REPAIR_ATTEMPTS {
+                return Err(RunFailure::ValidationRepairsExhausted {
+                    attempts: CI_REPAIR_ATTEMPTS,
+                    diagnostics: failure,
+                }
+                .into());
+            }
+            repair_attempt += 1;
+            reporter.step(
+                &format!("ci_repair_{repair_attempt}"),
+                StepStatus::Running,
+                &format!(
+                    "Required CI failed; asking Codex to repair attempt {repair_attempt} of {CI_REPAIR_ATTEMPTS}"
+                ),
+                Some(json!({"attempt": repair_attempt, "commit": commit})),
+            )?;
+            let codex = CodexContext {
+                app: context,
+                reporter,
+                repo: &repo,
+                running,
+                manifest,
+                executor,
+                executor_handle,
+            };
+            let repair_prompt = format!(
+                "Required GitHub CI failed for the pull request. Inspect the current workspace and the CI evidence below, fix the underlying issue, and run relevant checks. Do not commit, push, or open a pull request; the runner owns publication. CI failures are real blockers, so do not declare success while they remain.\n\n{failure}"
+            );
+            run_codex_prompt(
+                &codex,
+                &repair_prompt,
+                &format!("ci_repair_{repair_attempt}_codex"),
+                "Running Codex CI repair",
+            )?;
+            run_gates_with_repairs(
+                &codex,
+                QualityGateContext {
+                    app: context,
+                    api,
+                    run,
+                    ticket,
+                    reporter,
+                    repo: &repo,
+                    running,
+                    manifest,
+                    executor,
+                    executor_handle,
+                },
+                "CI repair local quality gates",
+            )?;
+            let paths = repo.new_agent_paths(&baseline)?;
+            if paths.is_empty() {
+                reporter.step(
+                    &format!("ci_repair_{repair_attempt}"),
+                    StepStatus::Failed,
+                    "Codex CI repair produced no committable changes; another repair attempt is required",
+                    Some(json!({"attempt": repair_attempt})),
+                )?;
+                continue;
+            }
+            reporter.step(
+                &format!("ci_repair_{repair_attempt}_commit"),
+                StepStatus::Running,
+                "Committing CI repair",
+                Some(json!({"paths": paths})),
+            )?;
+            commit = repo.commit_paths(
+                &paths,
+                &format!(
+                    "{}: {} (CI repair {repair_attempt})",
+                    ticket.key, ticket.title
+                ),
+            )?;
+            reporter.record_commit(&commit)?;
+            reporter.step(
+                &format!("ci_repair_{repair_attempt}_commit"),
+                StepStatus::Completed,
+                &format!("Created CI repair commit {}", short_sha(&commit)),
+                Some(json!({"commit": commit})),
+            )?;
+            publish_commit(
+                PublicationContext {
+                    app: context,
+                    api,
+                    run,
+                    ticket,
+                    reporter,
+                    repo: &repo,
+                    baseline: &baseline,
+                    running,
+                    manifest,
+                    executor,
+                    executor_handle,
+                },
+                &tokens,
+                &branch,
+                &mut commit,
+                repair_attempt,
+            )?;
+            reporter.step(
+                &format!("ci_repair_{repair_attempt}"),
+                StepStatus::Completed,
+                "Published CI repair; waiting for required workflows on the new commit",
+                Some(json!({"attempt": repair_attempt, "commit": commit})),
+            )?;
+        }
     }
 
     api.attach_pr(&ticket.id, &run.id, &pr.html_url, pr.number)?;

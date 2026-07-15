@@ -113,7 +113,10 @@ impl RunPhase {
                 | (Self::Preparing, Self::Executing)
                 | (Self::Preparing, Self::Publishing)
                 | (Self::Executing, Self::Verifying)
+                | (Self::Verifying, Self::Executing)
                 | (Self::Verifying, Self::Publishing)
+                | (Self::Publishing, Self::Executing)
+                | (Self::Publishing, Self::Verifying)
                 | (Self::Publishing, Self::AwaitingReview)
                 | (Self::AwaitingReview, Self::Succeeded)
                 | (
@@ -185,6 +188,9 @@ mod tests {
         assert!(RunPhase::Succeeded.is_terminal());
         assert!(RunPhase::Claimed.can_transition_to(RunPhase::Preparing));
         assert!(RunPhase::Executing.can_transition_to(RunPhase::TimedOut));
+        assert!(RunPhase::Verifying.can_transition_to(RunPhase::Executing));
+        assert!(RunPhase::Publishing.can_transition_to(RunPhase::Executing));
+        assert!(RunPhase::Publishing.can_transition_to(RunPhase::Verifying));
         assert!(!RunPhase::Succeeded.can_transition_to(RunPhase::Executing));
         assert!(!RunPhase::Claimed.can_transition_to(RunPhase::Succeeded));
         assert_eq!(StepStatus::Failed.severity(), "error");

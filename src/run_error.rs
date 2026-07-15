@@ -15,11 +15,29 @@ pub enum RunErrorKind {
 
 #[derive(Debug)]
 pub enum RunFailure {
-    RequiredWorkflowsTimedOut { seconds: u64 },
-    InfrastructureTransient { detail: String },
-    HumanIntervention { action: String },
-    PolicyViolation { detail: String },
-    Invariant { detail: String },
+    RequiredWorkflowsTimedOut {
+        seconds: u64,
+    },
+    RequiredWorkflowFailed {
+        diagnostics: String,
+        repairable: bool,
+    },
+    ValidationRepairsExhausted {
+        attempts: u32,
+        diagnostics: String,
+    },
+    InfrastructureTransient {
+        detail: String,
+    },
+    HumanIntervention {
+        action: String,
+    },
+    PolicyViolation {
+        detail: String,
+    },
+    Invariant {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for RunFailure {
@@ -28,6 +46,16 @@ impl std::fmt::Display for RunFailure {
             Self::RequiredWorkflowsTimedOut { seconds } => write!(
                 formatter,
                 "required GitHub workflows timed out after {seconds} seconds"
+            ),
+            Self::RequiredWorkflowFailed { diagnostics, .. } => {
+                write!(formatter, "required GitHub workflow failed:\n{diagnostics}")
+            }
+            Self::ValidationRepairsExhausted {
+                attempts,
+                diagnostics,
+            } => write!(
+                formatter,
+                "validation is still failing after {attempts} Codex attempt(s):\n{diagnostics}"
             ),
             Self::InfrastructureTransient { detail } => {
                 write!(
@@ -62,6 +90,8 @@ pub fn classify(error: &anyhow::Error) -> RunErrorKind {
     if let Some(failure) = error.downcast_ref::<RunFailure>() {
         return match failure {
             RunFailure::RequiredWorkflowsTimedOut { .. } => RunErrorKind::TimedOut,
+            RunFailure::RequiredWorkflowFailed { .. } => RunErrorKind::ExternalPermanent,
+            RunFailure::ValidationRepairsExhausted { .. } => RunErrorKind::HumanBlocked,
             RunFailure::InfrastructureTransient { .. } => RunErrorKind::Transient,
             RunFailure::HumanIntervention { .. } => RunErrorKind::HumanBlocked,
             RunFailure::PolicyViolation { .. } => RunErrorKind::PolicyViolation,
@@ -104,6 +134,16 @@ mod tests {
             classify(
                 &RunFailure::HumanIntervention {
                     action: "approve access".into()
+                }
+                .into()
+            ),
+            RunErrorKind::HumanBlocked
+        );
+        assert_eq!(
+            classify(
+                &RunFailure::ValidationRepairsExhausted {
+                    attempts: 3,
+                    diagnostics: "CI still fails".into(),
                 }
                 .into()
             ),

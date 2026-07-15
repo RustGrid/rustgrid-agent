@@ -49,6 +49,23 @@ pub struct WorkflowRun {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkflowJob {
+    pub id: u64,
+    pub name: String,
+    pub status: CheckStatus,
+    pub conclusion: Option<CheckConclusion>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowStep {
+    pub name: String,
+    pub status: CheckStatus,
+    pub conclusion: Option<CheckConclusion>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum CheckStatus {
     Queued,
@@ -92,6 +109,10 @@ impl CheckConclusion {
         matches!(self, Self::Success)
     }
 
+    pub const fn is_repairable_failure(&self) -> bool {
+        matches!(self, Self::Failure | Self::TimedOut)
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             Self::Success => "success",
@@ -128,6 +149,11 @@ struct CheckRunsResponse {
 #[derive(Debug, Deserialize)]
 struct WorkflowRunsResponse {
     workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowJobsResponse {
+    jobs: Vec<WorkflowJob>,
 }
 
 impl GitHubClient {
@@ -289,6 +315,130 @@ impl GitHubClient {
         bail!("GitHub workflow-run pagination exceeded 2,000 results")
     }
 
+    pub fn workflow_failure_diagnostics(
+        &self,
+        repo: &RepoConfig,
+        run: &WorkflowRun,
+    ) -> Result<String> {
+        let jobs = self.workflow_jobs(repo, run.id)?;
+        let mut diagnostics = format!(
+            "Workflow {} (run {}, attempt {}) concluded as {}.",
+            run.name,
+            run.id,
+            run.run_attempt,
+            run.conclusion
+                .as_ref()
+                .map_or("unknown", CheckConclusion::as_str)
+        );
+        for job in jobs.into_iter().filter(|job| {
+            job.status.is_completed()
+                && job
+                    .conclusion
+                    .as_ref()
+                    .is_none_or(|conclusion| !conclusion.is_success())
+        }) {
+            diagnostics.push_str(&format!(
+                "\n\nJob {} concluded as {}.",
+                job.name,
+                job.conclusion
+                    .as_ref()
+                    .map_or("unknown", CheckConclusion::as_str)
+            ));
+            let failed_steps = job
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.status.is_completed()
+                        && step
+                            .conclusion
+                            .as_ref()
+                            .is_none_or(|conclusion| !conclusion.is_success())
+                })
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>();
+            if !failed_steps.is_empty() {
+                diagnostics.push_str(&format!(" Failed steps: {}.", failed_steps.join(", ")));
+            }
+            match self.job_log(repo, job.id) {
+                Ok(log) if !log.trim().is_empty() => {
+                    diagnostics.push_str("\nLog tail:\n");
+                    diagnostics.push_str(log_tail(&log, 12_000));
+                }
+                Ok(_) => {}
+                Err(error) => diagnostics.push_str(&format!(
+                    " Log retrieval was unavailable: {}.",
+                    truncate(&format!("{error:#}"), 500)
+                )),
+            }
+            if diagnostics.len() >= 20_000 {
+                diagnostics.truncate(floor_char_boundary(&diagnostics, 20_000));
+                diagnostics.push_str("\n...[diagnostics truncated]");
+                break;
+            }
+        }
+        Ok(diagnostics)
+    }
+
+    fn workflow_jobs(&self, repo: &RepoConfig, run_id: u64) -> Result<Vec<WorkflowJob>> {
+        let mut jobs = Vec::new();
+        for page in 1..=20 {
+            let url = format!(
+                "{}/repos/{}/{}/actions/runs/{run_id}/jobs?filter=latest&per_page=100&page={page}",
+                self.api_base_url, repo.owner, repo.name
+            );
+            let response = self.send_with_retry("list workflow jobs", || {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&self.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+            })?;
+            let status = response.status();
+            let text = response
+                .text()
+                .context("could not read GitHub workflow-jobs response")?;
+            if !status.is_success() {
+                bail!(
+                    "GitHub workflow-jobs request returned {status}: {}",
+                    truncate(&text, 2_000)
+                );
+            }
+            let mut response: WorkflowJobsResponse = serde_json::from_str(&text)
+                .context("GitHub returned invalid workflow-job results")?;
+            let page_len = response.jobs.len();
+            jobs.append(&mut response.jobs);
+            if page_len < 100 {
+                return Ok(jobs);
+            }
+        }
+        bail!("GitHub workflow-job pagination exceeded 2,000 results")
+    }
+
+    fn job_log(&self, repo: &RepoConfig, job_id: u64) -> Result<String> {
+        let url = format!(
+            "{}/repos/{}/{}/actions/jobs/{job_id}/logs",
+            self.api_base_url, repo.owner, repo.name
+        );
+        let response = self.send_with_retry("download workflow job log", || {
+            self.http
+                .get(&url)
+                .bearer_auth(&self.token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+        })?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .context("could not read GitHub workflow-job log")?;
+        if !status.is_success() {
+            bail!(
+                "GitHub workflow-job log returned {status}: {}",
+                truncate(&String::from_utf8_lossy(&bytes), 2_000)
+            );
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     fn send_with_retry<F>(&self, operation: &str, mut build: F) -> Result<Response>
     where
         F: FnMut() -> RequestBuilder,
@@ -371,6 +521,25 @@ fn truncate(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+fn floor_char_boundary(value: &str, max: usize) -> usize {
+    let mut end = max.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn log_tail(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut start = value.len() - max;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +558,21 @@ mod tests {
                 .api_base_url,
             "https://github.example.com/api/v3"
         );
+    }
+
+    #[test]
+    fn log_tail_preserves_utf8_and_latest_output() {
+        let value = format!("old{}latest", "é".repeat(20));
+        let tail = log_tail(&value, 12);
+        assert!(tail.ends_with("latest"));
+        assert!(tail.len() <= 12);
+    }
+
+    #[test]
+    fn only_code_failures_enter_the_repair_loop() {
+        assert!(CheckConclusion::Failure.is_repairable_failure());
+        assert!(CheckConclusion::TimedOut.is_repairable_failure());
+        assert!(!CheckConclusion::Cancelled.is_repairable_failure());
+        assert!(!CheckConclusion::Skipped.is_repairable_failure());
     }
 }

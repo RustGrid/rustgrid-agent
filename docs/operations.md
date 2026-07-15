@@ -138,6 +138,16 @@ commit, and retries a normal push up to three times. It never force-pushes. A
 conflict aborts the rebase and retains the clean pre-rebase workspace for a
 human-assisted retry.
 
+Required validation is iterative. Local quality gates collect all required
+failures before returning diagnostics to Codex, with three total validation
+attempts. Once a pull request exists, a failed required GitHub workflow starts
+up to three CI repair iterations. The worker fetches failed job and step details
+and bounded log tails, asks Codex to repair the retained workspace, reruns local
+gates, commits the repair, pushes the existing branch, and waits on the new SHA.
+If the final attempt still fails, the ticket is marked blocked and the sandbox
+is retained for human inspection. Workflow timeouts, cancellation, and lease
+loss do not masquerade as code-repair iterations.
+
 After a process restart, the worker first lists actively leased runs assigned to
 its worker ID across every project in the tenant and resumes up to its configured
 concurrency before consuming new queue entries. Run cancellation is isolated:
