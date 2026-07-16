@@ -48,6 +48,12 @@ execution state.
 
 RustGrid and GitHub are trusted external control planes. Ticket content, repository content, Codex output, child processes, and network responses are untrusted. Docker Sandbox provides the production microVM boundary. Only the disposable run clone is mounted; control-plane credentials and publication stay in the parent coordinator. Unix limits remain defense in depth for the local executor.
 
+Inside the production microVM, Codex runs with its inner sandbox disabled so
+repository toolchains can execute downloaded binaries and subprocesses such as
+esbuild. This does not grant host access: the Docker Sandbox remains the outer
+filesystem, process, network-policy, and resource boundary. Local execution
+continues to use Codex `workspace-write` mode.
+
 The worker API key remains in the parent process. Child environments are rebuilt from an allowlist, while GitHub installation tokens are issued for the active run, validated against the manifest, held in memory, and refreshed before expiry.
 
 ## Ownership and concurrency

@@ -291,6 +291,12 @@ pub(crate) fn run_codex_prompt(
     message: &str,
 ) -> Result<()> {
     let policy = context.manifest.policy()?;
+    let externally_isolated = context.executor.externally_isolated();
+    let codex_sandbox_mode = if externally_isolated {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    };
     context.reporter.set_phase(RunPhase::Executing);
     context.reporter.step(
         step_id,
@@ -298,11 +304,13 @@ pub(crate) fn run_codex_prompt(
         message,
         Some(json!({
             "idle_timeout_seconds": policy.codex_idle_timeout().as_secs(),
-            "max_idle_attempts": CODEX_IDLE_ATTEMPTS
+            "max_idle_attempts": CODEX_IDLE_ATTEMPTS,
+            "codex_sandbox_mode": codex_sandbox_mode,
+            "external_isolation": externally_isolated
         })),
     )?;
     let blocked_action = RefCell::new(None);
-    let codex_args = policy.codex_args();
+    let codex_args = policy.codex_args(externally_isolated);
     let mut codex_attempt = 1u32;
     let codex_status = loop {
         let result = context.executor.streaming(

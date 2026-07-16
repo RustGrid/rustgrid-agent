@@ -53,7 +53,12 @@ that does not match `owner/name`.
 
 The worker verifies the policy SHA-256, executes only the server-owned Codex
 command and gates, applies their timeouts and environment allowlist, and refuses
-a sandbox policy it cannot enforce.
+a sandbox policy it cannot enforce. The manifest's `workspace_write` mode
+describes the effective repository scope. The local executor enforces it with
+Codex `workspace-write`; the production executor maps it to Codex
+`danger-full-access` only inside the disposable Docker Sandbox microVM, which
+enforces the same filesystem scope plus the process, network, and resource
+boundaries. Approval policy remains `never` in both cases.
 
 ## Queue and capacity
 

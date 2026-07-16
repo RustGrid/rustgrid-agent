@@ -294,7 +294,7 @@ impl ExecutionPolicy {
         Ok(())
     }
 
-    pub fn codex_args(&self) -> Vec<String> {
+    pub fn codex_args(&self, externally_isolated: bool) -> Vec<String> {
         let mut command = self.codex.command.clone();
         let insertion = command
             .iter()
@@ -302,7 +302,14 @@ impl ExecutionPolicy {
             .unwrap_or(command.len());
         command.splice(
             insertion..insertion,
-            ["--sandbox".into(), "workspace-write".into()],
+            [
+                "--sandbox".into(),
+                if externally_isolated {
+                    "danger-full-access".into()
+                } else {
+                    "workspace-write".into()
+                },
+            ],
         );
         let insertion = command
             .iter()
@@ -454,13 +461,19 @@ mod tests {
     #[test]
     fn hardens_the_codex_command() {
         let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
-        let args = policy.codex_args();
+        let args = policy.codex_args(false);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--sandbox", "workspace-write"])
         );
         assert!(args.iter().any(|arg| arg.contains("approval_policy")));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        assert!(
+            policy
+                .codex_args(true)
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "danger-full-access"])
+        );
     }
 
     #[test]

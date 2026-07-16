@@ -244,6 +244,10 @@ Production execution uses one Docker Sandbox microVM per run. Only that run's
 disposable repository clone is mounted into the sandbox. Codex and all quality
 gates run inside it; RustGrid API calls, GitHub token acquisition, commits,
 pushes, and pull-request publication remain in the trusted coordinator. The
+sandboxed Codex process uses `danger-full-access` only inside that disposable
+microVM so repository-installed executables and subprocess trees can run. Local
+development execution retains Codex `workspace-write`; the broader mode is
+never used without the external Docker Sandbox boundary. The
 sandbox receives only environment variables explicitly allowed by the signed
 execution policy. Values cross the boundary through a private, shell-quoted,
 short-lived file under `.git`, never command arguments; a controlled launcher

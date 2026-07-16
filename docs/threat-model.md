@@ -21,9 +21,12 @@ owns each run's filesystem, process, resource, and network isolation.
 - **Cross-run access:** production startup requires a working Docker Sandbox
   executor. Each run has a distinct microVM and only its disposable clone is
   mounted into that VM.
-- **Command escape:** commands are argument-parsed without a shell, Codex uses a
-  workspace sandbox, Git hooks are disabled, and quality gates receive only the
-  allowlisted environment.
+- **Command escape:** commands are argument-parsed without a shell, Git hooks
+  are disabled, and quality gates receive only the allowlisted environment.
+  Local execution keeps the Codex workspace sandbox. Production Codex disables
+  its redundant inner OS sandbox so repository binaries can spawn, but only
+  inside the per-run Docker Sandbox microVM that owns filesystem, process,
+  resource, and network isolation.
 - **Resource exhaustion:** wall/CPU/address-space/file/open-file/output limits,
   symlink-safe accounting, and deployment quotas bound untrusted children.
 - **Replay or duplicate side effects:** leases, ETags, ordered events, semantic

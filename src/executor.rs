@@ -67,6 +67,10 @@ pub(crate) struct RunCommand<'a> {
 }
 
 impl Executor {
+    pub(crate) const fn externally_isolated(&self) -> bool {
+        matches!(self, Self::DockerSandbox { .. })
+    }
+
     pub(crate) fn sandbox_name_for_run(run_id: &str) -> String {
         sandbox_name(run_id)
     }
@@ -985,6 +989,21 @@ mod tests {
         assert_eq!(sandbox_name("run/123?").len(), 41);
         assert_eq!(sandbox_name("run/123?"), sandbox_name("run/123?"));
         assert_ne!(sandbox_name("run/123?"), sandbox_name("run-123"));
+    }
+
+    #[test]
+    fn identifies_only_docker_sandbox_as_external_isolation() {
+        assert!(!Executor::Local.externally_isolated());
+        assert!(
+            Executor::DockerSandbox {
+                command: "sbx".into(),
+                template: "default".into(),
+                codex_version: "0.144.4".into(),
+                cpus: 1,
+                memory: "1g".into(),
+            }
+            .externally_isolated()
+        );
     }
 
     #[test]
