@@ -1,4 +1,7 @@
-use std::{cell::RefCell, collections::BTreeSet, sync::atomic::AtomicBool, thread, time::Duration};
+use std::{
+    cell::RefCell, collections::BTreeSet, path::PathBuf, sync::atomic::AtomicBool, thread,
+    time::Duration,
+};
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -28,6 +31,7 @@ pub(crate) struct ImplementationContext<'a> {
     pub repo: &'a Repo,
     pub baseline: &'a BTreeSet<String>,
     pub prompt: &'a str,
+    pub image_paths: &'a [PathBuf],
     pub running: &'a AtomicBool,
     pub manifest: &'a ExecutionManifest,
     pub executor: &'a Executor,
@@ -101,6 +105,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         repo,
         baseline,
         prompt: generated_prompt,
+        image_paths,
         running,
         manifest,
         executor,
@@ -121,7 +126,13 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor,
         executor_handle,
     };
-    run_codex_prompt(&codex_context, generated_prompt, "codex", "Running Codex")?;
+    run_codex_prompt(
+        &codex_context,
+        generated_prompt,
+        image_paths,
+        "codex",
+        "Running Codex",
+    )?;
     run_gates_with_repairs(
         &codex_context,
         QualityGateContext {
@@ -287,6 +298,7 @@ fn dependency_bootstrap_command(root: &std::path::Path) -> Option<(&'static str,
 pub(crate) fn run_codex_prompt(
     context: &CodexContext<'_>,
     prompt: &str,
+    image_paths: &[PathBuf],
     step_id: &str,
     message: &str,
 ) -> Result<()> {
@@ -310,7 +322,7 @@ pub(crate) fn run_codex_prompt(
         })),
     )?;
     let blocked_action = RefCell::new(None);
-    let codex_args = policy.codex_args(externally_isolated);
+    let codex_args = policy.codex_args(externally_isolated, image_paths);
     let mut codex_attempt = 1u32;
     let codex_status = loop {
         let result = context.executor.streaming(
@@ -428,6 +440,7 @@ pub(crate) fn run_gates_with_repairs(
         run_codex_prompt(
             codex,
             &prompt,
+            &[],
             &format!("validation_repair_{repair_attempt}_codex"),
             "Running Codex validation repair",
         )?;

@@ -10,6 +10,8 @@ use crate::config::RepoConfig;
 pub struct ExecutionManifest {
     pub manifest_version: u32,
     pub run: ManifestRun,
+    #[serde(default)]
+    pub attachments: Vec<ManifestAttachment>,
     pub project_id: String,
     pub project_key: String,
     pub project_name: String,
@@ -35,10 +37,37 @@ pub struct ExecutionManifest {
 pub struct ManifestRun {
     pub id: String,
     pub ticket_id: String,
+    #[serde(default)]
+    pub input_prompt: String,
     #[serde(default = "default_attempt")]
     pub attempt: u32,
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManifestAttachment {
+    pub id: String,
+    pub ticket_id: String,
+    pub filename: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    pub media_family: String,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    pub status: String,
+    pub virus_status: String,
+    #[serde(default)]
+    pub variants: Vec<ManifestAttachmentVariant>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ManifestAttachmentVariant {
+    pub kind: String,
+    pub mime: String,
+    pub ready: bool,
 }
 
 fn default_attempt() -> u32 {
@@ -147,6 +176,35 @@ impl ExecutionManifest {
         }
         if self.run.attempt == 0 {
             bail!("execution manifest run attempt must be at least 1");
+        }
+        if self.run.input_prompt.trim().is_empty() {
+            bail!("execution manifest run input_prompt cannot be empty");
+        }
+        if self.attachments.len() > 100 {
+            bail!("execution manifest contains too many attachments");
+        }
+        let mut attachment_ids = HashSet::new();
+        for attachment in &self.attachments {
+            if attachment.ticket_id != ticket_id
+                || attachment.filename.trim().is_empty()
+                || attachment.status != "ready"
+                || attachment.virus_status != "clean"
+            {
+                bail!("execution manifest contains invalid attachment context");
+            }
+            if uuid::Uuid::parse_str(&attachment.id).is_err()
+                || !attachment_ids.insert(&attachment.id)
+            {
+                bail!("execution manifest attachment IDs must be unique UUIDs");
+            }
+            if attachment.size_bytes.is_some_and(|size| size <= 0) {
+                bail!("execution manifest attachment sizes must be positive");
+            }
+            if attachment.sha256.as_ref().is_some_and(|sha256| {
+                sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                bail!("execution manifest attachment sha256 must be hexadecimal");
+            }
         }
         self.fresh_start()?;
         self.resume_from_run_id()?;
@@ -294,8 +352,22 @@ impl ExecutionPolicy {
         Ok(())
     }
 
-    pub fn codex_args(&self, externally_isolated: bool) -> Vec<String> {
+    pub fn codex_args(
+        &self,
+        externally_isolated: bool,
+        image_paths: &[std::path::PathBuf],
+    ) -> Vec<String> {
         let mut command = self.codex.command.clone();
+        let insertion = command
+            .iter()
+            .position(|part| part == "-")
+            .unwrap_or(command.len());
+        command.splice(
+            insertion..insertion,
+            image_paths
+                .iter()
+                .flat_map(|path| ["--image".to_owned(), path.to_string_lossy().into_owned()]),
+        );
         let insertion = command
             .iter()
             .position(|part| part == "-")
@@ -351,9 +423,11 @@ mod tests {
             run: ManifestRun {
                 id: "run-1".into(),
                 ticket_id: "ticket-1".into(),
+                input_prompt: "Implement the ticket.".into(),
                 attempt: 1,
                 metadata: serde_json::json!({}),
             },
+            attachments: vec![],
             project_id: "project-1".into(),
             project_key: "RG".into(),
             project_name: "RustGrid".into(),
@@ -461,16 +535,28 @@ mod tests {
     #[test]
     fn hardens_the_codex_command() {
         let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
-        let args = policy.codex_args(false);
+        let args = policy.codex_args(false, &[]);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--sandbox", "workspace-write"])
         );
         assert!(args.iter().any(|arg| arg.contains("approval_policy")));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        let image_args = policy.codex_args(
+            false,
+            &[std::path::PathBuf::from(
+                ".git/rustgrid-agent/context/attachments/screenshot.png",
+            )],
+        );
+        assert!(image_args.windows(2).any(|pair| {
+            pair == [
+                "--image",
+                ".git/rustgrid-agent/context/attachments/screenshot.png",
+            ]
+        }));
         assert!(
             policy
-                .codex_args(true)
+                .codex_args(true, &[])
                 .windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );

@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::{
     api::{AgentRun, RustGridClient, Ticket, Worker},
+    attachments,
     config::AppContext,
     coordinator::CoordinatorHealth,
     execution::{
@@ -209,7 +210,6 @@ fn execute_claimed(
             &manifest,
             &clone_token,
         )?;
-        let workspace_bytes = prepared.enforce_size_limit(context.config.max_workspace_bytes)?;
         let workspace_resumed = prepared.resumed();
         let repo = prepared.repo.clone();
         let baseline = if workspace_resumed {
@@ -217,6 +217,12 @@ fn execute_claimed(
         } else {
             repo.ensure_safe(false)?
         };
+        let staged_attachments = attachments::stage(api, &manifest, &repo.root)?;
+        let attachment_image_paths = staged_attachments
+            .iter()
+            .filter_map(|attachment| attachment.image_path.clone())
+            .collect::<Vec<_>>();
+        let workspace_bytes = prepared.enforce_size_limit(context.config.max_workspace_bytes)?;
         workspace.replace(Some(prepared));
         let handle = executor.prepare(
             &run.id,
@@ -244,7 +250,13 @@ fn execute_claimed(
             .map(|gate| gate.command.as_str())
             .collect::<Vec<_>>()
             .join(" && ");
-        let generated_prompt = prompt::build(ticket, &repo.root, &required_gates)?;
+        let generated_prompt = prompt::build(
+            ticket,
+            &repo.root,
+            &required_gates,
+            &manifest.run.input_prompt,
+            &staged_attachments,
+        )?;
         reporter.set_ticket_status(TicketStatus::InProgress)?;
         reporter.set_phase(RunPhase::Preparing);
         reporter.step(
@@ -282,6 +294,20 @@ fn execute_claimed(
                 "recovery_source_run_id": recovery_source
             })),
         )?;
+        if !staged_attachments.is_empty() {
+            reporter.step(
+                "attachments_staged",
+                StepStatus::Completed,
+                &format!(
+                    "Staged {} clean ticket attachment(s) for Codex context",
+                    staged_attachments.len()
+                ),
+                Some(json!({
+                    "attachments": staged_attachments.len(),
+                    "image_inputs": attachment_image_paths.len()
+                })),
+            )?;
+        }
         execute(ExecutionContext {
             app: context,
             api,
@@ -291,6 +317,7 @@ fn execute_claimed(
             repo,
             baseline,
             prompt: generated_prompt,
+            attachment_image_paths,
             running: &running,
             manifest: &manifest,
             executor: &executor,
@@ -422,6 +449,7 @@ struct ExecutionContext<'a> {
     repo: Repo,
     baseline: BTreeSet<String>,
     prompt: String,
+    attachment_image_paths: Vec<std::path::PathBuf>,
     running: &'a AtomicBool,
     manifest: &'a ExecutionManifest,
     executor: &'a Executor,
@@ -641,6 +669,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         repo,
         baseline,
         prompt: generated_prompt,
+        attachment_image_paths,
         running,
         manifest,
         executor,
@@ -737,6 +766,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             repo: &repo,
             baseline: &baseline,
             prompt: &generated_prompt,
+            image_paths: &attachment_image_paths,
             running,
             manifest,
             executor,
@@ -868,6 +898,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             run_codex_prompt(
                 &codex,
                 &repair_prompt,
+                &[],
                 &format!("ci_repair_{repair_attempt}_codex"),
                 "Running Codex CI repair",
             )?;

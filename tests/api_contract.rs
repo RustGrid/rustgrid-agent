@@ -147,8 +147,21 @@ fn retrieves_the_run_manifest_contract() {
         "manifest_version": 2,
         "run": {
             "id": "run-1", "ticket_id": "ticket-1", "attempt": 2,
+            "input_prompt": "Use the attached screenshot.",
             "metadata": {"resume_from_run_id": "run-previous"}
         },
+        "attachments": [{
+            "id": "11111111-1111-4111-8111-111111111111",
+            "ticket_id": "ticket-1",
+            "filename": "failure.png",
+            "mime": "image/png",
+            "media_family": "image",
+            "size_bytes": 4,
+            "sha256": "07".repeat(32),
+            "status": "ready",
+            "virus_status": "clean",
+            "variants": []
+        }],
         "project_id": "project-1", "project_key": "RG", "project_name": "RustGrid",
         "ticket_id": "ticket-1", "ticket_key": "RG-1", "ticket_title": "Task",
         "repository_id": 7, "repository": "RustGrid/example",
@@ -170,6 +183,7 @@ fn retrieves_the_run_manifest_contract() {
         .execution_manifest("run-1")
         .unwrap();
     assert_eq!(manifest.repository, "RustGrid/example");
+    assert_eq!(manifest.attachments[0].filename, "failure.png");
     assert_eq!(manifest.resume_from_run_id().unwrap(), Some("run-previous"));
     assert!(
         request

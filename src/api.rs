@@ -1,9 +1,9 @@
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::{
     Method, StatusCode,
     blocking::{Client, RequestBuilder},
@@ -232,6 +232,11 @@ struct QualityGateRecord {
     summary: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentDownloadTarget {
+    url: String,
+}
+
 impl RustGridClient {
     pub fn new(context: &AppContext) -> Result<Self> {
         Ok(Self {
@@ -287,6 +292,57 @@ impl RustGridClient {
             &[],
             None,
         )
+    }
+
+    pub fn download_attachment(&self, attachment_id: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        self.download_attachment_path(&format!("attachments/{attachment_id}/download"), max_bytes)
+    }
+
+    pub fn download_attachment_variant(
+        &self,
+        attachment_id: &str,
+        kind: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.download_attachment_path(
+            &format!(
+                "attachments/{attachment_id}/variants/{}/download",
+                url_encode(kind)
+            ),
+            max_bytes,
+        )
+    }
+
+    fn download_attachment_path(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let target: AttachmentDownloadTarget =
+            self.send_json(Method::GET, path, None, None, &[], None)?;
+        let mut response = self
+            .http
+            .get(&target.url)
+            .send()
+            .with_context(|| format!("could not download attachment bytes from {path}"))?;
+        if !response.status().is_success() {
+            bail!(
+                "attachment storage download for {path} returned {}",
+                response.status()
+            );
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            bail!("attachment storage download for {path} exceeds {max_bytes} bytes");
+        }
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("could not read attachment bytes from {path}"))?;
+        if bytes.len() as u64 > max_bytes {
+            bail!("attachment storage download for {path} exceeds {max_bytes} bytes");
+        }
+        Ok(bytes)
     }
 
     pub fn queue_events(&self, worker_id: &str, after_sequence: u64) -> Result<AgentQueueEvents> {

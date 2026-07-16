@@ -318,9 +318,11 @@ mod tests {
             run: ManifestRun {
                 id: "run-1".into(),
                 ticket_id: "ticket-1".into(),
+                input_prompt: "Implement the ticket.".into(),
                 attempt: 1,
                 metadata: json!({}),
             },
+            attachments: vec![],
             project_id: "project-1".into(),
             project_key: "RG".into(),
             project_name: "RustGrid".into(),

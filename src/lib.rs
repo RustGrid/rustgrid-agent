@@ -1,4 +1,5 @@
 pub mod api;
+pub mod attachments;
 pub mod command;
 pub mod config;
 pub mod coordinator;

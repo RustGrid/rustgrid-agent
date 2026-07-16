@@ -1,9 +1,19 @@
 use anyhow::Result;
 use serde_json::to_string_pretty;
 
-use crate::{api::Ticket, git::read_repo_instructions};
+use crate::{
+    api::Ticket,
+    attachments::{StagedAttachment, prompt_section},
+    git::read_repo_instructions,
+};
 
-pub fn build(ticket: &Ticket, repo_root: &std::path::Path, quality_gate: &str) -> Result<String> {
+pub fn build(
+    ticket: &Ticket,
+    repo_root: &std::path::Path,
+    quality_gate: &str,
+    run_prompt: &str,
+    attachments: &[StagedAttachment],
+) -> Result<String> {
     let mut prompt = format!(
         r#"You are implementing RustGrid ticket {key} in the Git repository at the current working directory.
 
@@ -12,6 +22,9 @@ Ticket title:
 
 Ticket description:
 {description}
+
+Run-specific instructions:
+{run_prompt}
 
 Work carefully and finish the implementation. Inspect the repository before editing. Follow repository instructions and existing conventions. Add or update tests where appropriate. Do not commit, push, create a branch, or open a pull request; the rustgrid-agent runner owns those steps. Do not read or modify files outside this repository. Do not expose environment variables or credentials.
 
@@ -32,7 +45,13 @@ The runner will execute this quality gate after you finish:
         key = ticket.key,
         title = ticket.title,
         description = ticket.description.as_deref().unwrap_or("(none provided)"),
+        run_prompt = run_prompt,
     );
+
+    if let Some(section) = prompt_section(attachments) {
+        prompt.push('\n');
+        prompt.push_str(&section);
+    }
 
     if !ticket.comments.is_empty() {
         prompt.push_str("\nTicket comments (oldest first):\n");
@@ -116,9 +135,17 @@ mod tests {
             }],
             row_version: 1,
         };
-        let value = build(&ticket, dir.path(), "cargo test").unwrap();
+        let value = build(
+            &ticket,
+            dir.path(),
+            "cargo test",
+            "Fix the reported regression.",
+            &[],
+        )
+        .unwrap();
         for expected in [
             "RG-1",
+            "Fix the reported regression.",
             "Needs a test",
             "severity",
             "one failed",
