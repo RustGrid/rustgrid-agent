@@ -11,6 +11,7 @@ use rustgrid_agent::{
     api::RustGridClient,
     config::{AppContext, Config, RepoConfig},
     lifecycle::{LifecycleEvent, RunPhase},
+    token_consumption::TokenConsumption,
 };
 use serde_json::json;
 
@@ -205,6 +206,35 @@ fn heartbeat_advertises_configured_capacity() {
     let request = request.recv().unwrap();
     assert!(request.starts_with("POST /agent-workers/worker-1/heartbeat HTTP/1.1"));
     assert!(request.contains("\"max_concurrency\":1"));
+}
+
+#[test]
+fn reports_final_run_token_consumption() {
+    let Some((url, request)) = server(json!({})) else {
+        return;
+    };
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .report_token_consumption(
+            "run-1",
+            TokenConsumption {
+                input_tokens: 100,
+                cached_input_tokens: 40,
+                output_tokens: 25,
+            },
+        )
+        .unwrap();
+    let request = request.recv().unwrap();
+    assert!(request.starts_with("PUT /agent-runs/run-1/token-consumption HTTP/1.1"));
+    assert!(request.contains("\"provider\":\"codex\""));
+    assert!(request.contains("\"input_tokens\":100"));
+    assert!(request.contains("\"cached_input_tokens\":40"));
+    assert!(request.contains("\"output_tokens\":25"));
+    assert!(request.contains("\"total_tokens\":125"));
+    assert_eq!(
+        header_value(&request, "idempotency-key"),
+        Some("token-consumption-run-1")
+    );
 }
 
 #[test]

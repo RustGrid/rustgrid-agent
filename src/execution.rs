@@ -344,6 +344,7 @@ pub(crate) fn run_codex_prompt(
                 max_workspace_bytes: context.app.config.max_workspace_bytes,
             },
             |line| {
+                context.reporter.observe_token_consumption(line)?;
                 if let Some(message) = feedback_from_output_line(line) {
                     if let Some(action) = blocked_action_from_feedback(&message) {
                         blocked_action.replace(Some(action));

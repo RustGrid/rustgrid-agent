@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::lifecycle::RunPhase;
+use crate::{lifecycle::RunPhase, token_consumption::TokenConsumption};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryPlan {
@@ -49,6 +49,8 @@ pub struct RunJournal {
     pub executor: Option<ExecutorCheckpoint>,
     #[serde(default)]
     pub recovery_source_run_id: Option<String>,
+    #[serde(default)]
+    pub token_consumption: TokenConsumption,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -106,6 +108,7 @@ impl RunJournal {
             last_error: None,
             executor: None,
             recovery_source_run_id: None,
+            token_consumption: TokenConsumption::default(),
             path,
         };
         journal.persist()?;
@@ -164,6 +167,7 @@ impl RunJournal {
         journal.last_sequence = 0;
         journal.progress_sequence = 0;
         journal.last_error = None;
+        journal.token_consumption = TokenConsumption::default();
         journal.recovery_source_run_id = Some(source_run_id.to_owned());
         journal.path = path.to_path_buf();
         journal.persist()?;
@@ -200,6 +204,11 @@ impl RunJournal {
 
     pub fn record_error(&mut self, error: &str) -> Result<()> {
         self.last_error = Some(error.to_owned());
+        self.persist()
+    }
+
+    pub fn record_token_consumption(&mut self, consumption: TokenConsumption) -> Result<()> {
+        self.token_consumption = consumption;
         self.persist()
     }
 

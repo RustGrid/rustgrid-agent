@@ -4,6 +4,10 @@
 ticket has been atomically claimed. The configured RustGrid API URL already
 contains `/api/v1`.
 
+## Token consumption
+
+At terminal finalization, the worker writes the aggregate consumption from every completed Codex turn in the run to `PUT /agent-runs/{run_id}/token-consumption`. The payload contains `provider`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `total_tokens`; retries replace the same per-run resource idempotently. This report is sent before the successful terminal status update, and unsuccessful runs attempt the same report before failure, cancellation, or timeout handling.
+
 ## Execution manifest
 
 `GET /agent-runs/{run_id}/manifest`

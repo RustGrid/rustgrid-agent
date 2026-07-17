@@ -21,4 +21,5 @@ pub mod runner;
 pub mod shutdown;
 pub mod supervisor;
 pub mod token;
+pub mod token_consumption;
 pub mod workspace;

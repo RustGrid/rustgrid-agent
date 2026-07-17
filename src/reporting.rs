@@ -15,6 +15,7 @@ use crate::{
     api::{RustGridClient, is_lease_lost},
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{AgentRunStatus, LifecycleEvent, RunPhase, StepStatus, TicketStatus},
+    token_consumption::TokenConsumption,
 };
 
 pub(crate) fn console_event(label: &str, message: &str, color: &str) {
@@ -58,6 +59,7 @@ pub(crate) struct Reporter<'a> {
     progress_sequence: Cell<u64>,
     run_started: std::time::Instant,
     phase_started: RefCell<std::time::Instant>,
+    token_consumption: Cell<TokenConsumption>,
 }
 
 impl<'a> Reporter<'a> {
@@ -72,6 +74,7 @@ impl<'a> Reporter<'a> {
         let progress_sequence = journal.progress_sequence;
         let sequence = journal.last_sequence;
         let phase = journal.phase;
+        let token_consumption = journal.token_consumption;
         Self {
             api,
             run_id,
@@ -84,6 +87,7 @@ impl<'a> Reporter<'a> {
             progress_sequence: Cell::new(progress_sequence),
             run_started: std::time::Instant::now(),
             phase_started: RefCell::new(std::time::Instant::now()),
+            token_consumption: Cell::new(token_consumption),
         }
     }
 
@@ -200,6 +204,23 @@ impl<'a> Reporter<'a> {
 
     pub(crate) fn record_error(&self, message: &str) -> Result<()> {
         self.journal.borrow_mut().record_error(message)
+    }
+
+    pub(crate) fn observe_token_consumption(&self, line: &str) -> Result<()> {
+        let mut consumption = self.token_consumption.get();
+        if consumption.observe_codex_jsonl(line)? {
+            self.token_consumption.set(consumption);
+            self.journal
+                .borrow_mut()
+                .record_token_consumption(consumption)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn report_token_consumption(&self) -> Result<()> {
+        self.api
+            .report_token_consumption(self.run_id, self.token_consumption.get())
+            .context("could not report final token consumption to RustGrid")
     }
 
     pub(crate) fn record_executor(&self, kind: &str, id: &str, state: &str) -> Result<()> {

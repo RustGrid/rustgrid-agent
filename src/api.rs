@@ -17,6 +17,7 @@ use crate::config::AppContext;
 use crate::{
     lifecycle::{AgentRunStatus, LifecycleEvent, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
+    token_consumption::TokenConsumption,
 };
 
 macro_rules! remote_string_enum {
@@ -658,6 +659,25 @@ impl RustGridClient {
             Some(&format!("run-status-{run_id}-{status}-{row_version}")),
             &[],
             Some(&format!("\"agent-runs:{run_id}:{row_version}\"")),
+        )
+    }
+
+    pub fn report_token_consumption(
+        &self,
+        run_id: &str,
+        consumption: TokenConsumption,
+    ) -> Result<()> {
+        self.send_empty(
+            Method::PUT,
+            &format!("{RUNS}/{run_id}/token-consumption"),
+            Some(json!({
+                "provider": "codex",
+                "input_tokens": consumption.input_tokens,
+                "cached_input_tokens": consumption.cached_input_tokens,
+                "output_tokens": consumption.output_tokens,
+                "total_tokens": consumption.total_tokens()?
+            })),
+            Some(&format!("token-consumption-{run_id}")),
         )
     }
 
