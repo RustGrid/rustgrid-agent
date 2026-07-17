@@ -261,6 +261,12 @@
       },
       "AgentExecutionManifestResponse": {
         "properties": {
+          "attachments": {
+            "items": {
+              "$ref": "#/components/schemas/AttachmentResponse"
+            },
+            "type": "array"
+          },
           "clone_url": {
             "format": "uri",
             "type": "string"
@@ -334,6 +340,7 @@
         "required": [
           "manifest_version",
           "run",
+          "attachments",
           "project_id",
           "project_key",
           "project_name",
@@ -411,6 +418,56 @@
         ],
         "type": "object"
       },
+      "AgentModelOptionsResponse": {
+        "properties": {
+          "default_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "default_model",
+          "models"
+        ],
+        "type": "object"
+      },
+      "AgentPullRequestDiscardResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "pull_request_number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pull_request_url": {
+            "format": "uri",
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_request_number",
+          "pull_request_url",
+          "state",
+          "message"
+        ],
+        "type": "object"
+      },
       "AgentPullRequestMergeResponse": {
         "properties": {
           "merged": {
@@ -441,6 +498,50 @@
           "sha",
           "merged",
           "message"
+        ],
+        "type": "object"
+      },
+      "AgentPullRequestStatusResponse": {
+        "properties": {
+          "draft": {
+            "type": "boolean"
+          },
+          "mergeable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "merged": {
+            "type": "boolean"
+          },
+          "pull_request_number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pull_request_url": {
+            "format": "uri",
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "closed",
+              "merged"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_request_number",
+          "pull_request_url",
+          "state",
+          "merged",
+          "draft"
         ],
         "type": "object"
       },
@@ -854,6 +955,61 @@
           "created_at",
           "updated_at",
           "row_version"
+        ],
+        "type": "object"
+      },
+      "AgentRunTokenConsumptionResponse": {
+        "properties": {
+          "cached_input_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "total_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "ticket_id",
+          "provider",
+          "input_tokens",
+          "cached_input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -1304,6 +1460,13 @@
               "null"
             ]
           },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "size_bytes": {
             "format": "int64",
             "type": [
@@ -1702,7 +1865,6 @@
       "ClaimAgentRunRequest": {
         "properties": {
           "input_prompt": {
-            "maxLength": 20000,
             "minLength": 1,
             "type": "string"
           },
@@ -1717,6 +1879,13 @@
             "additionalProperties": true,
             "default": {},
             "type": "object"
+          },
+          "model": {
+            "maxLength": 100,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "worker_id": {
             "format": "uuid",
@@ -1732,7 +1901,6 @@
       "ClaimNextAgentRunRequest": {
         "properties": {
           "input_prompt": {
-            "maxLength": 20000,
             "minLength": 1,
             "type": "string"
           },
@@ -1747,6 +1915,13 @@
             "additionalProperties": true,
             "default": {},
             "type": "object"
+          },
+          "model": {
+            "maxLength": 100,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "project_id": {
             "anyOf": [
@@ -1991,7 +2166,6 @@
           },
           "input_prompt": {
             "default": "Execute the assigned ticket.",
-            "maxLength": 20000,
             "minLength": 1,
             "type": "string"
           },
@@ -2006,6 +2180,13 @@
             "additionalProperties": true,
             "default": {},
             "type": "object"
+          },
+          "model": {
+            "maxLength": 100,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "started_at": {
             "anyOf": [
@@ -2201,7 +2382,7 @@
         ]
       },
       "CreateCommentRequest": {
-        "description": "------------------------------\nCreate\n------------------------------\nCreate a new comment on a ticket.\n`author_id` is optional (server may infer from auth); `body` must be 1..=5000.",
+        "description": "------------------------------\nCreate\n------------------------------\nCreate a new comment on a ticket.\n`author_id` is optional (server may infer from auth); `body` must be non-empty.",
         "properties": {
           "author_id": {
             "description": "Optional author; if omitted, backend can use the authenticated user.",
@@ -2215,7 +2396,6 @@
           "body": {
             "description": "Plain-text/markdown body",
             "example": "Looks good to me!",
-            "maxLength": 5000,
             "minLength": 1,
             "type": "string"
           }
@@ -2316,10 +2496,11 @@
             ]
           },
           "key": {
-            "description": "Short unique project key (must be non-empty, 1–32 chars)",
+            "description": "Ticket-compatible project key (2–10 uppercase letters or digits, starting with a letter)",
             "example": "DEMO",
-            "maxLength": 32,
-            "minLength": 1,
+            "maxLength": 10,
+            "minLength": 2,
+            "pattern": "^[A-Z][A-Z0-9]{1,9}$",
             "type": "string"
           },
           "name": {
@@ -2556,8 +2737,9 @@
           "project_key": {
             "description": "Project short key (e.g., \"DEMO\")",
             "example": "DEMO",
-            "maxLength": 32,
-            "minLength": 1,
+            "maxLength": 10,
+            "minLength": 2,
+            "pattern": "^[A-Z][A-Z0-9]{1,9}$",
             "type": [
               "string",
               "null"
@@ -4375,6 +4557,122 @@
         ],
         "type": "object"
       },
+      "TenantInvitation": {
+        "properties": {
+          "accepted_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "email": {
+            "format": "email",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "invited_by": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "last_sent_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "revoked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "send_count": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "accepted",
+              "revoked",
+              "expired"
+            ],
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "email",
+          "role_id",
+          "status",
+          "invited_by",
+          "created_at",
+          "expires_at",
+          "last_sent_at",
+          "send_count"
+        ],
+        "type": "object"
+      },
+      "TenantInvitationPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TenantInvitation"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "size": {
+            "format": "int64",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "size",
+          "total",
+          "total_pages"
+        ],
+        "type": "object"
+      },
       "TenantMemberResponse": {
         "description": "One tenant member in a list response.",
         "properties": {
@@ -4669,6 +4967,14 @@
       },
       "TicketListItemResponse": {
         "properties": {
+          "assignee_id": {
+            "description": "User currently assigned to the ticket.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "example": "2025-10-17T10:02:00Z",
             "type": "string"
@@ -4682,6 +4988,14 @@
           },
           "priority": {
             "$ref": "#/components/schemas/PriorityLevel"
+          },
+          "reporter_id": {
+            "description": "User who reported the ticket.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "row_version": {
             "description": "Optimistic-concurrency version. Clients may derive a strong ticket ETag when an intermediary does not expose the response header.",
@@ -4702,6 +5016,8 @@
           "status",
           "priority",
           "row_version",
+          "reporter_id",
+          "assignee_id",
           "created_at"
         ],
         "type": "object"
@@ -4791,6 +5107,14 @@
       },
       "TicketResponse": {
         "properties": {
+          "assignee_id": {
+            "description": "User currently assigned to the ticket.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "description": "RFC3339 UTC timestamp, e.g. \"2025-10-17T10:02:00Z\"",
             "example": "2025-10-17T10:02:00Z",
@@ -4812,6 +5136,14 @@
           "project_key": {
             "type": "string"
           },
+          "reporter_id": {
+            "description": "User who reported the ticket.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status": {
             "$ref": "#/components/schemas/TicketStatus"
           },
@@ -4829,6 +5161,8 @@
           "type",
           "status",
           "priority",
+          "reporter_id",
+          "assignee_id",
           "created_at"
         ],
         "type": "object"
@@ -5058,11 +5392,10 @@
         "type": "object"
       },
       "UpdateCommentRequest": {
-        "description": "------------------------------\nUpdate (partial)\n------------------------------\nPartial update. Only `body` is mutable for now.\nOmit to ignore; when present it must be 1..=5000.",
+        "description": "------------------------------\nUpdate (partial)\n------------------------------\nPartial update. Only `body` is mutable for now.\nOmit to ignore; when present it must be non-empty.",
         "properties": {
           "body": {
             "example": "Minor edit after review.",
-            "maxLength": 5000,
             "minLength": 1,
             "type": [
               "string",
@@ -5181,8 +5514,9 @@
           "key": {
             "description": "Change project key",
             "example": "DEMO2",
-            "maxLength": 32,
-            "minLength": 1,
+            "maxLength": 10,
+            "minLength": 2,
+            "pattern": "^[A-Z][A-Z0-9]{1,9}$",
             "type": [
               "string",
               "null"
@@ -5482,6 +5816,43 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "UpsertAgentRunTokenConsumptionRequest": {
+        "properties": {
+          "cached_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "maxLength": 80,
+            "minLength": 1,
+            "type": "string"
+          },
+          "total_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
         "type": "object"
       },
       "UpsertProjectMemberBody": {
@@ -7470,6 +7841,69 @@
         ]
       }
     },
+    "/api/v1/agent-runs/models": {
+      "get": {
+        "description": "Lists the server-configured Codex models that can be selected when creating or claiming an agent run.",
+        "operationId": "listAgentModels",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentModelOptionsResponse"
+                }
+              }
+            },
+            "description": "Selectable agent models",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          }
+        },
+        "summary": "List selectable agent models",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-runs/{run_id}": {
       "patch": {
         "description": "Update the status and summary fields for an agent run in the current tenant.",
@@ -7692,7 +8126,7 @@
     },
     "/api/v1/agent-runs/{run_id}/accept-pull-request": {
       "post": {
-        "description": "Merge the open GitHub pull request associated with a succeeded agent run using the tenant-owned GitHub App installation.",
+        "description": "Resolve the pull request from succeeded run metadata or its ticket link, verify its current open state through the tenant-owned GitHub App installation, and merge it.",
         "operationId": "acceptAgentRunPullRequest",
         "parameters": [
           {
@@ -7790,7 +8224,7 @@
                 }
               }
             },
-            "description": "Run, repository binding, or associated open pull request not found",
+            "description": "Run, repository binding, or associated pull request not found",
             "headers": {
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
@@ -7808,7 +8242,7 @@
                 }
               }
             },
-            "description": "Run is not succeeded, association is ambiguous, or App permissions are insufficient",
+            "description": "Run is not succeeded, association is ambiguous, the pull request is not open, or App permissions are insufficient",
             "headers": {
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
@@ -7889,6 +8323,210 @@
           }
         ],
         "summary": "Accept and merge an agent-run pull request",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/discard-pull-request": {
+      "post": {
+        "description": "Resolve the pull request from a succeeded run, verify it is open and unmerged through the tenant-owned GitHub App installation, and close it without merging.",
+        "operationId": "discardAgentRunPullRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentPullRequestDiscardResponse"
+                }
+              }
+            },
+            "description": "Pull request closed without merging",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing run-update or GitHub-management permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run, repository binding, or associated pull request not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run is not succeeded, association is ambiguous, the pull request is merged or not open, or App permissions are insufficient",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub pull request close failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discard and close an agent-run pull request",
         "tags": [
           "agents"
         ]
@@ -9000,6 +9638,199 @@
         ]
       }
     },
+    "/api/v1/agent-runs/{run_id}/pull-request": {
+      "get": {
+        "description": "Resolve the run-associated pull request and return its current state directly from the tenant-owned GitHub App installation.",
+        "operationId": "getAgentRunPullRequestStatus",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentPullRequestStatusResponse"
+                }
+              }
+            },
+            "description": "Live pull request state",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing agent-run read permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run, repository binding, or associated pull request not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Association is ambiguous or App permissions are insufficient",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub lookup failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get live agent-run pull request state",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-runs/{run_id}/steps": {
       "get": {
         "description": "List steps appended to an agent run in the current tenant.",
@@ -9701,6 +10532,202 @@
           }
         ],
         "summary": "Update an agent run step",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/token-consumption": {
+      "get": {
+        "description": "Read the canonical token consumption reported for an agent run tied to a ticket.",
+        "operationId": "getAgentRunTokenConsumption",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRunTokenConsumptionResponse"
+                }
+              }
+            },
+            "description": "Agent run token consumption"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run or token consumption report not found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get agent run token consumption",
+        "tags": [
+          "agents"
+        ]
+      },
+      "put": {
+        "description": "Create or replace the canonical aggregate token consumption for an agent run tied to a ticket.",
+        "operationId": "upsertAgentRunTokenConsumption",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertAgentRunTokenConsumptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRunTokenConsumptionResponse"
+                }
+              }
+            },
+            "description": "Agent run token consumption stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid token counts"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run not found"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Upsert agent run token consumption",
         "tags": [
           "agents"
         ]
@@ -15834,6 +16861,142 @@
         ]
       }
     },
+    "/api/v1/integrations/github/installations": {
+      "get": {
+        "description": "List active GitHub App installations owned by the authenticated tenant.",
+        "operationId": "listGithubInstallations",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "properties": {
+                      "account_login": {
+                        "type": "string"
+                      },
+                      "account_type": {
+                        "type": "string"
+                      },
+                      "claimed_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "claimed_by": {
+                        "format": "uuid",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "installation_id": {
+                        "format": "int64",
+                        "type": "integer"
+                      },
+                      "permissions": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "repository_selection": {
+                        "type": "string"
+                      },
+                      "state": {
+                        "type": "string"
+                      },
+                      "tenant_id": {
+                        "format": "uuid",
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "verification_source": {
+                        "type": "string"
+                      },
+                      "verified_at": {
+                        "format": "date-time",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "installation_id",
+                      "tenant_id",
+                      "account_login",
+                      "account_type",
+                      "repository_selection",
+                      "permissions",
+                      "state",
+                      "verification_source",
+                      "claimed_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Active tenant GitHub App installations."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List active GitHub App installations",
+        "tags": [
+          "integrations"
+        ]
+      }
+    },
     "/api/v1/integrations/github/installations/setup": {
       "post": {
         "description": "Begin tenant-bound GitHub App installation setup",
@@ -16002,6 +17165,210 @@
           }
         ],
         "summary": "Begin tenant-bound GitHub App installation setup",
+        "tags": [
+          "integrations"
+        ]
+      }
+    },
+    "/api/v1/integrations/github/installations/{id}": {
+      "delete": {
+        "description": "Disconnect one tenant-owned GitHub App installation and remove its active repository links while preserving RustGrid projects and history",
+        "operationId": "disconnectGithubInstallation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "disconnected": {
+                      "type": "boolean"
+                    },
+                    "installation_account": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "installation_id": {
+                      "format": "int64",
+                      "type": "integer"
+                    },
+                    "preserved_projects": {
+                      "format": "int64",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "removed_project_links": {
+                      "format": "int64",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "removed_repositories": {
+                      "format": "int64",
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "disconnected",
+                    "installation_id",
+                    "installation_account",
+                    "removed_project_links",
+                    "removed_repositories",
+                    "preserved_projects"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Installation disconnected and active repository links removed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid installation id",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Disconnect a GitHub App installation",
         "tags": [
           "integrations"
         ]
@@ -16708,6 +18075,32 @@
                       "null"
                     ]
                   },
+                  "pull_request_automation": {
+                    "description": "Optional per-repository ticket status mappings for linked pull request lifecycle events. Status names are resolved case-insensitively; ready_to_review and Ready to review are accepted aliases for ready_for_review.",
+                    "properties": {
+                      "merged": {
+                        "default": "done",
+                        "type": "string"
+                      },
+                      "opened": {
+                        "default": "ready_for_review",
+                        "type": "string"
+                      },
+                      "reopened": {
+                        "default": "ready_for_review",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "opened",
+                      "reopened",
+                      "merged"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
                   "repository": {
                     "example": "acme/rustgrid",
                     "type": "string"
@@ -17124,6 +18517,29 @@
                     "format": "uuid",
                     "type": [
                       "string",
+                      "null"
+                    ]
+                  },
+                  "pull_request_automation": {
+                    "description": "Optional replacement ticket status mappings for linked pull request lifecycle events. Status names are resolved case-insensitively; ready_to_review and Ready to review are accepted aliases for ready_for_review.",
+                    "properties": {
+                      "merged": {
+                        "type": "string"
+                      },
+                      "opened": {
+                        "type": "string"
+                      },
+                      "reopened": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "opened",
+                      "reopened",
+                      "merged"
+                    ],
+                    "type": [
+                      "object",
                       "null"
                     ]
                   },
@@ -26116,6 +27532,593 @@
         ]
       }
     },
+    "/api/v1/tenants/{tenant_id}/invitations": {
+      "get": {
+        "description": "Lists tenant invitations with deterministic newest-first pagination. Pending invitations past `expires_at` are returned as `expired`. Requires `tenants:members:manage`.",
+        "operationId": "listTenantInvitations",
+        "parameters": [
+          {
+            "description": "Tenant ID",
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "enum": [
+                "pending",
+                "accepted",
+                "revoked",
+                "expired"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "email",
+            "required": false,
+            "schema": {
+              "format": "email",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "size",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantInvitationPage"
+                }
+              }
+            },
+            "description": "Paginated tenant invitations",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid filter or pagination",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Tenant not found or inaccessible",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List tenant invitations",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/invitations/{invitation_id}": {
+      "delete": {
+        "description": "Idempotently revokes an unaccepted tenant invitation and invalidates its active token. Accepted invitations return conflict. Requires `tenants:members:manage`.",
+        "operationId": "revokeTenantInvitation",
+        "parameters": [
+          {
+            "description": "Tenant ID",
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Invitation ID",
+            "in": "path",
+            "name": "invitation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Invitation revoked",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invitation not found in tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Accepted invitation cannot be revoked",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Persistence or audit failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke a tenant invitation",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/invitations/{invitation_id}/resend": {
+      "post": {
+        "description": "Atomically replaces the token hash, refreshes the seven-day expiration, increments `send_count`, and dispatches the existing invitation email. A configurable cooldown defaults to 60 seconds. Requires `tenants:members:manage`.",
+        "operationId": "resendTenantInvitation",
+        "parameters": [
+          {
+            "description": "Tenant ID",
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Invitation ID",
+            "in": "path",
+            "name": "invitation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantInvitation"
+                }
+              }
+            },
+            "description": "Invitation resent",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invitation not found in tenant",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invitation lifecycle conflict",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invitation resend cooldown has not elapsed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Persistence, audit, or delivery failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resend a tenant invitation",
+        "tags": [
+          "tenants"
+        ]
+      }
+    },
     "/api/v1/tenants/{tenant_id}/invites": {
       "post": {
         "description": "Create an email-based tenant invitation for a user and role. The invitation token is accepted through `/api/v1/tenants/invites/accept`.",
@@ -34292,7 +36295,7 @@
     },
     "/api/v1/usage/history": {
       "get": {
-        "description": "Get usage counter history",
+        "description": "Get usage history as billing-period counters or calendar-day usage-event buckets. Daily buckets are derived from the timestamped usage ledger and are not interpolated from monthly totals.",
         "operationId": "usage_history",
         "parameters": [
           {
@@ -34304,6 +36307,20 @@
               "maximum": 500,
               "minimum": 1,
               "type": "integer"
+            }
+          },
+          {
+            "description": "History bucket granularity. Defaults to billing_period for backward compatibility.",
+            "in": "query",
+            "name": "granularity",
+            "required": false,
+            "schema": {
+              "default": "billing_period",
+              "enum": [
+                "billing_period",
+                "day"
+              ],
+              "type": "string"
             }
           },
           {

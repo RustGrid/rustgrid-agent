@@ -33,7 +33,7 @@ At terminal finalization, the worker writes the aggregate consumption from every
   "execution_policy": {
     "policy_version": 1,
     "codex": {
-      "command": ["codex", "exec", "--json"],
+      "command": ["codex", "exec", "--json", "--model", "gpt-5.6-terra"],
       "environment_allowlist": ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"],
       "idle_timeout_seconds": 300
     },
@@ -63,6 +63,10 @@ Codex `workspace-write`; the production executor maps it to Codex
 `danger-full-access` only inside the disposable Docker Sandbox microVM, which
 enforces the same filesystem scope plus the process, network, and resource
 boundaries. Approval policy remains `never` in both cases.
+
+The optional user-selected model is not read directly from client metadata by
+the worker. RustGrid validates the requested identifier against its configured
+catalog and places `--model <id>` in the snapshotted, hashed command above.
 
 ## Queue and capacity
 
