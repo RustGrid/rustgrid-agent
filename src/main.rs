@@ -22,9 +22,14 @@ enum Commands {
         /// Print the URL without launching a browser.
         #[arg(long)]
         no_browser: bool,
+        /// RustGrid control-plane instance URL (the /api/v1 suffix is optional).
+        #[arg(long, value_name = "URL")]
+        instance: Option<String>,
     },
-    /// Connect this machine to its pre-announced RustGrid worker.
+    /// Deprecated compatibility command. Use `login` instead.
     Register,
+    /// Revoke this worker credential and remove it from local secure storage.
+    Logout,
     /// Run one RustGrid ticket in the current Git repository.
     Run { ticket_id: String },
     /// Poll RustGrid for tickets and run them one at a time.
@@ -53,17 +58,40 @@ enum Commands {
 fn run() -> Result<()> {
     rustgrid_agent::shutdown::install()?;
     let cli = Cli::parse();
-    let context = AppContext::load(&cli.config)?;
 
     match cli.command {
-        Commands::Login { no_browser } => rustgrid_agent::auth::login(&context, !no_browser),
-        Commands::Register => runner::register(&context),
-        Commands::Run { ticket_id } => runner::run_ticket(&context, &ticket_id).map(|_| ()),
+        Commands::Login {
+            no_browser,
+            instance,
+        } => {
+            let mut context = AppContext::load_for_login(&cli.config, instance.as_deref())?;
+            rustgrid_agent::auth::login(&mut context, !no_browser)
+        }
+        Commands::Logout => {
+            let mut context = AppContext::load(&cli.config)?;
+            rustgrid_agent::auth::logout(&mut context)
+        }
+        Commands::Register => {
+            eprintln!("[warning] `register` is deprecated; use `rustgrid-agent login`");
+            let context = AppContext::load(&cli.config)?;
+            runner::register(&context)
+        }
+        Commands::Run { ticket_id } => {
+            let context = AppContext::load(&cli.config)?;
+            runner::run_ticket(&context, &ticket_id).map(|_| ())
+        }
         Commands::Watch { interval, once } => {
+            let context = AppContext::load(&cli.config)?;
             runner::watch(&context, Duration::from_secs(interval), once)
         }
-        Commands::Serve { interval } => runner::serve(&context, Duration::from_secs(interval)),
-        Commands::Status { json } => runner::status(&context, json),
+        Commands::Serve { interval } => {
+            let context = AppContext::load(&cli.config)?;
+            runner::serve(&context, Duration::from_secs(interval))
+        }
+        Commands::Status { json } => {
+            let context = AppContext::load(&cli.config)?;
+            runner::status(&context, json)
+        }
     }
 }
 

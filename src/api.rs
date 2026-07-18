@@ -224,6 +224,22 @@ struct AgentWorkerRun {
     row_version: i64,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AgentWorkerStatus {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub agent_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentWorkersPage {
+    items: Vec<AgentWorkerStatus>,
+}
+
 #[derive(Debug, Deserialize)]
 struct QualityGateRecord {
     status: QualityGateStatus,
@@ -263,6 +279,14 @@ impl RustGridClient {
             Some(json!({"status": status.as_str(), "max_concurrency": self.max_concurrency})),
             None,
         )
+    }
+
+    pub fn worker_status(&self, worker_id: &str) -> Result<AgentWorkerStatus> {
+        let page: AgentWorkersPage = self.send_json(Method::GET, WORKERS, None, None, &[], None)?;
+        page.items
+            .into_iter()
+            .find(|worker| worker.id == worker_id)
+            .with_context(|| format!("authenticated worker {worker_id} was not found"))
     }
 
     pub fn extend_lease(

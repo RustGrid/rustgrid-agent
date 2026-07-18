@@ -39,12 +39,22 @@ exhaustion is classified as transient worker infrastructure instead of letting
 Codex proceed with missing dependencies.
 
 The example systemd unit is in
-`packaging/systemd/rustgrid-agent.service`. Configure:
+`packaging/systemd/rustgrid-agent.service`. Prefer logging in once as the
+dedicated service account so the credential lands in that account's secret
+store or private fallback:
+
+```sh
+sudo -u rustgrid-agent rustgrid-agent \
+  --config /etc/rustgrid-agent/agent.json \
+  login --no-browser --instance https://agentops.example.com
+```
+
+For centrally managed secret injection, configure the compatibility variables:
 
 ```text
 RUSTGRID_WORKER_API_KEY=rgk_...
 RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
-RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
+RUSTGRID_INSTANCE_URL=https://agentops.example.com
 ```
 
 Long-running workers use the credential created by `rustgrid-agent login`, or
@@ -52,6 +62,10 @@ an injected `RUSTGRID_WORKER_API_KEY` bound to the exact identity in
 `RUSTGRID_WORKER_ID`. Startup heartbeats that worker and fails closed when the
 binding does not match. The credential is required for leased run events, manifests, and
 run-scoped GitHub token issuance.
+`RUSTGRID_API_URL` remains the highest-precedence legacy override when a
+deployment requires an exact custom API proxy prefix. Rotate and revoke managed
+secrets in the deployment secret manager; `logout` cannot unset environment
+variables.
 
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and

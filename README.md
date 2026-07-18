@@ -8,7 +8,7 @@ The Cargo package, executable, GitHub repository, and Homebrew formula all use t
 
 For each ticket, the agent:
 
-1. Registers and heartbeats a worker with RustGrid.
+1. Authenticates and heartbeats a worker with RustGrid.
 2. Receives an agent run explicitly assigned by RustGrid and fetches its ticket.
 3. Checks the local Git repository and creates an `agent/<ticket-key>-<slug>` branch.
 4. Builds a Codex prompt from the ticket title, description, comments, custom fields, previous quality-gate failures, and root `AGENTS.md` and `README.md` files.
@@ -21,7 +21,7 @@ For each ticket, the agent:
 
 - macOS or Linux with Git installed.
 - Access to the GitHub repository named in the agent configuration.
-- A RustGrid account authorized to register a worker, or a centrally managed
+- A RustGrid account authorized to approve a worker, or a centrally managed
   worker credential with the permissions listed in [Credentials](#credentials).
 - A RustGrid project linked to a GitHub repository through the RustGrid GitHub App.
 - The server-selected Codex executable installed and authenticated on the worker host.
@@ -120,19 +120,25 @@ rustgrid-agent login
 ```
 
 The command prints a one-time code, opens RustGrid in your browser, and waits
-while you sign in and authorize the device. It then stores the worker identity
-and its scoped credential in `<config-file>.credentials` with owner-only file
-permissions. The code expires and is never a worker credential.
+while you sign in and authorize the device. It stores the scoped credential in
+macOS Keychain, Windows Credential Manager, or Linux Secret Service. If no OS
+store is available, it emits a warning and uses an atomic owner-only file in the
+user configuration directory; it never writes a credential beside the project
+configuration. The code expires and is never a worker credential.
 
 For non-interactive, centrally managed deployments, `RUSTGRID_WORKER_API_KEY`
 and `RUSTGRID_WORKER_ID` remain supported and take precedence over stored login
 state. Administrative credentials must remain outside the long-running worker.
 
-The production RustGrid API URL is used by default. Set `RUSTGRID_API_URL` only when targeting a different deployment:
+Select a custom or self-hosted control-plane instance during login:
 
 ```sh
-export RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
+rustgrid-agent login --instance https://agentops.example.com
 ```
+
+`RUSTGRID_INSTANCE_URL` provides the same instance override for managed hosts.
+The legacy `RUSTGRID_API_URL` override remains supported and has highest
+precedence so existing reverse-proxy deployments can migrate without downtime.
 
 ### 3. Validate the setup
 
@@ -184,6 +190,11 @@ rustgrid-agent --config path/to/agent.json status
 
 | Field | Required | Description |
 | --- | --- | --- |
+| `instance_url` | No | RustGrid control-plane origin selected by `login`. Defaults to `https://app.rustgrid.com`; `/api/v1` is accepted and normalized away. |
+| `installation_id` | No | Stable non-secret installation UUID generated automatically. |
+| `worker_id` / `worker_name` / `tenant_id` | No | Non-secret linked worker metadata maintained by `login` and `logout`. |
+| `credential_store` | No | Non-secret storage source metadata such as `os_keychain` or `private_file_fallback`. |
+| `credential_expires_at_unix` | No | Non-secret expiry timestamp recorded after interactive login so `status` can request reauthentication when the credential expires. |
 | `project_key` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
 | `project_id` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
 | `repo.owner` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
@@ -226,17 +237,21 @@ being reconciled into the fresh result.
 | --- | --- | --- |
 | `RUSTGRID_WORKER_API_KEY` | No | Managed-deployment override for the credential created by `login`. |
 | `RUSTGRID_WORKER_ID` | No | Managed-deployment override for the worker created by `login`. |
-| `RUSTGRID_API_URL` | No | Overrides `https://app.rustgrid.com/api/v1`. |
+| `RUSTGRID_INSTANCE_URL` | No | Overrides the configured RustGrid instance; the agent derives `/api/v1`. |
+| `RUSTGRID_API_URL` | No | Legacy highest-precedence API endpoint override, including custom proxy prefixes. |
 | `CODEX_COMMAND` | No | Overrides the configured Codex command. |
 
 The RustGrid API key needs these permissions:
 
 - `tickets:read`, `tickets:update`, `comments:read`, and `comments:create`
-- `agents:workers:register` and `agents:workers:heartbeat`
-- `agents:runs:claim` and `agents:runs:update`
-- `agents:steps:create`
-- `agents:links:create`
-- `agents:quality_gates:read` and `agents:quality_gates:create`
+- `agents:workers:heartbeat`
+- `agents:runs:read`, `agents:runs:create`, `agents:runs:claim`, and `agents:runs:update`
+- `agents:steps:read`, `agents:steps:create`, `agents:steps:update`, and `agents:steps:delete`
+- `agents:links:read`, `agents:links:create`, `agents:links:update`, and `agents:links:delete`
+- `agents:quality_gates:read`, `agents:quality_gates:create`, `agents:quality_gates:update`, and `agents:quality_gates:delete`
+
+Interactive credentials never receive worker registration, worker credential
+administration, or API-key administration permissions.
 
 GitHub credentials are issued by RustGrid for the GitHub App installation in
 the claimed execution manifest. Tokens are held only in memory, refreshed before
@@ -305,12 +320,25 @@ For HTTPS remotes, the token is passed to the child `git push` process through t
 ```sh
 rustgrid-agent login
 rustgrid-agent login --no-browser
+rustgrid-agent login --instance https://agentops.example.com
 ```
 
 Starts a device authorization, displays its one-time code, opens the browser,
 and polls until authorization completes. `--no-browser` is useful on headless
 hosts: open the printed URL on another device. Login credentials are scoped to
-the worker and stored beside the selected configuration file.
+the worker and stored in the OS credential store, with an explicit owner-only
+fallback for headless systems.
+
+### `logout`
+
+```sh
+rustgrid-agent logout
+```
+
+Revokes the current bound credential server-side and then removes its local
+copy. Network or server failures retain the local credential so the command can
+be retried safely. Repeated logout is safe; managed environment variables must
+be unset by the deployment system.
 
 ### `register`
 
@@ -327,7 +355,9 @@ an immediate heartbeat. New installations should use `login`.
 rustgrid-agent status
 ```
 
-Shows the resolved configuration path, API URL, project, repository root, base branch, commands, credential presence, and worktree state. It exits with an error when either required credential is missing.
+Shows the instance, API URL, agent version, credential source, installation,
+tenant, linked worker, remote worker state, last heartbeat, and runtime
+readiness without exposing secrets. `status --json` emits schema version `1`.
 
 ### `run`
 
@@ -451,7 +481,7 @@ Common checks:
 - Only new changed paths reported by Git inside the discovered repository root are staged. The runner never uses `git add .`.
 - Existing local branches are never overwritten.
 - Codex and quality-gate commands run directly without a shell.
-- Long-lived credentials are not logged, embedded in Git URLs, or included in prompts. Device-login credentials are persisted only in the owner-readable credentials file beside the agent configuration. Explicitly allowlisted child values use a protected temporary env file that is deleted after execution.
+- Long-lived credentials are not logged, embedded in Git URLs, or included in prompts. Device-login credentials use the OS credential store or a warned owner-only fallback outside the project configuration. Explicitly allowlisted child values use a protected temporary env file that is deleted after execution.
 - API errors include the HTTP status, a bounded response body, and the RustGrid request ID when available.
 - Failed runs leave the branch and worktree in place for recovery.
 

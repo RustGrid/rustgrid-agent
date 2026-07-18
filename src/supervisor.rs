@@ -170,6 +170,13 @@ mod tests {
         });
         let context = AppContext {
             config: Config {
+                instance_url: Some(format!("http://{address}/api/v1")),
+                installation_id: Some("00000000-0000-4000-8000-000000000099".into()),
+                worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
+                tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
+                worker_name: Some("test-worker".into()),
+                credential_store: Some("environment".into()),
+                credential_expires_at_unix: None,
                 project_id: Some("project-1".into()),
                 project_key: None,
                 repo: None,
@@ -199,9 +206,20 @@ mod tests {
                 max_child_open_files: 1024,
             },
             config_path: PathBuf::from("test.json"),
+            instance_url: format!("http://{address}"),
             api_url: format!("http://{address}"),
             api_key: Some("test-key".into()),
             worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
+            worker_name: Some("test-worker".into()),
+            installation_id: "00000000-0000-4000-8000-000000000099".into(),
+            credential_source: crate::credentials::CredentialSource::Environment,
+            credential_expires_at_unix: None,
+            credential_store: crate::credentials::CredentialStore::new(
+                &format!("http://{address}"),
+                "00000000-0000-4000-8000-000000000099",
+            )
+            .unwrap(),
             credentials_path: PathBuf::from("test.json.credentials"),
             workspace_root: PathBuf::from("/tmp/rustgrid-agent-supervisor-test"),
         };

@@ -7,6 +7,9 @@
 - Recovery journal schema: `1`
 - Minimum Rust version for source builds: `1.94`
 - Supported worker operating systems: Linux and macOS
+- Interactive login server baseline: RustGrid with migration
+  `0047_worker_device_authentication` and the plural
+  `/api/v1/agent-workers/device-authorizations` endpoints
 
 Unknown manifest, policy, and journal versions fail closed. Additive API response fields are accepted. Known external status values use typed enums with an `Unknown` representation where ignoring a new value is safe.
 
@@ -15,6 +18,13 @@ Before `1.0.0`, minor releases may contain intentional compatibility changes des
 ## Control-plane upgrades
 
 Deploy additive RustGrid API changes before workers that require them. Do not remove an endpoint or required response field until all supported workers have been upgraded. The committed OpenAPI snapshot and CI assertions document the minimum worker contract.
+
+Interactive login treats `404 Not Found` and `405 Method Not Allowed` from the
+device-authorization start endpoint as an incompatible server and does not
+silently create an administrative credential. Existing managed workers may
+temporarily continue with `RUSTGRID_WORKER_API_KEY`, `RUSTGRID_WORKER_ID`, and
+the legacy exact `RUSTGRID_API_URL` override while the server is upgraded.
+Environment credentials take precedence over stored interactive credentials.
 
 ## Rollback
 

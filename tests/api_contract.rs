@@ -18,6 +18,13 @@ use serde_json::json;
 fn context(base_url: String) -> AppContext {
     AppContext {
         config: Config {
+            instance_url: Some(base_url.clone()),
+            installation_id: Some("00000000-0000-4000-8000-000000000099".into()),
+            worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
+            worker_name: Some("contract-worker".into()),
+            credential_store: Some("environment".into()),
+            credential_expires_at_unix: None,
             project_id: None,
             project_key: None,
             repo: Some(RepoConfig {
@@ -42,9 +49,20 @@ fn context(base_url: String) -> AppContext {
             max_child_open_files: 1024,
         },
         config_path: PathBuf::from("test.json"),
-        api_url: base_url,
+        instance_url: base_url.clone(),
+        api_url: base_url.clone(),
         api_key: Some("rgk_test".into()),
         worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
+        tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
+        worker_name: Some("contract-worker".into()),
+        installation_id: "00000000-0000-4000-8000-000000000099".into(),
+        credential_source: rustgrid_agent::credentials::CredentialSource::Environment,
+        credential_expires_at_unix: None,
+        credential_store: rustgrid_agent::credentials::CredentialStore::new(
+            &base_url,
+            "00000000-0000-4000-8000-000000000099",
+        )
+        .unwrap(),
         credentials_path: PathBuf::from("test.json.credentials"),
         workspace_root: PathBuf::from("/tmp/rustgrid-agent-tests"),
     }

@@ -1,62 +1,139 @@
 # Agent device authentication contract
 
-`rustgrid-agent login` uses a device flow so an operator never has to create a
-worker, copy its UUID, or handle an API key. The Agent Ops service must expose
-the two unauthenticated endpoints below. Device codes must be high entropy,
-single-use, short-lived, stored hashed, and bound to the final authenticated
-user and tenant. Responses must not be cacheable.
+`rustgrid-agent login` uses RustGrid's first-party device authorization flow so
+an operator never creates an API key, copies a worker UUID, or places an
+administrative credential on the worker host. It is inspired by OAuth 2.0
+device authorization but is a RustGrid-specific protocol.
 
-## Start authorization
+## Operator flows
 
-`POST /api/v1/agent-workers/device-authorization`
+Interactive login:
 
-Request:
-
-```json
-{"client_name":"rustgrid-agent"}
+```sh
+rustgrid-agent login
+rustgrid-agent status
+rustgrid-agent serve
 ```
 
-Response (`200`):
+Headless and custom-instance login:
+
+```sh
+rustgrid-agent login --no-browser --instance https://agentops.example.com
+```
+
+Open the printed verification URL on any browser, sign in, select an eligible
+tenant, review the hostname, operating system, architecture, installation ID,
+and agent version, then explicitly approve or deny it. The CLI stops on denial,
+expiry, consumption, an invalid device code, or Ctrl-C. It honors the server's
+poll interval and `slow_down` response and retries bounded transient failures.
+
+`rustgrid-agent logout` revokes the bound credential before deleting it
+locally. If server revocation cannot be confirmed, the secret is retained for a
+safe retry. Revoking the worker or credential in AgentOps immediately blocks
+subsequent authenticated worker requests; run `login` again to reconnect.
+
+## HTTP protocol
+
+All endpoints are under `/api/v1/agent-workers` and return
+`Cache-Control: no-store, max-age=0`. `device_code`, access tokens, and
+authorization headers must never enter URLs, logs, traces, browser storage,
+analytics, audit payloads, or error reports.
+
+### Start authorization
+
+`POST /device-authorizations` is unauthenticated and rate limited. The request
+contains `client_id: "rustgrid-agent"`, the stable installation UUID, machine
+metadata, agent version, and the fixed runtime scope set. A successful `201`
+returns:
 
 ```json
 {
-  "device_code": "opaque-secret",
+  "device_code": "opaque-high-entropy-secret",
   "user_code": "ABCD-EFGH",
-  "verification_uri": "https://app.rustgrid.com/device",
-  "verification_uri_complete": "https://app.rustgrid.com/device?user_code=ABCD-EFGH",
+  "verification_uri": "https://agentops.example.com/device",
+  "verification_uri_complete": "https://agentops.example.com/device?code=ABCD-EFGH",
   "expires_in": 900,
   "interval": 5
 }
 ```
 
-The browser page authenticates the operator, asks for the user code when it is
-not already in the URL, shows the worker being authorized, and requires explicit
-confirmation. The user code is only a lookup code and must not authenticate API
-requests.
+The database stores only hashes of both codes. The complete URI may contain the
+human-readable user code; it never contains the device code.
 
-## Exchange device code
+### Browser review
 
-`POST /api/v1/agent-workers/device-authorization/token`
+These endpoints require an authenticated user with
+`agents:workers:register`:
 
-Request:
+- `GET /device-authorizations/{user_code}` returns non-secret machine metadata.
+- `POST /device-authorizations/{user_code}/approve` atomically links or safely
+  reconnects the installation, rotates its prior device credential, and makes a
+  new credential available for one-time delivery.
+- `POST /device-authorizations/{user_code}/deny` creates no worker credential.
+
+Approval is tenant-bound. The same installation cannot be silently moved to a
+different tenant. Repeated approval returns the prior result without creating a
+second worker or credential.
+
+### Token exchange
+
+`POST /device-authorizations/token` is unauthenticated and accepts only:
 
 ```json
-{"device_code":"opaque-secret"}
+{"client_id":"rustgrid-agent","device_code":"opaque-high-entropy-secret"}
 ```
 
-Responses:
+Before approval, HTTP `400` returns a stable machine error such as
+`authorization_pending` or `slow_down`, including the next interval. Other
+terminal errors are `access_denied`, `expired_token`, `consumed_token`, and
+`invalid_device_code`. A successful `200` returns a 30-day `expires_in`, nested
+worker and instance metadata, runtime scopes, and `access_token` exactly once.
+The encrypted delivery copy is
+erased in the same transaction that marks the authorization consumed, so replay
+returns `consumed_token`.
 
-- `202 Accepted` while the operator has not completed authorization.
-- `429 Too Many Requests` when the client polls too quickly; the agent adds five
-  seconds to its polling interval.
-- `410 Gone` when the code expired or was consumed.
-- `200 OK` exactly once after approval:
+The worker credential excludes `agents:workers:register`,
+`agents:workers:credentials`, and all API-key administration scopes. It is
+bound to the worker, tenant, and installation. Reconnecting the same
+installation increments the credential version and revokes the prior device
+credential.
 
-```json
-{"worker_id":"00000000-0000-4000-8000-000000000000","api_key":"rgk_..."}
-```
+## Credential storage and precedence
 
-The returned key must be bound to that worker and have only the worker runtime
-permissions documented in [the worker API contract](worker-api-contract.md).
-Denial may return `403 Forbidden`. Other errors use the API's normal bounded
-JSON error response. The agent never logs or prints `device_code` or `api_key`.
+Interactive secrets use macOS Keychain, Windows Credential Manager, or Linux
+Secret Service through the `keyring` crate. A headless system without a working
+OS store receives a warning and uses an atomic owner-only file under its user
+configuration directory. The fallback rejects symlinks and broad permissions.
+The project configuration stores only non-secret identity and storage metadata.
+Legacy plaintext `<config>.credentials` files are migrated once and removed.
+
+Precedence is:
+
+1. `RUSTGRID_API_URL` for the legacy exact API endpoint override.
+2. `RUSTGRID_INSTANCE_URL`, then configured `instance_url`, then the production
+   default for instance selection.
+3. `RUSTGRID_WORKER_API_KEY` and `RUSTGRID_WORKER_ID` for centrally managed
+   credentials, ahead of stored interactive login state.
+
+CI and managed hosts may continue injecting environment credentials during the
+migration period. They must be worker-bound and least-privileged; they must not
+be administrative user or API-key credentials.
+
+## Compatibility and troubleshooting
+
+The server must be deployed with migration `0047_worker_device_authentication`
+and the plural `/device-authorizations` endpoints before interactive login is
+enabled. A `404` or `405` start response is reported as an incompatible server;
+the agent does not silently fall back to legacy registration. Existing managed
+environment credentials remain supported temporarily, and `register` remains a
+deprecated compatibility command.
+
+- If the browser does not open, rerun with `--no-browser` and use the printed
+  URL and code.
+- If a code expires or was consumed, run `login` again; codes are not reusable.
+- If approval is forbidden, select a tenant where the signed-in user has
+  `agents:workers:register`.
+- If the OS store is unavailable, verify the warned fallback directory is
+  private or configure `RUSTGRID_CREDENTIALS_DIR` for the service account.
+- If `status` reports `revoked` or `pending_upgrade`, reauthenticate after the
+  operator resolves the worker state in AgentOps.

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod command;
 pub mod config;
 pub mod coordinator;
+pub mod credentials;
 mod execution;
 mod executor;
 mod finalization;
