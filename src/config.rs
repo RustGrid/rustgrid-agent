@@ -136,6 +136,7 @@ pub struct AppContext {
     pub api_url: String,
     pub api_key: Option<String>,
     pub worker_id: Option<String>,
+    pub credentials_path: PathBuf,
     pub workspace_root: PathBuf,
 }
 
@@ -257,16 +258,21 @@ impl AppContext {
                 .join("rustgrid-agent")
                 .join("workspaces")
         });
-        let worker_id = nonempty_env("RUSTGRID_WORKER_ID");
+        let credentials_path = credentials_path(path);
+        let stored = StoredCredentials::load(&credentials_path)?;
+        let worker_id = nonempty_env("RUSTGRID_WORKER_ID")
+            .or_else(|| stored.as_ref().map(|value| value.worker_id.clone()));
         if let Some(worker_id) = worker_id.as_deref() {
-            uuid::Uuid::parse_str(worker_id).context("RUSTGRID_WORKER_ID must be a valid UUID")?;
+            uuid::Uuid::parse_str(worker_id).context("worker ID must be a valid UUID")?;
         }
         Ok(Self {
             config,
             config_path: path.to_path_buf(),
             api_url: env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into()),
-            api_key: nonempty_env("RUSTGRID_WORKER_API_KEY"),
+            api_key: nonempty_env("RUSTGRID_WORKER_API_KEY")
+                .or_else(|| stored.map(|value| value.api_key)),
             worker_id,
+            credentials_path,
             workspace_root,
         })
     }
@@ -274,14 +280,81 @@ impl AppContext {
     pub fn require_api_key(&self) -> Result<&str> {
         self.api_key
             .as_deref()
-            .context("RUSTGRID_WORKER_API_KEY is required")
+            .context("worker authentication is required; run `rustgrid-agent login`")
     }
 
     pub fn require_worker_id(&self) -> Result<&str> {
         self.worker_id
             .as_deref()
-            .context("RUSTGRID_WORKER_ID is required")
+            .context("worker authentication is required; run `rustgrid-agent login`")
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredCredentials {
+    pub worker_id: String,
+    pub api_key: String,
+}
+
+impl StoredCredentials {
+    fn load(path: &Path) -> Result<Option<Self>> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let value: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid credentials file {}", path.display()))?;
+        uuid::Uuid::parse_str(&value.worker_id)
+            .with_context(|| format!("invalid worker ID in {}", path.display()))?;
+        if value.api_key.trim().is_empty() {
+            bail!("empty API key in {}", path.display());
+        }
+        Ok(Some(value))
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        uuid::Uuid::parse_str(&self.worker_id).context("login returned an invalid worker ID")?;
+        if self.api_key.trim().is_empty() {
+            bail!("login returned an empty API key");
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        write_private_file(&temporary, &serde_json::to_vec_pretty(self)?)?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("could not save credentials to {}", path.display()))?;
+        Ok(())
+    }
+}
+
+fn credentials_path(config_path: &Path) -> PathBuf {
+    let name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent.json");
+    config_path.with_file_name(format!("{name}.credentials"))
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents).map_err(Into::into)
 }
 
 impl Config {
@@ -467,5 +540,30 @@ mod tests {
         assert_eq!(codex_version, "0.144.4");
         assert!(validate_codex_version("0.144").is_err());
         assert!(validate_codex_version("latest").is_err());
+    }
+
+    #[test]
+    fn stored_login_credentials_are_loaded_beside_the_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("agent.json");
+        fs::write(&config_path, r#"{"max_concurrency":1}"#).unwrap();
+        let credentials_path = directory.path().join("agent.json.credentials");
+        let credentials = StoredCredentials {
+            worker_id: "00000000-0000-4000-8000-000000000001".into(),
+            api_key: "rgk_test".into(),
+        };
+        credentials.save(&credentials_path).unwrap();
+
+        let loaded = StoredCredentials::load(&credentials_path).unwrap().unwrap();
+        assert_eq!(loaded.worker_id, credentials.worker_id);
+        assert_eq!(loaded.api_key, credentials.api_key);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(credentials_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

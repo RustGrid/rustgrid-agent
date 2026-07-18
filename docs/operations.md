@@ -6,9 +6,11 @@ Production uses the standalone Docker Sandboxes CLI. Install Docker Desktop and
 `sbx`, authenticate Codex through Docker's credential proxy, and configure
 `executor.kind` as `docker_sandbox`.
 
-Run one `serve` process per worker identity. The worker needs only its bound
-`RUSTGRID_WORKER_API_KEY`; GitHub credentials are issued per active run. Use a dedicated
-unprivileged OS account and a writable workspace root.
+Run one `serve` process per worker identity. Authenticate it with
+`rustgrid-agent login`, or inject `RUSTGRID_WORKER_API_KEY` and
+`RUSTGRID_WORKER_ID` for a centrally managed deployment. GitHub credentials are
+issued per active run. Use a dedicated unprivileged OS account and a writable
+workspace root.
 
 Set `max_concurrency` from measured host capacity. Each claimed run receives its
 own microVM with configured CPU and memory limits. The local executor is limited
@@ -45,9 +47,10 @@ RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
 RUSTGRID_API_URL=https://app.rustgrid.com/api/v1
 ```
 
-Long-running workers must use `RUSTGRID_WORKER_API_KEY` with a credential
-bound to the exact pre-announced identity in `RUSTGRID_WORKER_ID`. Startup
-heartbeats that worker and fails closed when the binding does not match. The credential is required for leased run events, manifests, and
+Long-running workers use the credential created by `rustgrid-agent login`, or
+an injected `RUSTGRID_WORKER_API_KEY` bound to the exact identity in
+`RUSTGRID_WORKER_ID`. Startup heartbeats that worker and fails closed when the
+binding does not match. The credential is required for leased run events, manifests, and
 run-scoped GitHub token issuance.
 
 The configuration file should set `workspace_root` to durable local storage.

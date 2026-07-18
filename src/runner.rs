@@ -70,7 +70,7 @@ fn connect_worker(context: &AppContext, api: &RustGridClient) -> Result<Worker> 
     let worker_id = context.require_worker_id()?;
     api.heartbeat(worker_id).with_context(|| {
         format!(
-            "could not connect to announced worker {worker_id}; verify RUSTGRID_WORKER_ID and that RUSTGRID_WORKER_API_KEY is bound to it"
+            "could not connect to authenticated worker {worker_id}; run `rustgrid-agent login` again if its access was revoked"
         )
     })?;
     Ok(Worker {

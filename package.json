@@ -1,0 +1,10 @@
+{
+  "name": "rustgrid-agent-quality-gates",
+  "version": "0.1.0",
+  "private": true,
+  "description": "npm entry points for the rustgrid-agent repository quality gates",
+  "scripts": {
+    "test": "sh scripts/cargo-quality-gate.sh test",
+    "build": "sh scripts/cargo-quality-gate.sh build"
+  }
+}

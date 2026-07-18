@@ -17,6 +17,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Authenticate this worker using a browser and one-time code.
+    Login {
+        /// Print the URL without launching a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Connect this machine to its pre-announced RustGrid worker.
     Register,
     /// Run one RustGrid ticket in the current Git repository.
@@ -50,6 +56,7 @@ fn run() -> Result<()> {
     let context = AppContext::load(&cli.config)?;
 
     match cli.command {
+        Commands::Login { no_browser } => rustgrid_agent::auth::login(&context, !no_browser),
         Commands::Register => runner::register(&context),
         Commands::Run { ticket_id } => runner::run_ticket(&context, &ticket_id).map(|_| ()),
         Commands::Watch { interval, once } => {

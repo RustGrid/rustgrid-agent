@@ -45,6 +45,7 @@ fn context(base_url: String) -> AppContext {
         api_url: base_url,
         api_key: Some("rgk_test".into()),
         worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
+        credentials_path: PathBuf::from("test.json.credentials"),
         workspace_root: PathBuf::from("/tmp/rustgrid-agent-tests"),
     }
 }
