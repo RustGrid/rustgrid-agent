@@ -18,7 +18,20 @@ use crate::{
     token_consumption::TokenConsumption,
 };
 
-pub(crate) fn console_event(label: &str, message: &str, color: &str) {
+const DARK_BLUE_BACKGROUND: &str = "48;5;17";
+const DARK_GREEN_BACKGROUND: &str = "48;5;22";
+
+fn format_console_event(label: &str, message: &str, styled: bool) -> String {
+    if styled {
+        format!(
+            "\x1b[1;97;{DARK_BLUE_BACKGROUND}m {label:>9} \x1b[0m\x1b[97;{DARK_GREEN_BACKGROUND}m {message} \x1b[0m"
+        )
+    } else {
+        format!("[{label:>9}] {message}")
+    }
+}
+
+pub(crate) fn console_event(label: &str, message: &str, _color: &str) {
     if std::env::var("RUSTGRID_AGENT_LOG").as_deref() == Ok("json") {
         let timestamp_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -35,11 +48,8 @@ pub(crate) fn console_event(label: &str, message: &str, color: &str) {
         );
         return;
     }
-    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-        println!("\x1b[1;{color}m[{label:>9}]\x1b[0m {message}");
-    } else {
-        println!("[{label:>9}] {message}");
-    }
+    let styled = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    println!("{}", format_console_event(label, message, styled));
 }
 
 fn feedback_idempotency_key(run_id: &str, message: &str) -> String {
@@ -415,6 +425,24 @@ fn truncate(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_events_use_dark_blue_and_green_panels_with_white_details() {
+        let event = format_console_event("phase", "executing", true);
+
+        assert_eq!(
+            event,
+            "\x1b[1;97;48;5;17m     phase \x1b[0m\x1b[97;48;5;22m executing \x1b[0m"
+        );
+    }
+
+    #[test]
+    fn plain_events_remain_readable_without_ansi_styling() {
+        assert_eq!(
+            format_console_event("phase", "executing", false),
+            "[    phase] executing"
+        );
+    }
 
     #[test]
     fn feedback_keys_are_stable_and_message_specific() {
