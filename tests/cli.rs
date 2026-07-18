@@ -41,7 +41,7 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
             ("/api/v1/agent-workers/device-authorizations ", start_response),
             (
                 "/api/v1/agent-workers/device-authorizations/token ",
-                r#"{"access_token":"rgk_0000000000000000000000000000000000000000000000000000000000000000","token_type":"Bearer","expires_in":2592000,"worker":{"id":"00000000-0000-4000-8000-000000000001","name":"test-worker","tenant_id":"00000000-0000-4000-8000-000000000002"},"instance":{"url":"http://127.0.0.1/device"},"scopes":["agents:workers:heartbeat"]}"#.into(),
+                r#"{"access_token":"test-worker-credential-00000000000000000000000000000000","token_type":"Bearer","expires_in":2592000,"worker":{"id":"00000000-0000-4000-8000-000000000001","name":"test-worker","tenant_id":"00000000-0000-4000-8000-000000000002"},"instance":{"url":"http://127.0.0.1/device"},"scopes":["agents:workers:heartbeat"]}"#.into(),
             ),
             (
                 "/api/v1/agent-workers/00000000-0000-4000-8000-000000000001/credentials/current/revoke ",
@@ -55,7 +55,7 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
                 assert!(request.contains("\"client_id\":\"rustgrid-agent\""));
             }
             if expected_path.contains("credentials/current/revoke") {
-                assert!(request.contains("authorization: Bearer rgk_0000"));
+                assert!(request.contains("authorization: Bearer test-worker-credential-"));
             }
             write!(
                 stream,
@@ -92,7 +92,7 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ABCD-EFGH"));
-    assert!(!stdout.contains("rgk_0000"));
+    assert!(!stdout.contains("test-worker-credential-"));
     assert!(!directory.path().join("agent.json.credentials").exists());
     let stored_config: serde_json::Value =
         serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
