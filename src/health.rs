@@ -40,7 +40,7 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
         })
     } else {
         Err(anyhow::anyhow!(
-            "RUSTGRID_WORKER_API_KEY and RUSTGRID_WORKER_ID are required"
+            "worker authentication is required; run `rustgrid-agent login`"
         ))
     };
     let rustgrid_reachable = remote_check.is_ok();
