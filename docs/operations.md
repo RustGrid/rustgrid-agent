@@ -2,8 +2,9 @@
 
 ## Deployment
 
-Production uses the standalone Docker Sandboxes CLI. Install Docker Desktop and
-`sbx`, authenticate Codex through Docker's credential proxy, and configure
+Production uses the standalone Docker Sandboxes CLI. Install `sbx` using
+Docker's current instructions for a supported macOS or Ubuntu Linux host,
+authenticate Codex through Docker's credential proxy, and configure
 `executor.kind` as `docker_sandbox`.
 
 Run one `serve` process per worker identity. Authenticate it with
@@ -46,7 +47,7 @@ store or private fallback:
 ```sh
 sudo -u rustgrid-agent rustgrid-agent \
   --config /etc/rustgrid-agent/agent.json \
-  login --no-browser --instance https://agentops.example.com
+  login --no-browser --instance https://rustgrid.example.com
 ```
 
 For centrally managed secret injection, configure the compatibility variables:
@@ -54,7 +55,7 @@ For centrally managed secret injection, configure the compatibility variables:
 ```text
 RUSTGRID_WORKER_API_KEY=rgk_...
 RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
-RUSTGRID_INSTANCE_URL=https://agentops.example.com
+RUSTGRID_INSTANCE_URL=https://rustgrid.example.com
 ```
 
 Long-running workers use the credential created by `rustgrid-agent login`, or

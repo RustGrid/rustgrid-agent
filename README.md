@@ -1,345 +1,300 @@
 # rustgrid-agent
 
-`rustgrid-agent` turns worker-assigned RustGrid runs into ready-to-review GitHub pull requests. RustGrid dispatches a ticket run to an announced worker; the worker gives the ticket and repository instructions to Codex, runs the repository's quality gate, commits the generated changes, opens a pull request, and records every major action in RustGrid.
+[![CI](https://github.com/RustGrid/rustgrid-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/RustGrid/rustgrid-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The Cargo package, executable, GitHub repository, and Homebrew formula all use the name `rustgrid-agent`.
+`rustgrid-agent` is the worker that turns RustGrid tickets into ready-to-review
+GitHub pull requests. RustGrid assigns a run, the worker executes Codex inside an
+isolated Docker Sandbox, validates the result with repository-specific quality
+gates, publishes the branch and pull request, and reports progress and token
+consumption back to RustGrid.
+
+This repository contains the worker, not the RustGrid control plane or AgentOps
+web application. Running it requires a compatible RustGrid instance and a
+project connected to GitHub through the RustGrid GitHub App.
+
+> [!IMPORTANT]
+> `1.0.0` is currently a release candidate. There is no public GitHub release or
+> RustGrid Homebrew tap yet. Until the first tagged release is published, install
+> from source. Production promotion also requires the credentialed checks in
+> [staging certification](docs/staging-certification.md).
 
 ## What it does
 
-For each ticket, the agent:
+For each run, the worker:
 
-1. Authenticates and heartbeats a worker with RustGrid.
-2. Receives an agent run explicitly assigned by RustGrid and fetches its ticket.
-3. Checks the local Git repository and creates an `agent/<ticket-key>-<slug>` branch.
-4. Builds a Codex prompt from the ticket title, description, comments, custom fields, previous quality-gate failures, and root `AGENTS.md` and `README.md` files.
-5. Marks the ticket `in_progress`, runs Codex locally, and publishes each Codex agent update as one ticket comment.
-6. Runs the configured quality gate without shell evaluation.
-7. Commits only agent-created paths, pushes the branch, and opens a GitHub pull request.
-8. Attaches the pull request, marks the ticket `awaiting_review`, and completes the RustGrid run. Terminal failures and explicit requests for human intervention mark the ticket `blocked`.
+1. Authenticates a tenant-scoped worker and maintains its heartbeat and run
+   lease.
+2. Receives a run assigned by RustGrid, then validates its versioned execution
+   manifest and policy hash.
+3. Obtains a short-lived, repository-scoped GitHub App token and creates an
+   isolated clone under the configured workspace root.
+4. Stages clean ticket attachments and builds a Codex prompt from the ticket,
+   comments, custom fields, prior gate failures, and repository instructions.
+5. Runs the exact Codex command and model selected by RustGrid inside a dedicated
+   Docker Sandbox microVM.
+6. Publishes concise Codex updates, ordered lifecycle events, run steps, and
+   aggregate token consumption to RustGrid.
+7. Runs required local gates, repairs eligible failures, commits only
+   agent-created changes, and waits for required GitHub workflows.
+8. Opens or updates a pull request, attaches it to the ticket, and moves the
+   ticket to `awaiting_review`. Failures that require intervention move it to
+   `blocked` and retain the workspace for recovery.
+
+The directory from which the worker is launched is not used as the run
+repository. Every run gets its own clone, branch, journal, and sandbox.
+
+## Platform support
+
+| Host | CLI | Production `serve` | Distribution |
+| --- | --- | --- | --- |
+| macOS | Supported | Supported on hosts that meet the current Docker Sandboxes requirements | Source today; signed native archive and Homebrew tap after the first release |
+| Ubuntu Linux | Supported | Supported when Docker Sandboxes, KVM, and worker preflight checks pass | Source today; signed `linux-x86_64` archive after the first release |
+| Windows | Not currently supported or tested | Not supported | No native artifact |
+
+The local executor is for development and tests only. Production `serve` fails
+closed unless `executor.kind` is `docker_sandbox`. See Docker's current
+[Docker Sandboxes prerequisites](https://docs.docker.com/ai/sandboxes/get-started/)
+before provisioning a host.
 
 ## Requirements
 
-- macOS or Linux with Git installed.
-- Access to the GitHub repository named in the agent configuration.
-- A RustGrid account authorized to approve a worker, or a centrally managed
-  worker credential with the permissions listed in [Credentials](#credentials).
-- A RustGrid project linked to a GitHub repository through the RustGrid GitHub App.
-- The server-selected Codex executable installed and authenticated on the worker host.
-- A Git author name and email configured for the commit the agent creates.
-- Rust 1.94 or newer when installing from source. A Homebrew installation does not require a separate Rust toolchain at runtime.
-
-The agent creates an isolated clone for every run from the repository in the
-RustGrid execution manifest. It does not need to start inside the target
-repository.
-
-## Project documentation
-
-- [Architecture and trust boundaries](docs/architecture.md)
-- [Agent device authentication contract](docs/device-authentication.md)
-- [Compatibility policy](docs/compatibility.md)
-- [Production operations](docs/operations.md)
-- [Container deployment](deploy/README.md)
-- [Known limitations](docs/known-limitations.md)
-- [Telemetry and data handling](docs/telemetry.md)
-- [Security policy](SECURITY.md)
-- [Contributing](CONTRIBUTING.md) and [support](SUPPORT.md)
-- [Roadmap](ROADMAP.md) and [changelog](CHANGELOG.md)
-
-The production executor creates one Docker Sandbox microVM per run. The local
-executor remains available for single-run development and tests.
+- Git and a configured Git author name and email.
+- A RustGrid account allowed to authorize a worker, or a centrally managed
+  worker ID and credential.
+- A RustGrid project connected to a GitHub repository through the RustGrid
+  GitHub App.
+- For production: Docker Sandboxes (`sbx`) 0.34.0 or newer, a working microVM
+  runtime, an effective network policy, and Codex authentication stored through
+  the Docker credential proxy.
+- Rust 1.94 or newer when building from source. Release binaries and Homebrew
+  installations do not require Rust at runtime.
 
 ## Install
 
-### Homebrew
-
-Once `rustgrid-agent` has been accepted into Homebrew/core, install it with:
-
-```sh
-brew install rustgrid-agent
-rustgrid-agent --version
-```
-
-Until then, a public RustGrid tap can provide it with:
-
-```sh
-brew install RustGrid/tap/rustgrid-agent
-rustgrid-agent --version
-```
-
-Use the fully qualified tap name until the formula is available from Homebrew/core. Maintainers can find the complete publication process in [Publishing with Homebrew](#publishing-with-homebrew).
-
 ### From source
 
-Clone this repository and install the binary with Cargo:
+Install Rust with [`rustup`](https://rust-lang.org/tools/install/) and then:
 
 ```sh
 git clone https://github.com/RustGrid/rustgrid-agent.git
 cd rustgrid-agent
+rustup toolchain install 1.94 --profile minimal
 cargo install --locked --path .
 rustgrid-agent --version
 ```
 
-Cargo installs the executable into `~/.cargo/bin` by default. Add that directory to `PATH` if the command is not found.
+Cargo installs the executable into `~/.cargo/bin` by default. Restart the shell
+or add that directory to `PATH` if `rustgrid-agent` is not found.
 
-## Quick start
+### Tagged releases
 
-### Fast path on macOS
+The release workflow will publish checksummed and attested source, macOS, and
+Linux artifacts for every stable tag. Verify the matching `.sha256` file and
+GitHub artifact attestation before installing a native binary. No release is
+published yet; the exact artifact names and release controls are documented in
+[the release workflow](.github/workflows/release.yml) and
+[release checklist](docs/release-checklist.md).
 
-On a new worker host, install Docker Sandboxes and the worker, authenticate both,
-then start the long-running daemon:
+### Homebrew
+
+The planned public tap command is:
+
+```sh
+brew install RustGrid/tap/rustgrid-agent
+```
+
+Do not use that command until `RustGrid/homebrew-tap` and the first tagged
+release exist. The unqualified `brew install rustgrid-agent` command will only
+be documented if a formula is later accepted into Homebrew/core.
+
+## Production quick start
+
+### 1. Install Docker Sandboxes
+
+On a supported macOS host:
 
 ```sh
 brew trust docker/tap
 brew install docker/tap/sbx
+```
+
+On a supported Ubuntu Linux host:
+
+```sh
+curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
+sudo apt-get install docker-sbx
+sudo usermod -aG kvm "$USER"
+newgrp kvm
+```
+
+Then authenticate Docker and Codex, initialize a balanced network policy, and
+allow the coordinator-owned local kit that pins the Codex CLI version:
+
+```sh
 sbx login
+sbx secret set -g openai --oauth
 sbx policy init balanced
 sbx settings set kit.allowLocalKits true
-
-brew install RustGrid/tap/rustgrid-agent
-rustgrid-agent login
-rustgrid-agent status
-rustgrid-agent serve
+sbx diagnose
 ```
 
-The first `rustgrid-agent login` creates `.rustgrid-agent.json` with a
-production-ready, single-run Docker Sandbox configuration. `status` checks the
-sandbox daemon, pinned execution settings, stored worker credential, and
-RustGrid connectivity before `serve` begins heartbeating. Keep `serve` running
-under a terminal or process manager. Use `login --no-browser` on a headless
-host.
+Review the effective network rules before admitting production work. Docker's
+[Codex authentication guide](https://docs.docker.com/ai/sandboxes/agents/codex/)
+explains the host-side credential proxy; the OpenAI credential is not copied
+into the sandbox.
 
-### 1. Customize worker capacity (optional)
+### 2. Log in to RustGrid
 
-Edit the generated `.rustgrid-agent.json`, or copy
-[`.rustgrid-agent.example.json`](.rustgrid-agent.example.json), when the host
-should execute more than one run at a time:
-
-```json
-{
-  "max_concurrency": 4,
-  "executor": {
-    "kind": "docker_sandbox",
-    "command": "sbx",
-    "template": "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97",
-    "codex_version": "0.144.4",
-    "cpus": 4,
-    "memory": "8g",
-    "capacity_cpus": 16,
-    "capacity_memory": "32g"
-  }
-}
-```
-
-Manage this file as deployment configuration so every process on the worker
-uses the same local capacity. Do not put secrets in it. Workers are
-tenant-scoped: RustGrid assigns runs from any authorized project, and each run
-manifest supplies its project, repository, and execution policy. Legacy
-project/repository fields are accepted as ignored compatibility hints and
-should be removed from new configurations.
-
-### 2. Device login details
-
-Start or repeat device login:
+Run login from the directory in which the worker configuration should live:
 
 ```sh
 rustgrid-agent login
 ```
 
-The command prints a one-time code, opens RustGrid in your browser, and waits
-while you sign in and authorize the device. It stores the scoped credential in
-macOS Keychain, Windows Credential Manager, or Linux Secret Service. If no OS
-store is available, it emits a warning and uses an atomic owner-only file in the
-user configuration directory; it never writes a credential beside the project
-configuration. The code expires and is never a worker credential.
-
-For non-interactive, centrally managed deployments, `RUSTGRID_WORKER_API_KEY`
-and `RUSTGRID_WORKER_ID` remain supported and take precedence over stored login
-state. Administrative credentials must remain outside the long-running worker.
-
-Select a custom or self-hosted control-plane instance during login:
+The default control-plane instance is `https://app.rustgrid.com`. Login prints a
+one-time code, opens the verification URL returned by RustGrid, waits for
+approval, and creates `.rustgrid-agent.json` with a single-run production
+Docker Sandbox configuration. Use `--no-browser` on a headless host:
 
 ```sh
-rustgrid-agent login --instance https://agentops.example.com
+rustgrid-agent login --no-browser
 ```
 
-`RUSTGRID_INSTANCE_URL` provides the same instance override for managed hosts.
-The legacy `RUSTGRID_API_URL` override remains supported and has highest
-precedence so existing reverse-proxy deployments can migrate without downtime.
+Use a different compatible control plane only when required:
 
-### 3. Validate the setup
+```sh
+rustgrid-agent login --instance https://rustgrid.example.com
+```
 
-Run this command from the target Git repository:
+The `/api/v1` suffix is optional. `RUSTGRID_INSTANCE_URL` provides the same
+override for managed hosts; the legacy exact `RUSTGRID_API_URL` override has
+highest precedence.
+
+The scoped worker credential is stored in macOS Keychain or Linux Secret
+Service. If the OS store is unavailable, the agent warns and uses an atomic,
+owner-only file in the user's configuration directory. No secret is written to
+`.rustgrid-agent.json`.
+
+### 3. Validate and start the worker
+
+Run these commands from the configuration directory, or pass `--config`:
 
 ```sh
 rustgrid-agent status
-```
-
-`status` validates the configuration and command strings, locates the repository, reports whether the worker identity and credentials are present, and shows whether the worktree is clean. It never prints credential values. `register` is a compatibility command that connects an already authenticated worker and sends an initial heartbeat.
-
-Use `rustgrid-agent status --json` for machine-readable readiness data. It exits
-non-zero unless credentials exist, the configured Docker Sandbox executor is
-available, and RustGrid authentication plus project resolution succeeds.
-Interactive lifecycle output uses color when attached to a terminal; set the
-standard `NO_COLOR` environment variable to disable it. Set
-`RUSTGRID_AGENT_LOG=json` for newline-delimited structured lifecycle events.
-
-### 4. Process tickets
-
-Run a specific ticket by its RustGrid UUID:
-
-```sh
-rustgrid-agent run <ticket-uuid>
-```
-
-Or continuously execute runs assigned to this worker:
-
-```sh
-rustgrid-agent watch
-```
-
-For a long-lived production worker, use daemon mode. It keeps worker heartbeats
-and active-run leases alive independently while Codex and quality gates run:
-
-```sh
 rustgrid-agent serve
 ```
 
-Stop watch mode with Ctrl-C. It finishes the current blocking operation before stopping.
+`status` verifies the configuration, credential, remote worker state, Docker
+Sandbox client and daemon, template and Codex pins, network policy, capacity,
+and RustGrid connectivity. It exits non-zero when the host is not production
+ready. `serve` then heartbeats the worker, recovers active assignments, consumes
+the durable queue, and runs up to `max_concurrency` isolated jobs.
 
-## Configuration reference
+For a service manager, start with the example
+[systemd unit](packaging/systemd/rustgrid-agent.service) and the
+[production operations guide](docs/operations.md).
 
-The default configuration path is `.rustgrid-agent.json` in the current directory. Use a different path with the global `--config` option:
+## Model and execution settings
+
+The model is not selected from `.rustgrid-agent.json`:
+
+1. A user selects an allowed model in AgentOps.
+2. RustGrid validates that model against its server-side catalog.
+3. RustGrid snapshots `--model <id>` into the run's signed execution policy.
+4. The worker verifies the policy hash and executes that exact command.
+
+The `executor.codex_version` setting pins the **Codex CLI version**, not the
+model. The worker creates a local Docker Sandbox kit outside the mounted
+repository, installs that exact `@openai/codex` version, and verifies
+`codex --version` before starting the run. Local `codex_command`,
+`quality_gate_command`, and timeout fields are retained only for configuration
+compatibility and cannot override a claimed run.
+
+RustGrid also owns the quality gates, timeouts, environment allowlist, required
+GitHub workflows, repository binding, and sandbox policy in each manifest. See
+[the worker run contract](docs/worker-api-contract.md) for the full schema.
+
+## Configuration
+
+The default path is `.rustgrid-agent.json` in the current directory. Pass the
+global option before or after the subcommand:
 
 ```sh
-rustgrid-agent --config path/to/agent.json status
+rustgrid-agent --config /etc/rustgrid-agent/agent.json status
+rustgrid-agent status --config /etc/rustgrid-agent/agent.json
 ```
 
-| Field | Required | Description |
+`login` creates a production Docker Sandbox configuration when the file does
+not exist. By contrast, deserializing an explicitly minimal configuration uses
+the development-only local executor unless `executor` is set.
+
+| Field | Default or constraint | Purpose |
 | --- | --- | --- |
-| `instance_url` | No | RustGrid control-plane origin selected by `login`. Defaults to `https://app.rustgrid.com`; `/api/v1` is accepted and normalized away. |
-| `installation_id` | No | Stable non-secret installation UUID generated automatically. |
-| `worker_id` / `worker_name` / `tenant_id` | No | Non-secret linked worker metadata maintained by `login` and `logout`. |
-| `credential_store` | No | Non-secret storage source metadata such as `os_keychain` or `private_file_fallback`. |
-| `credential_expires_at_unix` | No | Non-secret expiry timestamp recorded after interactive login so `status` can request reauthentication when the credential expires. |
-| `project_key` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
-| `project_id` | No | Deprecated compatibility hint. Ignored; the worker is tenant-scoped. |
-| `repo.owner` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
-| `repo.name` | No | Deprecated bootstrap hint. The claimed execution manifest is authoritative. |
-| `default_base_branch` | No | Bootstrap value used before a run is claimed. The execution manifest is authoritative for claimed runs. |
-| `quality_gate_command` | No | Deprecated compatibility field; ignored for claimed runs. |
-| `codex_command` | No | Deprecated compatibility field; ignored for claimed runs. |
-| `heartbeat_interval_seconds` | No | Worker heartbeat and run-lease renewal interval. Defaults to 15 seconds; allowed range is 5–300. |
-| `max_concurrency` | No | Simultaneous run capacity advertised to RustGrid. Defaults to 1; allowed range is 1–100. Values above 1 require the Docker Sandbox executor. |
-| `executor` | No | Execution backend. `{"kind":"local"}` is the default and is development-only. Production requires `docker_sandbox`, a template pinned by SHA-256, an exact numeric `codex_version` (default `0.144.4`), per-run `cpus`/`memory`, and aggregate `capacity_cpus`/`capacity_memory`. |
-| `lease_seconds` | No | Duration requested for each run lease. Defaults to 900 seconds; must exceed three heartbeat intervals. |
-| `workspace_root` | No | Durable parent directory for isolated run workspaces. Defaults to the OS temporary directory. |
-| `command_timeout_seconds` | No | Deprecated compatibility field; the manifest owns command and gate timeouts. |
-| `run_timeout_seconds` | No | Deprecated compatibility field; the manifest owns total run timeout. |
-| `failed_workspace_retention_hours` | No | Retention for failed/interrupted workspaces and stopped Docker Sandboxes before startup cleanup. Defaults to 72. |
-| `max_command_output_bytes` | No | Combined in-memory output budget for captured commands. Defaults to 8 MiB. |
-| `max_workspace_bytes` | No | Maximum allowed run-workspace size. Defaults to 5 GiB. |
-| `max_child_memory_bytes` | No | Per-child address-space ceiling on Unix. Defaults to 8 GiB. |
-| `max_child_file_bytes` | No | Largest file a child may create on Unix. Defaults to 1 GiB. |
-| `max_child_open_files` | No | Per-child open-file ceiling on Unix. Defaults to 1024. |
+| `instance_url` | `https://app.rustgrid.com` | RustGrid control-plane origin. A trailing `/api/v1` is accepted and normalized away. |
+| `installation_id` | Generated UUID | Stable, non-secret identity for this installation. |
+| `worker_id`, `worker_name`, `tenant_id` | Written by `login` | Non-secret metadata for the linked tenant worker. |
+| `credential_store` | Written by `login` | Non-secret source metadata such as `os_keychain` or `private_file_fallback`. |
+| `credential_expires_at_unix` | Written by `login` | Non-secret credential expiry used by readiness checks. |
+| `project_key`, `project_id` | Deprecated and ignored | Legacy project hints. Workers are tenant-scoped. |
+| `repo.owner`, `repo.name` | Deprecated and ignored for runs | Legacy bootstrap hints. The manifest repository is authoritative. |
+| `default_base_branch` | `main` | Fallback only when a claimed manifest omits its default branch. |
+| `quality_gate_command`, `codex_command` | Deprecated and ignored for runs | Accepted for compatibility; the manifest owns these commands. |
+| `heartbeat_interval_seconds` | `15`; range `5..=300` | Worker heartbeat and lease-renewal interval. |
+| `max_concurrency` | `1`; range `1..=100` | Capacity advertised to RustGrid. Values above one require per-run Docker Sandbox isolation. |
+| `executor.kind` | `local` in a minimal file | `local` is development-only; production requires `docker_sandbox`. |
+| `executor.command` | `sbx` | Docker Sandboxes executable. |
+| `executor.template` | Digest-pinned default | Production rejects mutable tags and requires a 64-character `@sha256:` digest. |
+| `executor.codex_version` | `0.144.4` | Exact numeric Codex CLI version, for example `0.144.4`. |
+| `executor.cpus`, `executor.memory` | `4`, `8g` | CPU and memory allocated to each run sandbox. |
+| `executor.capacity_cpus`, `executor.capacity_memory` | `4`, `8g` | Host capacity reserved for all concurrent worker sandboxes. Startup rejects overcommit. |
+| `lease_seconds` | `900`; range `30..=86400` | Requested run lease. Must exceed three heartbeat intervals. |
+| `workspace_root` | OS temp directory under `rustgrid-agent/workspaces` | Durable parent for isolated clones, journals, and retained run state. Set an explicit durable path in production. |
+| `command_timeout_seconds`, `run_timeout_seconds` | Deprecated | Accepted for compatibility; manifest timeouts are authoritative. |
+| `failed_workspace_retention_hours` | `72`; maximum `720` | Retention for unsuccessful workspaces and stopped sandboxes. |
+| `max_command_output_bytes` | `8388608`; minimum `65536` | Combined in-memory command-output budget. |
+| `max_workspace_bytes` | `5368709120`; minimum `67108864` | Maximum run-workspace size. The worker monitors active sandbox execution. |
+| `max_child_memory_bytes` | `8589934592`; minimum `268435456` | Unix child address-space ceiling for local execution. |
+| `max_child_file_bytes` | `1073741824`; minimum `1048576` | Unix per-child file-size ceiling for local execution. |
+| `max_child_open_files` | `1024`; range `64..=65536` | Unix per-child open-file ceiling for local execution. |
 
-Unknown JSON fields and empty required values are rejected. Command strings support quoted arguments, but they are parsed into an executable and arguments rather than evaluated by a shell. Shell operators, substitutions, environment expansion, pipes, and redirections therefore do not work. Put multi-step logic in a checked-in script and configure that script as the command instead.
+Unknown JSON fields, invalid UUIDs, insecure instance URLs, empty required
+values, invalid resource sizes, and unsafe executor combinations are rejected.
+Use [`.rustgrid-agent.example.json`](.rustgrid-agent.example.json) as the
+capacity-oriented production example. Never put secrets in this file.
 
-Codex commands, quality gates, timeouts, and sandbox behavior cannot be overridden locally; RustGrid snapshots them into each execution manifest.
+## Environment variables
 
-Retries can reuse retained work across distinct run IDs when RustGrid creates a
-later attempt with `metadata.resume_from_run_id` naming the unsuccessful source
-run. The worker validates and atomically adopts that explicit lineage; it never
-selects a previous run implicitly.
+| Variable | Purpose |
+| --- | --- |
+| `RUSTGRID_WORKER_API_KEY` | Managed-deployment override for the credential created by `login`. |
+| `RUSTGRID_WORKER_ID` | Worker UUID bound to the managed credential. Supply it with `RUSTGRID_WORKER_API_KEY`. |
+| `RUSTGRID_INSTANCE_URL` | Overrides the configured RustGrid control-plane origin. |
+| `RUSTGRID_API_URL` | Legacy, highest-precedence exact API URL, including custom proxy prefixes. |
+| `RUSTGRID_CREDENTIALS_DIR` | Overrides the private-file credential directory for a service account. |
+| `RUSTGRID_CREDENTIAL_STORE=file` | Forces the owner-only file store instead of the OS keychain. |
+| `RUSTGRID_AGENT_LOG=json` | Emits newline-delimited structured lifecycle logs. |
+| `NO_COLOR=1` | Disables terminal color in human-readable output. |
 
-A run with `metadata.fresh_start: true` cannot include recovery lineage. It uses
-the new run ID's isolated checkout and executor, so no retained repository state
-or agent context from an earlier run is adopted. It also publishes to a
-run-specific branch, preventing a discarded run's remote branch history from
-being reconciled into the fresh result.
+Environment worker credentials take precedence over stored interactive login.
+They must be tenant-scoped worker credentials, not administrative user or API
+key credentials. `logout` cannot revoke or unset values injected by a deployment
+system.
 
-## Credentials
+The device-authenticated credential requests these runtime permissions:
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `RUSTGRID_WORKER_API_KEY` | No | Managed-deployment override for the credential created by `login`. |
-| `RUSTGRID_WORKER_ID` | No | Managed-deployment override for the worker created by `login`. |
-| `RUSTGRID_INSTANCE_URL` | No | Overrides the configured RustGrid instance; the agent derives `/api/v1`. |
-| `RUSTGRID_API_URL` | No | Legacy highest-precedence API endpoint override, including custom proxy prefixes. |
-| `CODEX_COMMAND` | No | Overrides the configured Codex command. |
+- `projects:read`, `tickets:read`, `tickets:update`, `comments:read`, and
+  `comments:create`;
+- `agents:workers:heartbeat`;
+- `agents:runs:read`, `agents:runs:create`, `agents:runs:claim`, and
+  `agents:runs:update`;
+- read/create/update/delete permissions for agent steps, links, and quality
+  gates.
 
-The RustGrid API key needs these permissions:
-
-- `tickets:read`, `tickets:update`, `comments:read`, and `comments:create`
-- `agents:workers:heartbeat`
-- `agents:runs:read`, `agents:runs:create`, `agents:runs:claim`, and `agents:runs:update`
-- `agents:steps:read`, `agents:steps:create`, `agents:steps:update`, and `agents:steps:delete`
-- `agents:links:read`, `agents:links:create`, `agents:links:update`, and `agents:links:delete`
-- `agents:quality_gates:read`, `agents:quality_gates:create`, `agents:quality_gates:update`, and `agents:quality_gates:delete`
-
-Interactive credentials never receive worker registration, worker credential
-administration, or API-key administration permissions.
-
-GitHub credentials are issued by RustGrid for the GitHub App installation in
-the claimed execution manifest. Tokens are held only in memory, refreshed before
-expiry, and scoped by the server to the claimed run and repository.
-
-## Sandbox security boundary
-
-Production execution uses one Docker Sandbox microVM per run. Only that run's
-disposable repository clone is mounted into the sandbox. Codex and all quality
-gates run inside it; RustGrid API calls, GitHub token acquisition, commits,
-pushes, and pull-request publication remain in the trusted coordinator. The
-sandboxed Codex process uses `danger-full-access` only inside that disposable
-microVM so repository-installed executables and subprocess trees can run. Local
-development execution retains Codex `workspace-write`; the broader mode is
-never used without the external Docker Sandbox boundary. The
-sandbox receives only environment variables explicitly allowed by the signed
-execution policy. Values cross the boundary through a private, shell-quoted,
-short-lived file under `.git`, never command arguments; a controlled launcher
-exports them before replacing itself with the requested command, and the file is
-deleted when execution ends.
-Sandbox execution ignores allowlisted variables that can replace the template's
-command lookup, home directory, dynamic loader, shell startup, Git config, or
-language-runtime injection paths. This prevents host `PATH` and related values
-from breaking or hijacking commands inside the microVM.
-
-Sandbox names are deterministic, collision-resistant hashes and are journaled.
-Startup lists managed sandboxes and removes any not assigned to an active run;
-every terminal path removes
-the sandbox with `sbx rm --force`. Cancellation or lease loss first stops the
-sandbox. Failed sandbox destruction changes an otherwise successful run into a
-failure so resource leaks are visible rather than silently accepted.
-
-Install and authenticate the standalone `sbx` CLI before starting production
-workers. `rustgrid-agent status` and `serve` verify both the `sbx` client and its
-daemon and fail closed if either is unavailable. Docker documents supported
-installation paths for macOS and Ubuntu Linux; follow the current platform
-prerequisites at <https://docs.docker.com/ai/sandboxes/>.
-
-Production readiness also inspects the active Docker Sandbox network policy and
-requires `sbx` 0.34.0 or newer. Initialize a non-interactive host with
-`sbx policy init balanced`, enable the coordinator-owned version kit with
-`sbx settings set kit.allowLocalKits true`, and review the effective rules
-before admitting work. The
-worker continuously measures the mounted workspace during Codex and gate
-execution and stops the sandbox when `max_workspace_bytes` is exceeded.
-Review and intentionally update the pinned template digest during upgrades; do
-not replace it with a mutable tag.
-The coordinator applies a creation-time Docker Sandbox kit that installs the
-exact configured Codex CLI version, then checks `codex --version` before
-admitting the run. Retained sandboxes are upgraded with the same kit before
-reuse. Template digest pinning and Codex version pinning are independent: a new
-template is not trusted to contain the requested CLI version without the
-runtime check. The same kit explicitly allows `registry.npmjs.org`, bounds npm
-concurrency, prefers its local cache, and gives npm five fetch attempts. Every
-JavaScript workspace must pass registry admission even when npm is hidden behind
-a repository script. Before Codex starts, the runner hydrates a detected npm,
-pnpm, Yarn, or Bun lockfile without lifecycle scripts and retries the complete
-install up to three times for transient DNS, proxy, timeout, and connection
-failures. This prevents a single `EAI_AGAIN` from reducing Codex to static-only
-inspection.
-
-For HTTPS remotes, the token is passed to the child `git push` process through temporary Git configuration. It is not placed in command arguments or remote URLs. SSH remotes continue to use the normal SSH configuration. Credential values are never written to the agent configuration, logs, or Codex prompt.
+It deliberately excludes worker registration, worker credential
+administration, and API-key administration permissions. GitHub credentials are
+issued per run, held only in memory, and scoped by RustGrid to the manifest
+repository.
 
 ## Commands
 
@@ -348,14 +303,11 @@ For HTTPS remotes, the token is passed to the child `git push` process through t
 ```sh
 rustgrid-agent login
 rustgrid-agent login --no-browser
-rustgrid-agent login --instance https://agentops.example.com
+rustgrid-agent login --instance https://rustgrid.example.com
 ```
 
-Starts a device authorization, displays its one-time code, opens the browser,
-and polls until authorization completes. `--no-browser` is useful on headless
-hosts: open the printed URL on another device. Login credentials are scoped to
-the worker and stored in the OS credential store, with an explicit owner-only
-fallback for headless systems.
+Starts device authorization and creates the configuration if needed. The
+one-time code expires and is never itself a worker credential.
 
 ### `logout`
 
@@ -363,10 +315,9 @@ fallback for headless systems.
 rustgrid-agent logout
 ```
 
-Revokes the current bound credential server-side and then removes its local
-copy. Network or server failures retain the local credential so the command can
-be retried safely. Repeated logout is safe; managed environment variables must
-be unset by the deployment system.
+Revokes the current bound credential server-side before removing the local
+copy. Network or server failures retain the local credential so logout can be
+retried safely. Repeated logout is safe.
 
 ### `register`
 
@@ -374,18 +325,19 @@ be unset by the deployment system.
 rustgrid-agent register
 ```
 
-Compatibility command that connects an already authenticated worker and sends
-an immediate heartbeat. New installations should use `login`.
+Deprecated compatibility command that heartbeats an already authenticated
+worker. New installations should use `login`.
 
 ### `status`
 
 ```sh
 rustgrid-agent status
+rustgrid-agent status --json
 ```
 
-Shows the instance, API URL, agent version, credential source, installation,
-tenant, linked worker, remote worker state, last heartbeat, and runtime
-readiness without exposing secrets. `status --json` emits schema version `1`.
+Shows local and remote readiness without exposing secrets. JSON output uses
+schema version `1`, is printed even for an unhealthy worker, and exits non-zero
+when production checks fail.
 
 ### `run`
 
@@ -393,10 +345,9 @@ readiness without exposing secrets. `status --json` emits schema version `1`.
 rustgrid-agent run <ticket-uuid>
 ```
 
-Fetches and processes one ticket. The identifier is the RustGrid ticket UUID, not a key such as `RG-1`.
-
-Every run uses a clean isolated workspace. Existing files in the directory from
-which the agent was started are never staged or committed.
+Claims and processes one ticket manually. The identifier is the RustGrid ticket
+UUID, not a display key such as `RG-1`. The target repository still comes from
+the resulting run manifest; the launch directory is never staged or committed.
 
 ### `watch`
 
@@ -406,15 +357,11 @@ rustgrid-agent watch --interval 30
 rustgrid-agent watch --once
 ```
 
-Connects one tenant-scoped worker, heartbeats it, and executes runs explicitly
-assigned to that worker across all tenant projects. `--interval` controls the
-delay in seconds after each poll and defaults to 15. `--once` performs one
-assigned-run reconciliation and exits, which is useful for schedulers and smoke
-tests. A failed ticket is reported and watch mode continues to the next assignment.
-
-Multiple worker processes must use distinct worker credentials and workspace
-roots. A `serve` process can execute up to `max_concurrency` runs when each run
-uses its own Docker Sandbox.
+Consumes assigned runs across all authorized tenant projects, up to
+`max_concurrency`. `--interval` controls the empty-queue wait and defaults to 15
+seconds. `--once` performs one reconciliation cycle, requires
+`max_concurrency=1`, and is useful for schedulers and smoke tests. Unlike
+`serve`, `watch` does not enforce the production executor preflight.
 
 ### `serve`
 
@@ -423,230 +370,191 @@ rustgrid-agent serve
 rustgrid-agent serve --interval 30
 ```
 
-`serve` is the production-oriented long-running worker entrypoint. It consumes
-only runs already assigned by RustGrid, and every active run gets an independent
-supervisor that:
+Production entrypoint. It validates Docker Sandbox isolation, resumes active
+leases before taking new work, and supervises every run independently. SIGTERM
+drains active runs without accepting new assignments. SIGINT cancels active
+child process groups and exits safely.
 
-- heartbeats the worker as `busy`;
-- extends the run lease before it can expire;
-- continues operating while Codex or a quality gate is blocking;
-- reports degraded RustGrid connectivity without discarding local work; and
-- stops before the terminal run update to preserve optimistic-concurrency correctness.
+## Run lifecycle, recovery, and telemetry
 
-Ctrl-C also reaches an active Codex process through the cancellation token. The
-child is terminated, the run becomes `cancelled`, and the ticket returns to
-`todo` so another attempt can claim it safely.
+Manifest version `2` owns the repository, input prompt, selected model, Codex
+command, quality gates, timeouts, environment allowlist, sandbox policy, GitHub
+permissions, and required workflows. The worker rejects identity mismatches,
+unknown versions, invalid policy hashes, unpinned execution settings, and
+repository origins that do not match the manifest.
 
-Process managers should restart `serve` after an unexpected exit. SIGTERM
-drains: it stops new claims and waits for active runs to finish. SIGINT cancels
-active child process groups and exits safely.
-At startup, `serve` queries RustGrid's tenant-wide worker recovery collection
-for actively leased runs assigned to this worker and resumes them before waiting
-for new assignments. Each run owns its cancellation token,
-so a lease loss, timeout, or cancellation cannot stop unrelated concurrent runs.
-
-## Run lifecycle and recovery
-
-A successful run creates a branch, commit, pull request, RustGrid external link, individual agent-feedback comments, and an auditable sequence of run steps. The ticket moves to `in_progress` after it is claimed and to `awaiting_review` after the pull request is attached. Quality-gate output sent to RustGrid is capped at 16 KB.
-
-Before production promotion, complete the credentialed failure and recovery
-matrix in [`docs/staging-certification.md`](docs/staging-certification.md).
-
-Immediately after claim, the worker retrieves
-`GET /agent-runs/{run_id}/manifest`. It rejects unknown manifest
-versions, mismatched run/ticket identities, incomplete repository data, and a
-local `origin` that does not match the claimed repository. GitHub tokens come
-from `POST /agent-runs/{run_id}/github-token` and are refreshed before expiry.
-The worker caches a valid token in memory until its refresh window, derives the
-API origin from the manifest for GitHub Enterprise Server, paginates check runs,
-and verifies the remote branch commit after every push.
-Manifest version 2 also owns the Codex command, structured quality gates,
-timeouts, environment allowlist, and sandbox policy. Local command settings are
-accepted only for configuration-file compatibility and are not used to execute
-a claimed run.
-
-Each structured lifecycle event is published to
-`POST /agent-runs/{run_id}/events` with a stable idempotency key. If the
-response is ambiguous, the agent replays events after its last accepted server
-sequence and retries once only when the event was not already committed.
-Accepted sequences are persisted in the recovery journal.
-
-Run steps carry a versioned lifecycle event envelope with a per-run sequence,
-timestamp, phase, severity, event type, message, and structured data. Current
-phases are `claimed`, `preparing`, `executing`, `verifying`, `publishing`,
-`awaiting_review`, and terminal outcomes. Consumers should order the live
-timeline by `sequence` and treat unknown fields as forward-compatible.
-
-The worker also atomically checkpoints recovery state after phase and step
-changes. Journals live at `.git/rustgrid-agent/runs/<run-id>.json`; because they
-are inside Git metadata, they cannot become part of an agent commit. They record
-the last phase and sequence plus any created branch, commit, and pull request.
-
-Codex is instructed to emit concise progress updates. With Codex JSONL output, each completed `agent_message` becomes exactly one comment; reasoning summaries and command execution events are ignored. Compatible custom commands may emit plain text, where each non-empty output line becomes one comment.
-
-When Codex cannot proceed without a decision, credential, permission, or external-system change, it emits `RUSTGRID_AGENT_STATUS: BLOCKED` and a specific `HUMAN_ACTION_REQUIRED`. The runner stops safely, adds a blocked comment, marks the ticket `blocked`, and fails the agent run. Other terminal automation failures use the same blocked handoff because a human must resolve the failed run before it can continue.
-
-Required local quality-gate failures return their combined diagnostics to Codex for up to three total validation attempts. After a pull request is open, a failed required GitHub workflow is inspected through its failed jobs, failed steps, and bounded job-log tails. Codex gets up to three CI repair iterations; each successful repair is locally validated, committed, pushed to the same branch, and verified against the new commit. Exhausted validation repairs become a real blocked handoff and retain the sandbox and workspace for inspection. Cancellation, timeout, lease loss, policy violations, and genuine human dependencies remain terminal without entering the repair loop.
-
-If Codex, Git push, or pull-request creation fails, the agent reports the error to RustGrid when a run exists and exits without resetting or deleting the work. Before every publication, the coordinator first reconciles the generated remote branch, then fetches the latest remote base and rebases the complete agent commit range onto it before opening or updating the pull request. Every changed commit is revalidated. When an existing agent branch must be rewritten by the base rebase, publication uses `--force-with-lease` pinned to the exact observed remote SHA; concurrent movement is never overwritten. Other push races are reconciled at most three times. A rebase conflict is attempted, aborted cleanly, and retains the workspace for manual resolution.
-
-Common checks:
-
-- **Configuration cannot be read:** run from the directory containing `.rustgrid-agent.json`, or pass `--config`.
-- **Base branch is missing:** fetch it and create or switch to the locally configured `default_base_branch` before running the agent.
-- **Codex cannot start:** confirm the Codex CLI is installed, authenticated, and available on `PATH`; then inspect `rustgrid-agent status`.
-- **Quality gate remains blocked:** inspect the retained workspace and the final combined diagnostics after the three automated validation attempts. Shell syntax is not interpreted.
-- **Push or pull-request creation fails:** non-conflicting remote branch and base-branch movement is reconciled automatically. A stale force-with-lease means the agent branch moved again and was deliberately not overwritten. For a retained rebase conflict, resolve the generated branch in its isolated workspace and retry; otherwise verify the `origin` remote, repository fields, token permissions, organization policy, and base branch.
-- **Execution manifest fails:** verify that the project has an enabled GitHub App repository binding and that the run manifest matches the local `origin`.
-- **Progress cursor conflict:** the agent automatically resynchronizes once; repeated conflicts stop the run to preserve ordered telemetry.
-- **Lease ownership is lost:** local execution stops without publishing a terminal state because another worker or the control plane is authoritative.
-- **No committable changes:** Codex did not change the isolated run workspace.
-
-## Safety model
-
-- A dirty worktree is rejected by default.
-- Every run uses a repository clone dedicated to that run ID.
-- Only new changed paths reported by Git inside the discovered repository root are staged. The runner never uses `git add .`.
-- Existing local branches are never overwritten.
-- Codex and quality-gate commands run directly without a shell.
-- Long-lived credentials are not logged, embedded in Git URLs, or included in prompts. Device-login credentials use the OS credential store or a warned owner-only fallback outside the project configuration. Explicitly allowlisted child values use a protected temporary env file that is deleted after execution.
-- API errors include the HTTP status, a bounded response body, and the RustGrid request ID when available.
-- Failed runs leave the branch and worktree in place for recovery.
-
-## Publishing with Homebrew
-
-This section is for RustGrid maintainers. Homebrew distribution needs a versioned public release plus a formula. A tap can be published immediately under the RustGrid organization; the unqualified command `brew install rustgrid-agent` on a new machine requires acceptance into the central `Homebrew/homebrew-core` repository.
-
-### 1. Create a release artifact
-
-1. Make `RustGrid/rustgrid-agent` public. Homebrew clients must be able to fetch
-   the immutable release archive without GitHub credentials.
-2. Choose a semantic version and update `version` in `Cargo.toml` and the root package entry in `Cargo.lock`.
-3. Run the development checks listed below.
-4. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
-
-The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-agent.rb.in`](packaging/homebrew/rustgrid-agent.rb.in); generates an SPDX JSON SBOM; creates a GitHub artifact attestation binding the package and SBOM; and creates the GitHub release. The release contains these assets:
-
-- `rustgrid-agent-X.Y.Z.crate`, the immutable source archive
-- `rustgrid-agent-X.Y.Z.crate.sha256`, its SHA-256 checksum
-- native Linux and macOS binary archives with SHA-256 checksums and attestations
-- `rustgrid-agent.spdx.json`, the SPDX JSON software bill of materials
-- `rustgrid-agent.rb`, the formula with the release URL and checksum filled in
-
-The protected release environment also publishes an attested container image to
-`ghcr.io/rustgrid/rustgrid-agent:vX.Y.Z`. Production deployments must pin its
-digest rather than the mutable tag.
-
-The release URL will have this form:
+Lifecycle events are published in monotonically increasing client sequence and
+reconciled against RustGrid after ambiguous responses. Recovery state is
+checkpointed atomically at:
 
 ```text
-https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate
+<workspace_root>/<workspace-id>/journal.json
 ```
 
-### 2. Create the formula
+The journal records the run and ticket identity, phase, event cursors, branch,
+commit, pull request, retained executor, recovery lineage, last error, and token
+consumption. Do not edit it while a worker is running.
 
-Create the public `RustGrid/homebrew-tap` repository once with a `main` branch
-and a `Formula/` directory. Add a fine-grained `HOMEBREW_TAP_TOKEN` secret to
-the `production-release` environment with contents write access to that tap.
-Every tagged release then downloads its generated formula and commits it to
-`Formula/rustgrid-agent.rb` automatically.
+Successful runs destroy their sandbox and workspace after the terminal RustGrid
+update succeeds. Failed, blocked, cancelled, timed-out, and interrupted runs
+retain their workspace and stop the sandbox for the configured retention period.
+RustGrid can explicitly adopt that state in a later attempt with
+`metadata.resume_from_run_id`; the worker never guesses recovery lineage. A
+manifest with `metadata.fresh_start: true` always uses a new run-specific branch
+and cannot include recovery lineage.
 
-The generated formula has this shape:
+Codex JSONL `turn.completed` usage is accumulated across every Codex and repair
+turn. At terminal finalization the worker idempotently writes `input_tokens`,
+`cached_input_tokens`, `output_tokens`, and `total_tokens` to
+`PUT /agent-runs/{run_id}/token-consumption`. Cached input is a subset of input,
+and total consumption is input plus output. Successful runs require this report;
+unsuccessful runs attempt it before terminal failure handling.
 
-```ruby
-class RustgridAgent < Formula
-  desc "Run Codex against RustGrid tickets and publish GitHub pull requests"
-  homepage "https://github.com/RustGrid/rustgrid-agent"
-  url "https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-agent-X.Y.Z.crate"
-  sha256 "REPLACE_WITH_RELEASE_ARCHIVE_SHA256"
-  license "MIT"
+Human-readable lifecycle logs are the default. Use `RUSTGRID_AGENT_LOG=json`
+for service-manager collection. RustGrid receives bounded progress, step,
+quality-gate, ticket-comment, and terminal summaries; complete artifact upload
+and central OTLP export remain external deployment integrations described in
+[telemetry and data handling](docs/telemetry.md).
 
-  depends_on "rust" => :build
+## Security model
 
-  def install
-    system "cargo", "install", *std_cargo_args(path: ".")
-  end
+- Production runs execute in separate Docker Sandbox microVMs. Only the
+  disposable run clone crosses the filesystem boundary.
+- Codex uses `danger-full-access` only inside that disposable microVM. Local
+  development retains Codex `workspace-write`.
+- RustGrid API calls, GitHub token acquisition, commits, pushes, and pull-request
+  publication stay in the trusted coordinator.
+- The execution policy can allow only explicitly named environment variables.
+  Protected credential and process-control names are rejected.
+- Allowed values cross into the sandbox through a private, shell-quoted,
+  short-lived file under the run clone's `.git` directory. The file is deleted
+  after execution and cannot be committed.
+- Repository Git hooks are disabled for coordinator-owned clone, branch,
+  commit, rebase, and publication operations.
+- Only paths changed inside the isolated clone are staged; the runner never uses
+  `git add .` against an operator checkout.
+- GitHub tokens are short-lived, repository-scoped, never placed in remote URLs,
+  and refreshed before expiry.
+- Command output, workspace growth, run time, and local Unix child resources are
+  bounded. Production host quotas remain required as defense in depth.
+- Every terminal cleanup failure is visible. Unsuccessful work is retained
+  rather than silently discarded.
 
-  test do
-    assert_match version.to_s, shell_output("#{bin}/rustgrid-agent --version")
-  end
-end
-```
+The worker executes untrusted repository code. Read
+[the threat model](docs/threat-model.md),
+[architecture and trust boundaries](docs/architecture.md), and
+[security policy](SECURITY.md) before operating it with production access.
 
-The release workflow replaces both `X.Y.Z` values and the checksum. The formula and executable are both named `rustgrid-agent`.
+## RustGrid API contract
 
-Validate the formula in a clean Homebrew environment:
+The configured API base is `/api/v1`. The worker uses these endpoint groups:
 
-```sh
-brew audit --strict --online RustGrid/tap/rustgrid-agent
-brew install --build-from-source RustGrid/tap/rustgrid-agent
-brew test RustGrid/tap/rustgrid-agent
-rustgrid-agent --version
-brew uninstall rustgrid-agent
-```
-
-After the release and tap jobs pass, users can run:
-
-```sh
-brew install RustGrid/tap/rustgrid-agent
-```
-
-### 3. Enable `brew install rustgrid-agent`
-
-For installation without a tap qualifier, submit `Formula/r/rustgrid-agent.rb` as a pull request to `Homebrew/homebrew-core`. Use the same stable release URL and checksum, follow the current [Homebrew formula requirements](https://docs.brew.sh/Acceptable-Formulae), and run the audit, install, and test checks requested by Homebrew's contribution guide. Core requires a stable, tagged, open-source project that builds on supported macOS and Linux versions; it also applies notability and third-party-use criteria. A public tap remains the supported route until the project qualifies.
-
-Homebrew/core inclusion is reviewed by Homebrew maintainers and is not guaranteed. Until it is accepted, document the tap-qualified command. Once accepted, a new user can install with exactly:
-
-```sh
-brew install rustgrid-agent
-```
-
-### 4. Publish future versions
-
-For every release:
-
-1. Update the Cargo version and push its matching version tag.
-2. Confirm the release workflow published the source archive, native binaries,
-   SBOM, attestations, and generated formula.
-3. Confirm the Homebrew job updated `RustGrid/homebrew-tap`.
-4. Run `brew audit`, install from source, and `brew test`.
-5. Submit the formula update to Homebrew/core after the project qualifies.
-
-Do not replace an asset for an existing version: its checksum would change and break reproducible installs.
-
-## RustGrid agent API contract
-
-The RustGrid base API is `/api/v1`. The endpoint and payload mappings in `src/api.rs` match the RustGrid backend contract.
-
-| Action | Method and path |
+| Purpose | Method and path |
 | --- | --- |
-| Register worker | `POST /agent-workers/register` |
-| Heartbeat | `POST /agent-workers/{id}/heartbeat` |
-| Fetch ticket context | `GET /tickets/{id}`, `/tickets/{id}/comments`, `/tickets/{id}/quality-gate-results` |
-| Publish agent feedback | `POST /tickets/{id}/comments` |
-| Update ticket progress | `PATCH /tickets/{id}` with `If-Match` |
-| Claim ticket and create run | `POST /tickets/{id}/agent-runs/claim` |
-| List assigned active runs across the tenant | `GET /agent-workers/{id}/runs?status=running` |
-| Update run | `PATCH /agent-runs/{id}` with `If-Match` |
-| Append step | `POST /agent-runs/{id}/steps` |
-| Report gate | `POST /tickets/{id}/quality-gate-results` |
-| Attach PR | `POST /tickets/{id}/external-links` |
+| Start and poll device login | `POST /agent-workers/device-authorizations`; `POST /agent-workers/device-authorizations/token` |
+| Revoke current device credential | `POST /agent-workers/{worker_id}/credentials/current/revoke` |
+| Inspect and heartbeat the worker | `GET /agent-workers`; `POST /agent-workers/{worker_id}/heartbeat` |
+| Replay and stream the assignment queue | `GET /agent-workers/{worker_id}/queue`; `GET /agent-workers/{worker_id}/queue/stream` |
+| Recover active assigned runs | `GET /agent-workers/{worker_id}/runs?status=running` |
+| Fetch ticket context | `GET /tickets/{ticket_id}`; comments and quality-gate result collections |
+| Claim a ticket manually | `POST /tickets/{ticket_id}/agent-runs/claim` |
+| Fetch run policy and attachments | `GET /agent-runs/{run_id}/manifest`; attachment and variant download targets |
+| Obtain and refresh GitHub access | `POST /agent-runs/{run_id}/github-token` |
+| Renew a run lease | `POST /agent-runs/{run_id}/lease` |
+| Publish and replay lifecycle events | `POST` and `GET /agent-runs/{run_id}/events` |
+| Append run steps | `POST /agent-runs/{run_id}/steps` |
+| Report token consumption | `PUT /agent-runs/{run_id}/token-consumption` |
+| Update ticket and run status | `PATCH /tickets/{ticket_id}`; `PATCH /agent-runs/{run_id}` |
+| Report gates and attach the pull request | `POST /tickets/{ticket_id}/quality-gate-results`; `POST /tickets/{ticket_id}/external-links` |
 
-Create and claim requests use idempotency keys. Run updates use the backend's versioned ETag format. All API requests use bearer authentication.
+Mutations that can be retried use idempotency keys. Ticket and run updates use
+strong ETags and `If-Match`. All authenticated calls use bearer credentials;
+device authorization start and token polling are intentionally unauthenticated.
+The committed [OpenAPI snapshot](openapi.current.json) pins the runtime contract
+assertions used by CI. The [worker API contract](docs/worker-api-contract.md)
+and [device-authentication contract](docs/device-authentication.md) document the
+run and login boundaries used by the client.
+
+## Troubleshooting
+
+- **`login` is an unrecognized subcommand:** compare `command -v
+  rustgrid-agent`, `rustgrid-agent --version`, and `cargo run -- --help`. The
+  executable on `PATH` is usually older than the checkout; reinstall with
+  `cargo install --locked --path . --force`.
+- **The browser opens the wrong device URL:** the CLI opens
+  `verification_uri_complete` exactly as returned by RustGrid. Check the
+  control-plane AgentOps/browser URL configuration rather than changing the
+  worker's API origin.
+- **`status` reports an executor failure:** run `sbx diagnose`, confirm `sbx`
+  0.34.0 or newer, inspect the active policy, verify KVM access on Linux, and
+  confirm `kit.allowLocalKits` is enabled.
+- **Codex cannot authenticate:** run `sbx secret set -g openai --oauth` as the
+  same OS account that runs the worker. Sandboxes do not inherit `~/.codex`.
+- **Token consumption remains zero:** verify the manifest invokes Codex, inspect
+  JSON lifecycle logs for valid `turn.completed` usage, and verify RustGrid
+  accepts `PUT /agent-runs/{run_id}/token-consumption`.
+- **No work is assigned:** confirm the worker is online in AgentOps, the project
+  has an enabled GitHub repository binding, and the run is assigned to this
+  worker. Queue events are wake-up hints; the active-run collection is the
+  source of truth.
+- **A run fails after changing code:** inspect the retained workspace and final
+  diagnostics. Required local gates and GitHub workflows receive bounded repair
+  attempts before the ticket is blocked.
+
+More operational failure modes and recovery procedures are in
+[production operations](docs/operations.md).
+
+## Documentation
+
+- [Architecture and trust boundaries](docs/architecture.md)
+- [Device authentication](docs/device-authentication.md)
+- [Worker API contract](docs/worker-api-contract.md)
+- [Compatibility policy](docs/compatibility.md)
+- [Production operations](docs/operations.md)
+- [Container deployment](deploy/README.md)
+- [Known limitations](docs/known-limitations.md)
+- [Telemetry and data handling](docs/telemetry.md)
+- [Staging certification](docs/staging-certification.md)
+- [Release checklist](docs/release-checklist.md)
+- [Roadmap](ROADMAP.md) and [changelog](CHANGELOG.md)
 
 ## Development
 
-Rust 1.94 or newer is required.
+Install the pinned toolchain and run the same core checks as CI:
 
 ```sh
+rustup toolchain install 1.94 --profile minimal --component clippy,rustfmt
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo package --locked --allow-dirty
+bash scripts/check-secrets.sh
 ```
 
-Pull requests and pushes to `main` run these gates on Linux and macOS, verify
-the release package, and apply `cargo-deny` advisory, license, dependency, and
-source policy. Dependabot maintains both Rust crates and pinned GitHub Actions.
+CI runs on Linux and macOS, validates the container and deployment manifests,
+checks dependency policy with `cargo-deny`, verifies the release package, and
+asserts required RustGrid contracts in the OpenAPI snapshot.
+
+Before opening a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Use GitHub Issues for reproducible bugs,
+GitHub Discussions for community support, and the private process in
+[SECURITY.md](SECURITY.md) for vulnerabilities. See [SUPPORT.md](SUPPORT.md) for
+the support boundary.
+
+## Release process
+
+Pushing a matching semantic-version tag triggers the protected
+[release workflow](.github/workflows/release.yml). It refuses private source,
+runs locked quality gates, and is designed to publish:
+
+- a source crate, checksum, SPDX SBOM, and provenance attestation;
+- checksummed and attested native Linux and macOS archives;
+- a generated Homebrew formula committed to `RustGrid/homebrew-tap`; and
+- a scanned and attested `ghcr.io/rustgrid/rustgrid-agent` image.
+
+Maintainers must complete [the release checklist](docs/release-checklist.md) and
+must not replace assets for an existing version. Homebrew/core publication is a
+separate third-party review and is not assumed by this project.
 
 ## License
 
