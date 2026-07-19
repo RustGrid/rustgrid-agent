@@ -225,11 +225,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p Formula
-          cp /tmp/rustgrid-agent.rb Formula/rustgrid-agent.rb
-          if git diff --quiet -- Formula/rustgrid-agent.rb; then
+          if [[ -f Formula/rustgrid-agent.rb ]] && cmp -s /tmp/rustgrid-agent.rb Formula/rustgrid-agent.rb; then
             echo "Homebrew formula already matches ${GITHUB_REF_NAME}"
             exit 0
           fi
+          cp /tmp/rustgrid-agent.rb Formula/rustgrid-agent.rb
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/rustgrid-agent.rb
