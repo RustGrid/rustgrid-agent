@@ -20,6 +20,7 @@ mod publishing;
 mod reporting;
 pub mod run_error;
 pub mod runner;
+pub mod setup;
 pub mod shutdown;
 pub mod supervisor;
 pub mod token;

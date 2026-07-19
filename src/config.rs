@@ -113,6 +113,23 @@ impl ExecutorConfig {
         }
     }
 
+    pub(crate) fn production_for_host(
+        cpus: u16,
+        memory: String,
+        capacity_cpus: u16,
+        capacity_memory: String,
+    ) -> Self {
+        Self::DockerSandbox {
+            command: default_sbx_command(),
+            template: default_sandbox_template(),
+            codex_version: default_codex_version(),
+            cpus,
+            memory,
+            capacity_cpus,
+            capacity_memory,
+        }
+    }
+
     pub fn is_isolated(&self) -> bool {
         matches!(self, Self::DockerSandbox { .. })
     }
@@ -285,6 +302,34 @@ fn default_max_child_file_bytes() -> u64 {
 
 fn default_max_child_open_files() -> u64 {
     1024
+}
+
+pub fn user_config_path() -> Result<PathBuf> {
+    if let Some(path) = nonempty_env("RUSTGRID_AGENT_CONFIG") {
+        return Ok(PathBuf::from(path));
+    }
+    let base = nonempty_env("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| nonempty_env("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .context(
+            "could not determine the user configuration directory; set HOME, XDG_CONFIG_HOME, or --config",
+        )?;
+    Ok(base.join("rustgrid-agent").join("config.json"))
+}
+
+pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let user = user_config_path()?;
+    if user.is_file() {
+        return Ok(user);
+    }
+    let legacy = PathBuf::from(".rustgrid-agent.json");
+    if legacy.is_file() {
+        return Ok(legacy);
+    }
+    Ok(user)
 }
 
 impl AppContext {
@@ -505,7 +550,7 @@ impl AppContext {
     }
 }
 
-fn first_login_config() -> Result<Config> {
+pub(crate) fn first_login_config() -> Result<Config> {
     let mut config = serde_json::from_str::<Config>("{}")?;
     config.executor = ExecutorConfig::production_default();
     Ok(config)
@@ -546,14 +591,14 @@ fn credentials_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name(format!("{name}.credentials"))
 }
 
-fn parse_config(path: &Path, bytes: &[u8]) -> Result<Config> {
+pub(crate) fn parse_config(path: &Path, bytes: &[u8]) -> Result<Config> {
     let config: Config = serde_json::from_slice(bytes)
         .with_context(|| format!("invalid JSON configuration in {}", path.display()))?;
     config.validate()?;
     Ok(config)
 }
 
-fn save_config(path: &Path, config: &Config) -> Result<()> {
+pub(crate) fn save_config(path: &Path, config: &Config) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     if let Ok(metadata) = fs::symlink_metadata(path)
@@ -640,7 +685,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 impl Config {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if let Some(instance_url) = self.instance_url.as_deref() {
             normalize_instance_url(instance_url)?;
         }

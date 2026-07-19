@@ -8,8 +8,8 @@ use rustgrid_agent::{config::AppContext, runner};
 #[command(name = "rustgrid-agent", version, about)]
 struct Cli {
     /// Path to the RustGrid agent configuration file.
-    #[arg(long, global = true, default_value = ".rustgrid-agent.json")]
-    config: PathBuf,
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Commands,
@@ -17,6 +17,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Create or update a production-ready worker configuration.
+    Setup {
+        /// Maximum number of isolated jobs to run concurrently.
+        #[arg(long, value_name = "JOBS")]
+        max_concurrency: Option<usize>,
+    },
     /// Authenticate this worker using a browser and one-time code.
     Login {
         /// Print the URL without launching a browser.
@@ -58,38 +64,45 @@ enum Commands {
 fn run() -> Result<()> {
     rustgrid_agent::shutdown::install()?;
     let cli = Cli::parse();
+    let config_path = match &cli.command {
+        Commands::Setup { .. } => rustgrid_agent::setup::setup_config_path(cli.config.as_deref())?,
+        _ => rustgrid_agent::config::resolve_config_path(cli.config.as_deref())?,
+    };
 
     match cli.command {
+        Commands::Setup { max_concurrency } => {
+            rustgrid_agent::setup::run(&config_path, max_concurrency)
+        }
         Commands::Login {
             no_browser,
             instance,
         } => {
-            let mut context = AppContext::load_for_login(&cli.config, instance.as_deref())?;
+            let mut context = AppContext::load_for_login(&config_path, instance.as_deref())?;
             rustgrid_agent::auth::login(&mut context, !no_browser)
         }
         Commands::Logout => {
-            let mut context = AppContext::load(&cli.config)?;
+            let mut context = AppContext::load(&config_path)?;
             rustgrid_agent::auth::logout(&mut context)
         }
         Commands::Register => {
             eprintln!("[warning] `register` is deprecated; use `rustgrid-agent login`");
-            let context = AppContext::load(&cli.config)?;
+            let context = AppContext::load(&config_path)?;
             runner::register(&context)
         }
         Commands::Run { ticket_id } => {
-            let context = AppContext::load(&cli.config)?;
+            let context = AppContext::load(&config_path)?;
             runner::run_ticket(&context, &ticket_id).map(|_| ())
         }
         Commands::Watch { interval, once } => {
-            let context = AppContext::load(&cli.config)?;
+            let context = AppContext::load(&config_path)?;
             runner::watch(&context, Duration::from_secs(interval), once)
         }
         Commands::Serve { interval } => {
-            let context = AppContext::load(&cli.config)?;
+            let context = AppContext::load(&config_path)?;
             runner::serve(&context, Duration::from_secs(interval))
         }
         Commands::Status { json } => {
-            let context = AppContext::load(&cli.config)?;
+            let context = AppContext::load(&config_path)?;
             runner::status(&context, json)
         }
     }
