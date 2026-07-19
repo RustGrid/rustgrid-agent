@@ -5,6 +5,24 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.0.1 - 2026-07-19
+
+### Security
+
+- Move the release runtime to a digest-pinned Node 24.18 image based on Debian
+  trixie, upgrade installed operating-system packages, and pin npm 12.0.1 with
+  its patched `undici` 6.27.0 dependency.
+- Preserve a complete Grype vulnerability report while blocking publication on
+  every fixable High or Critical finding. Unfixed distribution findings remain
+  visible for deployment review instead of making remediation impossible.
+
+### Fixed
+
+- Update Anchore's scanner action to its Node 24 release, removing the GitHub
+  Actions Node 20 deprecation warning.
+- Derive the CI Homebrew formula version from Cargo metadata instead of a
+  hard-coded release number.
+
 ## 1.0.0 - 2026-07-19
 
 Initial stable public artifact release. Production deployment remains subject

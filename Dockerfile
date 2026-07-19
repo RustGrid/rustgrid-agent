@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG RUST_BUILDER_IMAGE=rust:1.94-bookworm
-ARG NODE_RUNTIME_IMAGE=node:24-bookworm-slim
+ARG NODE_RUNTIME_IMAGE=node:24-trixie-slim
 FROM ${RUST_BUILDER_IMAGE} AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -10,10 +10,15 @@ RUN cargo build --locked --release
 
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
 ARG CODEX_VERSION=0.144.4
+ARG NPM_VERSION=12.0.1
 RUN test -n "${CODEX_VERSION}" \
+    && test -n "${NPM_VERSION}" \
     && apt-get update \
+    && apt-get upgrade --no-install-recommends -y \
     && apt-get install --no-install-recommends -y ca-certificates git tini \
+    && npm install --global "npm@${NPM_VERSION}" \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 rustgrid-agent \
