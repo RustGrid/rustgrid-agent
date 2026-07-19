@@ -5,6 +5,23 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.2.0 - 2026-07-19
+
+### Added
+
+- Add versioned execution, phase, turn, model-call, and tool-call telemetry
+  snapshots with stable event identifiers and bounded batch delivery to the
+  RustGrid telemetry API.
+- Add a durable, size-limited telemetry outbox so transient delivery failures
+  do not interrupt agent runs and can be retried safely.
+- Normalize Codex turn usage into provider-reported token details while
+  preserving the existing aggregate token-consumption report.
+
+### Changed
+
+- Refresh the checked-in RustGrid OpenAPI contract for telemetry ingestion and
+  related API updates.
+
 ## 1.1.0 - 2026-07-19
 
 ### Added

@@ -254,7 +254,7 @@ pub struct CodexInvocation {
 }
 
 #[derive(Clone, Debug, Default)]
-struct NormalizedUsage {
+pub(crate) struct NormalizedUsage {
     input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -284,7 +284,10 @@ impl UsageAdapter for CodexUsageAdapter {
         let output_tokens = optional_count(usage, "output_tokens");
         let reasoning_tokens = optional_count(usage, "reasoning_output_tokens")
             .or_else(|| optional_count(usage, "reasoning_tokens"));
-        if input_tokens.zip(cached_input_tokens).is_some_and(|(input, cached)| cached > input) {
+        if input_tokens
+            .zip(cached_input_tokens)
+            .is_some_and(|(input, cached)| cached > input)
+        {
             cached_input_tokens = None;
         }
         let reported_total = optional_count(usage, "total_tokens");
@@ -334,8 +337,7 @@ fn safe_usage_payload(usage: &Map<String, Value>) -> Option<Map<String, Value>> 
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<_, _>>();
     (!safe.is_empty()
-        && serde_json::to_vec(&safe)
-            .is_ok_and(|bytes| bytes.len() <= MAX_RAW_USAGE_BYTES))
+        && serde_json::to_vec(&safe).is_ok_and(|bytes| bytes.len() <= MAX_RAW_USAGE_BYTES))
     .then_some(safe)
 }
 
@@ -348,7 +350,7 @@ pub struct TelemetryEmitter {
 enum EmitterMessage {
     Event {
         run_id: String,
-        event: TelemetryEvent,
+        event: Box<TelemetryEvent>,
     },
     Flush(mpsc::Sender<()>),
 }
@@ -382,7 +384,7 @@ impl TelemetryEmitter {
     pub fn emit(&self, run_id: &str, event: TelemetryEvent) {
         match self.sender.try_send(EmitterMessage::Event {
             run_id: run_id.to_owned(),
-            event,
+            event: Box::new(event),
         }) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => {
@@ -406,12 +408,10 @@ impl TelemetryEmitter {
 
     pub fn flush_best_effort(&self, timeout: Duration) {
         let (sender, receiver) = mpsc::channel();
-        if self
-            .sender
-            .try_send(EmitterMessage::Flush(sender))
-            .is_err()
-        {
-            eprintln!("[warning] telemetry flush could not be queued; delivery remains best-effort");
+        if self.sender.try_send(EmitterMessage::Flush(sender)).is_err() {
+            eprintln!(
+                "[warning] telemetry flush could not be queued; delivery remains best-effort"
+            );
             return;
         }
         if receiver.recv_timeout(timeout).is_err() {
@@ -434,7 +434,7 @@ fn delivery_loop(
         match receiver.recv_timeout(FLUSH_INTERVAL) {
             Ok(EmitterMessage::Event { run_id, event }) => {
                 let events = pending_by_run.entry(run_id.clone()).or_default();
-                events.push(event);
+                events.push(*event);
                 if events.len() >= BATCH_SIZE {
                     let batch = TelemetryBatch::new(std::mem::take(events));
                     deliver_batch(&api, &outbox_root, &run_id, batch);
@@ -470,12 +470,7 @@ fn flush_pending(
     pending_by_run.retain(|_, events| !events.is_empty());
 }
 
-fn deliver_batch(
-    api: &RustGridClient,
-    outbox_root: &Path,
-    run_id: &str,
-    batch: TelemetryBatch,
-) {
+fn deliver_batch(api: &RustGridClient, outbox_root: &Path, run_id: &str, batch: TelemetryBatch) {
     let envelope = OutboxBatch {
         run_id: run_id.to_owned(),
         batch,
@@ -745,7 +740,7 @@ impl CodexTelemetrySession {
             self.execution_id,
             &completed_at,
             TelemetryPayload::Execution {
-                execution: self.execution_snapshot(status, Some(completed_at)),
+                execution: self.execution_snapshot(status, Some(completed_at.clone())),
             },
         );
         self.finished = true;
@@ -765,9 +760,7 @@ impl CodexTelemetrySession {
         let id = stable_uuid(&format!("execution:{}:turn:{index}", self.execution_id));
         let model_call_id = stable_uuid(&format!("turn:{id}:model_call:0"));
         let started_at = now_rfc3339();
-        let context_window_limit = event
-            .get("model_context_window")
-            .and_then(Value::as_u64);
+        let context_window_limit = event.get("model_context_window").and_then(Value::as_u64);
         let context_tokens_before_call = event
             .get("context_tokens")
             .or_else(|| event.get("context_tokens_before_call"))
@@ -843,9 +836,7 @@ impl CodexTelemetrySession {
             usage.input_tokens,
             usage.cached_input_tokens,
             usage.output_tokens,
-        ) && let Err(error) = self
-            .legacy_delta
-            .add_counts(input, cached, output)
+        ) && let Err(error) = self.legacy_delta.add_counts(input, cached, output)
         {
             eprintln!("[warning] legacy token aggregate overflowed: {error:#}");
         }
@@ -899,7 +890,7 @@ impl CodexTelemetrySession {
                     phase_id: Some(self.phase_id),
                     turn_index: turn.index,
                     started_at: Some(turn.started_at),
-                    completed_at: Some(completed_at),
+                    completed_at: Some(completed_at.clone()),
                     status: execution_status(outcome),
                 },
             },
@@ -971,7 +962,7 @@ impl CodexTelemetrySession {
             TelemetryPayload::ToolCall {
                 tool_call: self.tool_snapshot(
                     &tool,
-                    Some(completed_at),
+                    Some(completed_at.clone()),
                     status,
                     error_code,
                     response_bytes,
@@ -982,7 +973,11 @@ impl CodexTelemetrySession {
     }
 
     fn finish_open_tools(&mut self, outcome: SessionOutcome, completed_at: &str) {
-        let tools = self.active_tools.drain().map(|(_, tool)| tool).collect::<Vec<_>>();
+        let tools = self
+            .active_tools
+            .drain()
+            .map(|(_, tool)| tool)
+            .collect::<Vec<_>>();
         for tool in tools {
             self.emit(
                 "tool_call.completed",
@@ -1284,9 +1279,7 @@ fn format_unix_millis(seconds: u64, millis: u32) -> String {
     let hour = seconds_of_day / 3_600;
     let minute = (seconds_of_day % 3_600) / 60;
     let second = seconds_of_day % 60;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
@@ -1294,8 +1287,7 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;
     let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
-            / 365;
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;

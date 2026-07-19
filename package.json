@@ -1,6 +1,6 @@
 {
   "name": "rustgrid-agent-quality-gates",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "npm entry points for the rustgrid-agent repository quality gates",
   "scripts": {
