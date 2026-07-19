@@ -296,7 +296,7 @@ jobs:
           fail-build: false
           severity-cutoff: high
           output-format: table
-          grype-version: 0.100.0
+          grype-version: v0.100.0
           cache-db: true
 
       - name: Block fixable high-severity vulnerabilities
@@ -307,7 +307,7 @@ jobs:
           severity-cutoff: high
           output-format: table
           only-fixed: true
-          grype-version: 0.100.0
+          grype-version: v0.100.0
           cache-db: true
 
       - name: Push image and resolve digest
