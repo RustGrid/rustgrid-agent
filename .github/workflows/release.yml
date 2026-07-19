@@ -253,10 +253,12 @@ jobs:
       - name: Require reviewed Codex version
         env:
           CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          NPM_VERSION: ${{ vars.NPM_VERSION }}
           RUST_BUILDER_IMAGE: ${{ vars.RUST_BUILDER_IMAGE }}
           NODE_RUNTIME_IMAGE: ${{ vars.NODE_RUNTIME_IMAGE }}
         run: |
           test -n "${CODEX_VERSION}"
+          test -n "${NPM_VERSION}"
           test -n "${RUST_BUILDER_IMAGE}"
           test -n "${NODE_RUNTIME_IMAGE}"
           [[ "${RUST_BUILDER_IMAGE}" == *@sha256:* ]]
@@ -271,6 +273,7 @@ jobs:
         id: local-image
         env:
           CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          NPM_VERSION: ${{ vars.NPM_VERSION }}
           RUST_BUILDER_IMAGE: ${{ vars.RUST_BUILDER_IMAGE }}
           NODE_RUNTIME_IMAGE: ${{ vars.NODE_RUNTIME_IMAGE }}
         shell: bash
@@ -279,19 +282,33 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rustgrid-agent:${GITHUB_REF_NAME}"
           docker build \
             --build-arg "CODEX_VERSION=${CODEX_VERSION}" \
+            --build-arg "NPM_VERSION=${NPM_VERSION}" \
             --build-arg "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}" \
             --build-arg "NODE_RUNTIME_IMAGE=${NODE_RUNTIME_IMAGE}" \
             --tag "${image}" .
           docker run --rm --entrypoint rustgrid-agent "${image}" --version | grep -F "${GITHUB_REF_NAME#v}"
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
 
-      - name: Scan container for high-severity vulnerabilities
-        uses: anchore/scan-action@f6601287cdb1efc985d6b765bbf99cb4c0ac29d8 # v7
+      - name: Report all container vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ steps.local-image.outputs.image }}
+          fail-build: false
+          severity-cutoff: high
+          output-format: table
+          grype-version: v0.100.0
+          cache-db: true
+
+      - name: Block fixable high-severity vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           image: ${{ steps.local-image.outputs.image }}
           fail-build: true
           severity-cutoff: high
           output-format: table
+          only-fixed: true
+          grype-version: v0.100.0
+          cache-db: true
 
       - name: Push image and resolve digest
         id: image

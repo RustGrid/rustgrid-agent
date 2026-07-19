@@ -24,14 +24,44 @@ jobs:
       - name: Scan tracked files for credential patterns
         run: bash scripts/check-secrets.sh
 
-      - name: Build the locked Rust container stage
-        run: docker build --target builder --tag rustgrid-agent-builder:${{ github.sha }} .
+      - name: Build and smoke-test the pinned release container
+        env:
+          CODEX_VERSION: 0.144.4
+          NPM_VERSION: 12.0.1
+          RUST_BUILDER_IMAGE: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+          NODE_RUNTIME_IMAGE: node:24-trixie-slim@sha256:ae91dcc111a68c9d2d81ff2a17bda61be126426176fde6fe7d08ab13b7f50573
+        run: |
+          docker build \
+            --build-arg "CODEX_VERSION=${CODEX_VERSION}" \
+            --build-arg "NPM_VERSION=${NPM_VERSION}" \
+            --build-arg "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}" \
+            --build-arg "NODE_RUNTIME_IMAGE=${NODE_RUNTIME_IMAGE}" \
+            --tag "rustgrid-agent-ci:${GITHUB_SHA}" .
+          docker run --rm --entrypoint rustgrid-agent \
+            "rustgrid-agent-ci:${GITHUB_SHA}" --version |
+            grep -F "$(cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+
+      - name: Block fixable high-severity container vulnerabilities
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: rustgrid-agent-ci:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: high
+          output-format: table
+          only-fixed: true
+          grype-version: v0.100.0
+          cache-db: true
 
       - name: Validate generated Homebrew formula
         shell: bash
         run: |
           set -euo pipefail
-          sed -e 's/@VERSION@/1.0.0/g' -e "s/@SHA256@/$(printf '0%.0s' {1..64})/g" \
+          version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])'
+          )"
+          sed -e "s/@VERSION@/${version}/g" -e "s/@SHA256@/$(printf '0%.0s' {1..64})/g" \
             packaging/homebrew/rustgrid-agent.rb.in > /tmp/rustgrid-agent.rb
           ruby -c /tmp/rustgrid-agent.rb
 
