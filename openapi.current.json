@@ -1068,12 +1068,70 @@
               }
             ]
           },
+          "credential_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_version": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "id": {
             "format": "uuid",
             "type": "string"
           },
+          "installation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "label": {
             "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revocation_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "revoked_at": {
             "anyOf": [
@@ -1107,7 +1165,13 @@
           "worker_id",
           "api_key_id",
           "label",
-          "created_at"
+          "created_at",
+          "installation_id",
+          "credential_version",
+          "expires_at",
+          "credential_prefix",
+          "last_used_at",
+          "revocation_reason"
         ],
         "type": "object"
       },
@@ -1116,6 +1180,26 @@
           "active_runs": {
             "format": "int64",
             "type": "integer"
+          },
+          "agent_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "architecture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "available_slots": {
             "format": "int64",
@@ -1129,9 +1213,30 @@
             "format": "date-time",
             "type": "string"
           },
+          "hostname": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "installation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "kind": {
             "type": "string"
@@ -1140,6 +1245,28 @@
             "anyOf": [
               {
                 "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "linked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "linked_by": {
+            "anyOf": [
+              {
+                "format": "uuid",
                 "type": "string"
               },
               {
@@ -1156,12 +1283,25 @@
           "name": {
             "type": "string"
           },
+          "operating_system": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "enum": [
               "offline",
               "online",
               "busy",
-              "disabled"
+              "disabled",
+              "active",
+              "revoked",
+              "pending_upgrade"
             ],
             "type": "string"
           },
@@ -1180,7 +1320,14 @@
           "active_runs",
           "available_slots",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "installation_id",
+          "hostname",
+          "operating_system",
+          "architecture",
+          "agent_version",
+          "linked_by",
+          "linked_at"
         ],
         "type": "object"
       },
@@ -1390,6 +1537,39 @@
           "status",
           "scope_version",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "ApprovedWorkerDeviceAuthorization": {
+        "properties": {
+          "credential_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "approved"
+            ],
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "worker_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "worker_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker_id",
+          "worker_name",
+          "tenant_id",
+          "credential_id",
+          "status"
         ],
         "type": "object"
       },
@@ -2895,6 +3075,21 @@
               }
             ]
           },
+          "credential_prefix": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "credential_version": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
           "expires_at": {
             "anyOf": [
               {
@@ -2910,11 +3105,43 @@
             "format": "uuid",
             "type": "string"
           },
+          "installation_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "key_prefix": {
             "type": "string"
           },
           "label": {
             "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revocation_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "revoked_at": {
             "anyOf": [
@@ -2950,7 +3177,13 @@
           "label",
           "created_at",
           "api_key",
-          "key_prefix"
+          "key_prefix",
+          "installation_id",
+          "credential_version",
+          "expires_at",
+          "credential_prefix",
+          "last_used_at",
+          "revocation_reason"
         ],
         "type": "object"
       },
@@ -3551,6 +3784,53 @@
         ],
         "type": "object"
       },
+      "ManageAgentWorkerRequest": {
+        "minProperties": 1,
+        "properties": {
+          "name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "disabled",
+              "offline"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ManagedAgentWorkerResponse": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "offline",
+              "online",
+              "busy",
+              "disabled",
+              "active",
+              "revoked",
+              "pending_upgrade"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "status"
+        ],
+        "type": "object"
+      },
       "MarkStaleAgentWorkersOfflineRequest": {
         "properties": {
           "stale_after_seconds": {
@@ -3831,6 +4111,30 @@
         "example": "medium",
         "type": "string"
       },
+      "ProjectAccessSummary": {
+        "properties": {
+          "permissions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "role_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "role_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "role_id",
+          "role_name",
+          "permissions"
+        ],
+        "type": "object"
+      },
       "ProjectInviteResponse": {
         "description": "One pending project invite. Token material is never returned.",
         "properties": {
@@ -4042,6 +4346,16 @@
             "description": "RFC3339 UTC",
             "example": "2025-10-17T10:02:00Z",
             "type": "string"
+          },
+          "current_user_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProjectAccessSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "description": {
             "type": [
@@ -4318,8 +4632,25 @@
         ],
         "type": "object"
       },
+      "RevokedCurrentWorkerCredentialResponse": {
+        "properties": {
+          "revoked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "revoked"
+        ],
+        "type": "object"
+      },
       "RoleResponse": {
         "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -4333,14 +4664,27 @@
           "role_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/RoleScope"
           }
         },
         "required": [
           "role_id",
           "name",
+          "description",
+          "scope",
           "permissions"
         ],
         "type": "object"
+      },
+      "RoleScope": {
+        "enum": [
+          "tenant",
+          "project",
+          "system"
+        ],
+        "type": "string"
       },
       "SignupRequest": {
         "properties": {
@@ -4529,6 +4873,105 @@
           "sprint_id",
           "completed",
           "total"
+        ],
+        "type": "object"
+      },
+      "StartWorkerDeviceAuthorizationRequest": {
+        "properties": {
+          "agent_version": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "architecture": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "client_id": {
+            "enum": [
+              "rustgrid-agent"
+            ],
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hostname": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "installation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operating_system": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "client_id",
+          "installation_id",
+          "hostname",
+          "operating_system",
+          "architecture",
+          "agent_version"
+        ],
+        "type": "object"
+      },
+      "StartedWorkerDeviceAuthorization": {
+        "properties": {
+          "device_code": {
+            "description": "One-time high-entropy secret. Never log or display this value.",
+            "type": "string"
+          },
+          "expires_in": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "interval": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "user_code": {
+            "pattern": "^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$",
+            "type": "string"
+          },
+          "verification_uri": {
+            "format": "uri",
+            "type": "string"
+          },
+          "verification_uri_complete": {
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_code",
+          "user_code",
+          "verification_uri",
+          "verification_uri_complete",
+          "expires_in",
+          "interval"
         ],
         "type": "object"
       },
@@ -6355,6 +6798,219 @@
           "enabled",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceAuthorizationView": {
+        "properties": {
+          "agent_version": {
+            "type": "string"
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "installation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "operating_system": {
+            "type": "string"
+          },
+          "previously_linked": {
+            "type": "boolean"
+          },
+          "requested_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "denied",
+              "expired",
+              "consumed"
+            ],
+            "type": "string"
+          },
+          "worker_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "installation_id",
+          "hostname",
+          "display_name",
+          "operating_system",
+          "architecture",
+          "agent_version",
+          "requested_scopes",
+          "expires_at",
+          "worker_id",
+          "previously_linked"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceCredential": {
+        "properties": {
+          "access_token": {
+            "description": "One-time worker API credential. Returned only by a successful token exchange.",
+            "type": "string"
+          },
+          "expires_in": {
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "instance": {
+            "$ref": "#/components/schemas/WorkerDeviceTokenInstance"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token_type": {
+            "enum": [
+              "Bearer"
+            ],
+            "type": "string"
+          },
+          "worker": {
+            "$ref": "#/components/schemas/WorkerDeviceTokenWorker"
+          }
+        },
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "worker",
+          "instance",
+          "scopes"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceStatusResponse": {
+        "properties": {
+          "status": {
+            "enum": [
+              "denied"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceTokenErrorResponse": {
+        "properties": {
+          "error": {
+            "enum": [
+              "authorization_pending",
+              "slow_down",
+              "access_denied",
+              "expired_token",
+              "consumed_token",
+              "invalid_device_code"
+            ],
+            "type": "string"
+          },
+          "interval": {
+            "format": "int32",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceTokenInstance": {
+        "properties": {
+          "url": {
+            "format": "uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceTokenRequest": {
+        "properties": {
+          "client_id": {
+            "enum": [
+              "rustgrid-agent"
+            ],
+            "type": "string"
+          },
+          "device_code": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_id",
+          "device_code"
+        ],
+        "type": "object"
+      },
+      "WorkerDeviceTokenWorker": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "tenant_id"
         ],
         "type": "object"
       }
@@ -10863,6 +11519,369 @@
         ]
       }
     },
+    "/api/v1/agent-workers/device-authorizations": {
+      "post": {
+        "description": "Create a short-lived worker device authorization. The returned device_code is a one-time secret and responses are not cacheable.",
+        "operationId": "startWorkerDeviceAuthorization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartWorkerDeviceAuthorizationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartedWorkerDeviceAuthorization"
+                }
+              }
+            },
+            "description": "Device authorization started"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid client or device metadata"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many authorization attempts"
+          }
+        },
+        "security": [],
+        "summary": "Start worker device authorization",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/device-authorizations/token": {
+      "post": {
+        "description": "Poll with the opaque device code. A successful exchange returns the credential once and consumes the authorization.",
+        "operationId": "exchangeWorkerDeviceAuthorization",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkerDeviceTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDeviceCredential"
+                }
+              }
+            },
+            "description": "One-time worker credential"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDeviceTokenErrorResponse"
+                }
+              }
+            },
+            "description": "Stable device authorization state"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests"
+          }
+        },
+        "security": [],
+        "summary": "Exchange an approved worker device authorization",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/device-authorizations/{user_code}": {
+      "get": {
+        "description": "Return non-secret machine metadata for an operator with agents:workers:register.",
+        "operationId": "getWorkerDeviceAuthorization",
+        "parameters": [
+          {
+            "description": "Short-lived human-readable worker authorization code.",
+            "in": "path",
+            "name": "user_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-?[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDeviceAuthorizationView"
+                }
+              }
+            },
+            "description": "Device authorization metadata"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid user code"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authorization not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Review worker device authorization metadata",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/device-authorizations/{user_code}/approve": {
+      "post": {
+        "description": "Atomically link the installation, rotate its prior device credential, and prepare one-time credential delivery.",
+        "operationId": "approveWorkerDeviceAuthorization",
+        "parameters": [
+          {
+            "description": "Short-lived human-readable worker authorization code.",
+            "in": "path",
+            "name": "user_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-?[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovedWorkerDeviceAuthorization"
+                }
+              }
+            },
+            "description": "Device authorization approved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid user code"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authorization not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Expired, denied, consumed, or cross-tenant authorization"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Approve worker device authorization",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/device-authorizations/{user_code}/deny": {
+      "post": {
+        "description": "Deny a pending authorization without creating a worker credential.",
+        "operationId": "denyWorkerDeviceAuthorization",
+        "parameters": [
+          {
+            "description": "Short-lived human-readable worker authorization code.",
+            "in": "path",
+            "name": "user_code",
+            "required": true,
+            "schema": {
+              "pattern": "^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-?[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerDeviceStatusResponse"
+                }
+              }
+            },
+            "description": "Device authorization denied"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid user code"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authorization not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authorization is no longer pending"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Deny worker device authorization",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-workers/mark-stale-offline": {
       "post": {
         "description": "Mark online or busy workers offline when they have not heartbeated within the requested threshold.",
@@ -11409,6 +12428,75 @@
         ]
       }
     },
+    "/api/v1/agent-workers/{id}/credentials/current/revoke": {
+      "post": {
+        "description": "Revoke the authenticated worker API credential. Intended for secure agent logout.",
+        "operationId": "revokeCurrentWorkerCredential",
+        "parameters": [
+          {
+            "description": "Agent worker identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedCurrentWorkerCredentialResponse"
+                }
+              }
+            },
+            "description": "Current credential revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker API key authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Credential is not bound to this worker"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker credential not found"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke the current worker credential",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
     "/api/v1/agent-workers/{id}/credentials/{credential_id}": {
       "delete": {
         "description": "Revoke an agent worker credential and its underlying API key in the current tenant.",
@@ -11706,6 +12794,105 @@
           }
         ],
         "summary": "Heartbeat an agent worker",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-workers/{id}/manage": {
+      "post": {
+        "description": "Update a worker display name or set its operational state. Disabling is rejected while active runs exist; re-enabling requires a usable worker credential.",
+        "operationId": "manageAgentWorker",
+        "parameters": [
+          {
+            "description": "Agent worker identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManageAgentWorkerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedAgentWorkerResponse"
+                }
+              }
+            },
+            "description": "Updated worker management state"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid name or status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Authentication required"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Permission denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Worker not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Active runs or missing usable credential block the transition"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rename, disable, or re-enable a worker",
         "tags": [
           "agents"
         ]
