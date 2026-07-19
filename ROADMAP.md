@@ -1,13 +1,9 @@
 # Roadmap
 
-## Release candidate
+## Post-1.0 priorities
 
-- Publish signed source, native binary, Homebrew, SBOM, and container artifacts.
-- Complete credentialed staging certification and rollback rehearsal.
-- Operate the release candidate through the documented soak period with no unresolved P0/P1 findings.
-
-## Toward 1.0
-
+- Complete credentialed staging certification, rollback rehearsal, and the
+  documented soak period before the first production deployment.
 - Add a remote executor option for Linux worker fleets; the current production executor launches a Docker Sandbox microVM per run.
 - Add tenant-scoped artifact upload with bounded retention and redaction policy.
 - Add deployment-integrated metrics/OTLP export without exposing ticket content.

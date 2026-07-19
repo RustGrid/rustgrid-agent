@@ -1,8 +1,10 @@
 # Staging certification
 
-Production promotion requires a credentialed run against the same RustGrid and
+Production deployment requires credentialed runs against the same RustGrid and
 GitHub App topology used in production. Local mocks and contract tests do not
-satisfy this gate.
+satisfy this gate. Artifact publication occurs first so certification can target
+the exact immutable release image digest; publication alone is not production
+approval.
 
 ## Prerequisites
 

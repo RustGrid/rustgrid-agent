@@ -16,10 +16,10 @@ the reporter will receive status updates at least every fourteen days.
 
 ## Supported versions
 
-Until the first stable release, only the latest commit on `main` is supported.
-After stable release, the latest minor release receives security fixes. Critical
-credential or isolation defects may require immediately disabling affected
-workers rather than waiting for a patched release.
+The latest stable minor release receives security fixes. The `main` branch is
+development code and is not a supported deployment target. Critical credential
+or isolation defects may require immediately disabling affected workers rather
+than waiting for a patched release.
 
 ## Credential safety
 

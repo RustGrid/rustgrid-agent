@@ -14,11 +14,11 @@ web application. Running it requires a compatible RustGrid instance and a
 project connected to GitHub through the RustGrid GitHub App.
 
 > [!IMPORTANT]
-> `1.0.0` is currently a release candidate. The public RustGrid Homebrew tap is
-> provisioned, but it does not contain a formula until the first tagged release
-> is published. Until then, install from source. Production promotion also
-> requires the credentialed checks in
-> [staging certification](docs/staging-certification.md).
+> `1.0.0` is the first stable public artifact release. Publishing the CLI,
+> Homebrew formula, and container does not approve a worker deployment for
+> production. Operators must complete the credentialed checks in
+> [staging certification](docs/staging-certification.md) against the published
+> image digest before production deployment.
 
 ## What it does
 
@@ -49,8 +49,8 @@ repository. Every run gets its own clone, branch, journal, and sandbox.
 
 | Host | CLI | Production `serve` | Distribution |
 | --- | --- | --- | --- |
-| macOS | Supported | Supported on hosts that meet the current Docker Sandboxes requirements | Source today; signed native archive and Homebrew tap after the first release |
-| Ubuntu Linux | Supported | Supported when Docker Sandboxes, KVM, and worker preflight checks pass | Source today; signed `linux-x86_64` archive after the first release |
+| macOS | Supported | Supported on hosts that meet the current Docker Sandboxes requirements | Homebrew tap and checksummed native archive |
+| Ubuntu Linux | Supported | Supported when Docker Sandboxes, KVM, and worker preflight checks pass | Checksummed `linux-x86_64` native archive |
 | Windows | Not currently supported or tested | Not supported | No native artifact |
 
 The local executor is for development and tests only. Production `serve` fails
@@ -90,10 +90,10 @@ or add that directory to `PATH` if `rustgrid-agent` is not found.
 
 ### Tagged releases
 
-The release workflow publishes checksummed and attested source, macOS, and
-Linux artifacts for every stable tag. Verify the matching `.sha256` file and
-GitHub artifact attestation before installing a native binary. No stable release
-is published yet; the exact artifact names and release controls are documented
+Stable releases publish checksummed and attested source, macOS, and Linux
+artifacts on [GitHub Releases](https://github.com/RustGrid/rustgrid-agent/releases).
+Verify the matching `.sha256` file and GitHub artifact attestation before
+installing a native binary. The exact artifact names and controls are documented
 in [the release workflow](.github/workflows/release.yml) and
 [release checklist](docs/release-checklist.md).
 
@@ -105,10 +105,8 @@ The public tap command is:
 brew install RustGrid/tap/rustgrid-agent
 ```
 
-The formula becomes available when the first tagged release completes. Until
-then, the command exits because the tap has no `rustgrid-agent` formula. The
-unqualified `brew install rustgrid-agent` command will only be documented if a
-formula is later accepted into Homebrew/core.
+The unqualified `brew install rustgrid-agent` command will only be documented
+if a formula is later accepted into Homebrew/core.
 
 ## Production quick start
 
@@ -557,6 +555,10 @@ runs locked quality gates, and is designed to publish:
 Maintainers must complete [the release checklist](docs/release-checklist.md) and
 must not replace assets for an existing version. Homebrew/core publication is a
 separate third-party review and is not assumed by this project.
+
+The workflow publishes versioned artifacts; it does not deploy a worker.
+Production deployment approval is a separate gate performed against the exact
+published image digest through [staging certification](docs/staging-certification.md).
 
 ## License
 
