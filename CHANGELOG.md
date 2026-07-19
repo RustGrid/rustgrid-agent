@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.1.0 - 2026-07-19
+
+### Added
+
+- Add `rustgrid-agent setup`, which detects host CPU and memory, recommends a
+  concurrent-job count, and derives production Docker Sandbox capacity without
+  requiring operators to maintain low-level resource fields manually.
+- Add a stable user-level configuration path with an environment override and
+  safe import of legacy working-directory configuration and worker identity.
+
 ## 1.0.1 - 2026-07-19
 
 ### Security

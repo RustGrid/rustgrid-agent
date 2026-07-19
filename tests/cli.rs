@@ -22,6 +22,79 @@ fn version_reports_package_name_and_version() {
 }
 
 #[test]
+fn setup_writes_a_host_sized_production_configuration() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let config = directory.path().join("config.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .env("RUSTGRID_AGENT_CONFIG", &config)
+        .args(["setup", "--max-concurrency", "1"])
+        .output()
+        .expect("rustgrid-agent setup should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(config.to_str().unwrap()));
+
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(stored["max_concurrency"], 1);
+    assert_eq!(stored["executor"]["kind"], "docker_sandbox");
+    assert!(stored["executor"]["cpus"].as_u64().unwrap() >= 1);
+    assert!(
+        stored["executor"]["memory"]
+            .as_str()
+            .unwrap()
+            .ends_with('m')
+    );
+    assert!(stored["executor"]["capacity_cpus"].as_u64().unwrap() >= 1);
+    assert!(
+        stored["executor"]["capacity_memory"]
+            .as_str()
+            .unwrap()
+            .ends_with('m')
+    );
+    uuid::Uuid::parse_str(stored["installation_id"].as_str().unwrap()).unwrap();
+}
+
+#[test]
+fn setup_imports_existing_login_metadata_into_the_stable_config() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let stable = directory.path().join("stable.json");
+    fs::write(
+        directory.path().join(".rustgrid-agent.json"),
+        r#"{
+          "installation_id":"00000000-0000-4000-8000-000000000010",
+          "worker_id":"00000000-0000-4000-8000-000000000001",
+          "tenant_id":"00000000-0000-4000-8000-000000000002",
+          "worker_name":"existing-worker",
+          "max_concurrency":1,
+          "executor":{"kind":"docker_sandbox"}
+        }"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .current_dir(directory.path())
+        .env("RUSTGRID_AGENT_CONFIG", &stable)
+        .args(["setup", "--max-concurrency", "1"])
+        .output()
+        .expect("rustgrid-agent setup should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Imported existing"));
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&stable).unwrap()).unwrap();
+    assert_eq!(
+        stored["installation_id"],
+        "00000000-0000-4000-8000-000000000010"
+    );
+    assert_eq!(stored["worker_id"], "00000000-0000-4000-8000-000000000001");
+    assert_eq!(stored["worker_name"], "existing-worker");
+}
+
+#[test]
 fn login_and_logout_complete_the_device_credential_lifecycle() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");

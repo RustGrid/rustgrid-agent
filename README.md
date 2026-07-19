@@ -144,9 +144,31 @@ Review the effective network rules before admitting production work. Docker's
 explains the host-side credential proxy; the OpenAI credential is not copied
 into the sandbox.
 
-### 2. Log in to RustGrid
+### 2. Configure and log in to RustGrid
 
-Run login from the directory in which the worker configuration should live:
+Run the guided setup once. It detects the host's logical CPUs and memory,
+recommends a balanced concurrent-job count, and derives the per-sandbox resource
+settings:
+
+```sh
+rustgrid-agent setup
+```
+
+Press Enter to accept the recommendation or enter a different number. For an
+unattended host or a later capacity change, pass the basic setting directly:
+
+```sh
+rustgrid-agent setup --max-concurrency 4
+```
+
+Setup writes the stable user configuration to
+`$XDG_CONFIG_HOME/rustgrid-agent/config.json`, or
+`~/.config/rustgrid-agent/config.json` when `XDG_CONFIG_HOME` is unset. It is
+safe to rerun: worker identity and login metadata are preserved while detected
+CPU and memory capacity are refreshed. On the first run it imports a legacy
+`.rustgrid-agent.json` from the current directory without deleting the original.
+
+Then log in:
 
 ```sh
 rustgrid-agent login
@@ -154,8 +176,9 @@ rustgrid-agent login
 
 The default control-plane instance is `https://app.rustgrid.com`. Login prints a
 one-time code, opens the verification URL returned by RustGrid, waits for
-approval, and creates `.rustgrid-agent.json` with a single-run production
-Docker Sandbox configuration. Use `--no-browser` on a headless host:
+approval, and stores worker identity alongside the setup configuration. If
+setup was skipped, login still creates a single-run production Docker Sandbox
+configuration at the stable user path. Use `--no-browser` on a headless host:
 
 ```sh
 rustgrid-agent login --no-browser
@@ -178,7 +201,7 @@ owner-only file in the user's configuration directory. No secret is written to
 
 ### 3. Validate and start the worker
 
-Run these commands from the configuration directory, or pass `--config`:
+The stable user configuration works from any directory:
 
 ```sh
 rustgrid-agent status
@@ -217,17 +240,22 @@ GitHub workflows, repository binding, and sandbox policy in each manifest. See
 
 ## Configuration
 
-The default path is `.rustgrid-agent.json` in the current directory. Pass the
-global option before or after the subcommand:
+The default path is `$XDG_CONFIG_HOME/rustgrid-agent/config.json`, or
+`~/.config/rustgrid-agent/config.json`. When that file does not exist, the CLI
+continues to recognize a legacy `.rustgrid-agent.json` in the current directory.
+`RUSTGRID_AGENT_CONFIG` or the global `--config` option selects an explicit
+path; the option may appear before or after the subcommand:
 
 ```sh
 rustgrid-agent --config /etc/rustgrid-agent/agent.json status
 rustgrid-agent status --config /etc/rustgrid-agent/agent.json
 ```
 
-`login` creates a production Docker Sandbox configuration when the file does
-not exist. By contrast, deserializing an explicitly minimal configuration uses
-the development-only local executor unless `executor` is set.
+`setup` is the supported way to create and resize a production configuration.
+It detects host capacity and keeps the detailed sandbox resource fields in sync.
+`login` creates a conservative single-run configuration when the file does not
+exist. By contrast, deserializing an explicitly minimal configuration uses the
+development-only local executor unless `executor` is set.
 
 | Field | Default or constraint | Purpose |
 | --- | --- | --- |
@@ -267,6 +295,7 @@ capacity-oriented production example. Never put secrets in this file.
 
 | Variable | Purpose |
 | --- | --- |
+| `RUSTGRID_AGENT_CONFIG` | Stable configuration path override. `--config` takes precedence. |
 | `RUSTGRID_WORKER_API_KEY` | Managed-deployment override for the credential created by `login`. |
 | `RUSTGRID_WORKER_ID` | Worker UUID bound to the managed credential. Supply it with `RUSTGRID_WORKER_API_KEY`. |
 | `RUSTGRID_INSTANCE_URL` | Overrides the configured RustGrid control-plane origin. |
