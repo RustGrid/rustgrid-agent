@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: Agent version
-      placeholder: "rustgrid-agent 0.1.0"
+      placeholder: "rustgrid-agent 1.0.0"
     validations:
       required: true
   - type: dropdown

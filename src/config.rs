@@ -101,6 +101,18 @@ pub enum ExecutorConfig {
 }
 
 impl ExecutorConfig {
+    fn production_default() -> Self {
+        Self::DockerSandbox {
+            command: default_sbx_command(),
+            template: default_sandbox_template(),
+            codex_version: default_codex_version(),
+            cpus: default_sandbox_cpus(),
+            memory: default_sandbox_memory(),
+            capacity_cpus: default_sandbox_capacity_cpus(),
+            capacity_memory: default_sandbox_capacity_memory(),
+        }
+    }
+
     pub fn is_isolated(&self) -> bool {
         matches!(self, Self::DockerSandbox { .. })
     }
@@ -287,7 +299,7 @@ impl AppContext {
         let (mut config, created) = match fs::read(path) {
             Ok(bytes) => (parse_config(path, &bytes)?, false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (serde_json::from_str::<Config>("{}")?, true)
+                (first_login_config()?, true)
             }
             Err(error) => {
                 return Err(error)
@@ -491,6 +503,12 @@ impl AppContext {
             .as_deref()
             .context("worker authentication is required; run `rustgrid-agent login`")
     }
+}
+
+fn first_login_config() -> Result<Config> {
+    let mut config = serde_json::from_str::<Config>("{}")?;
+    config.executor = ExecutorConfig::production_default();
+    Ok(config)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -831,6 +849,29 @@ mod tests {
         assert_eq!(codex_version, "0.144.4");
         assert!(validate_codex_version("0.144").is_err());
         assert!(validate_codex_version("latest").is_err());
+    }
+
+    #[test]
+    fn first_login_uses_a_production_ready_single_worker_executor() {
+        let config = first_login_config().unwrap();
+        assert_eq!(config.max_concurrency, 1);
+        let executor = config.executor;
+
+        executor.validate_production(1).unwrap();
+        let ExecutorConfig::DockerSandbox {
+            command,
+            cpus,
+            memory,
+            capacity_cpus,
+            capacity_memory,
+            ..
+        } = executor
+        else {
+            panic!("first login must configure Docker Sandbox");
+        };
+        assert_eq!(command, "sbx");
+        assert_eq!(cpus, capacity_cpus);
+        assert_eq!(memory, capacity_memory);
     }
 
     #[test]

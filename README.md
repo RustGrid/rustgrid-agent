@@ -83,10 +83,36 @@ Cargo installs the executable into `~/.cargo/bin` by default. Add that directory
 
 ## Quick start
 
-### 1. Configure the worker
+### Fast path on macOS
 
-Copy [`.rustgrid-agent.example.json`](.rustgrid-agent.example.json) to the
-worker host and update its local capacity:
+On a new worker host, install Docker Sandboxes and the worker, authenticate both,
+then start the long-running daemon:
+
+```sh
+brew trust docker/tap
+brew install docker/tap/sbx
+sbx login
+sbx policy init balanced
+sbx settings set kit.allowLocalKits true
+
+brew install RustGrid/tap/rustgrid-agent
+rustgrid-agent login
+rustgrid-agent status
+rustgrid-agent serve
+```
+
+The first `rustgrid-agent login` creates `.rustgrid-agent.json` with a
+production-ready, single-run Docker Sandbox configuration. `status` checks the
+sandbox daemon, pinned execution settings, stored worker credential, and
+RustGrid connectivity before `serve` begins heartbeating. Keep `serve` running
+under a terminal or process manager. Use `login --no-browser` on a headless
+host.
+
+### 1. Customize worker capacity (optional)
+
+Edit the generated `.rustgrid-agent.json`, or copy
+[`.rustgrid-agent.example.json`](.rustgrid-agent.example.json), when the host
+should execute more than one run at a time:
 
 ```json
 {
@@ -111,9 +137,9 @@ manifest supplies its project, repository, and execution policy. Legacy
 project/repository fields are accepted as ignored compatibility hints and
 should be removed from new configurations.
 
-### 2. Authenticate the worker
+### 2. Device login details
 
-Start the device login:
+Start or repeat device login:
 
 ```sh
 rustgrid-agent login
@@ -286,13 +312,15 @@ failure so resource leaks are visible rather than silently accepted.
 
 Install and authenticate the standalone `sbx` CLI before starting production
 workers. `rustgrid-agent status` and `serve` verify both the `sbx` client and its
-daemon and fail closed if either is unavailable. Docker Sandboxes currently require
-Docker Desktop and are not supported on Linux hosts; choose production worker
-hosts accordingly.
+daemon and fail closed if either is unavailable. Docker documents supported
+installation paths for macOS and Ubuntu Linux; follow the current platform
+prerequisites at <https://docs.docker.com/ai/sandboxes/>.
 
 Production readiness also inspects the active Docker Sandbox network policy and
-requires `sbx` 0.34.0 or newer. Initialize a non-interactive host with at least
-the balanced policy and review its effective rules before admitting work. The
+requires `sbx` 0.34.0 or newer. Initialize a non-interactive host with
+`sbx policy init balanced`, enable the coordinator-owned version kit with
+`sbx settings set kit.allowLocalKits true`, and review the effective rules
+before admitting work. The
 worker continuously measures the mounted workspace during Codex and gate
 execution and stops the sandbox when `max_workspace_bytes` is exceeded.
 Review and intentionally update the pinned template digest during upgrades; do
@@ -491,9 +519,11 @@ This section is for RustGrid maintainers. Homebrew distribution needs a versione
 
 ### 1. Create a release artifact
 
-1. Choose a semantic version and update `version` in `Cargo.toml` and the root package entry in `Cargo.lock`.
-2. Run the development checks listed below.
-3. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
+1. Make `RustGrid/rustgrid-agent` public. Homebrew clients must be able to fetch
+   the immutable release archive without GitHub credentials.
+2. Choose a semantic version and update `version` in `Cargo.toml` and the root package entry in `Cargo.lock`.
+3. Run the development checks listed below.
+4. Commit the release change, create a matching `vX.Y.Z` tag, and push the tag.
 
 The [release workflow](.github/workflows/release.yml) rejects tags that do not match the Cargo package version. It runs formatting, lint, and test checks; packages the locked crate; calculates its SHA-256 checksum; generates a versioned Homebrew formula from [`packaging/homebrew/rustgrid-agent.rb.in`](packaging/homebrew/rustgrid-agent.rb.in); generates an SPDX JSON SBOM; creates a GitHub artifact attestation binding the package and SBOM; and creates the GitHub release. The release contains these assets:
 
@@ -515,7 +545,13 @@ https://github.com/RustGrid/rustgrid-agent/releases/download/vX.Y.Z/rustgrid-age
 
 ### 2. Create the formula
 
-Download `rustgrid-agent.rb` from the GitHub release and add it as `Formula/rustgrid-agent.rb` in a public `RustGrid/homebrew-tap` repository. The generated formula has this shape:
+Create the public `RustGrid/homebrew-tap` repository once with a `main` branch
+and a `Formula/` directory. Add a fine-grained `HOMEBREW_TAP_TOKEN` secret to
+the `production-release` environment with contents write access to that tap.
+Every tagged release then downloads its generated formula and commits it to
+`Formula/rustgrid-agent.rb` automatically.
+
+The generated formula has this shape:
 
 ```ruby
 class RustgridAgent < Formula
@@ -549,7 +585,7 @@ rustgrid-agent --version
 brew uninstall rustgrid-agent
 ```
 
-Commit and push the formula to the default branch of the public tap. Users can then run:
+After the release and tap jobs pass, users can run:
 
 ```sh
 brew install RustGrid/tap/rustgrid-agent
@@ -570,9 +606,11 @@ brew install rustgrid-agent
 For every release:
 
 1. Update the Cargo version and push its matching version tag.
-2. Download the generated formula from the new GitHub release.
-3. Run `brew audit`, install from source, and `brew test`.
-4. Submit the formula update to the tap or Homebrew/core, depending on where the formula lives.
+2. Confirm the release workflow published the source archive, native binaries,
+   SBOM, attestations, and generated formula.
+3. Confirm the Homebrew job updated `RustGrid/homebrew-tap`.
+4. Run `brew audit`, install from source, and `brew test`.
+5. Submit the formula update to Homebrew/core after the project qualifies.
 
 Do not replace an asset for an existing version: its checksum would change and break reproducible installs.
 

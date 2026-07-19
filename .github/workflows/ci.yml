@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sed -e 's/@VERSION@/0.1.0/g' -e "s/@SHA256@/$(printf '0%.0s' {1..64})/g" \
+          sed -e 's/@VERSION@/1.0.0/g' -e "s/@SHA256@/$(printf '0%.0s' {1..64})/g" \
             packaging/homebrew/rustgrid-agent.rb.in > /tmp/rustgrid-agent.rb
           ruby -c /tmp/rustgrid-agent.rb
 

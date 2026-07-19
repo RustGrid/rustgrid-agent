@@ -25,7 +25,6 @@ fn version_reports_package_name_and_version() {
 fn login_and_logout_complete_the_device_credential_lifecycle() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
-    fs::write(&config, r#"{"max_concurrency":1}"#).expect("configuration should be written");
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -104,6 +103,8 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
         stored_config["tenant_id"],
         "00000000-0000-4000-8000-000000000002"
     );
+    assert_eq!(stored_config["max_concurrency"], 1);
+    assert_eq!(stored_config["executor"]["kind"], "docker_sandbox");
     assert!(
         stored_config["credential_expires_at_unix"]
             .as_u64()

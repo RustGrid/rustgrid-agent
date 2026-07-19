@@ -50,6 +50,18 @@ jobs:
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
+      - name: Require public release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          visibility="$(gh repo view "${GITHUB_REPOSITORY}" --json visibility --jq .visibility)"
+          if [[ "${visibility}" != "PUBLIC" ]]; then
+            echo "Homebrew releases require ${GITHUB_REPOSITORY} to be public; current visibility is ${visibility}" >&2
+            exit 1
+          fi
+
       - name: Run release checks
         run: |
           cargo fmt --check
@@ -176,6 +188,47 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARCHIVE: ${{ steps.archive.outputs.archive }}
         run: gh release upload "${GITHUB_REF_NAME}" "${ARCHIVE}" "${ARCHIVE}.sha256"
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production-release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out Homebrew tap
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: RustGrid/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download generated formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${GITHUB_REF_NAME}" --pattern rustgrid-agent.rb --dir /tmp
+
+      - name: Validate formula
+        run: ruby -c /tmp/rustgrid-agent.rb
+
+      - name: Publish formula
+        working-directory: homebrew-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Formula
+          cp /tmp/rustgrid-agent.rb Formula/rustgrid-agent.rb
+          if git diff --quiet -- Formula/rustgrid-agent.rb; then
+            echo "Homebrew formula already matches ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/rustgrid-agent.rb
+          git commit -m "rustgrid-agent ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
 
   container:
     name: Build and publish production container
