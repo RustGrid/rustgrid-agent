@@ -31,6 +31,19 @@ impl TokenConsumption {
         if cached_input_tokens > input_tokens {
             anyhow::bail!("Codex reported cached_input_tokens greater than input_tokens");
         }
+        self.add_counts(input_tokens, cached_input_tokens, output_tokens)?;
+        Ok(true)
+    }
+
+    pub fn add_counts(
+        &mut self,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<()> {
+        if cached_input_tokens > input_tokens {
+            anyhow::bail!("cached_input_tokens cannot exceed input_tokens");
+        }
         self.input_tokens = self
             .input_tokens
             .checked_add(input_tokens)
@@ -44,7 +57,7 @@ impl TokenConsumption {
             .checked_add(output_tokens)
             .context("output token consumption overflowed")?;
         self.total_tokens()?;
-        Ok(true)
+        Ok(())
     }
 }
 

@@ -23,6 +23,7 @@ pub mod runner;
 pub mod setup;
 pub mod shutdown;
 pub mod supervisor;
+pub mod telemetry;
 pub mod token;
 pub mod token_consumption;
 pub mod workspace;

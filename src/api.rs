@@ -17,6 +17,7 @@ use crate::config::AppContext;
 use crate::{
     lifecycle::{AgentRunStatus, LifecycleEvent, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
+    telemetry::TelemetryBatch,
     token_consumption::TokenConsumption,
 };
 
@@ -702,6 +703,22 @@ impl RustGridClient {
                 "total_tokens": consumption.total_tokens()?
             })),
             Some(&format!("token-consumption-{run_id}")),
+        )
+    }
+
+    pub fn report_telemetry_batch(&self, run_id: &str, batch: &TelemetryBatch) -> Result<()> {
+        if batch.telemetry_version != crate::telemetry::TELEMETRY_VERSION
+            || batch.events.is_empty()
+            || batch.events.len() > 100
+        {
+            anyhow::bail!("invalid telemetry batch");
+        }
+        let batch_id = batch.stable_id();
+        self.send_empty(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/telemetry/batch"),
+            Some(serde_json::to_value(batch)?),
+            Some(&format!("telemetry-{run_id}-{batch_id}")),
         )
     }
 

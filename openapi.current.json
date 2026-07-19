@@ -1763,6 +1763,42 @@
         ],
         "type": "object"
       },
+      "BillingPaymentSession": {
+        "properties": {
+          "amount_due": {
+            "description": "Invoice amount due in integer minor currency units, when Stripe provides it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "client_secret": {
+            "description": "Short-lived secret used only by Stripe Payment Element. Do not log, cache, or persist it.",
+            "type": "string"
+          },
+          "currency": {
+            "description": "Lowercase ISO 4217 currency code, when Stripe provides it.",
+            "pattern": "^[a-z]{3}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "publishable_key": {
+            "description": "Stripe publishable key for initializing Stripe.js.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "client_secret",
+          "publishable_key",
+          "amount_due",
+          "currency"
+        ],
+        "type": "object"
+      },
       "BillingPlan": {
         "properties": {
           "code": {
@@ -1782,6 +1818,11 @@
           "is_public": {
             "type": "boolean"
           },
+          "sort_order": {
+            "description": "Stable ascending display order for public plans.",
+            "format": "int32",
+            "type": "integer"
+          },
           "stripe_price_id": {
             "example": "price_123",
             "type": [
@@ -1793,8 +1834,10 @@
         "required": [
           "code",
           "display_name",
+          "stripe_price_id",
           "entitlements",
-          "is_public"
+          "is_public",
+          "sort_order"
         ],
         "type": "object"
       },
@@ -1823,22 +1866,6 @@
         },
         "required": [
           "plans"
-        ],
-        "type": "object"
-      },
-      "BillingPortalSession": {
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "url": {
-            "format": "uri",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "url"
         ],
         "type": "object"
       },
@@ -2010,13 +2037,38 @@
         ],
         "type": "object"
       },
-      "CheckoutRequest": {
+      "ChangeSubscriptionRequest": {
+        "additionalProperties": false,
         "properties": {
           "plan_code": {
+            "description": "Self-service target paid plan code. Enterprise is negotiated and remains a contact flow.",
             "enum": [
               "builder",
-              "scale",
-              "enterprise"
+              "scale"
+            ],
+            "type": "string"
+          },
+          "preview_token": {
+            "description": "Short-lived quote token returned by the preview endpoint. Required for upgrades and omitted for downgrades.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "plan_code"
+        ],
+        "type": "object"
+      },
+      "CheckoutRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_code": {
+            "description": "Self-service public paid plan to subscribe to. Free does not use Checkout and Enterprise remains a contact flow.",
+            "enum": [
+              "builder",
+              "scale"
             ],
             "type": "string"
           }
@@ -2028,17 +2080,35 @@
       },
       "CheckoutSession": {
         "properties": {
-          "id": {
+          "client_secret": {
+            "description": "Short-lived secret used only to mount Stripe Embedded Checkout in AgentOps. Do not log, cache, or persist it.",
             "type": "string"
           },
-          "url": {
-            "format": "uri",
+          "id": {
+            "description": "Stripe Checkout Session ID.",
+            "type": "string"
+          },
+          "publishable_key": {
+            "description": "Stripe publishable key for initializing Stripe.js for this embedded flow.",
             "type": "string"
           }
         },
         "required": [
           "id",
-          "url"
+          "client_secret",
+          "publishable_key"
+        ],
+        "type": "object"
+      },
+      "CheckoutSessionCancellationResult": {
+        "properties": {
+          "canceled": {
+            "description": "True when the tenant has no active embedded Checkout reservation. Idempotent retries also return true once that desired state is reached.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "canceled"
         ],
         "type": "object"
       },
@@ -4055,6 +4125,14 @@
         ],
         "type": "object"
       },
+      "PendingChangeType": {
+        "description": "Kind of unresolved self-service plan change. A scheduled downgrade can be undone; a payment-required upgrade can be completed in AgentOps or canceled.",
+        "enum": [
+          "scheduled_downgrade",
+          "payment_required_upgrade"
+        ],
+        "type": "string"
+      },
       "PresignedHeaderResponse": {
         "properties": {
           "name": {
@@ -4096,6 +4174,23 @@
           "url",
           "headers",
           "expires_at"
+        ],
+        "type": "object"
+      },
+      "PreviewSubscriptionChangeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "plan_code": {
+            "description": "Self-service target paid plan code. Enterprise is negotiated and remains a contact flow.",
+            "enum": [
+              "builder",
+              "scale"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_code"
         ],
         "type": "object"
       },
@@ -4975,6 +5070,191 @@
         ],
         "type": "object"
       },
+      "SubscriptionChangeCancellationResult": {
+        "properties": {
+          "canceled": {
+            "description": "True when a RustGrid-managed scheduled downgrade or pending-payment upgrade was canceled.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "canceled"
+        ],
+        "type": "object"
+      },
+      "SubscriptionChangeDirection": {
+        "description": "Whether the target is above or below the current plan's stable sort order.",
+        "enum": [
+          "upgrade",
+          "downgrade"
+        ],
+        "type": "string"
+      },
+      "SubscriptionChangePreview": {
+        "properties": {
+          "amount_due": {
+            "description": "Invoice amount due in integer minor currency units.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "currency": {
+            "description": "Lowercase ISO 4217 currency code.",
+            "pattern": "^[a-z]{3}$",
+            "type": "string"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/SubscriptionChangeDirection"
+          },
+          "effective_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "plan_code": {
+            "description": "Self-service target paid plan code.",
+            "enum": [
+              "builder",
+              "scale"
+            ],
+            "type": "string"
+          },
+          "preview_token": {
+            "description": "Tamper-evident short-lived upgrade quote token, or null for a downgrade.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proration_amount": {
+            "description": "Net proration in integer minor currency units; it may be negative.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "proration_date": {
+            "description": "Unix timestamp fixed into an upgrade quote, or null for a downgrade.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "recurring_amount": {
+            "description": "Base renewal total for the retained subscription quantity in integer minor units, before taxes and discounts.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "recurring_currency": {
+            "description": "Lowercase ISO 4217 currency code for the base renewal total.",
+            "pattern": "^[a-z]{3}$",
+            "type": "string"
+          },
+          "recurring_interval": {
+            "description": "Stripe billing interval for the target recurring price.",
+            "enum": [
+              "day",
+              "week",
+              "month",
+              "year"
+            ],
+            "type": "string"
+          },
+          "recurring_interval_count": {
+            "description": "Number of recurring intervals between renewals.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "plan_code",
+          "direction",
+          "effective_at",
+          "proration_date",
+          "preview_token",
+          "amount_due",
+          "proration_amount",
+          "currency",
+          "recurring_amount",
+          "recurring_currency",
+          "recurring_interval",
+          "recurring_interval_count"
+        ],
+        "type": "object"
+      },
+      "SubscriptionChangeResult": {
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/SubscriptionChangeDirection"
+          },
+          "effective_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "payment_client_secret": {
+            "description": "Short-lived Payment Element client secret when status is `requires_payment`; otherwise null.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_code": {
+            "description": "Self-service target paid plan code.",
+            "enum": [
+              "builder",
+              "scale"
+            ],
+            "type": "string"
+          },
+          "publishable_key": {
+            "description": "Stripe publishable key when status is `requires_payment`; otherwise null.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/SubscriptionChangeStatus"
+          }
+        },
+        "required": [
+          "plan_code",
+          "direction",
+          "status",
+          "effective_at",
+          "payment_client_secret",
+          "publishable_key"
+        ],
+        "type": "object"
+      },
+      "SubscriptionChangeStatus": {
+        "description": "Outcome of applying a subscription plan change.",
+        "enum": [
+          "applied",
+          "scheduled",
+          "requires_payment"
+        ],
+        "type": "string"
+      },
+      "SubscriptionLifecycleResult": {
+        "properties": {
+          "cancel_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cancel_at_period_end": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancel_at_period_end",
+          "cancel_at"
+        ],
+        "type": "object"
+      },
       "TenantBillingAccount": {
         "properties": {
           "billing_email": {
@@ -5193,6 +5473,18 @@
       },
       "TenantPlanAssignment": {
         "properties": {
+          "cancel_at": {
+            "description": "Scheduled Stripe cancellation time, when present.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cancel_at_period_end": {
+            "description": "Whether Stripe will cancel the subscription at the current period end.",
+            "type": "boolean"
+          },
           "current_period_end": {
             "format": "date-time",
             "type": [
@@ -5202,6 +5494,32 @@
           },
           "current_period_start": {
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_change_at": {
+            "description": "When the pending change is scheduled to take effect or its payment window expires, when Stripe provides a timestamp.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_change_type": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingChangeType"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Discriminator for the unresolved plan change, or null when no plan change is pending."
+          },
+          "pending_plan_code": {
+            "description": "Target plan for a scheduled downgrade or payment-required upgrade.",
             "type": [
               "string",
               "null"
@@ -5237,7 +5555,15 @@
           "tenant_id",
           "plan_code",
           "source",
-          "status"
+          "stripe_subscription_id",
+          "status",
+          "current_period_start",
+          "current_period_end",
+          "cancel_at_period_end",
+          "cancel_at",
+          "pending_plan_code",
+          "pending_change_type",
+          "pending_change_at"
         ],
         "type": "object"
       },
@@ -16499,7 +16825,7 @@
     },
     "/api/v1/billing/checkout": {
       "post": {
-        "description": "Create Stripe checkout session",
+        "description": "Starts the tenant's first self-service paid subscription. RustGrid creates a flexible-billing Stripe Checkout Session in `subscription` mode with `ui_mode=embedded`, `redirect_on_completion=never`, and payment methods restricted to card and Link. Mount the session inside AgentOps with the returned client secret and publishable key; do not navigate to Stripe or persist either value. Requires billing update permission and an `Idempotency-Key`.",
         "operationId": "billing_checkout",
         "parameters": [
           {
@@ -16514,10 +16840,10 @@
             }
           },
           {
-            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
             "in": "header",
             "name": "Idempotency-Key",
-            "required": false,
+            "required": true,
             "schema": {
               "maxLength": 255,
               "minLength": 1,
@@ -16544,8 +16870,38 @@
                 }
               }
             },
-            "description": "OK",
+            "description": "Embedded Checkout session configuration",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16564,6 +16920,12 @@
             },
             "description": "Unauthorized",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16582,6 +16944,36 @@
             },
             "description": "Forbidden",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16600,6 +16992,12 @@
             },
             "description": "Too many requests",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "retry-after": {
                 "description": "Seconds until retry is recommended.",
                 "schema": {
@@ -16635,6 +17033,30 @@
                 }
               }
             }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -16642,7 +17064,244 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Create Stripe checkout session",
+        "summary": "Create embedded Stripe Checkout session",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/checkout/cancel": {
+      "post": {
+        "description": "Discards the tenant's active embedded Checkout without trusting a browser-supplied Stripe identifier. RustGrid resolves or recovers the reserved session, expires it only while open, and clears only that exact reservation after Stripe confirms it is expired. A successful response returns `canceled=true` and means no active Checkout reservation remains. If Checkout already completed, RustGrid reconciles the subscription and returns a conflict so the caller refreshes billing. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_checkout_cancel",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckoutSessionCancellationResult"
+                }
+              }
+            },
+            "description": "Checkout reservation is no longer active",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Discard active embedded Checkout",
         "tags": [
           "billing"
         ]
@@ -16650,7 +17309,7 @@
     },
     "/api/v1/billing/current": {
       "get": {
-        "description": "Get current tenant billing state",
+        "description": "Returns the tenant billing account, current plan and usage, subscription lifecycle state, and any unresolved plan change. `pending_change_type` distinguishes a scheduled downgrade from an upgrade awaiting payment. Treat webhooks as authoritative and refresh this resource after an embedded Stripe flow. Requires billing read permission.",
         "operationId": "billing_current",
         "parameters": [
           {
@@ -16676,6 +17335,12 @@
             },
             "description": "OK",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16694,6 +17359,12 @@
             },
             "description": "Unauthorized",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16712,6 +17383,12 @@
             },
             "description": "Forbidden",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16730,6 +17407,12 @@
             },
             "description": "Too many requests",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "retry-after": {
                 "description": "Seconds until retry is recommended.",
                 "schema": {
@@ -16780,7 +17463,7 @@
     },
     "/api/v1/billing/plans": {
       "get": {
-        "description": "List billing plans",
+        "description": "Returns public billing plans in stable `sort_order`, including their default entitlements and configured Stripe price mapping. Requires billing read permission.",
         "operationId": "billing_list_plans",
         "parameters": [
           {
@@ -16806,6 +17489,12 @@
             },
             "description": "OK",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16824,6 +17513,12 @@
             },
             "description": "Unauthorized",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16842,6 +17537,12 @@
             },
             "description": "Forbidden",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16860,6 +17561,12 @@
             },
             "description": "Too many requests",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "retry-after": {
                 "description": "Seconds until retry is recommended.",
                 "schema": {
@@ -16908,10 +17615,10 @@
         ]
       }
     },
-    "/api/v1/billing/portal": {
+    "/api/v1/billing/subscription/cancel": {
       "post": {
-        "description": "Create Stripe billing portal session",
-        "operationId": "billing_portal",
+        "description": "Sets the Stripe subscription to cancel at the current period end. A visible pending upgrade or downgrade must first be completed or canceled; RustGrid only aborts a hidden, recoverable downgrade operation that cannot be exposed to the caller. Access continues through `cancel_at`; call the resume endpoint before then to reverse the cancellation. RustGrid re-retrieves Stripe state before confirming the requested lifecycle state. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_subscription_cancel",
         "parameters": [
           {
             "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
@@ -16925,10 +17632,10 @@
             }
           },
           {
-            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
             "in": "header",
             "name": "Idempotency-Key",
-            "required": false,
+            "required": true,
             "schema": {
               "maxLength": 255,
               "minLength": 1,
@@ -16941,12 +17648,42 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BillingPortalSession"
+                  "$ref": "#/components/schemas/SubscriptionLifecycleResult"
                 }
               }
             },
-            "description": "OK",
+            "description": "Subscription cancellation state",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16965,6 +17702,12 @@
             },
             "description": "Unauthorized",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -16983,6 +17726,36 @@
             },
             "description": "Forbidden",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
                 "schema": {
@@ -17001,6 +17774,12 @@
             },
             "description": "Too many requests",
             "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
               "retry-after": {
                 "description": "Seconds until retry is recommended.",
                 "schema": {
@@ -17036,6 +17815,30 @@
                 }
               }
             }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -17043,7 +17846,1201 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Create Stripe billing portal session",
+        "summary": "Schedule subscription cancellation",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/subscription/change": {
+      "post": {
+        "description": "Applies an upgrade immediately with invoiced proration or schedules a downgrade for the current period end without proration. Upgrades require the fresh `preview_token` returned by the preview endpoint. A `requires_payment` result supplies Payment Element configuration so customer action remains inside AgentOps. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_subscription_change",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeSubscriptionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionChangeResult"
+                }
+              }
+            },
+            "description": "Applied, scheduled, or payment-required plan change",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Apply or schedule subscription plan change",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/subscription/change/cancel": {
+      "post": {
+        "description": "Cancels the current RustGrid-managed pending plan change without canceling the subscription. For a scheduled downgrade, RustGrid releases its Stripe subscription schedule. For a pending-payment upgrade, RustGrid voids the verified upgrade invoice so Stripe rolls back the pending update. RustGrid re-retrieves and reconciles Stripe state before responding: it returns `canceled=true` when the managed change is gone and the original plan remains, `canceled=false` when no managed change existed, or a conflict when the target plan already took effect. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_subscription_change_cancel",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionChangeCancellationResult"
+                }
+              }
+            },
+            "description": "Scheduled-change cancellation result",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Cancel scheduled subscription change",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/subscription/change/preview": {
+      "post": {
+        "description": "Returns the authoritative direction, effective time, prorated impact, and target recurring terms for changing the existing Stripe subscription. Upgrade previews include a short-lived quote token that is required when applying the change; downgrade previews take effect at the current period end. Amounts use integer minor currency units, and recurring amounts are base renewal totals before taxes and discounts. Requires billing update permission.",
+        "operationId": "billing_subscription_change_preview",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewSubscriptionChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionChangePreview"
+                }
+              }
+            },
+            "description": "Subscription change preview",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Preview subscription plan change",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/subscription/payment": {
+      "post": {
+        "description": "Reconciles the latest Stripe subscription state, updates the actual open payable invoice to card and Link, verifies those methods, and returns its Payment Element configuration when customer action is still required. Complete payment inside AgentOps, then refresh current billing state; never log or persist the client secret. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_subscription_payment",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BillingPaymentSession"
+                }
+              }
+            },
+            "description": "In-app invoice payment configuration",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Create in-app invoice payment session",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/api/v1/billing/subscription/resume": {
+      "post": {
+        "description": "Clears a pending period-end cancellation on the existing Stripe subscription. Requires billing update permission and an `Idempotency-Key`.",
+        "operationId": "billing_subscription_resume",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required retry key for this logical billing mutation. Reuse the same key only when retrying the same operation; use a new key for a new operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionLifecycleResult"
+                }
+              }
+            },
+            "description": "Resumed subscription lifecycle state",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid billing request",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Billing lifecycle or quote conflict",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Stripe request failed or returned an invalid response",
+            "headers": {
+              "Cache-Control": {
+                "description": "Billing responses are private and must not be cached. The value is `no-store, private, max-age=0`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resume scheduled subscription",
         "tags": [
           "billing"
         ]
