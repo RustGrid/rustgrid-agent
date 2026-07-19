@@ -122,14 +122,16 @@ jobs:
           ARCHIVE: ${{ steps.package.outputs.archive }}
           CHECKSUM_FILE: ${{ steps.package.outputs.checksum_file }}
           SBOM: target/package/rustgrid-agent.spdx.json
+          RELEASE_NOTES: docs/releases/${{ github.ref_name }}.md
         run: |
+          test -f "${RELEASE_NOTES}"
           gh release create "${GITHUB_REF_NAME}" \
             "${ARCHIVE}" \
             "${CHECKSUM_FILE}#SHA-256 checksum" \
             "${SBOM}#SPDX JSON SBOM" \
             "target/package/rustgrid-agent.rb#Homebrew formula" \
             --verify-tag \
-            --generate-notes \
+            --notes-file "${RELEASE_NOTES}" \
             --title "rustgrid-agent ${GITHUB_REF_NAME}"
 
   binaries:
@@ -235,7 +237,7 @@ jobs:
           git push origin HEAD:main
 
   container:
-    name: Build and publish production container
+    name: Build and publish release container
     needs: release
     runs-on: ubuntu-latest
     environment: production-release

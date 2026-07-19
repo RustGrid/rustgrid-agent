@@ -1,9 +1,9 @@
 # Release checklist
 
-## Source and governance
+## Before artifact publication
 
 - [ ] Version and `CHANGELOG.md` are updated.
-- [ ] CI, dependency policy, secret scan, and container scan pass.
+- [ ] CI, dependency policy, secret scan, and container build pass.
 - [ ] The `production-release` environment accepts only `v*` tags, requires an
       independent reviewer, disables self-approval and admin bypass, and contains
       the reviewed release variables.
@@ -13,14 +13,14 @@
 - [ ] Security and compatibility impacts are documented.
 - [ ] Release notes include known limitations and rollback instructions.
 
-## Artifact verification
+## After artifact publication
 
 - [ ] Source package and release binaries install and report the tagged version.
 - [ ] Checksums, SPDX SBOM, signatures/attestations, and Homebrew formula are attached.
 - [ ] Container image is pinned by digest, scanned, signed/attested, and runs as non-root.
 - [ ] The formula passes audit, source install, and test in the public tap.
 
-## Production certification
+## Before production deployment
 
 - [ ] `docs/staging-certification.md` is completed against the exact image digest.
 - [ ] Evidence includes run IDs, PR URLs, ordered events, sanitized logs, and resource-limit results.
@@ -29,4 +29,7 @@
 - [ ] Rollback to the previous image has been exercised.
 - [ ] An operator and security reviewer approve promotion.
 
-The GitHub release workflow packages artifacts, but a maintainer must use a protected release environment and confirm this checklist before approving the release job.
+The protected GitHub workflow publishes immutable artifacts but does not deploy
+a worker. A maintainer may approve artifact publication after the first section
+is complete. The production section is evaluated later against the published
+image digest and must be complete before that image is deployed.

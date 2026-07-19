@@ -1,8 +1,14 @@
 # Changelog
 
-All notable changes to rustgrid-agent are documented here. The project follows Semantic Versioning once `1.0.0` is released.
+All notable changes to rustgrid-agent are documented here. The project follows
+Semantic Versioning.
 
 ## Unreleased
+
+## 1.0.0 - 2026-07-19
+
+Initial stable public artifact release. Production deployment remains subject
+to the separate staging certification and approval process.
 
 ### Added
 
@@ -20,7 +26,3 @@ All notable changes to rustgrid-agent are documented here. The project follows S
 - Homebrew publication downloads the generated formula from the tagged source
   repository explicitly, even though the workflow checks out the tap in a
   nested directory.
-
-## 1.0.0 - Unreleased
-
-Initial public release candidate. A release date is added only after credentialed staging certification succeeds.

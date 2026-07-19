@@ -130,9 +130,9 @@ Complete artifact bundles require an artifact-upload endpoint in the RustGrid
 worker API. Central OTLP export requires a deployment-selected collector and
 credentials. Continuous disk, CPU, memory, and network enforcement belongs to
 the host or container runtime; the worker performs bounded capture, policy
-validation, and before/after workspace checks. A release candidate is not
-production-approved until it completes a credentialed staging ticket against a
-real RustGrid project and GitHub App installation.
+validation, and before/after workspace checks. A published release is not
+production-approved until it completes credentialed staging against a real
+RustGrid project and GitHub App installation.
 
 ## Health and alerts
 
