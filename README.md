@@ -14,9 +14,10 @@ web application. Running it requires a compatible RustGrid instance and a
 project connected to GitHub through the RustGrid GitHub App.
 
 > [!IMPORTANT]
-> `1.0.0` is currently a release candidate. There is no public GitHub release or
-> RustGrid Homebrew tap yet. Until the first tagged release is published, install
-> from source. Production promotion also requires the credentialed checks in
+> `1.0.0` is currently a release candidate. The public RustGrid Homebrew tap is
+> provisioned, but it does not contain a formula until the first tagged release
+> is published. Until then, install from source. Production promotion also
+> requires the credentialed checks in
 > [staging certification](docs/staging-certification.md).
 
 ## What it does
@@ -89,24 +90,25 @@ or add that directory to `PATH` if `rustgrid-agent` is not found.
 
 ### Tagged releases
 
-The release workflow will publish checksummed and attested source, macOS, and
+The release workflow publishes checksummed and attested source, macOS, and
 Linux artifacts for every stable tag. Verify the matching `.sha256` file and
-GitHub artifact attestation before installing a native binary. No release is
-published yet; the exact artifact names and release controls are documented in
-[the release workflow](.github/workflows/release.yml) and
+GitHub artifact attestation before installing a native binary. No stable release
+is published yet; the exact artifact names and release controls are documented
+in [the release workflow](.github/workflows/release.yml) and
 [release checklist](docs/release-checklist.md).
 
 ### Homebrew
 
-The planned public tap command is:
+The public tap command is:
 
 ```sh
 brew install RustGrid/tap/rustgrid-agent
 ```
 
-Do not use that command until `RustGrid/homebrew-tap` and the first tagged
-release exist. The unqualified `brew install rustgrid-agent` command will only
-be documented if a formula is later accepted into Homebrew/core.
+The formula becomes available when the first tagged release completes. Until
+then, the command exits because the tap has no `rustgrid-agent` formula. The
+unqualified `brew install rustgrid-agent` command will only be documented if a
+formula is later accepted into Homebrew/core.
 
 ## Production quick start
 

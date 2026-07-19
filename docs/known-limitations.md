@@ -8,4 +8,6 @@
 - Cross-attempt reuse requires the RustGrid retry creator to copy the failed run ID into `metadata.resume_from_run_id`; the worker deliberately does not infer lineage from ticket history.
 - Network access is required by the current Codex policy. The worker verifies that a Docker policy exists; exact destination rules remain an operator or organization-governance responsibility.
 - Windows is not currently supported or tested.
-- Homebrew/core inclusion depends on third-party review. The planned RustGrid tap is not available until the first tagged release and public tap repository are published.
+- Homebrew/core inclusion depends on third-party review. The public RustGrid tap
+  exists, but its `rustgrid-agent` formula is not available until the first
+  tagged release completes.
