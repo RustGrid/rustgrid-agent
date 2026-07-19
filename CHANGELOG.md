@@ -15,6 +15,12 @@ All notable changes to rustgrid-agent are documented here. The project follows S
 - Sandbox identities are collision-resistant and journaled; startup removes managed orphans, active execution enforces workspace quotas, and allowlisted secrets use short-lived mode-0600 env files rather than process arguments.
 - Server-provided execution policy cannot override worker-enforced Codex sandbox or approval settings.
 
+### Fixed
+
+- Homebrew publication downloads the generated formula from the tagged source
+  repository explicitly, even though the workflow checks out the tap in a
+  nested directory.
+
 ## 1.0.0 - Unreleased
 
 Initial public release candidate. A release date is added only after credentialed staging certification succeeds.

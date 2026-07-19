@@ -208,7 +208,11 @@ jobs:
       - name: Download generated formula
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "${GITHUB_REF_NAME}" --pattern rustgrid-agent.rb --dir /tmp
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern rustgrid-agent.rb \
+            --dir /tmp
 
       - name: Validate formula
         run: ruby -c /tmp/rustgrid-agent.rb

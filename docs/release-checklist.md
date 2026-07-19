@@ -4,6 +4,11 @@
 
 - [ ] Version and `CHANGELOG.md` are updated.
 - [ ] CI, dependency policy, secret scan, and container scan pass.
+- [ ] The `production-release` environment accepts only `v*` tags, requires an
+      independent reviewer, disables self-approval and admin bypass, and contains
+      the reviewed release variables.
+- [ ] `HOMEBREW_TAP_TOKEN` is a fine-grained token limited to
+      `RustGrid/homebrew-tap` with Contents read/write access.
 - [ ] Sandbox template is pinned by verified digest and effective network policy is reviewed.
 - [ ] Security and compatibility impacts are documented.
 - [ ] Release notes include known limitations and rollback instructions.
