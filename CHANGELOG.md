@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.1.0 - 2026-07-19
+
 ### Added
 
 - Add `rustgrid-agent setup`, which detects host CPU and memory, recommends a
