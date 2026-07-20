@@ -11,9 +11,28 @@ use rustgrid_agent::{
     api::RustGridClient,
     config::{AppContext, Config, RepoConfig},
     lifecycle::{LifecycleEvent, RunPhase},
+    telemetry::{
+        ExecutionSnapshot, ExecutionStatus, TelemetryBatch, TelemetryEvent, TelemetryPayload,
+    },
     token_consumption::TokenConsumption,
 };
 use serde_json::json;
+use uuid::Uuid;
+
+#[test]
+fn model_call_usage_contract_exposes_sanitized_component_metadata() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../openapi.current.json")).expect("valid OpenAPI JSON");
+    let schema = &spec["components"]["schemas"]["ModelCallUsageResponse"];
+    assert!(schema["properties"]["provider_usage_payload"].is_object());
+    assert!(
+        schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "provider_usage_payload")
+    );
+}
 
 fn context(base_url: String) -> AppContext {
     AppContext {
@@ -254,6 +273,44 @@ fn reports_final_run_token_consumption() {
         header_value(&request, "idempotency-key"),
         Some("token-consumption-run-1")
     );
+}
+
+#[test]
+fn reports_detailed_run_telemetry_to_the_ingestion_endpoint() {
+    let Some((url, request)) = server(json!({
+        "accepted": 1, "duplicates": 0, "stale": 0, "latest_sequence": 1
+    })) else {
+        return;
+    };
+    let execution_id = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+    let batch = TelemetryBatch::new(vec![TelemetryEvent {
+        event_id: Uuid::parse_str("00000000-0000-4000-8000-000000000011").unwrap(),
+        entity_revision: 1,
+        occurred_at: "2026-07-20T12:00:00.000Z".into(),
+        event_type: "execution.started".into(),
+        payload: TelemetryPayload::Execution {
+            execution: ExecutionSnapshot {
+                id: execution_id,
+                agent_id: None,
+                agent_name: Some("Codex".into()),
+                role: Some("implementation".into()),
+                started_at: "2026-07-20T12:00:00.000Z".into(),
+                completed_at: None,
+                status: ExecutionStatus::Running,
+            },
+        },
+    }]);
+    RustGridClient::new(&context(url))
+        .unwrap()
+        .report_telemetry_batch("run-1", &batch)
+        .unwrap();
+
+    let request = request.recv().unwrap();
+    assert!(request.starts_with("POST /agent-runs/run-1/telemetry/batch HTTP/1.1"));
+    assert!(request.contains("\"telemetry_version\":\"1.0\""));
+    assert!(request.contains("\"type\":\"execution.started\""));
+    assert!(request.contains("\"execution\":"));
+    assert!(header_value(&request, "idempotency-key").is_some());
 }
 
 #[test]

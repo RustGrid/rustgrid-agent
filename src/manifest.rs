@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::config::RepoConfig;
+use crate::mission::MissionClass;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExecutionManifest {
@@ -356,6 +357,7 @@ impl ExecutionPolicy {
         &self,
         externally_isolated: bool,
         image_paths: &[std::path::PathBuf],
+        mission_class: MissionClass,
     ) -> Vec<String> {
         let mut command = self.codex.command.clone();
         let insertion = command
@@ -397,6 +399,50 @@ impl ExecutionPolicy {
             .unwrap_or(command.len());
         if !command.iter().any(|part| part == "--ephemeral") {
             command.insert(insertion, "--ephemeral".into());
+        }
+        let insertion = command
+            .iter()
+            .position(|part| part == "-")
+            .unwrap_or(command.len());
+        if !command.iter().any(|part| part == "--ignore-user-config") {
+            command.insert(insertion, "--ignore-user-config".into());
+        }
+        for override_value in [
+            format!(
+                "tool_output_token_limit={}",
+                mission_class.tool_output_token_limit()
+            ),
+            format!(
+                "model_auto_compact_token_limit={}",
+                mission_class.budget().max_input_tokens
+            ),
+            format!(
+                "project_doc_max_bytes={}",
+                mission_class.project_doc_max_bytes()
+            ),
+        ] {
+            let insertion = command
+                .iter()
+                .position(|part| part == "-")
+                .unwrap_or(command.len());
+            command.splice(insertion..insertion, ["-c".into(), override_value]);
+        }
+        for feature in [
+            "apps",
+            "browser_use",
+            "computer_use",
+            "goals",
+            "image_generation",
+            "memories",
+            "multi_agent",
+            "plugins",
+            "tool_suggest",
+        ] {
+            let insertion = command
+                .iter()
+                .position(|part| part == "-")
+                .unwrap_or(command.len());
+            command.splice(insertion..insertion, ["--disable".into(), feature.into()]);
         }
         command
     }
@@ -535,18 +581,26 @@ mod tests {
     #[test]
     fn hardens_the_codex_command() {
         let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
-        let args = policy.codex_args(false, &[]);
+        let args = policy.codex_args(false, &[], MissionClass::SingleFile);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--sandbox", "workspace-write"])
         );
         assert!(args.iter().any(|arg| arg.contains("approval_policy")));
         assert!(args.iter().any(|arg| arg == "--ephemeral"));
+        assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(args.iter().any(|arg| arg == "tool_output_token_limit=4000"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "model_auto_compact_token_limit=25000")
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--disable", "plugins"]));
         let image_args = policy.codex_args(
             false,
             &[std::path::PathBuf::from(
                 ".git/rustgrid-agent/context/attachments/screenshot.png",
             )],
+            MissionClass::SingleFile,
         );
         assert!(image_args.windows(2).any(|pair| {
             pair == [
@@ -556,7 +610,7 @@ mod tests {
         }));
         assert!(
             policy
-                .codex_args(true, &[])
+                .codex_args(true, &[], MissionClass::SingleFile)
                 .windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );

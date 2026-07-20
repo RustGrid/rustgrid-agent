@@ -184,6 +184,10 @@ pub(crate) fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &st
 pub(crate) fn print_summary(summary: &RunSummary, gate: &str) {
     println!("\nRun complete\n");
     println!("  Ticket:       {}", summary.ticket_key);
+    if let Some(operation) = &summary.direct_operation_summary {
+        println!("  Operation:    {operation}");
+        return;
+    }
     println!("  Branch:       {}", summary.branch);
     println!("  Commit:       {}", summary.commit);
     println!("  Quality gate: passed ({gate})");

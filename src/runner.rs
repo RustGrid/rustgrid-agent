@@ -31,6 +31,7 @@ use crate::{
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
+    mission::{DirectOperation, MissionProfile, direct_operation},
     outcome::{RunOutcome, RunSummary},
     prompt,
     publishing::{
@@ -136,6 +137,7 @@ fn execute_claimed(
                 ticket,
                 Arc::clone(&row_version),
                 &journal_path,
+                &context.workspace_root,
                 &error,
             )?;
             return Err(error);
@@ -161,6 +163,7 @@ fn execute_claimed(
                 ticket,
                 Arc::clone(&row_version),
                 &journal_path,
+                &context.workspace_root,
                 &error,
             )?;
             return Err(error.context("could not adopt requested recovery work"));
@@ -175,6 +178,7 @@ fn execute_claimed(
         &ticket.id,
         ticket.row_version,
         journal,
+        &context.workspace_root,
     );
 
     let supervisor = RunSupervisor::start(
@@ -192,10 +196,32 @@ fn execute_claimed(
     let workspace = RefCell::new(None::<RunWorkspace>);
     let executor = Executor::from_config(&context.config.executor);
     let executor_handle = RefCell::new(None::<ExecutionHandle>);
+    let mission_profile = MissionProfile::classify(ticket, &manifest);
 
     let result = (|| {
         if manifest.ticket_key != ticket.key {
             bail!("execution manifest does not match the fetched ticket");
+        }
+        let budget = mission_profile.class.budget();
+        reporter.step(
+            "mission_classified",
+            StepStatus::Completed,
+            &format!(
+                "Classified mission as {} before repository execution",
+                mission_profile.class.as_str()
+            ),
+            Some(json!({
+                "mission_class": mission_profile.class,
+                "classification_reason": mission_profile.reason,
+                "explicit": mission_profile.explicit,
+                "max_input_tokens": budget.max_input_tokens,
+                "max_model_calls": budget.max_model_calls,
+                "max_tool_calls": budget.max_tool_calls,
+                "tool_bundles": mission_profile.class.tool_bundles()
+            })),
+        )?;
+        if let Some(operation) = direct_operation(&manifest)? {
+            return execute_direct_operation(api, run, ticket, &reporter, operation);
         }
         let tokens = GitHubTokenManager::new(
             api,
@@ -256,6 +282,27 @@ fn execute_claimed(
             &required_gates,
             &manifest.run.input_prompt,
             &staged_attachments,
+            mission_profile.class,
+        )?;
+        let estimated_prompt_tokens = generated_prompt.len().div_ceil(4) as u64;
+        reporter.step(
+            "context_composed",
+            StepStatus::Completed,
+            &format!(
+                "Composed bounded {} context (approximately {} input tokens)",
+                mission_profile.class.as_str(),
+                estimated_prompt_tokens
+            ),
+            Some(json!({
+                "mission_class": mission_profile.class,
+                "estimated_input_tokens": estimated_prompt_tokens,
+                "max_input_tokens": budget.max_input_tokens,
+                "budget_warning": estimated_prompt_tokens > budget.max_input_tokens,
+                "ambient_user_config": "disabled",
+                "history_comments_included": ticket.comments.len().min(20),
+                "repository_context": ["AGENTS.md"],
+                "loading_strategy": "progressive"
+            })),
         )?;
         reporter.set_ticket_status(TicketStatus::InProgress)?;
         reporter.set_phase(RunPhase::Preparing);
@@ -414,12 +461,63 @@ fn execute_claimed(
     Ok(summary)
 }
 
+fn execute_direct_operation(
+    api: &RustGridClient,
+    run: &AgentRun,
+    ticket: &Ticket,
+    reporter: &Reporter<'_>,
+    operation: DirectOperation,
+) -> Result<RunSummary> {
+    reporter.step(
+        "direct_operation",
+        StepStatus::Running,
+        "Executing validated RustGrid operation without Codex or repository checkout",
+        Some(json!({
+            "mission_class": "metadata",
+            "model_calls": 0,
+            "repository_checkout": false,
+            "shell_access": false
+        })),
+    )?;
+    let key = format!("direct-operation-{}", run.id);
+    let summary = match operation {
+        DirectOperation::SetStatus { status } => {
+            if status.trim().is_empty() || status.len() > 40 {
+                bail!("direct operation status is invalid");
+            }
+            api.mutate_ticket_status(&ticket.id, ticket.row_version, &status, &key)?;
+            format!("Set ticket status to {status}")
+        }
+        DirectOperation::AddComment { body } => {
+            if body.trim().is_empty() {
+                bail!("direct operation comment is empty");
+            }
+            api.create_comment(&ticket.id, &body, &key)?;
+            "Added ticket comment".into()
+        }
+    };
+    reporter.step(
+        "direct_operation",
+        StepStatus::Completed,
+        &summary,
+        Some(json!({"model_calls": 0, "tool_calls": 0})),
+    )?;
+    Ok(RunSummary {
+        ticket_key: ticket.key.clone(),
+        branch: String::new(),
+        commit: String::new(),
+        pull_request_url: String::new(),
+        direct_operation_summary: Some(summary),
+    })
+}
+
 fn report_preparation_failure(
     api: &RustGridClient,
     run: &AgentRun,
     ticket: &Ticket,
     row_version: Arc<AtomicI64>,
     journal_path: &std::path::Path,
+    workspace_root: &std::path::Path,
     error: &anyhow::Error,
 ) -> Result<()> {
     if classify(error) == RunErrorKind::LeaseLost {
@@ -433,6 +531,7 @@ fn report_preparation_failure(
         &ticket.id,
         ticket.row_version,
         journal,
+        workspace_root,
     );
     match classify(error) {
         RunErrorKind::Transient | RunErrorKind::Invariant => reporter.fail_retryable(error),
@@ -505,6 +604,7 @@ fn validate_reconciled_commit(
         manifest: context.manifest,
         executor: context.executor,
         executor_handle: context.executor_handle,
+        mission_class: MissionProfile::classify(context.ticket, context.manifest).class,
     };
     run_gates_with_repairs(
         &codex,
@@ -891,6 +991,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 manifest,
                 executor,
                 executor_handle,
+                mission_class: MissionProfile::classify(ticket, manifest).class,
             };
             let repair_prompt = format!(
                 "Required GitHub CI failed for the pull request. Inspect the current workspace and the CI evidence below, fix the underlying issue, and run relevant checks. Do not commit, push, or open a pull request; the runner owns publication. CI failures are real blockers, so do not declare success while they remain.\n\n{failure}"
@@ -997,6 +1098,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         branch,
         commit,
         pull_request_url: pr.html_url,
+        direct_operation_summary: None,
     };
     print_summary(&summary, &gate_summary);
     Ok(summary)

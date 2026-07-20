@@ -6,6 +6,15 @@ pub struct RunSummary {
     pub branch: String,
     pub commit: String,
     pub pull_request_url: String,
+    pub direct_operation_summary: Option<String>,
+}
+
+impl RunSummary {
+    pub fn output_summary(&self) -> &str {
+        self.direct_operation_summary
+            .as_deref()
+            .unwrap_or(&self.pull_request_url)
+    }
 }
 
 #[derive(Debug)]
@@ -108,6 +117,7 @@ mod tests {
                 branch: "agent/rg-1".into(),
                 commit: "abc".into(),
                 pull_request_url: "https://github.com/o/r/pull/1".into(),
+                direct_operation_summary: None,
             })
             .should_retain_sandbox()
         );

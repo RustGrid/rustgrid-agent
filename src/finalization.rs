@@ -18,7 +18,7 @@ pub(crate) fn finalize(
             }
             reporter.report_token_consumption()?;
             reporter.set_phase(RunPhase::Succeeded);
-            reporter.update_run(AgentRunStatus::Succeeded, Some(&summary.pull_request_url))?;
+            reporter.update_run(AgentRunStatus::Succeeded, Some(summary.output_summary()))?;
             Ok(summary)
         }
         RunOutcome::LeaseLost(error) => {

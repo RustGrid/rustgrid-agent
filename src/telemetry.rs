@@ -251,6 +251,7 @@ pub struct CodexInvocation {
     pub model: String,
     pub attempt_number: u32,
     pub retry_of_call_id: Option<Uuid>,
+    pub context_estimates: Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -754,6 +755,14 @@ impl CodexTelemetrySession {
         std::mem::take(&mut self.legacy_delta)
     }
 
+    pub fn model_call_count(&self) -> u32 {
+        self.next_turn_index
+    }
+
+    pub fn tool_call_count(&self) -> usize {
+        self.completed_tools.len() + self.active_tools.len()
+    }
+
     fn start_turn(&mut self, event: &Value) {
         let index = self.next_turn_index;
         self.next_turn_index = self.next_turn_index.saturating_add(1);
@@ -828,10 +837,12 @@ impl CodexTelemetrySession {
             value => value,
         };
         self.finish_open_tools(tool_outcome, &completed_at);
-        let usage = usage.unwrap_or_else(|| NormalizedUsage {
+        let mut usage = usage.unwrap_or_else(|| NormalizedUsage {
             source: Some(UsageSource::Unavailable),
             ..NormalizedUsage::default()
         });
+        let raw = usage.raw.get_or_insert_with(Map::new);
+        raw.extend(self.invocation.context_estimates.clone());
         if let (Some(input), Some(cached), Some(output)) = (
             usage.input_tokens,
             usage.cached_input_tokens,
@@ -1295,4 +1306,80 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     (year, month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_session_emits_detailed_usage_and_preserves_legacy_delta() {
+        let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let emitter = TelemetryEmitter {
+            sender,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+        };
+        let mut session = CodexTelemetrySession::start(
+            CodexInvocation {
+                run_id: "run-1".into(),
+                execution_sequence: 7,
+                phase_name: "validation_repair_2_codex".into(),
+                provider: "openai".into(),
+                model: "gpt-5.6-codex".into(),
+                attempt_number: 2,
+                retry_of_call_id: None,
+                context_estimates: Map::from_iter([
+                    ("ctx_known_est_tokens".into(), Value::from(321)),
+                    ("ctx_ambient_config_loaded".into(), Value::Bool(false)),
+                ]),
+            },
+            Some(emitter),
+        );
+        session.observe_line(r#"{"type":"turn.started"}"#);
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":125}}"#,
+        );
+        session.finish(SessionOutcome::Succeeded);
+
+        let events = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                EmitterMessage::Event { event, .. } => Some(*event),
+                EmitterMessage::Flush(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "model_call.completed")
+            .expect("completed model call telemetry");
+        let TelemetryPayload::ModelCall { model_call } = &completed.payload else {
+            panic!("model_call.completed must contain a model call payload");
+        };
+        assert_eq!(model_call.input_tokens, Some(100));
+        assert_eq!(model_call.cached_input_tokens, Some(40));
+        assert_eq!(model_call.output_tokens, Some(25));
+        assert_eq!(model_call.reasoning_tokens, Some(5));
+        assert_eq!(model_call.total_tokens, Some(125));
+        assert_eq!(
+            model_call
+                .provider_usage_payload
+                .as_ref()
+                .and_then(|payload| payload.get("ctx_known_est_tokens"))
+                .and_then(Value::as_u64),
+            Some(321)
+        );
+        assert_eq!(model_call.attempt_number, 2);
+        assert!(matches!(
+            model_call.usage_source,
+            UsageSource::ProviderReported
+        ));
+        assert_eq!(
+            session.take_legacy_delta(),
+            TokenConsumption {
+                input_tokens: 100,
+                cached_input_tokens: 40,
+                output_tokens: 25,
+            }
+        );
+    }
 }

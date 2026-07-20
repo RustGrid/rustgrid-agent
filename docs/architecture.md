@@ -2,6 +2,23 @@
 
 `rustgrid-agent` is a control-plane worker that turns a leased RustGrid run into a reviewed GitHub pull request. RustGrid remains authoritative for tenant context, manifests, execution policy, leases, and run-scoped GitHub credentials.
 
+## Mission context and budgets
+
+The worker classifies a claimed mission before repository execution. Explicit
+`run.metadata.mission_class` values take precedence; otherwise a deterministic
+objective classifier selects `metadata`, `configuration`, `single_file`,
+`multi_file`, or `repository_wide`. The selected class and reason are published
+as lifecycle telemetry with its input/model/tool budgets and logical tool
+bundles.
+
+Production Codex invocations use `--ignore-user-config` and `--ephemeral`, and
+disable ambient app, browser, computer-use, plugin, memory, multi-agent, image
+generation, goal, and tool-suggestion features. Class-specific
+`tool_output_token_limit`, `model_auto_compact_token_limit`, and
+`project_doc_max_bytes` overrides bound future context growth. Root `AGENTS.md`
+is the only eagerly injected repository guidance; source files, README content,
+and other documentation are loaded on demand.
+
 ## Components
 
 - **Coordinator:** connects to a pre-announced worker identity, consumes the durable assignment queue, reconciles runs assigned by RustGrid, and drains on shutdown.

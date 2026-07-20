@@ -584,6 +584,28 @@ impl RustGridClient {
         )
     }
 
+    pub fn mutate_ticket_status(
+        &self,
+        ticket_id: &str,
+        row_version: i64,
+        status: &str,
+        idempotency_key: &str,
+    ) -> Result<i64> {
+        let (_, etag) = self.send_value_with_etag(
+            Method::PATCH,
+            &format!("tickets/{ticket_id}"),
+            Some(json!({"status": status})),
+            Some(idempotency_key),
+            Some(&format!("\"tickets:{ticket_id}:{row_version}\"")),
+        )?;
+        parse_etag_row_version(
+            etag.as_deref()
+                .context("ticket update did not include an ETag")?,
+            "tickets",
+            ticket_id,
+        )
+    }
+
     pub fn claim_ticket(&self, ticket_id: &str, worker_id: &str, prompt: &str) -> Result<AgentRun> {
         self.send_json(
             Method::POST,

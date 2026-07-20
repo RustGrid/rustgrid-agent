@@ -5,6 +5,15 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Fixed
+
+- Connect detailed Codex execution and token telemetry to the live streaming
+  path so model-call usage reaches RustGrid instead of leaving only the legacy
+  aggregate token report.
+- Isolate production Codex runs from ambient user plugins and configuration,
+  classify mission complexity, enforce class-specific compaction limits, bound
+  eagerly loaded ticket/repository context, and emit advisory budget warnings.
+
 ## 1.2.0 - 2026-07-19
 
 ### Added

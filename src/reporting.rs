@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     io::IsTerminal,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicI64, Ordering},
@@ -15,6 +16,10 @@ use crate::{
     api::{RustGridClient, is_lease_lost},
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{AgentRunStatus, LifecycleEvent, RunPhase, StepStatus, TicketStatus},
+    mission::MissionClass,
+    telemetry::{
+        CodexInvocation, CodexTelemetrySession, TelemetryEmitter, codex_provider_and_model,
+    },
     token_consumption::TokenConsumption,
 };
 
@@ -60,6 +65,7 @@ pub(crate) struct Reporter<'a> {
     run_started: std::time::Instant,
     phase_started: RefCell<std::time::Instant>,
     token_consumption: Cell<TokenConsumption>,
+    telemetry: Option<TelemetryEmitter>,
 }
 
 impl<'a> Reporter<'a> {
@@ -70,11 +76,23 @@ impl<'a> Reporter<'a> {
         ticket_id: &'a str,
         ticket_row_version: i64,
         journal: RunJournal,
+        workspace_root: &Path,
     ) -> Self {
         let progress_sequence = journal.progress_sequence;
         let sequence = journal.last_sequence;
         let phase = journal.phase;
         let token_consumption = journal.token_consumption;
+        let telemetry = TelemetryEmitter::start(
+            api.clone(),
+            workspace_root.join(".telemetry-outbox"),
+        )
+        .map_err(|error| {
+            eprintln!(
+                "[warning] could not start detailed telemetry delivery; the legacy token aggregate remains available: {error:#}"
+            );
+            error
+        })
+        .ok();
         Self {
             api,
             run_id,
@@ -88,6 +106,66 @@ impl<'a> Reporter<'a> {
             run_started: std::time::Instant::now(),
             phase_started: RefCell::new(std::time::Instant::now()),
             token_consumption: Cell::new(token_consumption),
+            telemetry,
+        }
+    }
+
+    pub(crate) fn start_codex_telemetry(
+        &self,
+        args: &[String],
+        prompt: &str,
+        mission_class: MissionClass,
+        phase_name: &str,
+        attempt_number: u32,
+        retry_of_call_id: Option<uuid::Uuid>,
+    ) -> CodexTelemetrySession {
+        let (provider, model) = codex_provider_and_model(args);
+        let context_estimates = serde_json::Map::from_iter([
+            (
+                "ctx_known_est_tokens".into(),
+                json!(prompt.len().div_ceil(4)),
+            ),
+            (
+                "ctx_tool_policy_est_tokens".into(),
+                json!(serde_json::to_vec(args).map_or(0, |bytes| bytes.len().div_ceil(4))),
+            ),
+            (
+                "ctx_budget_tokens".into(),
+                json!(mission_class.budget().max_input_tokens),
+            ),
+            ("ctx_ambient_config_loaded".into(), json!(false)),
+        ]);
+        CodexTelemetrySession::start(
+            CodexInvocation {
+                run_id: self.run_id.to_owned(),
+                execution_sequence: self.sequence.get(),
+                phase_name: phase_name.to_owned(),
+                provider,
+                model,
+                attempt_number,
+                retry_of_call_id,
+                context_estimates,
+            },
+            self.telemetry.clone(),
+        )
+    }
+
+    pub(crate) fn record_token_consumption_delta(&self, delta: TokenConsumption) -> Result<()> {
+        let mut consumption = self.token_consumption.get();
+        consumption.add_counts(
+            delta.input_tokens,
+            delta.cached_input_tokens,
+            delta.output_tokens,
+        )?;
+        self.token_consumption.set(consumption);
+        self.journal
+            .borrow_mut()
+            .record_token_consumption(consumption)
+    }
+
+    pub(crate) fn flush_telemetry(&self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.flush_best_effort(std::time::Duration::from_secs(2));
         }
     }
 
@@ -204,17 +282,6 @@ impl<'a> Reporter<'a> {
 
     pub(crate) fn record_error(&self, message: &str) -> Result<()> {
         self.journal.borrow_mut().record_error(message)
-    }
-
-    pub(crate) fn observe_token_consumption(&self, line: &str) -> Result<()> {
-        let mut consumption = self.token_consumption.get();
-        if consumption.observe_codex_jsonl(line)? {
-            self.token_consumption.set(consumption);
-            self.journal
-                .borrow_mut()
-                .record_token_consumption(consumption)?;
-        }
-        Ok(())
     }
 
     pub(crate) fn report_token_consumption(&self) -> Result<()> {

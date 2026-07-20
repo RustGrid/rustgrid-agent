@@ -437,6 +437,22 @@ turn. At terminal finalization the worker idempotently writes `input_tokens`,
 `cached_input_tokens`, `output_tokens`, and `total_tokens` to
 `PUT /agent-runs/{run_id}/token-consumption`. Cached input is a subset of input,
 and total consumption is input plus output. Successful runs require this report;
+
+Before repository execution, the worker deterministically classifies each
+mission as `metadata`, `configuration`, `single_file`, `multi_file`, or
+`repository_wide`. The class selects advisory input/model/tool budgets and
+bounded Codex context settings. Codex always runs ephemerally with ambient user
+configuration disabled; personal plugins, MCP servers, skills, browser tools,
+and unrelated global instructions are therefore not inherited by production
+missions. Tool output retention, automatic history compaction, and root
+instruction size are class-bounded. Budget overruns emit lifecycle diagnostics
+before any future hard enforcement.
+
+Initial repository context is deliberately small: the mission objective,
+bounded ticket context, repository identity, and root `AGENTS.md`. The worker no
+longer injects the repository README as instructions, replays at most the latest
+20 comments and 10 failed gates, and directs Codex to retrieve source and docs
+on demand.
 unsuccessful runs attempt it before terminal failure handling.
 
 Human-readable lifecycle logs are the default. Use `RUSTGRID_AGENT_LOG=json`

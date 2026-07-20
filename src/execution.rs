@@ -14,8 +14,10 @@ use crate::{
     git::Repo,
     lifecycle::{RunPhase, StepStatus},
     manifest::ExecutionManifest,
+    mission::{MissionClass, MissionProfile},
     reporting::Reporter,
     run_error::RunFailure,
+    telemetry::SessionOutcome,
 };
 
 const CODEX_IDLE_ATTEMPTS: u32 = 3;
@@ -61,6 +63,7 @@ pub(crate) struct CodexContext<'a> {
     pub manifest: &'a ExecutionManifest,
     pub executor: &'a Executor,
     pub executor_handle: &'a ExecutionHandle,
+    pub mission_class: MissionClass,
 }
 
 #[derive(Debug)]
@@ -111,6 +114,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor,
         executor_handle,
     } = implementation;
+    let mission_class = MissionProfile::classify(ticket, manifest).class;
     reporter.step(
         "prompt_built",
         StepStatus::Completed,
@@ -125,6 +129,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         manifest,
         executor,
         executor_handle,
+        mission_class,
     };
     run_codex_prompt(
         &codex_context,
@@ -322,9 +327,18 @@ pub(crate) fn run_codex_prompt(
         })),
     )?;
     let blocked_action = RefCell::new(None);
-    let codex_args = policy.codex_args(externally_isolated, image_paths);
+    let codex_args = policy.codex_args(externally_isolated, image_paths, context.mission_class);
     let mut codex_attempt = 1u32;
+    let mut retry_of_call_id = None;
     let codex_status = loop {
+        let telemetry = RefCell::new(context.reporter.start_codex_telemetry(
+            &codex_args,
+            prompt,
+            context.mission_class,
+            step_id,
+            codex_attempt,
+            retry_of_call_id,
+        ));
         let result = context.executor.streaming(
             context.executor_handle,
             RunCommand {
@@ -344,7 +358,7 @@ pub(crate) fn run_codex_prompt(
                 max_workspace_bytes: context.app.config.max_workspace_bytes,
             },
             |line| {
-                context.reporter.observe_token_consumption(line)?;
+                telemetry.borrow_mut().observe_line(line);
                 if let Some(message) = feedback_from_output_line(line) {
                     if let Some(action) = blocked_action_from_feedback(&message) {
                         blocked_action.replace(Some(action));
@@ -354,6 +368,46 @@ pub(crate) fn run_codex_prompt(
                 Ok(())
             },
         );
+        let outcome = match &result {
+            Ok(status) if status.success() => SessionOutcome::Succeeded,
+            Ok(_) => SessionOutcome::Failed,
+            Err(error) if command::is_timeout(error) || command::is_idle_timeout(error) => {
+                SessionOutcome::Timeout
+            }
+            Err(_) => SessionOutcome::Failed,
+        };
+        let mut telemetry = telemetry.into_inner();
+        telemetry.finish(outcome);
+        retry_of_call_id = telemetry.last_model_call_id();
+        let model_calls = telemetry.model_call_count();
+        let tool_calls = telemetry.tool_call_count();
+        let delta = telemetry.take_legacy_delta();
+        context.reporter.record_token_consumption_delta(delta)?;
+        let budget = context.mission_class.budget();
+        if delta.input_tokens > budget.max_input_tokens
+            || model_calls > budget.max_model_calls
+            || tool_calls > budget.max_tool_calls as usize
+        {
+            context.reporter.step(
+                &format!("{step_id}_budget_warning_{codex_attempt}"),
+                StepStatus::Running,
+                &format!(
+                    "{} mission exceeded its advisory execution budget; future calls require compaction or explicit escalation",
+                    context.mission_class.as_str()
+                ),
+                Some(json!({
+                    "mission_class": context.mission_class,
+                    "input_tokens": delta.input_tokens,
+                    "max_input_tokens": budget.max_input_tokens,
+                    "model_calls": model_calls,
+                    "max_model_calls": budget.max_model_calls,
+                    "tool_calls": tool_calls,
+                    "max_tool_calls": budget.max_tool_calls,
+                    "enforcement": "warning"
+                })),
+            )?;
+        }
+        context.reporter.flush_telemetry();
         match result {
             Ok(status) => break status,
             Err(error)
