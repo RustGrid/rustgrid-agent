@@ -427,6 +427,27 @@ impl ExecutionPolicy {
                 .unwrap_or(command.len());
             command.splice(insertion..insertion, ["-c".into(), override_value]);
         }
+        if externally_isolated {
+            // Docker Sandboxes inject the host-held ChatGPT OAuth credential through
+            // an HTTPS proxy. Codex's WebSocket transport is not reliable through
+            // that interception layer, while api.openai.com requires API-key scopes
+            // that the OAuth credential intentionally does not have. Force the
+            // OAuth-compatible HTTPS/SSE endpoint for Docker-isolated worker runs.
+            for override_value in [
+                "model_provider=\"rustgrid_chatgpt_http\"",
+                "model_providers.rustgrid_chatgpt_http.name=\"RustGrid ChatGPT HTTP\"",
+                "model_providers.rustgrid_chatgpt_http.base_url=\"https://chatgpt.com/backend-api/codex\"",
+                "model_providers.rustgrid_chatgpt_http.wire_api=\"responses\"",
+                "model_providers.rustgrid_chatgpt_http.requires_openai_auth=true",
+                "model_providers.rustgrid_chatgpt_http.supports_websockets=false",
+            ] {
+                let insertion = command
+                    .iter()
+                    .position(|part| part == "-")
+                    .unwrap_or(command.len());
+                command.splice(insertion..insertion, ["-c".into(), override_value.into()]);
+            }
+        }
         for feature in [
             "apps",
             "browser_use",
@@ -613,6 +634,23 @@ mod tests {
                 .codex_args(true, &[], MissionClass::SingleFile)
                 .windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
+        );
+        let docker_args = policy.codex_args(true, &[], MissionClass::SingleFile);
+        assert!(
+            docker_args
+                .iter()
+                .any(|arg| arg == "model_provider=\"rustgrid_chatgpt_http\"")
+        );
+        assert!(docker_args.iter().any(|arg| {
+            arg == "model_providers.rustgrid_chatgpt_http.supports_websockets=false"
+        }));
+        assert!(docker_args.iter().any(|arg| {
+            arg == "model_providers.rustgrid_chatgpt_http.base_url=\"https://chatgpt.com/backend-api/codex\""
+        }));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "model_provider=\"rustgrid_chatgpt_http\"")
         );
     }
 
