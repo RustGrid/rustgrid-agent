@@ -408,13 +408,8 @@ impl AppContext {
 
         let credential_store = CredentialStore::new(&api_url, &installation_id)?;
         let credentials_path = credentials_path(path);
-        let env_key = nonempty_env("RUSTGRID_WORKER_API_KEY");
-        let (mut api_key, mut credential_source) = if let Some(key) = env_key.as_ref() {
-            (Some(key.clone()), CredentialSource::Environment)
-        } else {
-            credential_store.load()?
-        };
-        let mut worker_id = nonempty_env("RUSTGRID_WORKER_ID").or_else(|| config.worker_id.clone());
+        let (mut api_key, mut credential_source) = credential_store.load()?;
+        let mut worker_id = config.worker_id.clone();
 
         if api_key.is_none()
             && let Some(legacy) = LegacyStoredCredentials::load(&credentials_path)?
@@ -444,16 +439,14 @@ impl AppContext {
         if let Some(tenant_id) = config.tenant_id.as_deref() {
             uuid::Uuid::parse_str(tenant_id).context("tenant ID must be a valid UUID")?;
         }
-        if env_key.is_none() {
-            let source = if credential_source == CredentialSource::Missing {
-                None
-            } else {
-                Some(credential_source.as_str().to_owned())
-            };
-            if config.credential_store != source {
-                config.credential_store = source;
-                identity_changed = true;
-            }
+        let source = if credential_source == CredentialSource::Missing {
+            None
+        } else {
+            Some(credential_source.as_str().to_owned())
+        };
+        if config.credential_store != source {
+            config.credential_store = source;
+            identity_changed = true;
         }
         if identity_changed && persist_identity {
             save_config(path, &config)?;
@@ -464,11 +457,7 @@ impl AppContext {
                 .join("rustgrid-agent")
                 .join("workspaces")
         });
-        let credential_expires_at_unix = if env_key.is_some() {
-            None
-        } else {
-            config.credential_expires_at_unix
-        };
+        let credential_expires_at_unix = config.credential_expires_at_unix;
         Ok(Self {
             tenant_id: config.tenant_id.clone(),
             worker_name: config.worker_name.clone(),

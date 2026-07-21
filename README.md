@@ -61,8 +61,7 @@ before provisioning a host.
 ## Requirements
 
 - Git and a configured Git author name and email.
-- A RustGrid account allowed to authorize a worker, or a centrally managed
-  worker ID and credential.
+- A RustGrid account allowed to authorize a worker through device login.
 - A RustGrid project connected to a GitHub repository through the RustGrid
   GitHub App.
 - For production: Docker Sandboxes (`sbx`) 0.34.0 or newer, a working microVM
@@ -296,8 +295,6 @@ capacity-oriented production example. Never put secrets in this file.
 | Variable | Purpose |
 | --- | --- |
 | `RUSTGRID_AGENT_CONFIG` | Stable configuration path override. `--config` takes precedence. |
-| `RUSTGRID_WORKER_API_KEY` | Managed-deployment override for the credential created by `login`. |
-| `RUSTGRID_WORKER_ID` | Worker UUID bound to the managed credential. Supply it with `RUSTGRID_WORKER_API_KEY`. |
 | `RUSTGRID_INSTANCE_URL` | Overrides the configured RustGrid control-plane origin. |
 | `RUSTGRID_API_URL` | Legacy, highest-precedence exact API URL, including custom proxy prefixes. |
 | `RUSTGRID_CREDENTIALS_DIR` | Overrides the private-file credential directory for a service account. |
@@ -305,10 +302,9 @@ capacity-oriented production example. Never put secrets in this file.
 | `RUSTGRID_AGENT_LOG=json` | Emits newline-delimited structured lifecycle logs. |
 | `NO_COLOR=1` | Disables terminal color in human-readable output. |
 
-Environment worker credentials take precedence over stored interactive login.
-They must be tenant-scoped worker credentials, not administrative user or API
-key credentials. `logout` cannot revoke or unset values injected by a deployment
-system.
+Worker identity and authentication are loaded only from the configuration and
+the credential store populated by `rustgrid-agent login`. Environment variables
+cannot override either value.
 
 The device-authenticated credential requests these runtime permissions:
 

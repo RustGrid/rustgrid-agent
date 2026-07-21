@@ -13,7 +13,6 @@ const KEYRING_SERVICE: &str = "com.rustgrid.agent";
 pub enum CredentialSource {
     Keychain,
     FallbackFile,
-    Environment,
     Missing,
 }
 
@@ -22,7 +21,6 @@ impl CredentialSource {
         match self {
             Self::Keychain => "os_keychain",
             Self::FallbackFile => "private_file_fallback",
-            Self::Environment => "environment",
             Self::Missing => "missing",
         }
     }

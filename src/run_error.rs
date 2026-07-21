@@ -29,9 +29,6 @@ pub enum RunFailure {
     InfrastructureTransient {
         detail: String,
     },
-    CodexProgressStalled {
-        narrative_messages: u32,
-    },
     HumanIntervention {
         action: String,
     },
@@ -66,10 +63,6 @@ impl std::fmt::Display for RunFailure {
                     "worker infrastructure temporarily unavailable: {detail}"
                 )
             }
-            Self::CodexProgressStalled { narrative_messages } => write!(
-                formatter,
-                "Codex made no tool or file progress after {narrative_messages} consecutive status messages"
-            ),
             Self::HumanIntervention { action } => {
                 write!(formatter, "human intervention required: {action}")
             }
@@ -100,7 +93,6 @@ pub fn classify(error: &anyhow::Error) -> RunErrorKind {
             RunFailure::RequiredWorkflowFailed { .. } => RunErrorKind::ExternalPermanent,
             RunFailure::ValidationRepairsExhausted { .. } => RunErrorKind::HumanBlocked,
             RunFailure::InfrastructureTransient { .. } => RunErrorKind::Transient,
-            RunFailure::CodexProgressStalled { .. } => RunErrorKind::TimedOut,
             RunFailure::HumanIntervention { .. } => RunErrorKind::HumanBlocked,
             RunFailure::PolicyViolation { .. } => RunErrorKind::PolicyViolation,
             RunFailure::Invariant { .. } => RunErrorKind::Invariant,
@@ -159,15 +151,6 @@ mod tests {
         );
         assert_eq!(
             classify(&CommandFailure::TimedOut { seconds: 10 }.into()),
-            RunErrorKind::TimedOut
-        );
-        assert_eq!(
-            classify(
-                &RunFailure::CodexProgressStalled {
-                    narrative_messages: 4,
-                }
-                .into()
-            ),
             RunErrorKind::TimedOut
         );
         assert_eq!(

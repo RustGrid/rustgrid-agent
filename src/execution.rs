@@ -21,7 +21,6 @@ use crate::{
 };
 
 const CODEX_IDLE_ATTEMPTS: u32 = 3;
-const MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS: u32 = 4;
 const DEPENDENCY_INSTALL_ATTEMPTS: u32 = 3;
 pub(crate) const VALIDATION_REPAIR_ATTEMPTS: u32 = 3;
 
@@ -332,7 +331,6 @@ pub(crate) fn run_codex_prompt(
     let mut codex_attempt = 1u32;
     let mut retry_of_call_id = None;
     let codex_status = loop {
-        let progress_watchdog = RefCell::new(CodexProgressWatchdog::default());
         let telemetry = RefCell::new(context.reporter.start_codex_telemetry(
             &codex_args,
             prompt,
@@ -361,7 +359,6 @@ pub(crate) fn run_codex_prompt(
             },
             |line| {
                 telemetry.borrow_mut().observe_line(line);
-                progress_watchdog.borrow_mut().observe_line(line)?;
                 if let Some(message) = feedback_from_output_line(line) {
                     if let Some(action) = blocked_action_from_feedback(&message) {
                         blocked_action.replace(Some(action));
@@ -655,32 +652,6 @@ fn codex_output_is_meaningful_activity(line: &str) -> bool {
     }
 }
 
-#[derive(Default)]
-struct CodexProgressWatchdog {
-    narrative_messages_without_progress: u32,
-}
-
-impl CodexProgressWatchdog {
-    fn observe_line(&mut self, line: &str) -> Result<()> {
-        if codex_output_is_tangible_tool_activity(line) {
-            self.narrative_messages_without_progress = 0;
-            return Ok(());
-        }
-        if !codex_output_is_agent_message(line) {
-            return Ok(());
-        }
-        self.narrative_messages_without_progress =
-            self.narrative_messages_without_progress.saturating_add(1);
-        if self.narrative_messages_without_progress >= MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS {
-            return Err(RunFailure::CodexProgressStalled {
-                narrative_messages: self.narrative_messages_without_progress,
-            }
-            .into());
-        }
-        Ok(())
-    }
-}
-
 fn codex_output_is_tangible_tool_activity(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
         return false;
@@ -692,18 +663,6 @@ fn codex_output_is_tangible_tool_activity(line: &str) -> bool {
             .and_then(serde_json::Value::as_str),
         Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search")
     )
-}
-
-fn codex_output_is_agent_message(line: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    event.get("type").and_then(serde_json::Value::as_str) == Some("item.completed")
-        && event
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(serde_json::Value::as_str)
-            == Some("agent_message")
 }
 
 fn should_retry_idle_codex_attempt(tool_calls: usize, attempt: u32) -> bool {
@@ -864,28 +823,6 @@ mod tests {
         assert!(!should_retry_idle_codex_attempt(0, 1));
         assert!(should_retry_idle_codex_attempt(1, 1));
         assert!(!should_retry_idle_codex_attempt(1, CODEX_IDLE_ATTEMPTS));
-    }
-
-    #[test]
-    fn repeated_narration_without_tool_progress_is_stopped() {
-        let narration = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Still inspecting."}}"#;
-        let tool = r#"{"type":"item.started","item":{"type":"command_execution"}}"#;
-        let mut watchdog = CodexProgressWatchdog::default();
-
-        for _ in 0..MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS - 1 {
-            watchdog.observe_line(narration).unwrap();
-        }
-        watchdog.observe_line(tool).unwrap();
-        for _ in 0..MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS - 1 {
-            watchdog.observe_line(narration).unwrap();
-        }
-        let error = watchdog.observe_line(narration).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<RunFailure>(),
-            Some(RunFailure::CodexProgressStalled {
-                narrative_messages: MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS
-            })
-        ));
     }
 
     #[test]

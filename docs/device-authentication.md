@@ -107,17 +107,15 @@ configuration directory. The fallback rejects symlinks and broad permissions.
 The project configuration stores only non-secret identity and storage metadata.
 Legacy plaintext `<config>.credentials` files are migrated once and removed.
 
-Precedence is:
+Endpoint precedence is:
 
 1. `RUSTGRID_API_URL` for the legacy exact API endpoint override.
 2. `RUSTGRID_INSTANCE_URL`, then configured `instance_url`, then the production
    default for instance selection.
-3. `RUSTGRID_WORKER_API_KEY` and `RUSTGRID_WORKER_ID` for centrally managed
-   credentials, ahead of stored interactive login state.
 
-CI and managed hosts may continue injecting environment credentials during the
-migration period. They must be worker-bound and least-privileged; they must not
-be administrative user or API-key credentials.
+Worker identity comes only from the configuration written by `login`, and the
+corresponding credential comes only from the OS keychain or private-file
+fallback. Environment variables cannot replace that pair.
 
 ## Compatibility and troubleshooting
 
@@ -125,8 +123,7 @@ The server must be deployed with migration `0047_worker_device_authentication`
 and the plural `/device-authorizations` endpoints before interactive login is
 enabled. A `404` or `405` start response is reported as an incompatible server;
 the agent does not silently fall back to legacy registration. Existing managed
-environment credentials remain supported temporarily, and `register` remains a
-deprecated compatibility command.
+`register` remains a deprecated compatibility command.
 
 - If the browser does not open, rerun with `--no-browser` and use the printed
   URL and code.

@@ -175,7 +175,7 @@ mod tests {
                 worker_id: Some("00000000-0000-4000-8000-000000000001".into()),
                 tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
                 worker_name: Some("test-worker".into()),
-                credential_store: Some("environment".into()),
+                credential_store: Some("private_file_fallback".into()),
                 credential_expires_at_unix: None,
                 project_id: Some("project-1".into()),
                 project_key: None,
@@ -213,7 +213,7 @@ mod tests {
             tenant_id: Some("00000000-0000-4000-8000-000000000002".into()),
             worker_name: Some("test-worker".into()),
             installation_id: "00000000-0000-4000-8000-000000000099".into(),
-            credential_source: crate::credentials::CredentialSource::Environment,
+            credential_source: crate::credentials::CredentialSource::FallbackFile,
             credential_expires_at_unix: None,
             credential_store: crate::credentials::CredentialStore::new(
                 &format!("http://{address}"),

@@ -7,11 +7,9 @@ Docker's current instructions for a supported macOS or Ubuntu Linux host,
 authenticate Codex through Docker's credential proxy, and configure
 `executor.kind` as `docker_sandbox`.
 
-Run one `serve` process per worker identity. Authenticate it with
-`rustgrid-agent login`, or inject `RUSTGRID_WORKER_API_KEY` and
-`RUSTGRID_WORKER_ID` for a centrally managed deployment. GitHub credentials are
-issued per active run. Use a dedicated unprivileged OS account and a writable
-workspace root.
+Run one `serve` process per worker identity and authenticate it with
+`rustgrid-agent login`. GitHub credentials are issued per active run. Use a
+dedicated unprivileged OS account and a writable workspace root.
 
 Set `max_concurrency` from measured host capacity. Each claimed run receives its
 own microVM with configured CPU and memory limits. The local executor is limited
@@ -50,23 +48,15 @@ sudo -u rustgrid-agent rustgrid-agent \
   login --no-browser --instance https://rustgrid.example.com
 ```
 
-For centrally managed secret injection, configure the compatibility variables:
-
-```text
-RUSTGRID_WORKER_API_KEY=rgk_...
-RUSTGRID_WORKER_ID=00000000-0000-4000-8000-000000000000
-RUSTGRID_INSTANCE_URL=https://rustgrid.example.com
-```
-
-Long-running workers use the credential created by `rustgrid-agent login`, or
-an injected `RUSTGRID_WORKER_API_KEY` bound to the exact identity in
-`RUSTGRID_WORKER_ID`. Startup heartbeats that worker and fails closed when the
-binding does not match. The credential is required for leased run events, manifests, and
-run-scoped GitHub token issuance.
+Long-running workers use only the identity and credential created by
+`rustgrid-agent login`. Startup heartbeats that worker and fails closed when the
+stored binding does not match. The credential is required for leased run events,
+manifests, and run-scoped GitHub token issuance. For containers, bootstrap login
+into a private file credential directory and mount that directory read-only;
+see `deploy/README.md`.
 `RUSTGRID_API_URL` remains the highest-precedence legacy override when a
 deployment requires an exact custom API proxy prefix. Rotate and revoke managed
-secrets in the deployment secret manager; `logout` cannot unset environment
-variables.
+credential-store files through the device login and logout lifecycle.
 
 The configuration file should set `workspace_root` to durable local storage.
 Successful workspaces are removed immediately. Failed, blocked, cancelled, and

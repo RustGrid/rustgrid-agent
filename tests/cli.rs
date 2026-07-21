@@ -1,10 +1,24 @@
-use std::process::Command;
 use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    path::Path,
+    process::Command,
     thread,
 };
+
+fn write_worker_credential_sidecar(config: &Path, worker_id: &str, api_key: &str) {
+    let name = config
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("config should have a UTF-8 filename");
+    let sidecar = config.with_file_name(format!("{name}.credentials"));
+    fs::write(
+        sidecar,
+        serde_json::json!({"worker_id": worker_id, "api_key": api_key}).to_string(),
+    )
+    .expect("worker credential sidecar should be written");
+}
 
 #[test]
 fn version_reports_package_name_and_version() {
@@ -142,8 +156,6 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_API_URL", format!("http://{address}"))
-        .env_remove("RUSTGRID_WORKER_API_KEY")
-        .env_remove("RUSTGRID_WORKER_ID")
         .env("RUSTGRID_CREDENTIAL_STORE", "file")
         .env(
             "RUSTGRID_CREDENTIALS_DIR",
@@ -194,8 +206,6 @@ fn login_and_logout_complete_the_device_credential_lifecycle() {
     let logout = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
         .env("RUSTGRID_API_URL", format!("http://{address}"))
-        .env_remove("RUSTGRID_WORKER_API_KEY")
-        .env_remove("RUSTGRID_WORKER_ID")
         .env("RUSTGRID_CREDENTIAL_STORE", "file")
         .env(
             "RUSTGRID_CREDENTIALS_DIR",
@@ -302,10 +312,11 @@ fn login_reports_an_incompatible_server_without_falling_back_to_registration() {
 }
 
 #[test]
-fn status_can_emit_machine_readable_health() {
+fn status_ignores_legacy_worker_environment_credentials() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("agent.json");
     fs::write(&config, r#"{"max_concurrency":1}"#).expect("configuration should be written");
+    write_worker_credential_sidecar(&config, "00000000-0000-4000-8000-000000000001", "test-key");
     let listener = match TcpListener::bind("127.0.0.1:0") {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -327,9 +338,14 @@ fn status_can_emit_machine_readable_health() {
     });
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_WORKER_API_KEY", "test-key")
-        .env("RUSTGRID_WORKER_ID", "00000000-0000-4000-8000-000000000001")
+        .env("RUSTGRID_WORKER_API_KEY", "stale-environment-key")
+        .env("RUSTGRID_WORKER_ID", "00000000-0000-4000-8000-000000000009")
         .env("RUSTGRID_API_URL", format!("http://{address}"))
+        .env("RUSTGRID_CREDENTIAL_STORE", "file")
+        .env(
+            "RUSTGRID_CREDENTIALS_DIR",
+            directory.path().join("credentials"),
+        )
         .args(["--config", config.to_str().unwrap(), "status", "--json"])
         .output()
         .expect("rustgrid-agent status should run");
@@ -347,6 +363,8 @@ fn status_can_emit_machine_readable_health() {
     assert_eq!(value["rustgrid_reachable"], true);
     assert_eq!(value["scope"], "tenant");
     assert_eq!(value["credential_expired"], false);
+    assert_eq!(value["worker_id"], "00000000-0000-4000-8000-000000000001");
+    assert_eq!(value["credential_source"], "private_file_fallback");
     assert!(value.get("credential_expires_at_unix").is_some());
 }
 
@@ -357,7 +375,6 @@ fn serve_fails_closed_with_local_executor() {
     fs::write(&config, r#"{"max_concurrency":1}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "serve"])
         .output()
         .expect("rustgrid-agent serve should run");
@@ -372,7 +389,6 @@ fn local_executor_rejects_shared_process_concurrency() {
     std::fs::write(&config, r#"{"max_concurrency":2}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "serve"])
         .output()
         .expect("rustgrid-agent serve should run");
@@ -390,7 +406,6 @@ fn watch_once_fails_closed_with_multiple_run_capacity() {
     fs::write(&config, r#"{"max_concurrency":2}"#).expect("configuration should be written");
     let output = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
         .current_dir(directory.path())
-        .env("RUSTGRID_WORKER_API_KEY", "test-key")
         .args(["--config", config.to_str().unwrap(), "watch", "--once"])
         .output()
         .expect("rustgrid-agent watch should run");

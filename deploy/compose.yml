@@ -16,11 +16,11 @@ services:
     mem_limit: 10g
     cpus: 4
     environment:
-      RUSTGRID_WORKER_API_KEY: ${RUSTGRID_WORKER_API_KEY:?set the bound worker credential}
       RUSTGRID_API_URL: ${RUSTGRID_API_URL:-https://app.rustgrid.com/api/v1}
       RUSTGRID_AGENT_LOG: json
     volumes:
       - ./agent.json:/etc/rustgrid-agent/agent.json:ro
+      - ./credentials:/var/lib/rustgrid-agent/.config/rustgrid-agent/credentials:ro
       - codex-home:/var/lib/rustgrid-agent/.codex
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=1g

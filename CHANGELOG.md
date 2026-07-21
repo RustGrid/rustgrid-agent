@@ -5,6 +5,12 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Remove worker ID and API-key environment authentication. Worker identity now
+  comes only from the configuration written by device login, and authentication
+  comes only from the OS keychain or owner-only credential-file store.
+
 ### Fixed
 
 - Connect detailed Codex execution and token telemetry to the live streaming

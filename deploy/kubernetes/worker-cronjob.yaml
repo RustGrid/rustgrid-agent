@@ -24,6 +24,21 @@ spec:
             runAsGroup: 65532
             fsGroup: 65532
             seccompProfile: {type: RuntimeDefault}
+          initContainers:
+            - name: prepare-worker-credential
+              image: ghcr.io/rustgrid/rustgrid-agent@sha256:REPLACE_WITH_DIGEST
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - cp /credential-source/* /credentials/ && chmod 600 /credentials/*
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts:
+                - {name: credential-source, mountPath: /credential-source, readOnly: true}
+                - {name: credentials, mountPath: /credentials}
           containers:
             - name: worker
               image: ghcr.io/rustgrid/rustgrid-agent@sha256:REPLACE_WITH_DIGEST
@@ -31,9 +46,6 @@ spec:
               args: ["--config", "/etc/rustgrid-agent/agent.json", "watch", "--once"]
               env:
                 - {name: RUSTGRID_AGENT_LOG, value: json}
-                - name: RUSTGRID_WORKER_API_KEY
-                  valueFrom:
-                    secretKeyRef: {name: rustgrid-agent, key: api-key}
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
@@ -43,12 +55,19 @@ spec:
                 limits: {cpu: "4", memory: 10Gi, ephemeral-storage: 8Gi}
               volumeMounts:
                 - {name: config, mountPath: /etc/rustgrid-agent, readOnly: true}
+                - {name: credentials, mountPath: /var/lib/rustgrid-agent/.config/rustgrid-agent/credentials, readOnly: true}
                 - {name: workspaces, mountPath: /var/lib/rustgrid-agent/workspaces}
                 - {name: codex-home, mountPath: /var/lib/rustgrid-agent/.codex}
                 - {name: tmp, mountPath: /tmp}
           volumes:
             - name: config
               configMap: {name: rustgrid-agent}
+            - name: credential-source
+              secret:
+                secretName: rustgrid-agent-credentials
+                defaultMode: 0440
+            - name: credentials
+              emptyDir: {}
             - name: workspaces
               emptyDir: {sizeLimit: 8Gi}
             - name: codex-home

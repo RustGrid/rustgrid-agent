@@ -21,10 +21,9 @@ Deploy additive RustGrid API changes before workers that require them. Do not re
 
 Interactive login treats `404 Not Found` and `405 Method Not Allowed` from the
 device-authorization start endpoint as an incompatible server and does not
-silently create an administrative credential. Existing managed workers may
-temporarily continue with `RUSTGRID_WORKER_API_KEY`, `RUSTGRID_WORKER_ID`, and
-the legacy exact `RUSTGRID_API_URL` override while the server is upgraded.
-Environment credentials take precedence over stored interactive credentials.
+silently create an administrative credential. Workers must use the credential
+store populated by device login. The legacy exact `RUSTGRID_API_URL` endpoint
+override remains supported while a control-plane deployment is upgraded.
 
 ## Rollback
 
