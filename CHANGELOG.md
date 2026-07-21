@@ -23,6 +23,9 @@ Semantic Versioning.
   report preparation progress immediately, make sandbox commands cancellable
   and time-bounded, and verify the Codex version embedded in the pinned template
   instead of installing a different CLI release during every run.
+- Prevent duplicate active attempts for one ticket in a worker session, bind
+  step idempotency to the exact request body, and retry RustGrid's explicit
+  in-flight idempotency conflict without retrying permanent 409 responses.
 
 ## 1.2.0 - 2026-07-19
 

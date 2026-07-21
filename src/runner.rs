@@ -1186,8 +1186,14 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
     }
     sweep_workspaces(context, &active_run_ids)?;
     let mut tasks: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
-    let mut started_run_ids = active_run_ids;
-    for run in active_runs.into_iter().take(context.config.max_concurrency) {
+    let mut started_run_ids = HashSet::new();
+    let mut attempted_ticket_ids = HashSet::new();
+    for run in select_unstarted_assignments(
+        active_runs,
+        &started_run_ids,
+        &attempted_ticket_ids,
+        context.config.max_concurrency,
+    ) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -1206,6 +1212,8 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         let task_api = api.clone();
         let task_worker = worker.clone();
         let run_id = run.id.clone();
+        started_run_ids.insert(run_id.clone());
+        attempted_ticket_ids.insert(run.ticket_id.clone());
         tasks.push((
             run_id,
             thread::spawn(move || {
@@ -1264,7 +1272,12 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
         };
         let mut assigned = 0usize;
         let assigned_runs = api.active_runs(&worker.id)?;
-        for run in select_unstarted_assignments(assigned_runs, &started_run_ids, available_slots) {
+        for run in select_unstarted_assignments(
+            assigned_runs,
+            &started_run_ids,
+            &attempted_ticket_ids,
+            available_slots,
+        ) {
             let ticket = match api.fetch_ticket(&run.ticket_id) {
                 Ok(ticket) => ticket,
                 Err(error) => {
@@ -1282,6 +1295,7 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
             );
             let run_id = run.id.clone();
             started_run_ids.insert(run_id.clone());
+            attempted_ticket_ids.insert(run.ticket_id.clone());
             let task_context = context.clone();
             let task_api = api.clone();
             let task_worker = worker.clone();
@@ -1343,11 +1357,14 @@ pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()>
 fn select_unstarted_assignments(
     assigned_runs: Vec<AgentRun>,
     started_run_ids: &HashSet<String>,
+    attempted_ticket_ids: &HashSet<String>,
     available_slots: usize,
 ) -> Vec<AgentRun> {
+    let mut selected_ticket_ids = attempted_ticket_ids.clone();
     assigned_runs
         .into_iter()
         .filter(|run| !started_run_ids.contains(&run.id))
+        .filter(|run| selected_ticket_ids.insert(run.ticket_id.clone()))
         .take(available_slots)
         .collect()
 }
@@ -1401,10 +1418,40 @@ mod tests {
         let selected = select_unstarted_assignments(
             vec![run("run-1"), run("run-2"), run("run-3")],
             &started,
+            &HashSet::new(),
             1,
         );
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "run-2");
+    }
+
+    #[test]
+    fn assigned_run_selection_starts_at_most_one_attempt_per_ticket() {
+        let mut duplicate = run("run-2");
+        duplicate.ticket_id = "ticket-run-1".into();
+
+        let selected = select_unstarted_assignments(
+            vec![run("run-1"), duplicate, run("run-3")],
+            &HashSet::new(),
+            &HashSet::new(),
+            4,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].id, "run-1");
+        assert_eq!(selected[1].id, "run-3");
+    }
+
+    #[test]
+    fn assigned_run_selection_does_not_retry_a_ticket_in_one_worker_session() {
+        let selected = select_unstarted_assignments(
+            vec![run("run-2")],
+            &HashSet::new(),
+            &HashSet::from(["ticket-run-2".to_owned()]),
+            1,
+        );
+
+        assert!(selected.is_empty());
     }
 }

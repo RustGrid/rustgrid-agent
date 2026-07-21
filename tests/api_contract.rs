@@ -525,7 +525,7 @@ fn lifecycle_side_effects_use_stable_idempotency_keys() {
         )
         .unwrap();
     let request = request.recv().unwrap().to_ascii_lowercase();
-    assert!(request.contains("idempotency-key: step-run-1-7"));
+    assert!(request.contains("idempotency-key: step-run-1-7-"));
 
     let Some((url, request)) = server(json!({
         "id": "run-1", "ticket_id": "ticket-1", "row_version": 4

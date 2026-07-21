@@ -77,7 +77,7 @@ remote_string_enum!(QualityGateStatus {
 
 const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
-const STANDARD_RETRY_POLICY: RetryPolicy = RetryPolicy::new(3, 250, 30_000);
+const STANDARD_RETRY_POLICY: RetryPolicy = RetryPolicy::new(6, 250, 30_000);
 const GITHUB_TOKEN_RETRY_POLICY: RetryPolicy = RetryPolicy::new(8, 1_000, 30_000);
 
 #[derive(Clone, Copy)]
@@ -670,17 +670,24 @@ impl RustGridClient {
     ) -> Result<()> {
         let status = status.as_str();
         let step_key = format!("{}-{status}", name.replace('_', "-"));
+        let body = json!({
+            "step_key": step_key,
+            "title": truncate(message, 300),
+            "status": status,
+            "summary": truncate(message, 5000),
+            "metadata": metadata.unwrap_or_else(|| json!({}))
+        });
+        let fingerprint = hex::encode(Sha256::digest(
+            serde_json::to_vec(&body).expect("step request body is serializable"),
+        ));
         self.send_empty(
             Method::POST,
             &format!("{RUNS}/{run_id}/steps"),
-            Some(json!({
-                "step_key": step_key,
-                "title": truncate(message, 300),
-                "status": status,
-                "summary": truncate(message, 5000),
-                "metadata": metadata.unwrap_or_else(|| json!({}))
-            })),
-            Some(&format!("step-{run_id}-{client_sequence}")),
+            Some(body),
+            Some(&format!(
+                "step-{run_id}-{client_sequence}-{}",
+                &fingerprint[..16]
+            )),
         )
     }
 
@@ -898,9 +905,14 @@ impl RustGridClient {
                 .text()
                 .map_err(|error| HttpFailure::transport(path, error))?;
             if !status.is_success() {
+                let idempotency_busy = idempotency.is_some()
+                    && status == StatusCode::CONFLICT
+                    && is_idempotency_busy_body(&text);
                 if retry_safe
                     && attempt + 1 < retry_policy.max_attempts
-                    && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+                    && (status == StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error()
+                        || idempotency_busy)
                 {
                     let delay = if let Some(seconds) = retry_after {
                         Duration::from_secs(seconds)
@@ -964,6 +976,12 @@ impl RustGridClient {
             .map(|_| ())
             .map_err(Into::into)
     }
+}
+
+fn is_idempotency_busy_body(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("idempotency key is busy")
+        && normalized.contains("another attempt in-flight")
 }
 
 pub fn is_conflict(error: &anyhow::Error) -> bool {
@@ -1150,6 +1168,19 @@ mod tests {
         });
         assert!(!is_conflict(&transient));
         assert!(!is_lease_lost(&transient));
+    }
+
+    #[test]
+    fn retries_only_explicit_in_flight_idempotency_conflicts() {
+        assert!(is_idempotency_busy_body(
+            r#"{"error":"idempotency key is busy; another attempt in-flight","code":"conflict"}"#
+        ));
+        assert!(!is_idempotency_busy_body(
+            r#"{"error":"idempotency key reused with a different request fingerprint","code":"conflict"}"#
+        ));
+        assert!(!is_idempotency_busy_body(
+            r#"{"error":"agent run lease is not active for this worker","code":"conflict"}"#
+        ));
     }
 
     #[test]
