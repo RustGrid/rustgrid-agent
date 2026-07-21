@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{api::Ticket, manifest::ExecutionManifest};
@@ -48,25 +50,6 @@ impl MissionClass {
             ],
         }
     }
-
-    pub const fn tool_output_token_limit(self) -> u64 {
-        match self {
-            Self::Metadata => 1_000,
-            Self::Configuration => 2_000,
-            Self::SingleFile => 4_000,
-            Self::MultiFile => 8_000,
-            Self::RepositoryWide => 12_000,
-        }
-    }
-
-    pub const fn project_doc_max_bytes(self) -> u64 {
-        match self {
-            Self::Metadata => 0,
-            Self::Configuration | Self::SingleFile => 8 * 1024,
-            Self::MultiFile => 16 * 1024,
-            Self::RepositoryWide => 32 * 1024,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -103,7 +86,11 @@ pub struct MissionProfile {
 }
 
 impl MissionProfile {
-    pub fn classify(ticket: &Ticket, manifest: &ExecutionManifest) -> Self {
+    pub fn classify_after_checkout(
+        ticket: &Ticket,
+        manifest: &ExecutionManifest,
+        repo_root: &Path,
+    ) -> Self {
         if manifest.run.metadata.get("direct_operation").is_some() {
             return Self {
                 class: MissionClass::Metadata,
@@ -114,7 +101,7 @@ impl MissionProfile {
         if let Some(class) = explicit_class(&manifest.run.metadata) {
             return Self {
                 class,
-                reason: "execution manifest override".into(),
+                reason: "execution manifest override evaluated after checkout".into(),
                 explicit: true,
             };
         }
@@ -165,9 +152,20 @@ impl MissionProfile {
         } else {
             MissionClass::MultiFile
         };
+        let markers = ["Cargo.toml", "package.json", "go.mod", "pyproject.toml"]
+            .into_iter()
+            .filter(|name| repo_root.join(name).is_file())
+            .collect::<Vec<_>>();
         Self {
             class,
-            reason: "deterministic objective classifier".into(),
+            reason: format!(
+                "advisory post-checkout objective analysis; repository markers: {}",
+                if markers.is_empty() {
+                    "none".into()
+                } else {
+                    markers.join(", ")
+                }
+            ),
             explicit: false,
         }
     }
@@ -253,11 +251,13 @@ mod tests {
 
     #[test]
     fn classifies_the_observed_navigation_rename_as_single_file() {
-        let profile = MissionProfile::classify(
+        let profile = MissionProfile::classify_after_checkout(
             &ticket("Replace Live Fleet menu title to Live Agents"),
             &manifest(json!({})),
+            Path::new("."),
         );
         assert_eq!(profile.class, MissionClass::SingleFile);
+        assert!(profile.reason.contains("post-checkout"));
         assert_eq!(profile.class.budget().max_input_tokens, 25_000);
         assert_eq!(
             profile.class.tool_bundles(),
@@ -271,9 +271,10 @@ mod tests {
 
     #[test]
     fn explicit_manifest_classification_wins_and_is_auditable() {
-        let profile = MissionProfile::classify(
+        let profile = MissionProfile::classify_after_checkout(
             &ticket("Change several things"),
             &manifest(json!({"mission_class": "configuration"})),
+            Path::new("."),
         );
         assert_eq!(profile.class, MissionClass::Configuration);
         assert!(profile.explicit);
@@ -284,7 +285,11 @@ mod tests {
         let manifest = manifest(json!({
             "direct_operation": {"type": "set_status", "status": "done"}
         }));
-        let profile = MissionProfile::classify(&ticket("Mark this done"), &manifest);
+        let profile = MissionProfile::classify_after_checkout(
+            &ticket("Mark this done"),
+            &manifest,
+            Path::new("."),
+        );
         assert_eq!(profile.class, MissionClass::Metadata);
         assert_eq!(profile.class.tool_bundles(), [ToolBundle::Metadata]);
         assert_eq!(

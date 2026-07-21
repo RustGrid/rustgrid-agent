@@ -21,7 +21,7 @@ use crate::{
         CodexContext, ImplementationContext, QualityGateContext, bootstrap_dependencies,
         implement_and_commit, run_codex_prompt, run_gates_with_repairs, short_sha,
     },
-    executor::{ExecutionHandle, Executor},
+    executor::{ExecutionHandle, Executor, SANDBOX_PREPARE_TIMEOUT_SECONDS},
     finalization::finalize,
     git::{
         ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, branch_name,
@@ -196,33 +196,40 @@ fn execute_claimed(
     let workspace = RefCell::new(None::<RunWorkspace>);
     let executor = Executor::from_config(&context.config.executor);
     let executor_handle = RefCell::new(None::<ExecutionHandle>);
-    let mission_profile = MissionProfile::classify(ticket, &manifest);
 
     let result = (|| {
         if manifest.ticket_key != ticket.key {
             bail!("execution manifest does not match the fetched ticket");
         }
-        let budget = mission_profile.class.budget();
-        reporter.step(
-            "mission_classified",
-            StepStatus::Completed,
-            &format!(
-                "Classified mission as {} before repository execution",
-                mission_profile.class.as_str()
-            ),
-            Some(json!({
-                "mission_class": mission_profile.class,
-                "classification_reason": mission_profile.reason,
-                "explicit": mission_profile.explicit,
-                "max_input_tokens": budget.max_input_tokens,
-                "max_model_calls": budget.max_model_calls,
-                "max_tool_calls": budget.max_tool_calls,
-                "tool_bundles": mission_profile.class.tool_bundles()
-            })),
-        )?;
         if let Some(operation) = direct_operation(&manifest)? {
             return execute_direct_operation(api, run, ticket, &reporter, operation);
         }
+        reporter.set_ticket_status(TicketStatus::InProgress)?;
+        reporter.set_phase(RunPhase::Preparing);
+        reporter.step(
+            "ticket_fetched",
+            StepStatus::Completed,
+            &format!("Fetched ticket {}", ticket.key),
+            Some(json!({"ticket_id": ticket.id})),
+        )?;
+        reporter.step(
+            "ticket_claimed",
+            StepStatus::Completed,
+            &format!("Claimed ticket {}", ticket.key),
+            Some(json!({"worker_id": worker.id})),
+        )?;
+        reporter.step(
+            "run_created",
+            StepStatus::Completed,
+            &format!("Created and claimed agent run {}", run.id),
+            None,
+        )?;
+        reporter.step(
+            "workspace_prepare",
+            StepStatus::Running,
+            "Acquiring repository credentials and preparing the isolated checkout",
+            Some(json!({"repository": manifest.repository})),
+        )?;
         let tokens = GitHubTokenManager::new(
             api,
             &run.id,
@@ -250,11 +257,35 @@ fn execute_claimed(
             .collect::<Vec<_>>();
         let workspace_bytes = prepared.enforce_size_limit(context.config.max_workspace_bytes)?;
         workspace.replace(Some(prepared));
+        reporter.step(
+            "workspace_prepare",
+            StepStatus::Completed,
+            if fresh_start {
+                "Prepared a fresh isolated repository workspace with no recovery context"
+            } else if recovery_source.is_some() {
+                "Adopted retained repository workspace from the previous attempt"
+            } else {
+                "Prepared isolated repository workspace"
+            },
+            Some(json!({
+                "bytes": workspace_bytes,
+                "resumed": workspace_resumed,
+                "fresh_start": fresh_start,
+                "recovery_source_run_id": recovery_source
+            })),
+        )?;
+        reporter.step(
+            "sandbox_prepare",
+            StepStatus::Running,
+            "Creating and validating the isolated execution sandbox",
+            Some(json!({"timeout_seconds": SANDBOX_PREPARE_TIMEOUT_SECONDS})),
+        )?;
         let handle = executor.prepare(
             &run.id,
             &repo.root,
             execution_policy.requires_npm_registry() || repo.root.join("package.json").is_file(),
             retained_executor_id.as_deref(),
+            &running,
         )?;
         // Adopt the executor immediately after it is prepared. Everything below this
         // point may fail (including local journaling and remote step reporting), and
@@ -269,6 +300,34 @@ fn execute_claimed(
                 Some(json!({"executor": context.config.executor.kind(), "sandbox_id": id})),
             )?;
         }
+        reporter.step(
+            "sandbox_prepare",
+            StepStatus::Completed,
+            "Execution sandbox is ready",
+            Some(json!({"executor": context.config.executor.kind()})),
+        )?;
+        let mission_profile =
+            MissionProfile::classify_after_checkout(ticket, &manifest, &repo.root);
+        let budget = mission_profile.class.budget();
+        reporter.step(
+            "mission_classified",
+            StepStatus::Completed,
+            &format!(
+                "Analyzed the checked-out repository and classified the mission as {} for advisory telemetry",
+                mission_profile.class.as_str()
+            ),
+            Some(json!({
+                "mission_class": mission_profile.class,
+                "classification_reason": mission_profile.reason,
+                "explicit": mission_profile.explicit,
+                "max_input_tokens": budget.max_input_tokens,
+                "max_model_calls": budget.max_model_calls,
+                "max_tool_calls": budget.max_tool_calls,
+                "tool_bundles": mission_profile.class.tool_bundles(),
+                "enforcement": "advisory",
+                "repository_checked_out": true
+            })),
+        )?;
         let required_gates = execution_policy
             .quality_gates
             .iter()
@@ -289,7 +348,7 @@ fn execute_claimed(
             "context_composed",
             StepStatus::Completed,
             &format!(
-                "Composed bounded {} context (approximately {} input tokens)",
+                "Composed complete {} task context (approximately {} input tokens)",
                 mission_profile.class.as_str(),
                 estimated_prompt_tokens
             ),
@@ -298,47 +357,10 @@ fn execute_claimed(
                 "estimated_input_tokens": estimated_prompt_tokens,
                 "max_input_tokens": budget.max_input_tokens,
                 "budget_warning": estimated_prompt_tokens > budget.max_input_tokens,
-                "ambient_user_config": "disabled",
-                "history_comments_included": ticket.comments.len().min(20),
-                "repository_context": ["AGENTS.md"],
-                "loading_strategy": "progressive"
-            })),
-        )?;
-        reporter.set_ticket_status(TicketStatus::InProgress)?;
-        reporter.set_phase(RunPhase::Preparing);
-        reporter.step(
-            "ticket_fetched",
-            StepStatus::Completed,
-            &format!("Fetched ticket {}", ticket.key),
-            Some(json!({"ticket_id": ticket.id})),
-        )?;
-        reporter.step(
-            "ticket_claimed",
-            StepStatus::Completed,
-            &format!("Claimed ticket {}", ticket.key),
-            Some(json!({"worker_id": worker.id})),
-        )?;
-        reporter.step(
-            "run_created",
-            StepStatus::Completed,
-            &format!("Created and claimed agent run {}", run.id),
-            None,
-        )?;
-        reporter.step(
-            "workspace_prepared",
-            StepStatus::Completed,
-            if fresh_start {
-                "Prepared a fresh isolated repository workspace with no recovery context"
-            } else if recovery_source.is_some() {
-                "Adopted retained repository workspace from the previous attempt"
-            } else {
-                "Prepared isolated repository workspace"
-            },
-            Some(json!({
-                "bytes": workspace_bytes,
-                "resumed": workspace_resumed,
-                "fresh_start": fresh_start,
-                "recovery_source_run_id": recovery_source
+                "history_comments_included": ticket.comments.len(),
+                "repository_context": "applicable repository instructions",
+                "loading_strategy": "correctness_first",
+                "budget_enforcement": "advisory"
             })),
         )?;
         if !staged_attachments.is_empty() {
@@ -604,7 +626,12 @@ fn validate_reconciled_commit(
         manifest: context.manifest,
         executor: context.executor,
         executor_handle: context.executor_handle,
-        mission_class: MissionProfile::classify(context.ticket, context.manifest).class,
+        mission_class: MissionProfile::classify_after_checkout(
+            context.ticket,
+            context.manifest,
+            &context.repo.root,
+        )
+        .class,
     };
     run_gates_with_repairs(
         &codex,
@@ -991,7 +1018,10 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 manifest,
                 executor,
                 executor_handle,
-                mission_class: MissionProfile::classify(ticket, manifest).class,
+                mission_class: MissionProfile::classify_after_checkout(
+                    ticket, manifest, &repo.root,
+                )
+                .class,
             };
             let repair_prompt = format!(
                 "Required GitHub CI failed for the pull request. Inspect the current workspace and the CI evidence below, fix the underlying issue, and run relevant checks. Do not commit, push, or open a pull request; the runner owns publication. CI failures are real blockers, so do not declare success while they remain.\n\n{failure}"

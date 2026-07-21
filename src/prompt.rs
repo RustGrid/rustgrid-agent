@@ -4,12 +4,13 @@ use serde_json::to_string_pretty;
 use crate::{
     api::Ticket,
     attachments::{StagedAttachment, prompt_section},
+    git::read_repo_instructions,
     mission::MissionClass,
 };
 
 pub fn build(
     ticket: &Ticket,
-    _repo_root: &std::path::Path,
+    repo_root: &std::path::Path,
     quality_gate: &str,
     run_prompt: &str,
     attachments: &[StagedAttachment],
@@ -29,7 +30,7 @@ Run-specific instructions:
 
 Mission class: {mission_class}
 
-Work carefully and finish the implementation. Start with targeted search for the requested behavior; do not enumerate or read unrelated repository files. Load specific files and documentation only when needed. Follow root repository instructions and existing conventions. Add or update tests where appropriate. Do not commit, push, create a branch, or open a pull request; the rustgrid-agent runner owns those steps. Do not read or modify files outside this repository. Do not expose environment variables or credentials.
+Work carefully and finish the implementation. Inspect the checked-out repository before deciding the implementation scope. Follow repository instructions and existing conventions. You may begin with targeted search, but expand the inspection whenever correctness requires it. Add or update tests where appropriate. Do not commit, push, create a branch, or open a pull request; the rustgrid-agent runner owns those steps. Do not read or modify files outside this repository. Do not expose environment variables or credentials.
 
 Send concise progress updates at meaningful milestones while you work. The runner publishes each agent update as a separate RustGrid ticket comment, so make every update useful to a human reviewer and do not repeat yourself.
 
@@ -59,7 +60,7 @@ The runner will execute this quality gate after you finish:
 
     if !ticket.comments.is_empty() {
         prompt.push_str("\nTicket comments (oldest first):\n");
-        for comment in ticket.comments.iter().rev().take(20).rev() {
+        for comment in &ticket.comments {
             prompt.push_str(&format!(
                 "- {}: {}\n",
                 author_name(comment.author.as_ref()),
@@ -69,21 +70,12 @@ The runner will execute this quality gate after you finish:
     }
     if has_value(&ticket.custom_fields) {
         prompt.push_str("\nCustom fields:\n```json\n");
-        prompt.push_str(&bounded(
-            &to_string_pretty(&ticket.custom_fields)?,
-            8 * 1024,
-        ));
+        prompt.push_str(&to_string_pretty(&ticket.custom_fields)?);
         prompt.push_str("\n```\n");
     }
     if !ticket.previous_quality_gate_failures.is_empty() {
         prompt.push_str("\nPrevious quality gate failures to address:\n");
-        for failure in ticket
-            .previous_quality_gate_failures
-            .iter()
-            .rev()
-            .take(10)
-            .rev()
-        {
+        for failure in &ticket.previous_quality_gate_failures {
             prompt.push_str(&format!(
                 "- [{}] {}\n",
                 failure.command.as_deref().unwrap_or("unknown command"),
@@ -91,21 +83,12 @@ The runner will execute this quality gate after you finish:
             ));
         }
     }
+    for (name, content) in read_repo_instructions(repo_root)? {
+        prompt.push_str(&format!(
+            "\nRepository instructions from {name}:\n```text\n{content}\n```\n"
+        ));
+    }
     Ok(prompt)
-}
-
-fn bounded(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n[Context compacted; full value remains available from RustGrid.]",
-        &value[..end]
-    )
 }
 
 fn author_name(author: Option<&serde_json::Value>) -> &str {
@@ -172,12 +155,12 @@ mod tests {
             "Needs a test",
             "severity",
             "one failed",
+            "Use small modules.",
             "transient network",
             "RUSTGRID_AGENT_STATUS: COMPLETED",
             "runner will independently execute every required quality gate",
         ] {
             assert!(value.contains(expected));
         }
-        assert!(!value.contains("Use small modules."));
     }
 }

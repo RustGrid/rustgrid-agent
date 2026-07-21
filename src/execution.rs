@@ -114,7 +114,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor,
         executor_handle,
     } = implementation;
-    let mission_class = MissionProfile::classify(ticket, manifest).class;
+    let mission_class = MissionProfile::classify_after_checkout(ticket, manifest, &repo.root).class;
     reporter.step(
         "prompt_built",
         StepStatus::Completed,
@@ -327,7 +327,7 @@ pub(crate) fn run_codex_prompt(
         })),
     )?;
     let blocked_action = RefCell::new(None);
-    let codex_args = policy.codex_args(externally_isolated, image_paths, context.mission_class);
+    let codex_args = policy.codex_args(externally_isolated, image_paths);
     let mut codex_attempt = 1u32;
     let mut retry_of_call_id = None;
     let codex_status = loop {
@@ -392,7 +392,7 @@ pub(crate) fn run_codex_prompt(
                 &format!("{step_id}_budget_warning_{codex_attempt}"),
                 StepStatus::Running,
                 &format!(
-                    "{} mission exceeded its advisory execution budget; future calls require compaction or explicit escalation",
+                    "{} mission exceeded its advisory execution budget; execution continues unchanged to preserve correctness",
                     context.mission_class.as_str()
                 ),
                 Some(json!({
@@ -411,8 +411,7 @@ pub(crate) fn run_codex_prompt(
         match result {
             Ok(status) => break status,
             Err(error)
-                if command::is_idle_timeout(&error)
-                    && should_retry_idle_codex_attempt(tool_calls, codex_attempt) =>
+                if command::is_idle_timeout(&error) && codex_attempt < CODEX_IDLE_ATTEMPTS =>
             {
                 let delay = Duration::from_secs(u64::from(codex_attempt) * 2);
                 context.reporter.step(
@@ -639,34 +638,18 @@ fn codex_output_is_meaningful_activity(line: &str) -> bool {
     };
     match event.get("type").and_then(serde_json::Value::as_str) {
         Some("item.started" | "item.updated" | "item.completed") => {
-            codex_output_is_tangible_tool_activity(line)
+            event
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str)
+                != Some("reasoning")
         }
-        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed") => true,
-        // Narration-only assistant messages and reconnect errors are useful
-        // feedback, but they are not execution progress. Counting them as
-        // activity lets a model repeatedly announce the same next step and
-        // evade the idle timeout forever.
-        Some("error") => false,
+        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed" | "error") => {
+            true
+        }
         Some(_) => false,
         None => true,
     }
-}
-
-fn codex_output_is_tangible_tool_activity(line: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    matches!(
-        event
-            .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(serde_json::Value::as_str),
-        Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search")
-    )
-}
-
-fn should_retry_idle_codex_attempt(tool_calls: usize, attempt: u32) -> bool {
-    tool_calls > 0 && attempt < CODEX_IDLE_ATTEMPTS
 }
 
 fn print_output(stdout: &str, stderr: &str) {
@@ -797,14 +780,14 @@ mod tests {
     }
 
     #[test]
-    fn only_tangible_codex_progress_resets_the_idle_timeout() {
+    fn all_non_reasoning_codex_output_preserves_a_working_session() {
         assert!(!codex_output_is_meaningful_activity(
             r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#
         ));
-        assert!(!codex_output_is_meaningful_activity(
+        assert!(codex_output_is_meaningful_activity(
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"working"}}"#
         ));
-        assert!(!codex_output_is_meaningful_activity(
+        assert!(codex_output_is_meaningful_activity(
             r#"{"type":"error","message":"Reconnecting... 4/5"}"#
         ));
         assert!(codex_output_is_meaningful_activity(
@@ -816,13 +799,6 @@ mod tests {
         assert!(!codex_output_is_meaningful_activity(
             r#"{"type":"response.keepalive"}"#
         ));
-    }
-
-    #[test]
-    fn narration_only_idle_attempts_are_not_restarted() {
-        assert!(!should_retry_idle_codex_attempt(0, 1));
-        assert!(should_retry_idle_codex_attempt(1, 1));
-        assert!(!should_retry_idle_codex_attempt(1, CODEX_IDLE_ATTEMPTS));
     }
 
     #[test]

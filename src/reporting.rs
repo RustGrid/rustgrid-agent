@@ -454,7 +454,7 @@ impl<'a> Reporter<'a> {
         self.set_phase(RunPhase::Cancelled);
         self.step(
             "run_cancelled",
-            StepStatus::Cancelled,
+            StepStatus::Failed,
             "Agent run cancelled by operator",
             None,
         )?;

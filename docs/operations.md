@@ -21,16 +21,12 @@ exceed either ceiling. Pin `template` by verified `@sha256:` digest; tags are
 rejected by production readiness. Pin `codex_version` to an exact numeric
 release. Use `sbx` 0.34.0 or newer.
 
-At sandbox creation, the coordinator materializes a coordinator-owned local mixin kit
-outside the mounted repository. The kit installs `@openai/codex` at the exact
-configured version. Sandbox admission then requires `codex --version` to match
-exactly. A retained sandbox with another version receives the kit through
-`sbx kit add` before reuse; failed upgrades preserve the sandbox and fail the
-run as transient infrastructure. Worker startup also fails closed unless
-`kit.allowLocalKits` is enabled. The kit explicitly allows the npm registry,
-bounds npm socket concurrency, prefers cached artifacts, and sets fetch
-retry/backoff variables for every sandbox process. JavaScript workspaces always
-receive registry admission, including when signed gates invoke npm indirectly.
+Sandbox admission requires the Codex CLI already embedded in the immutable
+template to match `codex_version` exactly. The worker never installs or upgrades
+Codex while starting a ticket. A mismatch fails quickly with an actionable
+configuration error; update the version and template digest together.
+JavaScript workspaces always receive registry admission, including when signed
+gates invoke npm indirectly.
 Before Codex starts, a detected npm, pnpm, Yarn, or Bun lockfile is hydrated
 without lifecycle scripts. Transient `gateway.docker.internal` DNS, proxy,
 timeout, and connection failures retry the whole install up to three times;

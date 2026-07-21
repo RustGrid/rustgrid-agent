@@ -16,9 +16,13 @@ Semantic Versioning.
 - Connect detailed Codex execution and token telemetry to the live streaming
   path so model-call usage reaches RustGrid instead of leaving only the legacy
   aggregate token report.
-- Isolate production Codex runs from ambient user plugins and configuration,
-  classify mission complexity, enforce class-specific compaction limits, bound
-  eagerly loaded ticket/repository context, and emit advisory budget warnings.
+- Classify coding missions only after repository checkout, restore complete
+  ticket and repository-instruction context, and keep optimization budgets
+  advisory so they cannot under-equip or prematurely terminate a valid task.
+- Prevent ticket assignment from freezing during Docker Sandbox preparation:
+  report preparation progress immediately, make sandbox commands cancellable
+  and time-bounded, and verify the Codex version embedded in the pinned template
+  instead of installing a different CLI release during every run.
 
 ## 1.2.0 - 2026-07-19
 

@@ -1,7 +1,7 @@
 # Known limitations
 
 - Production isolation depends on Docker Sandboxes. macOS and Ubuntu Linux hosts must meet Docker's current virtualization, architecture, and KVM requirements; the worker fails closed when `sbx` preflight does not pass.
-- Docker Sandbox templates and local kits evolve with `sbx`; production rejects mutable template tags, but digest and kit changes still require staging.
+- Docker Sandbox templates evolve with `sbx`; production rejects mutable template tags, but digest and embedded Codex-version changes still require staging.
 - `status --json` is a readiness check and contacts RustGrid; it is not an independent process-liveness endpoint.
 - Complete artifact bundles and central OTLP export require deployment/control-plane integrations described in `docs/telemetry.md`.
 - Failed workspaces may contain proprietary source and remain on disk until retention cleanup. Production storage must be encrypted and access controlled.

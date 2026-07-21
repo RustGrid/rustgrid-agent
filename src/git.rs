@@ -1,7 +1,7 @@
-use std::{collections::BTreeSet, path::PathBuf};
-
-#[cfg(test)]
-use std::path::Path;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -592,6 +592,19 @@ pub fn fresh_branch_name(key: &str, title: &str, run_id: &str) -> String {
     format!("{}-{run_id}", branch_name(key, title))
         .trim_end_matches('-')
         .to_owned()
+}
+
+pub fn read_repo_instructions(root: &Path) -> Result<Vec<(String, String)>> {
+    let mut result = Vec::new();
+    for name in ["AGENTS.md", "README.md"] {
+        let path = root.join(name);
+        if path.is_file() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("could not read {}", path.display()))?;
+            result.push((name.into(), content));
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

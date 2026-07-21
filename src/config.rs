@@ -218,7 +218,7 @@ fn default_sandbox_template() -> String {
     "docker.io/docker/sandbox-templates@sha256:943c52aa48a4f4473a9c91e43aced8def51667935ad9866ffc29a821d5982f97".into()
 }
 fn default_codex_version() -> String {
-    "0.144.4".into()
+    "0.142.4".into()
 }
 fn default_sandbox_cpus() -> u16 {
     4
@@ -880,7 +880,7 @@ mod tests {
         let ExecutorConfig::DockerSandbox { codex_version, .. } = executor else {
             panic!("expected Docker Sandbox executor");
         };
-        assert_eq!(codex_version, "0.144.4");
+        assert_eq!(codex_version, "0.142.4");
         assert!(validate_codex_version("0.144").is_err());
         assert!(validate_codex_version("latest").is_err());
     }

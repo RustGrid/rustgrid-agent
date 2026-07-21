@@ -127,14 +127,12 @@ sudo usermod -aG kvm "$USER"
 newgrp kvm
 ```
 
-Then authenticate Docker and Codex, initialize a balanced network policy, and
-allow the coordinator-owned local kit that pins the Codex CLI version:
+Then authenticate Docker and Codex and initialize a balanced network policy:
 
 ```sh
 sbx login
 sbx secret set -g openai --oauth
 sbx policy init balanced
-sbx settings set kit.allowLocalKits true
 sbx diagnose
 ```
 
@@ -227,9 +225,9 @@ The model is not selected from `.rustgrid-agent.json`:
 4. The worker verifies the policy hash and executes that exact command.
 
 The `executor.codex_version` setting pins the **Codex CLI version**, not the
-model. The worker creates a local Docker Sandbox kit outside the mounted
-repository, installs that exact `@openai/codex` version, and verifies
-`codex --version` before starting the run. Local `codex_command`,
+model. The selected immutable Docker Sandbox template must already contain that
+exact version; the worker verifies `codex --version` before starting the run and
+never installs or upgrades Codex while a ticket is starting. Local `codex_command`,
 `quality_gate_command`, and timeout fields are retained only for configuration
 compatibility and cannot override a claimed run.
 
@@ -272,7 +270,7 @@ development-only local executor unless `executor` is set.
 | `executor.kind` | `local` in a minimal file | `local` is development-only; production requires `docker_sandbox`. |
 | `executor.command` | `sbx` | Docker Sandboxes executable. |
 | `executor.template` | Digest-pinned default | Production rejects mutable tags and requires a 64-character `@sha256:` digest. |
-| `executor.codex_version` | `0.144.4` | Exact numeric Codex CLI version, for example `0.144.4`. |
+| `executor.codex_version` | `0.142.4` | Exact numeric Codex CLI version, for example `0.142.4`. Must match the pinned template. |
 | `executor.cpus`, `executor.memory` | `4`, `8g` | CPU and memory allocated to each run sandbox. |
 | `executor.capacity_cpus`, `executor.capacity_memory` | `4`, `8g` | Host capacity reserved for all concurrent worker sandboxes. Startup rejects overcommit. |
 | `lease_seconds` | `900`; range `30..=86400` | Requested run lease. Must exceed three heartbeat intervals. |
@@ -433,23 +431,20 @@ turn. At terminal finalization the worker idempotently writes `input_tokens`,
 `cached_input_tokens`, `output_tokens`, and `total_tokens` to
 `PUT /agent-runs/{run_id}/token-consumption`. Cached input is a subset of input,
 and total consumption is input plus output. Successful runs require this report;
-
-Before repository execution, the worker deterministically classifies each
-mission as `metadata`, `configuration`, `single_file`, `multi_file`, or
-`repository_wide`. The class selects advisory input/model/tool budgets and
-bounded Codex context settings. Codex always runs ephemerally with ambient user
-configuration disabled; personal plugins, MCP servers, skills, browser tools,
-and unrelated global instructions are therefore not inherited by production
-missions. Tool output retention, automatic history compaction, and root
-instruction size are class-bounded. Budget overruns emit lifecycle diagnostics
-before any future hard enforcement.
-
-Initial repository context is deliberately small: the mission objective,
-bounded ticket context, repository identity, and root `AGENTS.md`. The worker no
-longer injects the repository README as instructions, replays at most the latest
-20 comments and 10 failed gates, and directs Codex to retrieve source and docs
-on demand.
 unsuccessful runs attempt it before terminal failure handling.
+
+For coding missions, the worker first checks out the repository and then
+classifies the mission as `configuration`, `single_file`, `multi_file`, or
+`repository_wide`. Classification selects advisory input/model/tool budgets for
+telemetry only. It cannot remove capabilities, compact required context, stop a
+working Codex process, or bypass validation. Budget overruns emit diagnostics
+without changing execution.
+
+The initial coding prompt includes the complete ticket context and applicable
+repository instructions. Codex starts with targeted inspection but may expand
+to any relevant source, documentation, test, or tool needed for correctness.
+Validated direct metadata operations remain the only path that intentionally
+skips repository checkout and Codex.
 
 Human-readable lifecycle logs are the default. Use `RUSTGRID_AGENT_LOG=json`
 for service-manager collection. RustGrid receives bounded progress, step,
@@ -528,7 +523,7 @@ run and login boundaries used by the client.
   worker's API origin.
 - **`status` reports an executor failure:** run `sbx diagnose`, confirm `sbx`
   0.34.0 or newer, inspect the active policy, verify KVM access on Linux, and
-  confirm `kit.allowLocalKits` is enabled.
+  confirm the configured Codex version matches the pinned template.
 - **Codex cannot authenticate:** run `sbx secret set -g openai --oauth` as the
   same OS account that runs the worker. Sandboxes do not inherit `~/.codex`.
 - **Token consumption remains zero:** verify the manifest invokes Codex, inspect
