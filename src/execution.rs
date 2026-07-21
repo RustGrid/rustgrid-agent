@@ -21,6 +21,7 @@ use crate::{
 };
 
 const CODEX_IDLE_ATTEMPTS: u32 = 3;
+const MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS: u32 = 4;
 const DEPENDENCY_INSTALL_ATTEMPTS: u32 = 3;
 pub(crate) const VALIDATION_REPAIR_ATTEMPTS: u32 = 3;
 
@@ -331,6 +332,7 @@ pub(crate) fn run_codex_prompt(
     let mut codex_attempt = 1u32;
     let mut retry_of_call_id = None;
     let codex_status = loop {
+        let progress_watchdog = RefCell::new(CodexProgressWatchdog::default());
         let telemetry = RefCell::new(context.reporter.start_codex_telemetry(
             &codex_args,
             prompt,
@@ -359,6 +361,7 @@ pub(crate) fn run_codex_prompt(
             },
             |line| {
                 telemetry.borrow_mut().observe_line(line);
+                progress_watchdog.borrow_mut().observe_line(line)?;
                 if let Some(message) = feedback_from_output_line(line) {
                     if let Some(action) = blocked_action_from_feedback(&message) {
                         blocked_action.replace(Some(action));
@@ -411,7 +414,8 @@ pub(crate) fn run_codex_prompt(
         match result {
             Ok(status) => break status,
             Err(error)
-                if command::is_idle_timeout(&error) && codex_attempt < CODEX_IDLE_ATTEMPTS =>
+                if command::is_idle_timeout(&error)
+                    && should_retry_idle_codex_attempt(tool_calls, codex_attempt) =>
             {
                 let delay = Duration::from_secs(u64::from(codex_attempt) * 2);
                 context.reporter.step(
@@ -638,18 +642,72 @@ fn codex_output_is_meaningful_activity(line: &str) -> bool {
     };
     match event.get("type").and_then(serde_json::Value::as_str) {
         Some("item.started" | "item.updated" | "item.completed") => {
-            event
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(serde_json::Value::as_str)
-                != Some("reasoning")
+            codex_output_is_tangible_tool_activity(line)
         }
-        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed" | "error") => {
-            true
-        }
+        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed") => true,
+        // Narration-only assistant messages and reconnect errors are useful
+        // feedback, but they are not execution progress. Counting them as
+        // activity lets a model repeatedly announce the same next step and
+        // evade the idle timeout forever.
+        Some("error") => false,
         Some(_) => false,
         None => true,
     }
+}
+
+#[derive(Default)]
+struct CodexProgressWatchdog {
+    narrative_messages_without_progress: u32,
+}
+
+impl CodexProgressWatchdog {
+    fn observe_line(&mut self, line: &str) -> Result<()> {
+        if codex_output_is_tangible_tool_activity(line) {
+            self.narrative_messages_without_progress = 0;
+            return Ok(());
+        }
+        if !codex_output_is_agent_message(line) {
+            return Ok(());
+        }
+        self.narrative_messages_without_progress =
+            self.narrative_messages_without_progress.saturating_add(1);
+        if self.narrative_messages_without_progress >= MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS {
+            return Err(RunFailure::CodexProgressStalled {
+                narrative_messages: self.narrative_messages_without_progress,
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+fn codex_output_is_tangible_tool_activity(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    matches!(
+        event
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str),
+        Some("command_execution" | "file_change" | "mcp_tool_call" | "web_search")
+    )
+}
+
+fn codex_output_is_agent_message(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    event.get("type").and_then(serde_json::Value::as_str) == Some("item.completed")
+        && event
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("agent_message")
+}
+
+fn should_retry_idle_codex_attempt(tool_calls: usize, attempt: u32) -> bool {
+    tool_calls > 0 && attempt < CODEX_IDLE_ATTEMPTS
 }
 
 fn print_output(stdout: &str, stderr: &str) {
@@ -780,18 +838,53 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_protocol_frames_do_not_mask_codex_inactivity() {
+    fn only_tangible_codex_progress_resets_the_idle_timeout() {
         assert!(!codex_output_is_meaningful_activity(
             r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#
         ));
-        assert!(codex_output_is_meaningful_activity(
+        assert!(!codex_output_is_meaningful_activity(
             r#"{"type":"item.completed","item":{"type":"agent_message","text":"working"}}"#
+        ));
+        assert!(!codex_output_is_meaningful_activity(
+            r#"{"type":"error","message":"Reconnecting... 4/5"}"#
         ));
         assert!(codex_output_is_meaningful_activity(
             r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#
         ));
+        assert!(codex_output_is_meaningful_activity(
+            r#"{"type":"item.completed","item":{"type":"file_change","changes":[]}}"#
+        ));
         assert!(!codex_output_is_meaningful_activity(
             r#"{"type":"response.keepalive"}"#
+        ));
+    }
+
+    #[test]
+    fn narration_only_idle_attempts_are_not_restarted() {
+        assert!(!should_retry_idle_codex_attempt(0, 1));
+        assert!(should_retry_idle_codex_attempt(1, 1));
+        assert!(!should_retry_idle_codex_attempt(1, CODEX_IDLE_ATTEMPTS));
+    }
+
+    #[test]
+    fn repeated_narration_without_tool_progress_is_stopped() {
+        let narration = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Still inspecting."}}"#;
+        let tool = r#"{"type":"item.started","item":{"type":"command_execution"}}"#;
+        let mut watchdog = CodexProgressWatchdog::default();
+
+        for _ in 0..MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS - 1 {
+            watchdog.observe_line(narration).unwrap();
+        }
+        watchdog.observe_line(tool).unwrap();
+        for _ in 0..MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS - 1 {
+            watchdog.observe_line(narration).unwrap();
+        }
+        let error = watchdog.observe_line(narration).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RunFailure>(),
+            Some(RunFailure::CodexProgressStalled {
+                narrative_messages: MAX_NARRATIVE_MESSAGES_WITHOUT_PROGRESS
+            })
         ));
     }
 
