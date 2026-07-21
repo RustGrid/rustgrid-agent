@@ -1,6 +1,9 @@
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashSet},
+    fs::{self, OpenOptions},
+    io::{Seek, Write},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -11,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
     api::{AgentRun, RustGridClient, Ticket, Worker},
@@ -47,6 +51,74 @@ use crate::{
 
 const CI_REPAIR_ATTEMPTS: u32 = 3;
 
+#[derive(Debug)]
+struct WorkerProcessLock {
+    file: fs::File,
+}
+
+impl WorkerProcessLock {
+    fn acquire(context: &AppContext) -> Result<Self> {
+        let worker_id = context.require_worker_id()?;
+        Self::acquire_for(&context.workspace_root, worker_id)
+    }
+
+    fn acquire_for(workspace_root: &Path, worker_id: &str) -> Result<Self> {
+        fs::create_dir_all(workspace_root).with_context(|| {
+            format!(
+                "could not create worker workspace root {}",
+                workspace_root.display()
+            )
+        })?;
+        let digest = hex::encode(Sha256::digest(worker_id.as_bytes()));
+        let path = workspace_root.join(format!(".worker-{}.lock", &digest[..16]));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("could not open worker lock {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: flock only reads the valid descriptor and does not retain it.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    bail!(
+                        "another rustgrid-agent execution process already owns worker {worker_id}; stop the existing `serve`, `watch`, or `run` process before starting another"
+                    );
+                }
+                return Err(error)
+                    .with_context(|| format!("could not lock worker state {}", path.display()));
+            }
+        }
+        #[cfg(not(unix))]
+        bail!("single-worker process locking is supported on macOS and Linux");
+
+        file.set_len(0)?;
+        file.rewind()?;
+        writeln!(file, "pid={}", std::process::id())?;
+        file.sync_data()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for WorkerProcessLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: the descriptor remains owned by self until this drop completes.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 pub fn register(context: &AppContext) -> Result<()> {
     console_event("starting", "Connecting to announced RustGrid worker", "36");
     let api = RustGridClient::new(context)?;
@@ -60,6 +132,7 @@ pub fn register(context: &AppContext) -> Result<()> {
 }
 
 pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
+    let _process_lock = WorkerProcessLock::acquire(context)?;
     sweep_workspaces(context, &HashSet::new())?;
     let api = RustGridClient::new(context)?;
     console_event("starting", "Connecting to announced worker", "36");
@@ -1135,6 +1208,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
 }
 
 pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
+    let _process_lock = WorkerProcessLock::acquire(context)?;
     if once && context.config.max_concurrency != 1 {
         bail!(
             "watch --once requires max_concurrency=1 so one runtime boundary owns at most one run"
@@ -1453,5 +1527,18 @@ mod tests {
         );
 
         assert!(selected.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_process_lock_rejects_a_second_execution_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = WorkerProcessLock::acquire_for(directory.path(), "worker-1").unwrap();
+
+        let error = WorkerProcessLock::acquire_for(directory.path(), "worker-1").unwrap_err();
+        assert!(error.to_string().contains("already owns worker worker-1"));
+
+        drop(first);
+        WorkerProcessLock::acquire_for(directory.path(), "worker-1").unwrap();
     }
 }

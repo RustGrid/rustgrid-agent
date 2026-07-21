@@ -26,6 +26,9 @@ Semantic Versioning.
 - Prevent duplicate active attempts for one ticket in a worker session, bind
   step idempotency to the exact request body, and retry RustGrid's explicit
   in-flight idempotency conflict without retrying permanent 409 responses.
+- Enforce one local `serve`, `watch`, or `run` execution owner per worker
+  identity so duplicate processes cannot steal leases or race deterministic
+  sandbox names.
 
 ## 1.2.0 - 2026-07-19
 
