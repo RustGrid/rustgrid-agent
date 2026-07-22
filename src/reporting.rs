@@ -265,7 +265,7 @@ impl<'a> Reporter<'a> {
                 name,
                 status,
                 message,
-                Some(event.data.clone()),
+                Some(step_api_metadata(&event)),
             )
             .with_context(|| format!("could not report step {name} to RustGrid"))
     }
@@ -498,6 +498,10 @@ fn truncate(value: &str, max: usize) -> String {
     format!("{}…", &value[..end])
 }
 
+fn step_api_metadata(event: &LifecycleEvent) -> serde_json::Value {
+    event.data.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +516,24 @@ mod tests {
             feedback_idempotency_key("run-1", "blocked"),
             feedback_idempotency_key("run-1", "running")
         );
+    }
+
+    #[test]
+    fn step_api_metadata_is_the_flat_lifecycle_payload() {
+        let mut event = LifecycleEvent::new(
+            1,
+            RunPhase::Executing,
+            "step.context-composed-completed",
+            "info",
+            "context composed",
+            Some(json!({"ticket_context_tokens": 42})),
+        );
+        event.data["phase_elapsed_ms"] = json!(7);
+
+        let metadata = step_api_metadata(&event);
+        assert_eq!(metadata["ticket_context_tokens"], 42);
+        assert_eq!(metadata["phase_elapsed_ms"], 7);
+        assert!(metadata.get("data").is_none());
+        assert!(metadata.get("event_type").is_none());
     }
 }

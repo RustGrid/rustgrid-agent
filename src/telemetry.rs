@@ -1339,9 +1339,7 @@ fn apply_codex_config_identity(value: &str, provider: &mut String, model: &mut O
     let value = value.trim().trim_matches('"');
     match key.trim() {
         "model" if safe_identifier(value, 200).is_some() => *model = Some(value.to_owned()),
-        "model_provider" if safe_identifier(value, 100).is_some() => {
-            *provider = value.to_owned()
-        }
+        "model_provider" if safe_identifier(value, 100).is_some() => *provider = value.to_owned(),
         _ => {}
     }
 }
