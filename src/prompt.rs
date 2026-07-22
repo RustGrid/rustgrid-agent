@@ -8,6 +8,19 @@ use crate::{
     mission::{ExecutionOwnership, MissionClass, ValidationPlan},
 };
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextComposition {
+    pub ticket_tokens: usize,
+    pub repository_instruction_tokens: usize,
+    pub worker_instruction_tokens: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltPrompt {
+    pub text: String,
+    pub composition: ContextComposition,
+}
+
 pub fn build(
     ticket: &Ticket,
     repo_root: &std::path::Path,
@@ -17,6 +30,36 @@ pub fn build(
     attachments: &[StagedAttachment],
     mission_class: MissionClass,
 ) -> Result<String> {
+    Ok(build_with_composition(
+        ticket,
+        repo_root,
+        validation_plan,
+        ownership,
+        run_prompt,
+        attachments,
+        mission_class,
+    )?
+    .text)
+}
+
+pub fn build_with_composition(
+    ticket: &Ticket,
+    repo_root: &std::path::Path,
+    validation_plan: &ValidationPlan,
+    ownership: &ExecutionOwnership,
+    run_prompt: &str,
+    attachments: &[StagedAttachment],
+    mission_class: MissionClass,
+) -> Result<BuiltPrompt> {
+    let mut ticket_characters = ticket.key.chars().count()
+        + ticket.title.chars().count()
+        + ticket
+            .description
+            .as_deref()
+            .unwrap_or("(none provided)")
+            .chars()
+            .count()
+        + run_prompt.chars().count();
     let mut prompt = format!(
         r#"You are implementing RustGrid ticket {key} in the Git repository at the current working directory.
 
@@ -96,6 +139,7 @@ Execution ownership (audit record):
     );
 
     if let Some(section) = prompt_section(attachments) {
+        ticket_characters = ticket_characters.saturating_add(section.chars().count());
         prompt.push('\n');
         prompt.push_str(&section);
     }
@@ -103,6 +147,9 @@ Execution ownership (audit record):
     if !ticket.comments.is_empty() {
         prompt.push_str("\nTicket comments (oldest first):\n");
         for comment in &ticket.comments {
+            ticket_characters = ticket_characters
+                .saturating_add(author_name(comment.author.as_ref()).chars().count())
+                .saturating_add(comment.content.chars().count());
             prompt.push_str(&format!(
                 "- {}: {}\n",
                 author_name(comment.author.as_ref()),
@@ -111,13 +158,25 @@ Execution ownership (audit record):
         }
     }
     if has_value(&ticket.custom_fields) {
+        let custom_fields = to_string_pretty(&ticket.custom_fields)?;
+        ticket_characters = ticket_characters.saturating_add(custom_fields.chars().count());
         prompt.push_str("\nCustom fields:\n```json\n");
-        prompt.push_str(&to_string_pretty(&ticket.custom_fields)?);
+        prompt.push_str(&custom_fields);
         prompt.push_str("\n```\n");
     }
     if !ticket.previous_quality_gate_failures.is_empty() {
         prompt.push_str("\nPrevious quality gate failures to address:\n");
         for failure in &ticket.previous_quality_gate_failures {
+            ticket_characters = ticket_characters
+                .saturating_add(
+                    failure
+                        .command
+                        .as_deref()
+                        .unwrap_or("unknown command")
+                        .chars()
+                        .count(),
+                )
+                .saturating_add(failure.message.chars().count());
             prompt.push_str(&format!(
                 "- [{}] {}\n",
                 failure.command.as_deref().unwrap_or("unknown command"),
@@ -125,12 +184,27 @@ Execution ownership (audit record):
             ));
         }
     }
+    let mut repository_instruction_characters = 0usize;
     for (name, content) in read_repo_instructions(repo_root)? {
+        repository_instruction_characters = repository_instruction_characters
+            .saturating_add(name.chars().count())
+            .saturating_add(content.chars().count());
         prompt.push_str(&format!(
             "\nRepository instructions from {name}:\n```text\n{content}\n```\n"
         ));
     }
-    Ok(prompt)
+    let total_characters = prompt.chars().count();
+    let worker_instruction_characters = total_characters
+        .saturating_sub(ticket_characters)
+        .saturating_sub(repository_instruction_characters);
+    Ok(BuiltPrompt {
+        text: prompt,
+        composition: ContextComposition {
+            ticket_tokens: ticket_characters.div_ceil(4),
+            repository_instruction_tokens: repository_instruction_characters.div_ceil(4),
+            worker_instruction_tokens: worker_instruction_characters.div_ceil(4),
+        },
+    })
 }
 
 fn author_name(author: Option<&serde_json::Value>) -> &str {
@@ -213,5 +287,44 @@ mod tests {
         ] {
             assert!(value.contains(expected));
         }
+    }
+
+    #[test]
+    fn reports_bounded_prompt_source_estimates() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Use small modules.").unwrap();
+        let ticket = Ticket {
+            id: "1".into(),
+            key: "RG-2".into(),
+            title: "Rename navigation".into(),
+            description: Some("Replace the old label.".into()),
+            comments: Vec::new(),
+            custom_fields: serde_json::Value::Null,
+            previous_quality_gate_failures: Vec::new(),
+            row_version: 1,
+        };
+        let built = build_with_composition(
+            &ticket,
+            dir.path(),
+            &ValidationPlan {
+                focused_candidates: vec!["Run the navigation test".into()],
+                worker_gates: vec!["npm test".into()],
+                codex_instructions: "focused only".into(),
+            },
+            &ExecutionOwnership::default(),
+            "Keep the change narrow.",
+            &[],
+            MissionClass::Configuration,
+        )
+        .unwrap();
+        assert!(built.composition.ticket_tokens > 0);
+        assert!(built.composition.repository_instruction_tokens > 0);
+        assert!(built.composition.worker_instruction_tokens > 0);
+        assert!(
+            built.composition.ticket_tokens
+                + built.composition.repository_instruction_tokens
+                + built.composition.worker_instruction_tokens
+                <= built.text.len().div_ceil(4) + 2
+        );
     }
 }

@@ -604,6 +604,7 @@ struct ActiveTurn {
     started_at: String,
     context_tokens_before_call: Option<u64>,
     context_window_limit: Option<u64>,
+    narration_characters: u64,
 }
 
 struct ActiveTool {
@@ -717,6 +718,14 @@ impl CodexTelemetrySession {
             }
             Some("item.completed") => {
                 if let Some(item) = event.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("agent_message")
+                        && let Some(text) = item.get("text").and_then(Value::as_str)
+                        && let Some(turn) = self.active_turn.as_mut()
+                    {
+                        turn.narration_characters = turn
+                            .narration_characters
+                            .saturating_add(text.chars().count().try_into().unwrap_or(u64::MAX));
+                    }
                     self.complete_tool(item);
                 }
             }
@@ -810,6 +819,7 @@ impl CodexTelemetrySession {
             started_at: started_at.clone(),
             context_tokens_before_call,
             context_window_limit,
+            narration_characters: 0,
         });
         self.last_model_call_id = Some(model_call_id);
         self.emit(
@@ -872,6 +882,10 @@ impl CodexTelemetrySession {
         });
         let raw = usage.raw.get_or_insert_with(Map::new);
         raw.extend(self.invocation.context_estimates.clone());
+        raw.insert(
+            "model_narration_characters".into(),
+            Value::from(turn.narration_characters),
+        );
         if let (Some(input), Some(cached), Some(output)) = (
             usage.input_tokens,
             usage.cached_input_tokens,
@@ -1379,6 +1393,9 @@ mod tests {
         );
         session.observe_line(r#"{"type":"turn.started"}"#);
         session.observe_line(
+            r#"{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"Implementation complete."}}"#,
+        );
+        session.observe_line(
             r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":25,"reasoning_output_tokens":5,"total_tokens":125}}"#,
         );
         session.finish(SessionOutcome::Succeeded);
@@ -1409,6 +1426,14 @@ mod tests {
                 .and_then(|payload| payload.get("ctx_known_est_tokens"))
                 .and_then(Value::as_u64),
             Some(321)
+        );
+        assert_eq!(
+            model_call
+                .provider_usage_payload
+                .as_ref()
+                .and_then(|payload| payload.get("model_narration_characters"))
+                .and_then(Value::as_u64),
+            Some(24)
         );
         assert_eq!(model_call.attempt_number, 2);
         assert!(matches!(

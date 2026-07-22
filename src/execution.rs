@@ -238,6 +238,7 @@ pub(crate) fn bootstrap_dependencies(
         &format!("Installing locked {manager} dependencies before Codex execution"),
         Some(json!({"manager": manager, "command": command_text})),
     )?;
+    let bootstrap_started = Instant::now();
     for attempt in 1..=DEPENDENCY_INSTALL_ATTEMPTS {
         let started = Instant::now();
         let install = executor.captured(
@@ -284,7 +285,8 @@ pub(crate) fn bootstrap_dependencies(
                     "output": processed.model_summary,
                     "raw_output_location": processed.raw_output_location,
                     "original_characters": processed.original_characters,
-                    "model_characters": processed.model_characters
+                    "model_characters": processed.model_characters,
+                    "duration_ms": bootstrap_started.elapsed().as_millis()
                 })),
             )?;
             return Ok(());
@@ -1162,6 +1164,7 @@ fn run_quality_gates(
             )?;
             continue;
         }
+        let gate_total_started = Instant::now();
         let mut gate_attempt = 1u32;
         let gate = loop {
             let gate_started = Instant::now();
@@ -1251,6 +1254,7 @@ fn run_quality_gates(
                 "raw_output_location": processed.raw_output_location,
                 "original_characters": processed.original_characters,
                 "model_characters": processed.model_characters,
+                "duration_ms": gate_total_started.elapsed().as_millis(),
                 "output_mode": processed.mode,
                 "truncated": processed.truncated
             })),

@@ -416,7 +416,7 @@ fn execute_claimed(
                 "repository_checked_out": true
             })),
         )?;
-        let generated_prompt = prompt::build(
+        let generated_prompt = prompt::build_with_composition(
             ticket,
             &repo.root,
             &validation_plan,
@@ -425,6 +425,8 @@ fn execute_claimed(
             &staged_attachments,
             mission_profile.class,
         )?;
+        let prompt_composition = generated_prompt.composition;
+        let generated_prompt = generated_prompt.text;
         let estimated_prompt_tokens = generated_prompt.len().div_ceil(4) as u64;
         reporter.step(
             "context_composed",
@@ -441,6 +443,9 @@ fn execute_claimed(
                 "budget_warning": estimated_prompt_tokens > budget.max_initial_prompt_tokens,
                 "history_comments_included": ticket.comments.len(),
                 "repository_context": "applicable repository instructions",
+                "ticket_tokens": prompt_composition.ticket_tokens,
+                "repository_instruction_tokens": prompt_composition.repository_instruction_tokens,
+                "worker_instruction_tokens": prompt_composition.worker_instruction_tokens,
                 "loading_strategy": "correctness_first",
                 "budget_enforcement": "active"
             })),

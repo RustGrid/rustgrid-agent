@@ -103,7 +103,10 @@ pub(crate) fn wait_for_required_workflows(
                 "required_workflows",
                 StepStatus::Completed,
                 "Required GitHub workflows passed",
-                Some(json!({"required": requirements.required})),
+                Some(json!({
+                    "required": requirements.required,
+                    "duration_ms": started.elapsed().as_millis()
+                })),
             )?;
             return Ok(());
         }
