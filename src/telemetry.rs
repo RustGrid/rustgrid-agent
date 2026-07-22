@@ -1318,6 +1318,10 @@ pub fn codex_provider_and_model(args: &[String]) -> (String, String) {
                 provider = args[index + 1].clone();
                 index += 1;
             }
+            "-c" | "--config" if index + 1 < args.len() => {
+                apply_codex_config_identity(&args[index + 1], &mut provider, &mut model);
+                index += 1;
+            }
             value if value.starts_with("--model=") => {
                 model = value.split_once('=').map(|(_, value)| value.to_owned());
             }
@@ -1326,6 +1330,20 @@ pub fn codex_provider_and_model(args: &[String]) -> (String, String) {
         index += 1;
     }
     (provider, model.unwrap_or_else(|| "unknown".into()))
+}
+
+fn apply_codex_config_identity(value: &str, provider: &mut String, model: &mut Option<String>) {
+    let Some((key, value)) = value.split_once('=') else {
+        return;
+    };
+    let value = value.trim().trim_matches('"');
+    match key.trim() {
+        "model" if safe_identifier(value, 200).is_some() => *model = Some(value.to_owned()),
+        "model_provider" if safe_identifier(value, 100).is_some() => {
+            *provider = value.to_owned()
+        }
+        _ => {}
+    }
 }
 
 fn stable_uuid(value: &str) -> Uuid {
@@ -1367,6 +1385,34 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_model_identity_from_codex_flags_and_config_overrides() {
+        let args = vec![
+            "codex".into(),
+            "exec".into(),
+            "--model".into(),
+            "gpt-5.6-terra".into(),
+            "-c".into(),
+            "model_provider=\"rustgrid_chatgpt_http\"".into(),
+            "-".into(),
+        ];
+        assert_eq!(
+            codex_provider_and_model(&args),
+            ("rustgrid_chatgpt_http".into(), "gpt-5.6-terra".into())
+        );
+
+        let config_only = vec![
+            "codex".into(),
+            "exec".into(),
+            "--config".into(),
+            "model=\"gpt-5.6-sol\"".into(),
+        ];
+        assert_eq!(
+            codex_provider_and_model(&config_only),
+            ("openai".into(), "gpt-5.6-sol".into())
+        );
+    }
 
     #[test]
     fn codex_session_emits_detailed_usage_and_preserves_legacy_delta() {

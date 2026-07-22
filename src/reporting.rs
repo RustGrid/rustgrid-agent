@@ -265,7 +265,7 @@ impl<'a> Reporter<'a> {
                 name,
                 status,
                 message,
-                Some(event.metadata()),
+                Some(event.data.clone()),
             )
             .with_context(|| format!("could not report step {name} to RustGrid"))
     }

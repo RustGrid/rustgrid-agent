@@ -39,6 +39,12 @@ its sanitized usage metadata. Lifecycle budget events include the threshold,
 current multidimensional usage, and action. Ownership interruptions and
 duplicate gate/bootstrap avoidance are recorded as steps.
 
+Step records receive the measurement payload directly; the separate progress
+event retains the full lifecycle envelope. Model identity is resolved from
+Codex model flags and safe `model`/`model_provider` config overrides, allowing
+the control plane to distinguish API-priced calls from the ChatGPT subscription
+transport without inspecting credentials.
+
 Worker command output has three model-facing modes: `summary`,
 `failure_excerpt`, and explicit `full_requested`. Successful output is reduced
 to aggregate results; failures are bounded to 160 lines and 24,000 characters.
