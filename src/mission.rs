@@ -111,10 +111,12 @@ impl MissionBudget {
                 if let Some(value) = value
                     .get(stringify!($field))
                     .and_then(serde_json::Value::as_u64)
-                    && value > 0
-                    && let Ok(value) = <$ty>::try_from(value)
+                    .filter(|value| *value > 0)
                 {
-                    budget.$field = value;
+                    match <$ty>::try_from(value) {
+                        Ok(converted) => budget.$field = converted,
+                        Err(_) => {}
+                    }
                 }
             };
         }
