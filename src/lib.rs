@@ -15,6 +15,7 @@ pub mod journal;
 pub mod lifecycle;
 pub mod manifest;
 pub mod mission;
+pub mod optimization;
 pub mod outcome;
 pub mod prompt;
 mod publishing;

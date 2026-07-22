@@ -35,7 +35,9 @@ use crate::{
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
     manifest::ExecutionManifest,
-    mission::{DirectOperation, MissionProfile, direct_operation},
+    mission::{
+        DirectOperation, ExecutionOwnership, MissionProfile, ValidationPlan, direct_operation,
+    },
     outcome::{RunOutcome, RunSummary},
     prompt,
     publishing::{
@@ -381,7 +383,13 @@ fn execute_claimed(
         )?;
         let mission_profile =
             MissionProfile::classify_after_checkout(ticket, &manifest, &repo.root);
-        let budget = mission_profile.class.budget();
+        let budget = mission_profile.budget;
+        let ownership = ExecutionOwnership::default();
+        let validation_plan = ValidationPlan::build(
+            mission_profile.class,
+            &repo.root,
+            &execution_policy.quality_gates,
+        );
         reporter.step(
             "mission_classified",
             StepStatus::Completed,
@@ -393,25 +401,26 @@ fn execute_claimed(
                 "mission_class": mission_profile.class,
                 "classification_reason": mission_profile.reason,
                 "explicit": mission_profile.explicit,
-                "max_input_tokens": budget.max_input_tokens,
-                "max_model_calls": budget.max_model_calls,
+                "execution_ownership": ownership,
+                "validation_plan": validation_plan,
+                "max_initial_prompt_tokens": budget.max_initial_prompt_tokens,
+                "max_inference_turns": budget.max_inference_turns,
                 "max_tool_calls": budget.max_tool_calls,
+                "max_peak_context_tokens": budget.max_peak_context_tokens,
+                "max_cumulative_uncached_input_tokens": budget.max_cumulative_uncached_input_tokens,
+                "max_cumulative_cached_input_tokens": budget.max_cumulative_cached_input_tokens,
+                "max_output_tokens": budget.max_output_tokens,
+                "max_codex_duration_ms": budget.max_codex_duration_ms,
                 "tool_bundles": mission_profile.class.tool_bundles(),
-                "enforcement": "advisory",
+                "enforcement": "active",
                 "repository_checked_out": true
             })),
         )?;
-        let required_gates = execution_policy
-            .quality_gates
-            .iter()
-            .filter(|gate| gate.required)
-            .map(|gate| gate.command.as_str())
-            .collect::<Vec<_>>()
-            .join(" && ");
         let generated_prompt = prompt::build(
             ticket,
             &repo.root,
-            &required_gates,
+            &validation_plan,
+            &ownership,
             &manifest.run.input_prompt,
             &staged_attachments,
             mission_profile.class,
@@ -428,12 +437,12 @@ fn execute_claimed(
             Some(json!({
                 "mission_class": mission_profile.class,
                 "estimated_input_tokens": estimated_prompt_tokens,
-                "max_input_tokens": budget.max_input_tokens,
-                "budget_warning": estimated_prompt_tokens > budget.max_input_tokens,
+                "max_initial_prompt_tokens": budget.max_initial_prompt_tokens,
+                "budget_warning": estimated_prompt_tokens > budget.max_initial_prompt_tokens,
                 "history_comments_included": ticket.comments.len(),
                 "repository_context": "applicable repository instructions",
                 "loading_strategy": "correctness_first",
-                "budget_enforcement": "advisory"
+                "budget_enforcement": "active"
             })),
         )?;
         if !staged_attachments.is_empty() {
@@ -691,6 +700,11 @@ fn validate_reconciled_commit(
             }
         })),
     )?;
+    let mission_profile = MissionProfile::classify_after_checkout(
+        context.ticket,
+        context.manifest,
+        &context.repo.root,
+    );
     let codex = CodexContext {
         app: context.app,
         reporter: context.reporter,
@@ -699,12 +713,10 @@ fn validate_reconciled_commit(
         manifest: context.manifest,
         executor: context.executor,
         executor_handle: context.executor_handle,
-        mission_class: MissionProfile::classify_after_checkout(
-            context.ticket,
-            context.manifest,
-            &context.repo.root,
-        )
-        .class,
+        mission_class: mission_profile.class,
+        budget: mission_profile.budget,
+        baseline: context.baseline,
+        ticket: context.ticket,
     };
     run_gates_with_repairs(
         &codex,
@@ -1083,6 +1095,8 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 ),
                 Some(json!({"attempt": repair_attempt, "commit": commit})),
             )?;
+            let mission_profile =
+                MissionProfile::classify_after_checkout(ticket, manifest, &repo.root);
             let codex = CodexContext {
                 app: context,
                 reporter,
@@ -1091,13 +1105,25 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 manifest,
                 executor,
                 executor_handle,
-                mission_class: MissionProfile::classify_after_checkout(
-                    ticket, manifest, &repo.root,
-                )
-                .class,
+                mission_class: mission_profile.class,
+                budget: mission_profile.budget,
+                baseline: &baseline,
+                ticket,
             };
+            let changed = repo.new_agent_paths(&baseline)?;
+            let diff = crate::command::capture(
+                "git",
+                ["diff", "--no-ext-diff", "--unified=3", "HEAD", "--"],
+                &repo.root,
+            )?
+            .stdout;
             let repair_prompt = format!(
-                "Required GitHub CI failed for the pull request. Inspect the current workspace and the CI evidence below, fix the underlying issue, and run relevant checks. Do not commit, push, or open a pull request; the runner owns publication. CI failures are real blockers, so do not declare success while they remain.\n\n{failure}"
+                "This is a compact CI repair session for {} - {}. Fix only the required CI failure below in the existing workspace. Do not repeat broad discovery, reinstall dependencies, run full repository gates, commit, push, or open a pull request; the worker owns deterministic validation and publication. Run at most one focused diagnostic, inspect the diff, and finish.\n\nChanged files: {}\n\nCI failure summary:\n{}\n\nCurrent bounded diff:\n{}",
+                ticket.key,
+                ticket.title,
+                changed.into_iter().collect::<Vec<_>>().join(", "),
+                bounded_text(&failure, 20_000),
+                bounded_text(&diff, 20_000),
             );
             run_codex_prompt(
                 &codex,
@@ -1441,6 +1467,17 @@ fn select_unstarted_assignments(
         .filter(|run| selected_ticket_ids.insert(run.ticket_id.clone()))
         .take(available_slots)
         .collect()
+}
+
+fn bounded_text(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_owned();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n...[truncated]", &value[..end])
 }
 
 pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {

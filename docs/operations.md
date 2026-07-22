@@ -155,8 +155,16 @@ observed SHA. A stale lease is a concurrency signal and must not be bypassed
 with an unconditional force push.
 
 Required validation is iterative. Local quality gates collect all required
-failures before returning diagnostics to Codex, with three total validation
-attempts. Once a pull request exists, a failed required GitHub workflow starts
+failures before returning normalized summaries and bounded excerpts to a new
+compact Codex repair session, with three total validation attempts. Complete
+gate output remains in the audit record. Successful gates are keyed by command
+and source-tree hash so an unchanged repair cycle cannot execute them twice.
+Successful focused-validation commands observed in the Codex event stream are
+also associated with the current source-tree hash. A later edit invalidates
+that completion evidence. Budget, ownership, idle, and incomplete-completion
+restarts receive a compact ticket-and-diff handoff instead of an empty
+continuation instruction or replayed tool history.
+Once a pull request exists, a failed required GitHub workflow starts
 up to three CI repair iterations. The worker fetches failed job and step details
 and bounded log tails, asks Codex to repair the retained workspace, reruns local
 gates, commits the repair, pushes the existing branch, and waits on the new SHA.

@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{api::RustGridClient, token_consumption::TokenConsumption};
+use crate::{api::RustGridClient, mission::BudgetUsage, token_consumption::TokenConsumption};
 
 pub const TELEMETRY_VERSION: &str = "1.0";
 const BATCH_SIZE: usize = 100;
@@ -68,7 +68,7 @@ pub enum TelemetryPayload {
     Execution { execution: ExecutionSnapshot },
     Phase { phase: PhaseSnapshot },
     Turn { turn: TurnSnapshot },
-    ModelCall { model_call: ModelCallSnapshot },
+    ModelCall { model_call: Box<ModelCallSnapshot> },
     ToolCall { tool_call: ToolCallSnapshot },
 }
 
@@ -146,6 +146,8 @@ pub struct ModelCallSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
@@ -153,6 +155,12 @@ pub struct ModelCallSnapshot {
     pub total_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens_before_call: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_context_tokens_so_far: Option<u64>,
+    pub cumulative_input_tokens: u64,
+    pub cumulative_cached_input_tokens: u64,
+    pub cumulative_uncached_input_tokens: u64,
+    pub cumulative_output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -622,6 +630,7 @@ pub struct CodexTelemetrySession {
     completed_tools: HashSet<String>,
     last_model_call_id: Option<Uuid>,
     legacy_delta: TokenConsumption,
+    peak_context_tokens: u64,
     finished: bool,
 }
 
@@ -646,6 +655,7 @@ impl CodexTelemetrySession {
             completed_tools: HashSet::new(),
             last_model_call_id: None,
             legacy_delta: TokenConsumption::default(),
+            peak_context_tokens: 0,
             finished: false,
         };
         session.emit(
@@ -763,6 +773,22 @@ impl CodexTelemetrySession {
         self.completed_tools.len() + self.active_tools.len()
     }
 
+    pub fn budget_usage(&self, initial_prompt_tokens: u64, duration_ms: u64) -> BudgetUsage {
+        BudgetUsage {
+            initial_prompt_tokens,
+            inference_turns: self.model_call_count(),
+            tool_calls: self.tool_call_count().try_into().unwrap_or(u32::MAX),
+            peak_context_tokens: self.peak_context_tokens,
+            cumulative_uncached_input_tokens: self
+                .legacy_delta
+                .input_tokens
+                .saturating_sub(self.legacy_delta.cached_input_tokens),
+            cumulative_cached_input_tokens: self.legacy_delta.cached_input_tokens,
+            output_tokens: self.legacy_delta.output_tokens,
+            codex_duration_ms: duration_ms,
+        }
+    }
+
     fn start_turn(&mut self, event: &Value) {
         let index = self.next_turn_index;
         self.next_turn_index = self.next_turn_index.saturating_add(1);
@@ -774,6 +800,9 @@ impl CodexTelemetrySession {
             .get("context_tokens")
             .or_else(|| event.get("context_tokens_before_call"))
             .and_then(Value::as_u64);
+        self.peak_context_tokens = self
+            .peak_context_tokens
+            .max(context_tokens_before_call.unwrap_or(0));
         self.active_turn = Some(ActiveTurn {
             id,
             model_call_id,
@@ -806,7 +835,7 @@ impl CodexTelemetrySession {
             model_call_id,
             &started_at,
             TelemetryPayload::ModelCall {
-                model_call: self.model_snapshot(
+                model_call: Box::new(self.model_snapshot(
                     model_call_id,
                     index,
                     &started_at,
@@ -817,7 +846,7 @@ impl CodexTelemetrySession {
                     context_window_limit,
                     None,
                     None,
-                ),
+                )),
             },
         );
     }
@@ -875,7 +904,7 @@ impl CodexTelemetrySession {
             turn.model_call_id,
             &completed_at,
             TelemetryPayload::ModelCall {
-                model_call: self.model_snapshot(
+                model_call: Box::new(self.model_snapshot(
                     turn.model_call_id,
                     turn.index,
                     &turn.started_at,
@@ -886,7 +915,7 @@ impl CodexTelemetrySession {
                     turn.context_window_limit,
                     finish_reason,
                     provider_request_id,
-                ),
+                )),
             },
         );
         self.emit(
@@ -1040,10 +1069,23 @@ impl CodexTelemetrySession {
             status,
             input_tokens: usage.input_tokens,
             cached_input_tokens: usage.cached_input_tokens,
+            uncached_input_tokens: usage
+                .input_tokens
+                .zip(usage.cached_input_tokens)
+                .map(|(input, cached)| input.saturating_sub(cached)),
             output_tokens: usage.output_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.total_tokens,
             context_tokens_before_call,
+            peak_context_tokens_so_far: (self.peak_context_tokens > 0)
+                .then_some(self.peak_context_tokens),
+            cumulative_input_tokens: self.legacy_delta.input_tokens,
+            cumulative_cached_input_tokens: self.legacy_delta.cached_input_tokens,
+            cumulative_uncached_input_tokens: self
+                .legacy_delta
+                .input_tokens
+                .saturating_sub(self.legacy_delta.cached_input_tokens),
+            cumulative_output_tokens: self.legacy_delta.output_tokens,
             context_window_limit,
             finish_reason,
             retry_of_call_id: self.invocation.retry_of_call_id,
@@ -1381,5 +1423,39 @@ mod tests {
                 output_tokens: 25,
             }
         );
+    }
+
+    #[test]
+    fn one_agent_session_reports_multiple_inference_turns_and_distinct_context() {
+        let mut session = CodexTelemetrySession::start(
+            CodexInvocation {
+                run_id: "run-turns".into(),
+                execution_sequence: 1,
+                phase_name: "implementation".into(),
+                provider: "openai".into(),
+                model: "gpt-test".into(),
+                attempt_number: 1,
+                retry_of_call_id: None,
+                context_estimates: Map::new(),
+            },
+            None,
+        );
+        session.observe_line(r#"{"type":"turn.started","context_tokens_before_call":4000}"#);
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":3000,"output_tokens":500}}"#,
+        );
+        session.observe_line(r#"{"type":"turn.started","context_tokens_before_call":7000}"#);
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":8000,"cached_input_tokens":6000,"output_tokens":700}}"#,
+        );
+
+        let usage = session.budget_usage(2_000, 10_000);
+        assert_eq!(session.model_call_count(), 2);
+        assert_eq!(usage.inference_turns, 2);
+        assert_eq!(usage.peak_context_tokens, 7_000);
+        assert_eq!(usage.cumulative_cached_input_tokens, 9_000);
+        assert_eq!(usage.cumulative_uncached_input_tokens, 4_000);
+        assert_eq!(usage.output_tokens, 1_200);
+        assert_ne!(usage.peak_context_tokens, 13_000);
     }
 }

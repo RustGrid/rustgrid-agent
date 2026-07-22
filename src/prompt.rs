@@ -5,13 +5,14 @@ use crate::{
     api::Ticket,
     attachments::{StagedAttachment, prompt_section},
     git::read_repo_instructions,
-    mission::MissionClass,
+    mission::{ExecutionOwnership, MissionClass, ValidationPlan},
 };
 
 pub fn build(
     ticket: &Ticket,
     repo_root: &std::path::Path,
-    quality_gate: &str,
+    validation_plan: &ValidationPlan,
+    ownership: &ExecutionOwnership,
     run_prompt: &str,
     attachments: &[StagedAttachment],
     mission_class: MissionClass,
@@ -32,25 +33,66 @@ Mission class: {mission_class}
 
 Work carefully and finish the implementation. Inspect the checked-out repository before deciding the implementation scope. Follow repository instructions and existing conventions. You may begin with targeted search, but expand the inspection whenever correctness requires it. Add or update tests where appropriate. Do not commit, push, create a branch, or open a pull request; the rustgrid-agent runner owns those steps. Do not read or modify files outside this repository. Do not expose environment variables or credentials.
 
-Send concise progress updates at meaningful milestones while you work. The runner publishes each agent update as a separate RustGrid ticket comment, so make every update useful to a human reviewer and do not repeat yourself.
+Routine progress is derived from tool activity by the worker. You may send one brief initial message, one message for a meaningful scope decision or blocker, and one final summary. Do not narrate searches, file reads, edits, or routine validation.
 
-The runner, not Codex, owns final validation and publication. Attempt repository-requested dependency installation, tests, builds, linting, typechecking, dev-server startup, screenshots, or visual inspection when useful, and report exact failures. The runner hydrates locked JavaScript dependencies before starting you. If a later dependency or registry request fails with a transient DNS, proxy, timeout, or connection error, retry it with bounded backoff instead of immediately continuing without the dependency. Inability to perform validation because of transient network, registry, dependency, tool, browser, or dev-server availability is not by itself a human blocker. If the requested code implementation is complete, finish with `RUSTGRID_AGENT_STATUS: COMPLETED`; the runner will independently execute every required quality gate below. A failed gate or required GitHub workflow can return the current workspace to Codex for a bounded repair iteration, so treat those diagnostics as unfinished implementation work.
+Codex owns targeted discovery, implementation, focused validation, and focused repair. The RustGrid worker owns dependency bootstrap, full repository tests, lint, type-checking, builds, commit, push, pull-request creation, and GitHub checks. The worker already hydrated locked dependencies before starting you. Do not reinstall dependencies. Do not run a worker-owned full command yourself. You may run only the smallest focused test, lint, type-check, or diagnostic command necessary for this ticket. If a focused alternative cannot diagnose a failure, explain the exceptional override before attempting broader validation; the worker records and enforces this boundary.
+
+For a small configuration task use this sequence:
+1. Read applicable repository instructions.
+2. Search for the exact label, key, or option.
+3. Open direct matches and nearby tests only.
+4. Inspect one representative neighboring test.
+5. Change the smallest correct set of files.
+6. Run one focused validation.
+7. Inspect the final diff.
+8. Finish.
+
+Do not broadly read generated or oversized content such as `dist`, `build`, `coverage`, `node_modules`, minified bundles, lockfiles unrelated to the change, binary files, or generated API specifications. For a text file larger than 64 KiB, search first and read only the relevant bounded range.
+
+Focused-validation plan:
+{focused_validation}
+{validation_instructions}
+
+The RustGrid worker will run these authoritative commands after your implementation:
+{worker_gates}
+
+Do not run those full repository commands yourself. A failed worker gate may start a new compact repair session containing only the failure, current diff, and remaining budget. Inability to perform optional local validation because of transient infrastructure is not by itself a human blocker.
 
 Use `BLOCKED` only when the code implementation itself cannot continue without a human decision, missing credential, required permission change, or required external-system state change. End your final update with exactly:
 RUSTGRID_AGENT_STATUS: BLOCKED
 HUMAN_ACTION_REQUIRED: <the specific action a human must take>
 
-If the implementation is complete, end your final update with exactly:
+If the implementation is complete, end your final update with exactly these three lines. Use PASSED only after a focused command actually succeeded. Use NOT_APPLICABLE only for documentation-only changes. If a code change has no viable focused command or focused validation is blocked by transient infrastructure, use DEFERRED_TO_WORKER. NOT_APPLICABLE and DEFERRED_TO_WORKER both require a fourth `RUSTGRID_VALIDATION_REASON:` line:
+RUSTGRID_IMPLEMENTATION_COMPLETE: YES
+RUSTGRID_FOCUSED_VALIDATION: PASSED
 RUSTGRID_AGENT_STATUS: COMPLETED
 
-The runner will execute this quality gate after you finish:
-{quality_gate}
+Execution ownership (audit record):
+{ownership}
 "#,
         key = ticket.key,
         title = ticket.title,
         description = ticket.description.as_deref().unwrap_or("(none provided)"),
         run_prompt = run_prompt,
         mission_class = mission_class.as_str(),
+        focused_validation = validation_plan
+            .focused_candidates
+            .iter()
+            .map(|candidate| format!("- {candidate}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        validation_instructions = validation_plan.codex_instructions,
+        worker_gates = if validation_plan.worker_gates.is_empty() {
+            "- (none configured)".into()
+        } else {
+            validation_plan
+                .worker_gates
+                .iter()
+                .map(|gate| format!("- {gate}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        ownership = serde_json::to_string(ownership)?,
     );
 
     if let Some(section) = prompt_section(attachments) {
@@ -143,7 +185,12 @@ mod tests {
         let value = build(
             &ticket,
             dir.path(),
-            "cargo test",
+            &ValidationPlan {
+                focused_candidates: vec!["Run parser_test".into()],
+                worker_gates: vec!["cargo test".into()],
+                codex_instructions: "focused only".into(),
+            },
+            &ExecutionOwnership::default(),
             "Fix the reported regression.",
             &[],
             MissionClass::SingleFile,
@@ -156,9 +203,13 @@ mod tests {
             "severity",
             "one failed",
             "Use small modules.",
-            "transient network",
+            "transient infrastructure",
+            "RUSTGRID_IMPLEMENTATION_COMPLETE: YES",
+            "RUSTGRID_FOCUSED_VALIDATION: PASSED",
             "RUSTGRID_AGENT_STATUS: COMPLETED",
-            "runner will independently execute every required quality gate",
+            "worker will run these authoritative commands",
+            "Do not run those full repository commands yourself",
+            "Run parser_test",
         ] {
             assert!(value.contains(expected));
         }

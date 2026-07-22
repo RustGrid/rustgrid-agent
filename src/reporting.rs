@@ -110,11 +110,13 @@ impl<'a> Reporter<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_codex_telemetry(
         &self,
         args: &[String],
         prompt: &str,
         mission_class: MissionClass,
+        budget: crate::mission::MissionBudget,
         phase_name: &str,
         attempt_number: u32,
         retry_of_call_id: Option<uuid::Uuid>,
@@ -130,9 +132,15 @@ impl<'a> Reporter<'a> {
                 json!(serde_json::to_vec(args).map_or(0, |bytes| bytes.len().div_ceil(4))),
             ),
             (
-                "ctx_budget_tokens".into(),
-                json!(mission_class.budget().max_input_tokens),
+                "ctx_initial_prompt_budget_tokens".into(),
+                json!(budget.max_initial_prompt_tokens),
             ),
+            ("agent_sessions".into(), json!(1)),
+            (
+                "model_inference_turn_semantics".into(),
+                json!("provider_turn"),
+            ),
+            ("mission_class".into(), json!(mission_class.as_str())),
             ("ctx_ambient_config_loaded".into(), json!(false)),
         ]);
         CodexTelemetrySession::start(
@@ -161,6 +169,17 @@ impl<'a> Reporter<'a> {
         self.journal
             .borrow_mut()
             .record_token_consumption(consumption)
+    }
+
+    pub(crate) fn dependency_state(&self) -> Option<crate::optimization::DependencyState> {
+        self.journal.borrow().dependency_state.clone()
+    }
+
+    pub(crate) fn record_dependency_state(
+        &self,
+        state: crate::optimization::DependencyState,
+    ) -> Result<()> {
+        self.journal.borrow_mut().record_dependency_state(state)
     }
 
     pub(crate) fn flush_telemetry(&self) {

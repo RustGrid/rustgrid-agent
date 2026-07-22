@@ -18,6 +18,36 @@ The RustGrid control plane and deployment platform should alert on:
 - run outcome category and child termination reason;
 - process and container restart rate.
 
+## Execution-efficiency semantics
+
+An agent session is one `codex exec` process. A model inference turn is one
+provider `turn.started`/`turn.completed` pair inside that process. Tool calls are
+captured from provider item events. These counts are separate: a single agent
+session may contain many inference turns and tool calls. Historical runs that
+only contain an aggregate model call must not be reinterpreted as turn-level
+data; consumers should show inference turns as unavailable.
+
+Provider-reported input is cumulative model input across inference turns, not a
+single context window. Cached input is a subset of input; fresh input is input
+minus cached input. `context_tokens_before_call` is the context size for a turn,
+and the maximum observed value is peak context. Missing provider context or
+reasoning fields remain unavailable rather than being estimated as zero.
+
+Each completed model-call snapshot includes the explicit mission class,
+initial-prompt estimate, budget, session count, and provider-turn semantics in
+its sanitized usage metadata. Lifecycle budget events include the threshold,
+current multidimensional usage, and action. Ownership interruptions and
+duplicate gate/bootstrap avoidance are recorded as steps.
+
+Worker command output has three model-facing modes: `summary`,
+`failure_excerpt`, and explicit `full_requested`. Successful output is reduced
+to aggregate results; failures are bounded to 160 lines and 24,000 characters.
+ANSI control sequences and duplicate lines are removed from normalized output.
+Raw output remains in the quality-gate record and under the run checkout's
+`.git/rustgrid-agent-audit/commands` directory for local recovery and forensics.
+The raw path, original/model character counts, mode, and truncation flag are
+included in lifecycle metadata.
+
 ## Sensitive data
 
 Never export API keys, GitHub tokens, authorization headers, raw environment variables, private source, or unbounded command output. Ticket descriptions, comments, paths, branch names, gate output, and pull-request URLs may be tenant-sensitive.

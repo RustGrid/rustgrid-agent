@@ -9,15 +9,29 @@ Every coding mission checks out its repository first. The worker then analyzes
 the objective with the checked-out repository available and classifies it as
 `configuration`, `single_file`, `multi_file`, or `repository_wide`. Explicit
 `run.metadata.mission_class` values take precedence. The selected class, reason,
-input/model/tool budgets, and logical tool bundles are published as advisory
-lifecycle telemetry.
+multidimensional budget, ownership boundary, focused-validation plan, and
+logical tool bundles are published as lifecycle telemetry. Individual budget
+dimensions may be overridden through signed run metadata.
 
-Classification never restricts Codex capabilities or required context. Codex
-runs ephemerally with the complete ticket context and applicable repository
-instructions, may inspect any relevant files, and retains the tools needed to
-finish and validate the task. Budget overruns are observable warnings, not
-termination conditions. Correctness gates, repair iterations, publication, and
-recovery behavior are identical across coding mission classes.
+Codex owns targeted discovery, implementation, and focused validation. The
+worker owns dependency bootstrap, full repository gates, commit, publication,
+and GitHub checks. Worker-owned commands are listed in the prompt. If Codex
+attempts an exact full gate, the worker stops that attempt and starts a compact
+corrective session instead of paying for duplicate deterministic work.
+
+Budgets are evaluated after provider turns and tool events. At 70% the worker
+restarts Codex with a constrained prompt; at 90% it requires finalization. Every
+restart receives a compact handoff containing ticket and run requirements,
+changed paths, the bounded diff, current focused-validation evidence, and usage
+so far. At the hard limit, additional exploration stops. A code mission can
+proceed to authoritative worker gates only with a changed workspace and a
+successful focused validation against the current source-tree hash. A normal
+completion also requires an explicit implementation-complete declaration. A
+code change with no viable focused command may explicitly defer validation to
+the mandatory worker gate with a reason; documentation-only changes may record
+why automated focused validation is not applicable. Gates, publication, lease
+renewal, audit persistence, and cleanup are never skipped or interrupted by a
+Codex budget.
 
 ## Components
 
@@ -54,8 +68,17 @@ force-with-lease bound to the observed remote SHA, so another worker's movement
 causes a safe stop instead of an overwrite. Changed commits always pass local
 validation again before publication.
 
-Required local gates aggregate failures and return them to Codex for a bounded
-repair loop. Required GitHub workflow failures are resolved to the latest run,
+Locked dependency state is fingerprinted from the package manifest and lockfile
+and persisted in `journal.json`. A successful bootstrap is reused until either
+fingerprint changes or the installed dependency directory is invalid. Combined
+quality gates omit a redundant leading install, and the same full gate is not
+executed twice against the same source-tree hash within a repair cycle.
+
+Required local gates retain complete output in the gate audit and send only a
+normalized, ANSI-free summary or bounded failure excerpt into a new compact
+repair session. The compact prompt contains the ticket summary, changed files,
+current bounded diff, failure summary, and remaining cycles—not the prior tool
+history. Required GitHub workflow failures are resolved to the latest run,
 failed jobs and steps, and bounded job-log tails. Each CI repair is locally
 validated and pushed as a new commit to the existing pull request. Three
 unsuccessful repair iterations produce a blocked handoff and retain the isolated

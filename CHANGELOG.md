@@ -10,6 +10,18 @@ Semantic Versioning.
 - Remove worker ID and API-key environment authentication. Worker identity now
   comes only from the configuration written by device login, and authentication
   comes only from the OS keychain or owner-only credential-file store.
+- Separate Codex reasoning from worker-owned deterministic delivery. Prompts now
+  expose focused validation and full-gate ownership, reusable dependency state
+  prevents duplicate installs, and gate failures create compact repair sessions.
+- Enforce multidimensional mission budgets during provider turns and tool calls,
+  derive routine progress from tool activity, and distinguish agent sessions,
+  inference turns, context size, and cumulative token usage in telemetry.
+- Normalize and summarize worker command output before repair context ingestion
+  while retaining complete raw gate evidence and source-tree fingerprints.
+- Preserve ticket requirements, changed paths, bounded diffs, validation
+  evidence, and budget state across constrained Codex restarts. Completion now
+  requires explicit implementation readiness and current focused-validation
+  evidence for code changes.
 
 ### Fixed
 

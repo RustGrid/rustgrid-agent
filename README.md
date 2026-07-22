@@ -435,14 +435,19 @@ unsuccessful runs attempt it before terminal failure handling.
 
 For coding missions, the worker first checks out the repository and then
 classifies the mission as `configuration`, `single_file`, `multi_file`, or
-`repository_wide`. Classification selects advisory input/model/tool budgets for
-telemetry only. It cannot remove capabilities, compact required context, stop a
-working Codex process, or bypass validation. Budget overruns emit diagnostics
-without changing execution.
+`repository_wide`. Classification selects an explicit ownership and focused
+validation plan plus separate limits for initial prompt, inference turns, tool
+calls, peak context, fresh/cached cumulative input, output, and Codex duration.
+At 70% and 90% the worker replaces broad exploration with compact constrained
+sessions. At the hard limit it stops Codex exploration but still runs every
+required worker-owned gate before any successful delivery.
 
 The initial coding prompt includes the complete ticket context and applicable
 repository instructions. Codex starts with targeted inspection but may expand
-to any relevant source, documentation, test, or tool needed for correctness.
+to relevant source and tests when correctness requires it. Dependency bootstrap,
+full repository tests/builds, commit, publication, and GitHub checks remain
+worker-owned. Successful dependency state and full-gate results are reused only
+while their manifest, lockfile, command, and source-tree fingerprints match.
 Validated direct metadata operations remain the only path that intentionally
 skips repository checkout and Codex.
 
