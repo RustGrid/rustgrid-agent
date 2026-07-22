@@ -19,19 +19,17 @@ and GitHub checks. Worker-owned commands are listed in the prompt. If Codex
 attempts an exact full gate, the worker stops that attempt and starts a compact
 corrective session instead of paying for duplicate deterministic work.
 
-Budgets are evaluated after provider turns and tool events. At 70% the worker
-restarts Codex with a constrained prompt; at 90% it requires finalization. Every
-restart receives a compact handoff containing ticket and run requirements,
-changed paths, the bounded diff, current focused-validation evidence, and usage
-so far. At the hard limit, additional exploration stops. A code mission can
-proceed to authoritative worker gates only with a changed workspace and a
-successful focused validation against the current source-tree hash. A normal
-completion also requires an explicit implementation-complete declaration. A
-code change with no viable focused command may explicitly defer validation to
-the mandatory worker gate with a reason; documentation-only changes may record
-why automated focused validation is not applicable. Gates, publication, lease
-renewal, audit persistence, and cleanup are never skipped or interrupted by a
-Codex budget.
+Budgets are evaluated after provider turns and tool events. The worker records
+70%, 90%, and 100% threshold events as advisory telemetry and keeps the active
+Codex session running so it retains context and can finish a validated change.
+Initial prompts that already exceed a threshold receive focused guidance, but a
+budget estimate never aborts a mission. A normal completion requires an
+explicit implementation-complete declaration and successful focused validation
+against the current source-tree hash. A code change with no viable focused
+command may explicitly defer validation to the mandatory worker gate with a
+reason; documentation-only changes may record why automated focused validation
+is not applicable. Gates, publication, lease renewal, audit persistence, and
+cleanup are never skipped or interrupted by a Codex budget.
 
 ## Components
 

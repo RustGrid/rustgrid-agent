@@ -447,7 +447,7 @@ fn execute_claimed(
                 "repository_instruction_tokens": prompt_composition.repository_instruction_tokens,
                 "worker_instruction_tokens": prompt_composition.worker_instruction_tokens,
                 "loading_strategy": "correctness_first",
-                "budget_enforcement": "active"
+                "budget_enforcement": "advisory"
             })),
         )?;
         if !staged_attachments.is_empty() {

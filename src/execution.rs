@@ -360,14 +360,12 @@ fn dependency_bootstrap_command(root: &std::path::Path) -> Option<(&'static str,
 
 #[derive(Clone, Debug)]
 enum CodexControl {
-    Budget(BudgetStage),
     WorkerOwnedCommand(String),
 }
 
 impl std::fmt::Display for CodexControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Budget(stage) => write!(formatter, "Codex budget intervention: {stage:?}"),
             Self::WorkerOwnedCommand(command) => {
                 write!(formatter, "Codex attempted worker-owned command: {command}")
             }
@@ -433,8 +431,8 @@ pub(crate) fn run_codex_prompt(
             context.reporter.step(
                 &format!("{step_id}_initial_prompt_constrained"),
                 StepStatus::Running,
-                "Initial prompt reached 70% of its budget; broad discovery is disabled",
-                Some(json!({"threshold_percent": 70, "usage": accumulated_usage, "action": "constrain_initial_session"})),
+                "Initial prompt reached 70% of its advisory budget; asking Codex to stay focused",
+                Some(json!({"threshold_percent": 70, "usage": accumulated_usage, "action": "advise_initial_session"})),
             )?;
         }
         BudgetStage::FinalizationRequired => {
@@ -444,15 +442,20 @@ pub(crate) fn run_codex_prompt(
             context.reporter.step(
                 &format!("{step_id}_initial_prompt_finalization"),
                 StepStatus::Running,
-                "Initial prompt reached 90% of its budget; immediate focused finalization is required",
-                Some(json!({"threshold_percent": 90, "usage": accumulated_usage, "action": "finalize_initial_session"})),
+                "Initial prompt reached 90% of its advisory budget; asking Codex to minimize additional discovery",
+                Some(json!({"threshold_percent": 90, "usage": accumulated_usage, "action": "advise_initial_session"})),
             )?;
         }
         BudgetStage::HardLimit => {
-            bail!(
-                "initial Codex prompt estimate {initial_prompt_tokens} exceeded the configured {} token hard limit",
-                context.budget.max_initial_prompt_tokens
-            );
+            highest_intervention.set(BudgetStage::HardLimit);
+            session_prompt.push_str("\n\n");
+            session_prompt.push_str(&constrained_prompt(true));
+            context.reporter.step(
+                &format!("{step_id}_initial_prompt_budget_exceeded"),
+                StepStatus::Running,
+                "Initial prompt exceeded its advisory budget; continuing because task completion takes priority",
+                Some(json!({"threshold_percent": 100, "usage": accumulated_usage, "action": "continue_for_correctness"})),
+            )?;
         }
     }
     let codex_succeeded = loop {
@@ -616,7 +619,18 @@ pub(crate) fn run_codex_prompt(
                 let stage = current.stage(context.budget);
                 if stage > highest_intervention.get() {
                     highest_intervention.set(stage);
-                    return Err(CodexControl::Budget(stage).into());
+                    let (stage_name, threshold_percent, message) =
+                        budget_advisory(stage).expect("non-normal budget stage has an advisory");
+                    context.reporter.step(
+                        &format!("{step_id}_budget_{stage_name}"),
+                        StepStatus::Running,
+                        message,
+                        Some(json!({
+                            "threshold_percent": threshold_percent,
+                            "usage": current,
+                            "action": "continue_active_session"
+                        })),
+                    )?;
                 }
                 Ok(())
             },
@@ -666,60 +680,6 @@ pub(crate) fn run_codex_prompt(
             Err(error) => {
                 if let Some(control) = error.downcast_ref::<CodexControl>().cloned() {
                     match control {
-                        CodexControl::Budget(BudgetStage::Constrained) => {
-                            context.reporter.step(
-                            &format!("{step_id}_budget_constrained"),
-                            StepStatus::Running,
-                            "Codex reached 70% of an execution budget; restarting with constrained scope",
-                            Some(json!({"threshold_percent": 70, "usage": accumulated_usage, "action": "compact_constrained_restart"})),
-                        )?;
-                            session_prompt = compact_handoff_prompt(
-                                context,
-                                &constrained_prompt(false),
-                                &focused_validation.borrow(),
-                                accumulated_usage,
-                            )?;
-                        }
-                        CodexControl::Budget(BudgetStage::FinalizationRequired) => {
-                            context.reporter.step(
-                            &format!("{step_id}_budget_finalization"),
-                            StepStatus::Running,
-                            "Codex reached 90% of an execution budget; requiring finalization",
-                            Some(json!({"threshold_percent": 90, "usage": accumulated_usage, "action": "compact_finalization_restart"})),
-                        )?;
-                            session_prompt = compact_handoff_prompt(
-                                context,
-                                &constrained_prompt(true),
-                                &focused_validation.borrow(),
-                                accumulated_usage,
-                            )?;
-                        }
-                        CodexControl::Budget(BudgetStage::HardLimit) => {
-                            let paths = context.repo.new_agent_paths(context.baseline)?;
-                            let tree_hash = source_tree_hash(&context.repo.root)?;
-                            let has_current_validation = focused_validation
-                                .borrow()
-                                .iter()
-                                .any(|evidence| evidence.source_tree_hash == tree_hash);
-                            let can_verify = !paths.is_empty() && has_current_validation;
-                            context.reporter.step(
-                            &format!("{step_id}_budget_hard_limit"),
-                            if can_verify { StepStatus::Completed } else { StepStatus::Failed },
-                            if can_verify {
-                                "Codex reached the hard budget with current focused-validation evidence; worker gates will determine correctness"
-                            } else {
-                                "Codex exhausted its execution budget without enough evidence to continue safely"
-                            },
-                            Some(json!({"threshold_percent": 100, "usage": accumulated_usage, "action": if can_verify { "run_worker_gates" } else { "fail" }, "changed_paths": paths, "focused_validation_current": has_current_validation})),
-                        )?;
-                            if !can_verify {
-                                bail!(
-                                    "Codex execution budget exhausted before producing a complete, focused-validated change"
-                                );
-                            }
-                            break true;
-                        }
-                        CodexControl::Budget(BudgetStage::Normal) => unreachable!(),
                         CodexControl::WorkerOwnedCommand(command) => {
                             let attempts = ownership_interrupts.get().saturating_add(1);
                             ownership_interrupts.set(attempts);
@@ -814,6 +774,27 @@ fn constrained_prompt(finalization: bool) -> String {
         "The mission budget is nearly exhausted. Continue from the existing workspace. Do not perform additional discovery unless required to avoid an incorrect change. Finalize the smallest correct implementation, run at most one focused validation command, inspect the changed files, and return a concise summary ending with RUSTGRID_AGENT_STATUS: COMPLETED. Do not run full repository gates; the RustGrid worker owns them.".into()
     } else {
         "You are approaching the mission execution budget. Continue from the existing workspace. Stop broad exploration. Use the files already identified, complete the smallest correct implementation, run one focused validation, inspect the diff, and finish. Do not run full repository gates; the RustGrid worker owns them.".into()
+    }
+}
+
+fn budget_advisory(stage: BudgetStage) -> Option<(&'static str, u8, &'static str)> {
+    match stage {
+        BudgetStage::Normal => None,
+        BudgetStage::Constrained => Some((
+            "constrained",
+            70,
+            "Codex reached 70% of an advisory execution budget; continuing the active session",
+        )),
+        BudgetStage::FinalizationRequired => Some((
+            "finalization",
+            90,
+            "Codex reached 90% of an advisory execution budget; continuing toward a validated result",
+        )),
+        BudgetStage::HardLimit => Some((
+            "exceeded",
+            100,
+            "Codex exceeded an advisory execution budget; continuing because task completion takes priority",
+        )),
     }
 }
 
@@ -1909,6 +1890,23 @@ mod tests {
         assert!(prompt.contains("at most one focused validation"));
         assert!(prompt.contains("worker owns them"));
         assert!(!prompt.contains("tool history"));
+    }
+
+    #[test]
+    fn execution_budget_thresholds_are_advisory_through_hard_limit() {
+        assert!(budget_advisory(BudgetStage::Normal).is_none());
+        assert_eq!(
+            budget_advisory(BudgetStage::Constrained).map(|advisory| advisory.1),
+            Some(70)
+        );
+        assert_eq!(
+            budget_advisory(BudgetStage::FinalizationRequired).map(|advisory| advisory.1),
+            Some(90)
+        );
+        let hard_limit = budget_advisory(BudgetStage::HardLimit).unwrap();
+        assert_eq!(hard_limit.1, 100);
+        assert!(hard_limit.2.contains("continuing"));
+        assert!(hard_limit.2.contains("task completion takes priority"));
     }
 
     #[test]

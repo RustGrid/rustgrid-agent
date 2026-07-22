@@ -438,9 +438,10 @@ classifies the mission as `configuration`, `single_file`, `multi_file`, or
 `repository_wide`. Classification selects an explicit ownership and focused
 validation plan plus separate limits for initial prompt, inference turns, tool
 calls, peak context, fresh/cached cumulative input, output, and Codex duration.
-At 70% and 90% the worker replaces broad exploration with compact constrained
-sessions. At the hard limit it stops Codex exploration but still runs every
-required worker-owned gate before any successful delivery.
+At 70%, 90%, and 100% the worker records advisory budget telemetry without
+interrupting the active Codex session or discarding its context. Initial prompts
+that already exceed an advisory budget ask Codex to minimize broad discovery,
+but task completion and correctness take priority over the budget estimate.
 
 The initial coding prompt includes the complete ticket context and applicable
 repository instructions. Codex starts with targeted inspection but may expand
