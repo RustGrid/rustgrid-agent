@@ -362,7 +362,6 @@ fn dependency_bootstrap_command(root: &std::path::Path) -> Option<(&'static str,
 enum CodexControl {
     Budget(BudgetStage),
     WorkerOwnedCommand(String),
-    Completion,
 }
 
 impl std::fmt::Display for CodexControl {
@@ -372,7 +371,6 @@ impl std::fmt::Display for CodexControl {
             Self::WorkerOwnedCommand(command) => {
                 write!(formatter, "Codex attempted worker-owned command: {command}")
             }
-            Self::Completion => formatter.write_str("Codex completed with a committable diff"),
         }
     }
 }
@@ -566,33 +564,44 @@ pub(crate) fn run_codex_prompt(
                             &tree_hash,
                             &focused_validation.borrow(),
                         );
-                        if readiness.ready {
-                            context.reporter.step(
-                                &format!("{step_id}_completion_ready"),
-                                StepStatus::Completed,
-                                "Codex supplied complete delivery and validation evidence",
-                                Some(json!({
-                                    "validation_mode": readiness.validation_mode,
-                                    "changed_paths": changed_paths,
-                                    "source_tree_hash": tree_hash
-                                })),
-                            )?;
-                            completion_ready.set(true);
-                            return Err(CodexControl::Completion.into());
-                        }
-                        if !completion_rejection_reported.replace(true) {
-                            context.reporter.step(
-                                &format!("{step_id}_completion_not_ready"),
-                                StepStatus::Running,
-                                "Codex requested completion without the required implementation and validation evidence",
-                                Some(json!({
-                                    "missing": readiness.missing,
-                                    "changed_paths": changed_paths,
-                                    "source_tree_hash": tree_hash
-                                })),
-                            )?;
+                        match completion_notice(
+                            readiness.ready,
+                            &completion_ready,
+                            &completion_rejection_reported,
+                        ) {
+                            CompletionNotice::Ready => {
+                                context.reporter.step(
+                                    &format!("{step_id}_completion_ready"),
+                                    StepStatus::Completed,
+                                    "Codex supplied complete delivery and validation evidence",
+                                    Some(json!({
+                                        "validation_mode": readiness.validation_mode,
+                                        "changed_paths": changed_paths,
+                                        "source_tree_hash": tree_hash
+                                    })),
+                                )?;
+                            }
+                            CompletionNotice::NotReady => {
+                                context.reporter.step(
+                                    &format!("{step_id}_completion_not_ready"),
+                                    StepStatus::Running,
+                                    "Codex requested completion without the required implementation and validation evidence",
+                                    Some(json!({
+                                        "missing": readiness.missing,
+                                        "changed_paths": changed_paths,
+                                        "source_tree_hash": tree_hash
+                                    })),
+                                )?;
+                            }
+                            CompletionNotice::None => {}
                         }
                     }
+                }
+                // A terminal usage event follows the final agent message. Once completion is
+                // accepted, keep draining the stream instead of interrupting it for a budget
+                // transition and losing the provider-reported token counts.
+                if completion_ready.get() {
+                    return Ok(());
                 }
                 let current = accumulated_usage.combined_with(
                     telemetry.borrow().budget_usage(
@@ -615,13 +624,6 @@ pub(crate) fn run_codex_prompt(
         let outcome = match &result {
             Ok(status) if status.success() => SessionOutcome::Succeeded,
             Ok(_) => SessionOutcome::Failed,
-            Err(error)
-                if error
-                    .downcast_ref::<CodexControl>()
-                    .is_some_and(|control| matches!(control, CodexControl::Completion)) =>
-            {
-                SessionOutcome::Succeeded
-            }
             Err(error) if command::is_timeout(error) || command::is_idle_timeout(error) => {
                 SessionOutcome::Timeout
             }
@@ -664,15 +666,6 @@ pub(crate) fn run_codex_prompt(
             Err(error) => {
                 if let Some(control) = error.downcast_ref::<CodexControl>().cloned() {
                     match control {
-                        CodexControl::Completion => {
-                            context.reporter.step(
-                                &format!("{step_id}_completion_controller"),
-                                StepStatus::Completed,
-                                "Codex completion marker and committable diff detected; transitioning immediately to worker validation",
-                                Some(json!({"action": "terminate_codex_and_run_worker_gates"})),
-                            )?;
-                            break true;
-                        }
                         CodexControl::Budget(BudgetStage::Constrained) => {
                             context.reporter.step(
                             &format!("{step_id}_budget_constrained"),
@@ -829,6 +822,31 @@ struct CompletionReadiness {
     ready: bool,
     missing: Vec<&'static str>,
     validation_mode: &'static str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CompletionNotice {
+    Ready,
+    NotReady,
+    None,
+}
+
+fn completion_notice(
+    readiness: bool,
+    completion_ready: &Cell<bool>,
+    completion_rejection_reported: &Cell<bool>,
+) -> CompletionNotice {
+    if readiness {
+        if completion_ready.replace(true) {
+            CompletionNotice::None
+        } else {
+            CompletionNotice::Ready
+        }
+    } else if completion_rejection_reported.replace(true) {
+        CompletionNotice::None
+    } else {
+        CompletionNotice::NotReady
+    }
 }
 
 fn completion_readiness(
@@ -1813,6 +1831,24 @@ mod tests {
         assert!(!completion_readiness(no_validation, &["src/nav.tsx".into()], "tree-2", &[]).ready);
         let deferred = "RUSTGRID_IMPLEMENTATION_COMPLETE: YES\nRUSTGRID_FOCUSED_VALIDATION: DEFERRED_TO_WORKER\nRUSTGRID_VALIDATION_REASON: repository exposes only the authoritative full gate\nRUSTGRID_AGENT_STATUS: COMPLETED";
         assert!(completion_readiness(deferred, &["src/nav.tsx".into()], "tree-2", &[]).ready);
+    }
+
+    #[test]
+    fn accepted_completion_is_recorded_once_without_a_rejection() {
+        let ready = Cell::new(false);
+        let rejected = Cell::new(false);
+
+        assert_eq!(
+            completion_notice(true, &ready, &rejected),
+            CompletionNotice::Ready
+        );
+        assert!(ready.get());
+        assert!(!rejected.get());
+        assert_eq!(
+            completion_notice(true, &ready, &rejected),
+            CompletionNotice::None
+        );
+        assert!(!rejected.get());
     }
 
     #[test]
