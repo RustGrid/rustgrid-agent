@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.3.0 - 2026-07-23
+
 ### Changed
 
 - Remove worker ID and API-key environment authentication. Worker identity now
