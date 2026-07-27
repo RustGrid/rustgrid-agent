@@ -18,6 +18,26 @@ owns each run's filesystem, process, resource, and network isolation.
 
 - **Credential theft:** secrets are removed from child environments; GitHub
   tokens are scoped, cached only in memory, and validated against the manifest.
+- **Hosted provider credential theft:** GitHub OIDC request credentials and
+  RustGrid execution tokens remain in the parent process and have redacted
+  debug representations. The hosted path refuses inherited OpenAI/ChatGPT
+  credentials, never loads Codex auth state, validates every manifest endpoint
+  against the mission API origin, and gives repository subprocesses no
+  RustGrid, GitHub, Actions, OpenAI, or other sensitive allowlisted variable.
+  Repository-token Git operations additionally require the exact HTTPS origin
+  and an unchanged local Git config/history, ignore ambient Git config and
+  credential helpers, reject the external transport, and disable Git hooks.
+  The hosted Linux coordinator is non-dumpable so same-user child processes
+  cannot inspect its environment, memory, or descriptors through procfs or
+  ptrace. Repository commands start behind a trusted gate in a root-owned
+  cgroup-v2 leaf with `no_new_privs`; `cgroup.kill` is drained after every
+  focused command, dependency bootstrap, and quality gate and immediately
+  before every GitHub token request. Session changes and double-forks therefore
+  cannot leave a helper alive for later credentialed publication. Unsupported
+  or escapable cgroup configurations fail closed.
+- **Arbitrary model proxying:** the hosted adapter calls only the execution's
+  fixed `/ai/responses` endpoint with the resolved model and bounded function
+  tools. It cannot select provider resource endpoints, storage, or streaming.
 - **Cross-run access:** production startup requires a working Docker Sandbox
   executor. Each run has a distinct microVM and only its disposable clone is
   mounted into that VM.
@@ -42,6 +62,16 @@ The agent cannot independently attest the Docker Desktop host, enforce
 GitHub repository rules unavailable on the current plan, or protect against a
 compromised RustGrid control plane. Credentialed staging and periodic isolation
 escape tests remain mandatory.
+
+Hosted Git publication materializes the short-lived authorization header in
+the trusted Git subprocess environment. Repository-controlled descendants are
+drained before that token is requested, and the coordinator is non-dumpable,
+but a separate pre-existing process running as the same workflow user could
+inspect the transient Git child through procfs. The canonical workflow must
+therefore retain job-level runner isolation and must not start unrelated
+same-user background processes. Removing this residual requires a future
+credential-helper or authenticated broker design that does not place the token
+in the Git child environment.
 
 Codex authentication state is a high-value deployment secret. Production
 sandboxes must use a dedicated least-privilege Codex identity, make its state

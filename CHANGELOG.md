@@ -5,6 +5,22 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- Add ephemeral `execute --provider github-actions` and
+  `report-emergency-failure` commands with GitHub OIDC exchange, mission claim,
+  heartbeat, execution-token refresh, event/telemetry reporting, deterministic
+  branch and pull-request recovery, validation, and idempotent completion.
+- Add a bounded internal Responses function-tool adapter for the RustGrid AI
+  gateway, plus the version 3 hosted execution contract and operator runbook.
+
+### Security
+
+- Keep OpenAI credentials server-side and execution/GitHub credentials
+  in-memory, zeroize secret buffers, validate all mission endpoints and policy
+  hashes, refuse inherited provider credentials, reject symlink escapes, and
+  strip GitHub Actions/OIDC/provider credentials from repository subprocesses.
+
 ## 1.3.0 - 2026-07-23
 
 ### Changed

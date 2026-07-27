@@ -1,8 +1,14 @@
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rustgrid_agent::{config::AppContext, runner};
+use uuid::Uuid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExecutionProvider {
+    GithubActions,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rustgrid-agent", version, about)]
@@ -59,11 +65,43 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Execute one ephemeral mission dispatched by an execution provider.
+    Execute {
+        /// Hosted execution provider that authenticated this process.
+        #[arg(long, value_enum)]
+        provider: ExecutionProvider,
+        /// RustGrid mission execution identifier.
+        #[arg(long)]
+        execution_id: Uuid,
+    },
+    /// Best-effort terminal callback for a hosted workflow that failed before execution completed.
+    ReportEmergencyFailure {
+        /// Hosted execution provider that authenticated this process.
+        #[arg(long, value_enum)]
+        provider: ExecutionProvider,
+        /// RustGrid mission execution identifier.
+        #[arg(long)]
+        execution_id: Uuid,
+    },
 }
 
 fn run() -> Result<()> {
+    if rustgrid_agent::command::contained_child_requested() {
+        return rustgrid_agent::command::exec_contained_child();
+    }
     rustgrid_agent::shutdown::install()?;
     let cli = Cli::parse();
+    match &cli.command {
+        Commands::Execute {
+            provider: ExecutionProvider::GithubActions,
+            execution_id,
+        } => return rustgrid_agent::hosted::execute_github_actions(*execution_id),
+        Commands::ReportEmergencyFailure {
+            provider: ExecutionProvider::GithubActions,
+            execution_id,
+        } => return rustgrid_agent::hosted::report_emergency_failure(*execution_id),
+        _ => {}
+    }
     let config_path = match &cli.command {
         Commands::Setup { .. } => rustgrid_agent::setup::setup_config_path(cli.config.as_deref())?,
         _ => rustgrid_agent::config::resolve_config_path(cli.config.as_deref())?,
@@ -104,6 +142,9 @@ fn run() -> Result<()> {
         Commands::Status { json } => {
             let context = AppContext::load(&config_path)?;
             runner::status(&context, json)
+        }
+        Commands::Execute { .. } | Commands::ReportEmergencyFailure { .. } => {
+            unreachable!("hosted commands return before local configuration is resolved")
         }
     }
 }

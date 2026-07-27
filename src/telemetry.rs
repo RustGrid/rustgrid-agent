@@ -1348,7 +1348,7 @@ fn stable_uuid(value: &str) -> Uuid {
     Uuid::new_v5(&TELEMETRY_NAMESPACE, value.as_bytes())
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

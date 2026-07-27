@@ -34,6 +34,36 @@ fn model_call_usage_contract_exposes_sanitized_component_metadata() {
     );
 }
 
+#[test]
+fn openapi_snapshot_contains_the_ephemeral_execution_contract() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../openapi.current.json")).expect("valid OpenAPI JSON");
+    let paths = spec["paths"].as_object().expect("OpenAPI paths");
+    for path in [
+        "/api/v1/execution-auth/github-actions/exchange",
+        "/api/v1/executions/{execution_id}/claim",
+        "/api/v1/executions/{execution_id}/manifest",
+        "/api/v1/executions/{execution_id}/heartbeat",
+        "/api/v1/executions/{execution_id}/token/refresh",
+        "/api/v1/executions/{execution_id}/worker-events",
+        "/api/v1/executions/{execution_id}/telemetry/batch",
+        "/api/v1/executions/{execution_id}/state",
+        "/api/v1/executions/{execution_id}/github-token",
+        "/api/v1/executions/{execution_id}/ai/responses",
+        "/api/v1/executions/{execution_id}/complete",
+    ] {
+        assert!(
+            paths.contains_key(path),
+            "missing hosted execution path {path}"
+        );
+    }
+    let exchange = &spec["components"]["schemas"]["GithubActionsOidcExchangeResponse"];
+    assert_eq!(
+        exchange["properties"]["access_token"]["format"], "password",
+        "execution credentials must remain a write-only secret contract"
+    );
+}
+
 fn context(base_url: String) -> AppContext {
     AppContext {
         config: Config {

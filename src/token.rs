@@ -72,7 +72,7 @@ impl<'a> GitHubTokenManager<'a> {
     }
 }
 
-fn parse_rfc3339_utc(value: &str) -> Result<SystemTime> {
+pub(crate) fn parse_rfc3339_utc(value: &str) -> Result<SystemTime> {
     let (core, offset_seconds) = if let Some(core) = value.strip_suffix('Z') {
         (core, 0i64)
     } else {

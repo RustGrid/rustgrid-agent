@@ -7,12 +7,13 @@ use reqwest::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
+use zeroize::Zeroizing;
 
 use crate::config::RepoConfig;
 
 pub struct GitHubClient {
     http: Client,
-    token: String,
+    token: Zeroizing<String>,
     api_base_url: String,
 }
 
@@ -169,7 +170,7 @@ impl GitHubClient {
                 .timeout(Duration::from_secs(30))
                 .user_agent(concat!("rustgrid-agent/", env!("CARGO_PKG_VERSION")))
                 .build()?,
-            token: token.to_owned(),
+            token: Zeroizing::new(token.to_owned()),
             api_base_url,
         })
     }
@@ -190,7 +191,7 @@ impl GitHubClient {
         let response = self.send_with_retry("create pull request", || {
             self.http
                 .post(&url)
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .json(&payload)
@@ -222,7 +223,7 @@ impl GitHubClient {
         let response = self.send_with_retry("look up pull request", || {
             self.http
                 .get(&url)
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
         })?;
@@ -252,7 +253,7 @@ impl GitHubClient {
             let response = self.send_with_retry("list check runs", || {
                 self.http
                     .get(&url)
-                    .bearer_auth(&self.token)
+                    .bearer_auth(self.token.as_str())
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
             })?;
@@ -290,7 +291,7 @@ impl GitHubClient {
             let response = self.send_with_retry("list workflow runs", || {
                 self.http
                     .get(&url)
-                    .bearer_auth(&self.token)
+                    .bearer_auth(self.token.as_str())
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
             })?;
@@ -389,7 +390,7 @@ impl GitHubClient {
             let response = self.send_with_retry("list workflow jobs", || {
                 self.http
                     .get(&url)
-                    .bearer_auth(&self.token)
+                    .bearer_auth(self.token.as_str())
                     .header("Accept", "application/vnd.github+json")
                     .header("X-GitHub-Api-Version", "2022-11-28")
             })?;
@@ -422,7 +423,7 @@ impl GitHubClient {
         let response = self.send_with_retry("download workflow job log", || {
             self.http
                 .get(&url)
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
         })?;

@@ -4,6 +4,61 @@
 ticket has been atomically claimed. The configured RustGrid API URL already
 contains `/api/v1`.
 
+## Ephemeral GitHub Actions contract (manifest v3)
+
+The GitHub Actions provider does not use any persistent worker endpoint or
+credential. Its sequence is:
+
+1. request a GitHub OIDC JWT using the workflow's
+   `ACTIONS_ID_TOKEN_REQUEST_URL` and request token;
+2. `POST /execution-auth/github-actions/exchange` with the execution UUID,
+   one-time dispatch nonce, and JWT;
+3. use the returned `rge_` bearer token for
+   `/executions/{execution_id}/claim`, `/manifest`, `/heartbeat`,
+   `/token/refresh`, `/worker-events`, `/telemetry/batch`, `/state`,
+   `/github-token`, `/ai/responses`, and `/complete`.
+
+The exchange response identifies the tenant, project, execution, attempt,
+ephemeral worker/session, immutable repository, and GitHub workflow run. The
+agent validates those identities, requires the workflow's `GITHUB_SHA` to
+exactly match the manifest `base_sha`, and keeps `access_token` only in process
+memory. It refreshes before expiry while renewing the execution lease.
+
+Manifest version 3 contains:
+
+- the execution/run/ticket/project identity and terminal budgets;
+- immutable GitHub repository and installation IDs, clone/web origins,
+  `base_sha`, PR target `base_ref`, deterministic branch, and repository-token
+  endpoint;
+- the resolved model, AI gateway endpoint, input/output/model-call/cost limits;
+- the hashed execution policy and mission-scoped lifecycle endpoint paths.
+
+Every endpoint path is validated against the configured RustGrid API origin and
+execution UUID before use. The policy hash is computed from the typed v3 policy
+wire representation. The agent rejects a mismatched workflow repository ID,
+model or budget mismatch, unsafe Git ref, alternate gateway origin, sensitive
+child-environment variable, or unsupported sandbox policy.
+
+A fresh deterministic branch is created from the locally present immutable
+`base_sha`; the agent does not fetch mutable `refs/heads/{base_ref}` to seed the
+mission. A retry may fetch only its deterministic remote execution branch.
+
+`POST /executions/{execution_id}/ai/responses` accepts only the constrained
+Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
+internal function-tool adapter so the execution bearer never enters Codex,
+`OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
+RustGrid is authoritative for model-call usage and cost; the agent sends
+non-model execution telemetry only. Each required quality gate emits
+deterministic `phase.started` and `phase.completed` telemetry with a
+`quality_gate:*` phase name so successful completion has durable validation
+evidence.
+
+Successful completion requires the deterministic branch, 40-character head
+SHA, pull-request number and URL. The completion idempotency key is derived
+from the complete request. Failures use stable machine-readable codes and never
+include provider response bodies. Cancellation or token revocation stops
+repository commands and suppresses unsafe publication.
+
 ## Token consumption
 
 At terminal finalization, the worker writes the aggregate consumption from every completed Codex turn in the run to `PUT /agent-runs/{run_id}/token-consumption`. The payload contains `provider`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `total_tokens`; retries replace the same per-run resource idempotently. This report is sent before the successful terminal status update, and unsuccessful runs attempt the same report before failure, cancellation, or timeout handling.

@@ -1464,6 +1464,7 @@ dependencies = [
  "shlex",
  "tempfile",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

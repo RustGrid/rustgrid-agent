@@ -36,6 +36,37 @@ fn version_reports_package_name_and_version() {
 }
 
 #[test]
+fn hosted_commands_are_available_without_loading_local_worker_configuration() {
+    let help = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .args(["execute", "--help"])
+        .output()
+        .expect("hosted execute help should run");
+    assert!(help.status.success());
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("--provider"));
+    assert!(stdout.contains("github-actions"));
+    assert!(stdout.contains("--execution-id"));
+
+    let execution_id = "11111111-1111-4111-8111-111111111111";
+    let missing_environment = Command::new(env!("CARGO_BIN_EXE_rustgrid-agent"))
+        .env_remove("RUSTGRID_EXECUTION_ID")
+        .env_remove("RUSTGRID_AGENT_CONFIG")
+        .args([
+            "execute",
+            "--provider",
+            "github-actions",
+            "--execution-id",
+            execution_id,
+        ])
+        .output()
+        .expect("hosted execute should fail closed without workflow identity");
+    assert!(!missing_environment.status.success());
+    let stderr = String::from_utf8_lossy(&missing_environment.stderr);
+    assert!(stderr.contains("RUSTGRID_EXECUTION_ID"));
+    assert!(!stderr.contains("config file"));
+}
+
+#[test]
 fn setup_writes_a_host_sized_production_configuration() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let config = directory.path().join("config.json");

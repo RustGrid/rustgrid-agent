@@ -45,6 +45,36 @@ For each run, the worker:
 The directory from which the worker is launched is not used as the run
 repository. Every run gets its own clone, branch, journal, and sandbox.
 
+### Ephemeral GitHub Actions execution
+
+RustGrid can also dispatch one mission to the canonical repository workflow:
+
+```sh
+rustgrid-agent execute \
+  --provider github-actions \
+  --execution-id "$RUSTGRID_EXECUTION_ID"
+```
+
+This command is non-interactive and does not load the local worker
+configuration, keyring, `~/.codex/auth.json`, or a browser login. It exchanges
+the workflow's GitHub OIDC identity and one-time dispatch nonce for a
+short-lived RustGrid execution token, claims exactly that execution, and uses
+the mission-scoped RustGrid AI gateway. The tenant's OpenAI key remains
+encrypted in RustGrid and is never returned to the process.
+
+The hosted model adapter exposes bounded repository file/search/edit and
+focused-command tools internally. The execution token stays in the parent
+process and is removed from every repository subprocess. RustGrid separately
+brokers short-lived GitHub App credentials for branch, push, and pull-request
+operations. Branches use `rustgrid/<ticket-key>-<execution-short-id>` and an
+existing branch or open pull request is reused after a safe workflow retry.
+
+The canonical workflow supplies `RUSTGRID_API_URL`,
+`RUSTGRID_EXECUTION_ID`, `RUSTGRID_DISPATCH_NONCE`,
+`RUSTGRID_OIDC_REQUEST_URL`, and `RUSTGRID_OIDC_REQUEST_TOKEN`; users must not
+configure `OPENAI_API_KEY`, `CODEX_API_KEY`, or a permanent RustGrid/GitHub
+secret. See [hosted execution operations](docs/github-actions-execution.md).
+
 ## Platform support
 
 | Host | CLI | Production `serve` | Distribution |

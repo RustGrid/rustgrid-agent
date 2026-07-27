@@ -11,6 +11,7 @@ mod finalization;
 pub mod git;
 pub mod github;
 pub mod health;
+pub mod hosted;
 pub mod journal;
 pub mod lifecycle;
 pub mod manifest;
