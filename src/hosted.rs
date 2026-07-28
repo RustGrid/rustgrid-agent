@@ -33,7 +33,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     command,
-    config::RepoConfig,
+    config::{DEFAULT_INSTANCE_URL, RepoConfig},
     git::{RemoteBranchMoved, Repo, read_repo_instructions},
     github::GitHubClient,
     shutdown,
@@ -44,7 +44,6 @@ use crate::{
     token::parse_rfc3339_utc,
 };
 
-const DEFAULT_API_URL: &str = "https://api.rustgrid.com";
 const EXECUTION_LEASE_SECONDS: i64 = 900;
 const EXECUTION_TOKEN_TTL_SECONDS: i64 = 900;
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(180);
@@ -118,7 +117,7 @@ impl GithubActionsEnvironment {
         }
 
         let api_root = normalize_api_root(
-            &env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_owned()),
+            &env::var("RUSTGRID_API_URL").unwrap_or_else(|_| DEFAULT_INSTANCE_URL.to_owned()),
         )?;
         let audience = api_origin(&api_root)?;
         let oidc_request_url = secure_github_oidc_url(
@@ -3238,20 +3237,23 @@ mod tests {
 
     #[test]
     fn normalizes_hosted_api_roots_without_double_api_prefixes() {
+        let production_root = normalize_api_root(DEFAULT_INSTANCE_URL).unwrap();
+        assert_eq!(production_root.as_str(), "https://app.rustgrid.com/api/v1/");
         assert_eq!(
-            normalize_api_root("https://api.rustgrid.com")
+            production_root
+                .join("execution-auth/github-actions/exchange")
                 .unwrap()
                 .as_str(),
-            "https://api.rustgrid.com/api/v1/"
+            "https://app.rustgrid.com/api/v1/execution-auth/github-actions/exchange"
         );
         assert_eq!(
-            normalize_api_root("https://api.rustgrid.com/api/v1")
+            normalize_api_root("https://app.rustgrid.com/api/v1")
                 .unwrap()
                 .as_str(),
-            "https://api.rustgrid.com/api/v1/"
+            "https://app.rustgrid.com/api/v1/"
         );
-        assert!(normalize_api_root("http://api.rustgrid.com").is_err());
-        assert!(normalize_api_root("https://user:password@api.rustgrid.com").is_err());
+        assert!(normalize_api_root("http://app.rustgrid.com").is_err());
+        assert!(normalize_api_root("https://user:password@app.rustgrid.com").is_err());
         assert!(
             secure_github_oidc_url(
                 "RUSTGRID_OIDC_REQUEST_URL",

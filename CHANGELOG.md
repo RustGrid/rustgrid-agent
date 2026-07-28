@@ -5,6 +5,12 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Fixed
+
+- Use the shared `https://app.rustgrid.com` control-plane origin for ephemeral
+  GitHub Actions execution so the OIDC exchange targets the production API
+  instead of the retired `api.rustgrid.com` hostname.
+
 ## 1.4.0 - 2026-07-28
 
 ### Added
