@@ -68,9 +68,12 @@ commands begin, preventing same-user child processes from inspecting its
 environment, memory, or file descriptors through procfs/ptrace. Every
 repository-controlled focused command, dependency bootstrap, and quality gate
 runs in a root-owned cgroup-v2 leaf. A trusted `/proc/self/exe` gate attaches
-the child before repository code starts, sets `no_new_privs`, and drains
-`cgroup.kill` after the command and before any GitHub token is requested. This
-also kills descendants that use `setsid` and double-fork. Hosted execution
+the blocked child before repository code starts through a bounded privileged
+write to the leaf's `cgroup.procs`, verifies membership, sets `no_new_privs`,
+and then releases it. Only the leaf's `cgroup.kill` control is delegated to the
+unprivileged coordinator so it can drain the command after execution and before
+any GitHub token is requested. This also kills descendants that use `setsid`
+and double-fork. Hosted execution
 fails closed on non-Linux systems, cgroup v1, kernels without `cgroup.kill`, a
 writable parent cgroup, effective capabilities, root execution, or a runner
 without non-interactive `/usr/bin/sudo`. The GitHub authorization header exists

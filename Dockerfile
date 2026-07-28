@@ -11,13 +11,32 @@ RUN cargo build --locked --release
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
 ARG CODEX_VERSION=0.144.4
 ARG NPM_VERSION=12.0.1
+ARG NPM_BRACE_EXPANSION_VERSION=5.0.8
+ARG NPM_TAR_VERSION=7.5.22
 RUN test -n "${CODEX_VERSION}" \
     && test -n "${NPM_VERSION}" \
+    && test -n "${NPM_BRACE_EXPANSION_VERSION}" \
+    && test -n "${NPM_TAR_VERSION}" \
     && apt-get update \
     && apt-get upgrade --no-install-recommends -y \
     && apt-get install --no-install-recommends -y ca-certificates git tini \
     && npm install --global "npm@${NPM_VERSION}" \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm install --prefix /tmp/npm-security-patches --ignore-scripts --no-audit --no-fund \
+      "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}" \
+      "tar@${NPM_TAR_VERSION}" \
+    && rm -rf \
+      /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
+      /usr/local/lib/node_modules/npm/node_modules/tar \
+    && cp -a \
+      /tmp/npm-security-patches/node_modules/brace-expansion \
+      /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
+    && cp -a \
+      /tmp/npm-security-patches/node_modules/tar \
+      /usr/local/lib/node_modules/npm/node_modules/tar \
+    && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/brace-expansion/package.json').version")" = "${NPM_BRACE_EXPANSION_VERSION}" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/tar/package.json').version")" = "${NPM_TAR_VERSION}" \
+    && rm -rf /tmp/npm-security-patches \
     && npm cache clean --force \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \

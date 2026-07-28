@@ -30,11 +30,13 @@ owns each run's filesystem, process, resource, and network isolation.
   The hosted Linux coordinator is non-dumpable so same-user child processes
   cannot inspect its environment, memory, or descriptors through procfs or
   ptrace. Repository commands start behind a trusted gate in a root-owned
-  cgroup-v2 leaf with `no_new_privs`; `cgroup.kill` is drained after every
-  focused command, dependency bootstrap, and quality gate and immediately
-  before every GitHub token request. Session changes and double-forks therefore
-  cannot leave a helper alive for later credentialed publication. Unsupported
-  or escapable cgroup configurations fail closed.
+  cgroup-v2 leaf with `no_new_privs`; the blocked child is attached through a
+  bounded privileged write and its membership is verified before release.
+  Only the leaf's `cgroup.kill` is delegated to the coordinator and is drained
+  after every focused command, dependency bootstrap, and quality gate and
+  immediately before every GitHub token request. Session changes and
+  double-forks therefore cannot leave a helper alive for later credentialed
+  publication. Unsupported or escapable cgroup configurations fail closed.
 - **Arbitrary model proxying:** the hosted adapter calls only the execution's
   fixed `/ai/responses` endpoint with the resolved model and bounded function
   tools. It cannot select provider resource endpoints, storage, or streaming.

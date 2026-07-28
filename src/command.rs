@@ -60,10 +60,11 @@ pub enum CommandFailure {
 /// Linux cgroup-v2 boundary for repository-controlled hosted commands.
 ///
 /// The cgroup is created by the trusted coordinator as a root-owned child of
-/// its own cgroup. Only the leaf `cgroup.procs` and `cgroup.kill` controls are
-/// delegated to the unprivileged runner user. A command cannot migrate to the
-/// parent, and `PR_SET_NO_NEW_PRIVS` prevents it from using the runner's
-/// passwordless sudo installation to escape the boundary.
+/// its own cgroup. The coordinator uses a bounded privileged write to move the
+/// blocked child into the leaf, while only `cgroup.kill` is delegated to the
+/// unprivileged runner user. A command cannot migrate to the parent, and
+/// `PR_SET_NO_NEW_PRIVS` prevents it from using the runner's passwordless sudo
+/// installation to escape the boundary.
 pub struct HostedProcessContainment {
     #[cfg(target_os = "linux")]
     cgroup_path: PathBuf,
@@ -154,11 +155,8 @@ impl HostedProcessContainment {
                 bail!("hosted command cgroup lacks cgroup.kill; Linux 5.14 or newer is required");
             }
             let owner = format!("{effective_uid}:{effective_gid}");
-            run_privileged_cgroup_command(
-                "/usr/bin/chown",
-                &["--", &owner, path_text(&procs)?, path_text(&kill)?],
-            )
-            .context("could not delegate the hosted command cgroup controls")?;
+            run_privileged_cgroup_command("/usr/bin/chown", &["--", &owner, path_text(&kill)?])
+                .context("could not delegate the hosted command kill control")?;
             Ok::<(), anyhow::Error>(())
         })();
         if let Err(error) = configured {
@@ -218,11 +216,12 @@ impl HostedProcessContainment {
 
     #[cfg(target_os = "linux")]
     fn attach(&self, pid: u32) -> Result<()> {
-        fs::write(
-            self.cgroup_path.join("cgroup.procs"),
-            format!("{pid}\n").as_bytes(),
-        )
-        .context("could not attach the hosted repository command to its cgroup")?;
+        // Moving a process out of the protected coordinator cgroup requires
+        // privilege at the common ancestor. The child is still blocked on the
+        // trusted pre-exec gate here, so use a bounded sudo write and verify
+        // membership before releasing it.
+        run_privileged_cgroup_write(&self.cgroup_path.join("cgroup.procs"), &format!("{pid}\n"))
+            .context("could not attach the hosted repository command to its cgroup")?;
         let actual = linux_process_cgroup(pid)?;
         if actual != self.expected_cgroup {
             bail!(
@@ -311,6 +310,39 @@ fn run_privileged_cgroup_command(program: &str, args: &[&str]) -> Result<()> {
     if !output.status.success() {
         bail!(
             "trusted cgroup helper {program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_privileged_cgroup_write(path: &Path, value: &str) -> Result<()> {
+    if !Path::new("/usr/bin/sudo").is_file() || !Path::new("/usr/bin/tee").is_file() {
+        bail!("GitHub runner is missing the trusted cgroup write helpers");
+    }
+    let mut child = Command::new("/usr/bin/sudo")
+        .args(["-n", "--", "/usr/bin/tee", "--", path_text(path)?])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not start the trusted cgroup write helper")?;
+    child
+        .stdin
+        .take()
+        .context("trusted cgroup write helper has no stdin")?
+        .write_all(value.as_bytes())
+        .context("could not provide the cgroup membership to the trusted helper")?;
+    let output = child
+        .wait_with_output()
+        .context("could not wait for the trusted cgroup write helper")?;
+    if !output.status.success() {
+        bail!(
+            "trusted cgroup write helper exited with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
