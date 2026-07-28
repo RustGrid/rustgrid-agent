@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.0 - 2026-07-28
+
 ### Added
 
 - Add ephemeral `execute --provider github-actions` and
@@ -20,6 +22,22 @@ Semantic Versioning.
   in-memory, zeroize secret buffers, validate all mission endpoints and policy
   hashes, refuse inherited provider credentials, reject symlink escapes, and
   strip GitHub Actions/OIDC/provider credentials from repository subprocesses.
+- Isolate every repository-controlled hosted command in a root-owned cgroup-v2
+  leaf, attach the blocked child through a bounded privileged write, verify
+  membership before execution, and drain all descendants before publication.
+- Patch the npm runtime's embedded `brace-expansion` and `tar` packages to
+  versions without their fixable container findings.
+
+### Changed
+
+- Upgrade all open Dependabot suggestions for Rust dependencies and
+  `actions/checkout`, including the `sha2` and `base64` major-version updates.
+
+### Fixed
+
+- Make hosted cgroup attachment work on GitHub's Ubuntu runners, where moving a
+  process from the protected parent requires privilege at the common ancestor
+  even if the destination membership file is writable.
 
 ## 1.3.0 - 2026-07-23
 
