@@ -1598,7 +1598,7 @@ impl<'a> GatewayAgent<'a> {
 
     fn implement(&mut self) -> Result<String> {
         let prompt = build_hosted_prompt(self.manifest, self.repo)?;
-        self.run_session(&prompt)
+        self.run_session(&prompt, true)
     }
 
     fn repair(&mut self, failures: &[ValidationResult], attempt: usize) -> Result<String> {
@@ -1614,13 +1614,16 @@ impl<'a> GatewayAgent<'a> {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        self.run_session(&format!(
-            "Repair validation attempt {attempt} for RustGrid ticket {}. Inspect the current diff and make the smallest correct changes needed for these failures. Do not commit, push, create branches, or open pull requests.\n\n{diagnostics}",
-            self.manifest.ticket_key
-        ))
+        self.run_session(
+            &format!(
+                "Repair validation attempt {attempt} for RustGrid ticket {}. Inspect the current diff and make the smallest correct changes needed for these failures. Do not commit, push, create branches, or open pull requests.\n\n{diagnostics}",
+                self.manifest.ticket_key
+            ),
+            false,
+        )
     }
 
-    fn run_session(&mut self, prompt: &str) -> Result<String> {
+    fn run_session(&mut self, prompt: &str, allow_budget_handoff: bool) -> Result<String> {
         let initial = json!({"role": "user", "content": prompt});
         let mut turns = VecDeque::<Vec<Value>>::new();
         loop {
@@ -1629,6 +1632,22 @@ impl<'a> GatewayAgent<'a> {
                 .unwrap_or_default()
                 .min(MAX_MODEL_CALLS_HARD_LIMIT);
             if self.calls_used >= maximum_calls {
+                let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
+                if let Some(summary) =
+                    model_budget_handoff_summary(allow_budget_handoff, &changed_paths)
+                {
+                    self.api.append_event(
+                        "message",
+                        json!({
+                            "step": "ai_gateway",
+                            "status": "budget_handoff",
+                            "model_calls_used": self.calls_used,
+                            "changed_paths": changed_paths,
+                            "summary": summary
+                        }),
+                    )?;
+                    return Ok(summary);
+                }
                 bail!("execution AI model-call budget was exhausted");
             }
             let mut input = vec![initial.clone()];
@@ -1844,6 +1863,16 @@ impl<'a> GatewayAgent<'a> {
                     .with_context(|| format!("could not write repository file {path}"))?;
                 Ok(format!("wrote {} bytes to {path}", content.len()))
             }
+            "replace_text" => {
+                let path = required_tool_string(object, "path", 4_096)?;
+                let old_text = required_tool_string(object, "old_text", MAX_MODEL_FILE_BYTES)?;
+                let new_text = object
+                    .get("new_text")
+                    .and_then(Value::as_str)
+                    .filter(|value| value.len() <= MAX_MODEL_FILE_BYTES)
+                    .context("tool argument `new_text` is missing or too large")?;
+                replace_unique_repo_text(&self.repo.root, path, old_text, new_text)
+            }
             "delete_file" => {
                 let path = required_tool_string(object, "path", 4_096)?;
                 let target = safe_repo_path(&self.repo.root, path, false)?;
@@ -1868,6 +1897,14 @@ impl<'a> GatewayAgent<'a> {
                     None,
                     self.containment,
                 )?;
+                if !output.status.success() {
+                    bail!(
+                        "focused command exited with {}\nstdout:\n{}\nstderr:\n{}",
+                        output.status,
+                        truncate_text(&output.stdout, MAX_TOOL_OUTPUT_BYTES / 2),
+                        truncate_text(&output.stderr, MAX_TOOL_OUTPUT_BYTES / 2)
+                    );
+                }
                 Ok(format!(
                     "exit={}\nstdout:\n{}\nstderr:\n{}",
                     output.status,
@@ -1942,6 +1979,22 @@ fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "replace_text",
+            "description": "Edit one existing UTF-8 repository file by replacing one exact, unique string. Use this for targeted edits instead of mutation commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"}
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
             "name": "delete_file",
             "description": "Delete one regular repository file.",
             "parameters": {
@@ -1955,7 +2008,7 @@ fn hosted_tools() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "run_focused_command",
-            "description": "Run one focused, non-publication command in the repository. The environment contains no RustGrid, GitHub, or OpenAI credential.",
+            "description": "Run one focused validation or read-only diagnostic program directly, without a shell. Shell operators, pipelines, redirects, heredocs, and command chaining are unsupported. Use repository edit tools for mutations. The environment contains no RustGrid, GitHub, or OpenAI credential.",
             "parameters": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -1970,7 +2023,10 @@ fn hosted_tools() -> Vec<Value> {
 fn hosted_agent_instructions() -> &'static str {
     "You are the implementation model inside an ephemeral RustGrid GitHub Actions worker. \
 Use only the provided repository tools. Inspect the smallest relevant scope, follow repository \
-instructions, implement the mission, add focused tests, and inspect your final changes. Never \
+instructions, implement the mission, add focused tests, and inspect your final changes. Use \
+replace_text for targeted edits and write_file only when replacing a complete file is appropriate. \
+run_focused_command starts one executable directly without a shell; never pass shell operators, \
+pipelines, redirects, heredocs, or chained commands to it, and never use it to mutate files. Never \
 commit, push, switch branches, modify Git remotes, open pull requests, read environment variables, \
 read files outside the repository, or attempt to discover credentials. The RustGrid worker owns \
 full quality gates and publication. End with a concise implementation and focused-validation summary."
@@ -2800,8 +2856,57 @@ fn required_tool_string<'a>(
         .with_context(|| format!("tool argument `{name}` is missing or too large"))
 }
 
+fn model_budget_handoff_summary(allowed: bool, changed_paths: &[String]) -> Option<String> {
+    (allowed && !changed_paths.is_empty()).then(|| {
+        format!(
+            "The implementation model used its configured call budget after changing {} path(s). RustGrid is continuing with authoritative quality gates to determine whether the implementation is complete.",
+            changed_paths.len()
+        )
+    })
+}
+
+fn replace_unique_repo_text(
+    root: &Path,
+    path: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<String> {
+    let target = safe_repo_path(root, path, false)?;
+    let content = fs::read_to_string(&target)
+        .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    let matches = content.match_indices(old_text).count();
+    if matches != 1 {
+        bail!(
+            "replace_text requires exactly one match in {path}; found {matches}. Read a more specific surrounding range and retry."
+        );
+    }
+    let updated = content.replacen(old_text, new_text, 1);
+    if updated.len() > MAX_MODEL_FILE_BYTES {
+        bail!("replace_text result exceeds the hosted tool limit");
+    }
+    fs::write(&target, updated.as_bytes())
+        .with_context(|| format!("could not write repository file {path}"))?;
+    Ok(format!(
+        "replaced {} bytes with {} bytes in {path}",
+        old_text.len(),
+        new_text.len()
+    ))
+}
+
 fn validate_model_command(value: &str) -> Result<()> {
+    if value.contains('\n') || value.contains('\r') {
+        bail!("focused model command must be one direct command without shell syntax");
+    }
     let parts = command::parse(value)?;
+    if parts.iter().any(|part| {
+        matches!(part.as_str(), "&&" | "||" | "|" | ";" | "<" | ">")
+            || part.starts_with("<<")
+            || part.starts_with(">>")
+    }) {
+        bail!(
+            "focused model command runs without a shell; operators, redirects, heredocs, and command chaining are unsupported"
+        );
+    }
     let program = Path::new(&parts[0])
         .file_name()
         .and_then(|value| value.to_str())
@@ -3421,6 +3526,9 @@ mod tests {
         assert!(validate_model_command("git diff -- src/lib.rs").is_ok());
         assert!(validate_model_command("git push origin branch").is_err());
         assert!(validate_model_command("curl https://example.com").is_err());
+        assert!(validate_model_command("npm test && npm run build").is_err());
+        assert!(validate_model_command("python3 - <<PY\nprint('no')\nPY").is_err());
+        assert!(validate_model_command("sed -n 1,20p src/lib.rs").is_ok());
     }
 
     #[test]
@@ -3560,6 +3668,38 @@ mod tests {
             std::os::unix::fs::symlink("/tmp", directory.path().join("linked")).unwrap();
             assert!(safe_repo_path(directory.path(), "linked/file", true).is_err());
         }
+    }
+
+    #[test]
+    fn replace_text_requires_one_exact_match_and_supports_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("theme.css");
+        fs::write(&path, "root {}\nred {}\n").unwrap();
+
+        replace_unique_repo_text(directory.path(), "theme.css", "red {}", "blue {}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "root {}\nblue {}\n");
+
+        replace_unique_repo_text(directory.path(), "theme.css", "blue {}\n", "").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "root {}\n");
+        assert!(
+            replace_unique_repo_text(directory.path(), "theme.css", "missing", "value").is_err()
+        );
+
+        fs::write(&path, "same\nsame\n").unwrap();
+        assert!(replace_unique_repo_text(directory.path(), "theme.css", "same", "other").is_err());
+    }
+
+    #[test]
+    fn model_budget_handoff_salvages_only_nonempty_initial_implementations() {
+        let empty = Vec::new();
+        assert!(model_budget_handoff_summary(true, &empty).is_none());
+
+        let changed = vec!["src/theme.css".to_owned()];
+        assert!(model_budget_handoff_summary(false, &changed).is_none());
+        assert!(
+            model_budget_handoff_summary(true, &changed)
+                .is_some_and(|summary| summary.contains("authoritative quality gates"))
+        );
     }
 
     #[test]
