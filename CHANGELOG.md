@@ -5,6 +5,22 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.2 - 2026-07-28
+
+### Added
+
+- Add a bounded exact-text replacement tool for hosted implementation sessions
+  so targeted repository edits do not require shell mutation commands.
+
+### Fixed
+
+- Reject shell operators, redirects, heredocs, and command chaining in the
+  direct-process focused-command tool, and report non-zero command exits as
+  failed tool calls instead of successful results.
+- Continue to worker-owned authoritative quality gates when the implementation
+  model exhausts its call budget after producing changes, while preserving
+  fail-closed behavior for empty implementations and exhausted repair sessions.
+
 ## 1.4.1 - 2026-07-28
 
 ### Fixed
