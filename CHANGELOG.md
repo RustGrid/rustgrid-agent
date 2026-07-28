@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.1 - 2026-07-28
+
 ### Fixed
 
 - Use the shared `https://app.rustgrid.com` control-plane origin for ephemeral
