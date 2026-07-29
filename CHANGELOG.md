@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.7 - 2026-07-29
+
 ### Changed
 
 - Accept the canonical hosted `model_call_budget` contract together with
