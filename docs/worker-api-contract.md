@@ -57,9 +57,22 @@ roll forward only into implementation/repair. Non-default totals use
 deterministic `20/10/50/10/10` proportional allocation with implementation and
 repair receiving at least half.
 
-Every AI request identifies one of `discovery`, `planning`, `implementation`,
-`repair`, `diff_review`, or `completion_evaluation`; worker-owned actions use
-`validation` and `publication`. The RustGrid gateway must validate this
+Manifest v4 adds the canonical top-level `model_call_budget` field and requires
+`requested_model_call_budget`, `resolved_model_call_budget`, `budget_source`,
+`clamped`, and `clamp_reason`. The worker-derived
+`worker_received_model_call_budget` is the exact limit delivered to the AI
+gateway. Requested, resolved, canonical, persisted-execution, and received
+values must match, `clamped` must be false, and `clamp_reason` must be null or
+the worker fails before its first model request with
+`execution_budget_mismatch`. Manifest v3 remains supported only as a legacy
+signed contract and never supplies a worker-side default.
+
+Every AI request identifies one of `discovery`, `artifact_repair`, `planning`,
+`implementation`, `repair`, `diff_review`, or `completion_evaluation`;
+worker-owned actions use `validation` and `publication`. `artifact_repair` is a
+single supplemental infrastructure-recovery call, admits only
+`record_impact_map`, and does not consume configured coding capacity. The
+RustGrid gateway must validate this
 internal phase metadata, omit it from the upstream provider request, persist it
 on the authoritative model-call usage row, and enforce both the total and
 phase allocation. The worker emits durable phase-transition, phase-budget
@@ -73,6 +86,15 @@ starting at call 33. Search duplicates and a fourth consecutive search are
 rejected. After discovery, broad root or `src` searches are rejected and
 targeted reads must map to a planned edit, acceptance criterion, or failed
 write.
+
+Impact-map artifact state records `semantic_status` independently from
+`persistence_status`. A produced map may advance to planning when its event
+write fails because the strict artifact remains in memory and the notebook.
+The worker retries event persistence without a model call and emits
+`worker.artifact_persistence_failed` with a safe error, revision, expected
+previous revision, artifact hash, model-call index, and phase. A strict fallback
+may reconstruct the map from tool arguments, assistant JSON, and already
+recorded discovery progress; it never invents missing semantic content.
 
 The compact versioned worker notebook is included in durable worker events and
 in every subsequent model request. A continuation manifest may return it under

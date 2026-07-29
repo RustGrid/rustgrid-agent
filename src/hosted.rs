@@ -403,12 +403,23 @@ impl HostedApiClient {
         {
             bail!("invalid hosted execution event");
         }
+        let body = json!({"event_type": event_type, "data": data});
+        let encoded = serde_json::to_vec(&body)?;
+        let idempotency_key = Uuid::new_v5(
+            &HOSTED_NAMESPACE,
+            &[
+                b"worker-event:".as_slice(),
+                self.execution_id.as_bytes().as_slice(),
+                encoded.as_slice(),
+            ]
+            .concat(),
+        );
         let _: Value = self.send_json(
             Method::POST,
             &format!("executions/{}/worker-events", self.execution_id),
-            Some(json!({"event_type": event_type, "data": data})),
-            None,
-            1,
+            Some(body),
+            Some(idempotency_key),
+            2,
         )?;
         Ok(())
     }
@@ -664,6 +675,18 @@ struct GithubTokenResponse {
 #[derive(Clone, Debug, Deserialize)]
 struct HostedManifest {
     manifest_version: i32,
+    #[serde(default)]
+    model_call_budget: Option<i32>,
+    #[serde(default)]
+    requested_model_call_budget: Option<i32>,
+    #[serde(default)]
+    resolved_model_call_budget: Option<i32>,
+    #[serde(default)]
+    budget_source: Option<BudgetSource>,
+    #[serde(default)]
+    clamped: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    clamp_reason: Option<Option<String>>,
     execution: ManifestExecution,
     run: ManifestRun,
     project_id: Uuid,
@@ -743,6 +766,55 @@ struct HostedAiManifest {
     maximum_model_calls: i32,
     maximum_cost_usd: String,
 }
+
+fn deserialize_present_nullable<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BudgetSource {
+    UserSelected,
+    ProjectDefault,
+    SystemDefault,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BudgetAudit {
+    requested_model_call_budget: i32,
+    resolved_model_call_budget: i32,
+    worker_received_model_call_budget: i32,
+    budget_source: Option<BudgetSource>,
+    clamped: bool,
+    clamp_reason: Option<String>,
+    contract: &'static str,
+}
+
+#[derive(Debug)]
+struct ExecutionBudgetMismatch {
+    requested: Option<i32>,
+    resolved: Option<i32>,
+    canonical: Option<i32>,
+    execution: Option<i32>,
+    worker_received: i32,
+}
+
+impl std::fmt::Display for ExecutionBudgetMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "execution_budget_mismatch: requested={:?}, resolved={:?}, canonical={:?}, execution={:?}, worker_received={}",
+            self.requested, self.resolved, self.canonical, self.execution, self.worker_received
+        )
+    }
+}
+
+impl std::error::Error for ExecutionBudgetMismatch {}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HostedExecutionPolicy {
@@ -865,7 +937,8 @@ struct CompletionEvaluation {
     summary: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ImpactMap {
     can_implement: bool,
     #[serde(default)]
@@ -878,7 +951,8 @@ struct ImpactMap {
     blocking_unknowns: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ImpactArea {
     area: String,
     #[serde(default)]
@@ -947,6 +1021,58 @@ struct ToolFailureRecord {
     intended_change_sha256: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactSemanticStatus {
+    Produced,
+    Invalid,
+    #[default]
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactPersistenceStatus {
+    Persisted,
+    Failed,
+    #[default]
+    PendingRetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ArtifactCheckpoint {
+    artifact: String,
+    semantic_status: ArtifactSemanticStatus,
+    persistence_status: ArtifactPersistenceStatus,
+    #[serde(default)]
+    artifact_sha256: Option<String>,
+    #[serde(default)]
+    model_call_index: Option<usize>,
+    phase: ExecutionPhase,
+    #[serde(default)]
+    safe_error: Option<String>,
+}
+
+impl Default for ArtifactCheckpoint {
+    fn default() -> Self {
+        Self {
+            artifact: "impact_map".into(),
+            semantic_status: ArtifactSemanticStatus::Missing,
+            persistence_status: ArtifactPersistenceStatus::PendingRetry,
+            artifact_sha256: None,
+            model_call_index: None,
+            phase: ExecutionPhase::Discovery,
+            safe_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ImpactMapFailure {
+    code: &'static str,
+    safe_error: String,
+}
+
 #[derive(Clone, Debug)]
 struct ImplementationOutcome {
     summary: String,
@@ -980,6 +1106,8 @@ struct WorkerNotebook {
     architecture_findings: Vec<String>,
     #[serde(default)]
     impact_map: Vec<ImpactArea>,
+    #[serde(default)]
+    impact_map_artifact: ArtifactCheckpoint,
     #[serde(default)]
     files_inspected: Vec<String>,
     #[serde(default)]
@@ -1020,13 +1148,20 @@ struct HostedAgentExecutionFailure {
     underlying_error: UnderlyingFailure,
     model_calls_used: usize,
     model_calls_limit: usize,
+    model_calls_remaining: usize,
     phase_calls_used: usize,
     phase_calls_limit: usize,
     last_successful_action: Value,
     usage: ToolUsage,
     recoverable: bool,
-    resume_phase: ExecutionPhase,
+    resume_phase: String,
     recommended_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_status: Option<ArtifactSemanticStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence_status: Option<ArtifactPersistenceStatus>,
 }
 
 impl std::fmt::Display for HostedAgentExecutionFailure {
@@ -1063,13 +1198,198 @@ fn notebook_orchestration_state(
         ExecutionPhase::Implementation
     } else if impact_map.is_some() {
         ExecutionPhase::Planning
+    } else if notebook.phase == ExecutionPhase::ArtifactRepair {
+        ExecutionPhase::ArtifactRepair
     } else {
         ExecutionPhase::Discovery
     };
     (impact_map, implementation_plan, phase)
 }
 
+fn validate_impact_map(map: &ImpactMap) -> Result<()> {
+    if map.impact_map.is_empty()
+        || map.files_inspected.is_empty()
+        || (map.can_implement && !map.blocking_unknowns.is_empty())
+        || (!map.can_implement && map.blocking_unknowns.is_empty())
+        || map.impact_map.iter().any(|area| {
+            area.area.trim().is_empty()
+                || area.reason.trim().is_empty()
+                || area.candidate_paths.is_empty()
+                || area
+                    .candidate_paths
+                    .iter()
+                    .any(|path| path.trim().is_empty())
+                || area.acceptance_criteria.is_empty()
+        })
+    {
+        bail!(
+            "impact map must identify areas, candidate paths, evidence, inspected files, and acceptance criteria"
+        );
+    }
+    Ok(())
+}
+
+fn merge_impact_map_discovery(mut map: ImpactMap, notebook: &WorkerNotebook) -> ImpactMap {
+    if map.files_inspected.is_empty() {
+        map.files_inspected = notebook.files_inspected.clone();
+    }
+    if map.searches_completed.is_empty() {
+        map.searches_completed = notebook.searches_completed.clone();
+    }
+    map
+}
+
+fn impact_map_from_value(value: Value, notebook: &WorkerNotebook) -> Result<ImpactMap> {
+    let map = serde_json::from_value::<ImpactMap>(value)
+        .context("impact map does not match the strict artifact schema")?;
+    let map = merge_impact_map_discovery(map, notebook);
+    validate_impact_map(&map)?;
+    Ok(map)
+}
+
+fn json_object_from_text(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && value.is_object()
+    {
+        return Some(value);
+    }
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim);
+    if let Some(unfenced) = unfenced
+        && let Ok(value) = serde_json::from_str::<Value>(unfenced)
+        && value.is_object()
+    {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start < end)
+        .then(|| serde_json::from_str::<Value>(&trimmed[start..=end]).ok())
+        .flatten()
+        .filter(Value::is_object)
+}
+
+fn recover_impact_map(
+    raw_arguments: Option<&str>,
+    assistant_text: Option<&str>,
+    notebook: &WorkerNotebook,
+) -> Result<ImpactMap> {
+    let mut errors = Vec::new();
+    for candidate in [
+        raw_arguments.and_then(json_object_from_text),
+        assistant_text.and_then(json_object_from_text),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match impact_map_from_value(candidate, notebook) {
+            Ok(map) => return Ok(map),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    bail!(
+        "impact map recovery found no valid structured artifact{}",
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", errors.join("; "))
+        }
+    )
+}
+
+fn impact_map_sha256(map: &ImpactMap) -> Option<String> {
+    serde_json::to_vec(map)
+        .ok()
+        .map(|encoded| hex::encode(Sha256::digest(encoded)))
+}
+
+fn classify_impact_map_failure(error: &anyhow::Error) -> ImpactMapFailure {
+    let safe_error = truncate_text(&format!("{error:#}"), 2_000);
+    let lower = safe_error.to_ascii_lowercase();
+    let code = if lower.contains("valid json")
+        || lower.contains("strict artifact schema")
+        || lower.contains("malformed")
+    {
+        "impact_map_schema_mismatch"
+    } else if lower.contains("persist")
+        || lower.contains("worker-events")
+        || lower.contains("transport")
+    {
+        "impact_map_persistence_failed"
+    } else if lower.contains("impact map") {
+        "impact_map_invalid"
+    } else {
+        "impact_map_tool_failure"
+    };
+    ImpactMapFailure { code, safe_error }
+}
+
 impl HostedManifest {
+    fn budget_audit(&self) -> Result<BudgetAudit> {
+        let worker_received = self.ai_gateway.maximum_model_calls;
+        let execution = self.execution.maximum_model_calls;
+        let has_canonical_contract = self.model_call_budget.is_some()
+            || self.requested_model_call_budget.is_some()
+            || self.resolved_model_call_budget.is_some()
+            || self.budget_source.is_some()
+            || self.clamped.is_some()
+            || self.clamp_reason.is_some();
+        if has_canonical_contract {
+            let requested = self.requested_model_call_budget;
+            let resolved = self.resolved_model_call_budget;
+            let canonical = self.model_call_budget;
+            let clamped = self.clamped;
+            let exact_match = requested.is_some()
+                && requested == resolved
+                && resolved == canonical
+                && canonical == execution
+                && canonical == Some(worker_received)
+                && self.budget_source.is_some()
+                && clamped == Some(false)
+                && self.clamp_reason == Some(None);
+            if !exact_match {
+                return Err(anyhow!(ExecutionBudgetMismatch {
+                    requested,
+                    resolved,
+                    canonical,
+                    execution,
+                    worker_received,
+                }));
+            }
+            return Ok(BudgetAudit {
+                requested_model_call_budget: requested.expect("checked above"),
+                resolved_model_call_budget: resolved.expect("checked above"),
+                worker_received_model_call_budget: worker_received,
+                budget_source: self.budget_source,
+                clamped: false,
+                clamp_reason: self.clamp_reason.clone().flatten(),
+                contract: "canonical",
+            });
+        }
+        if self.manifest_version >= 4 || execution != Some(worker_received) {
+            return Err(anyhow!(ExecutionBudgetMismatch {
+                requested: None,
+                resolved: None,
+                canonical: None,
+                execution,
+                worker_received,
+            }));
+        }
+        Ok(BudgetAudit {
+            requested_model_call_budget: worker_received,
+            resolved_model_call_budget: worker_received,
+            worker_received_model_call_budget: worker_received,
+            budget_source: None,
+            clamped: false,
+            clamp_reason: None,
+            contract: "legacy_signed_manifest",
+        })
+    }
+
     fn validate(
         &self,
         execution_id: Uuid,
@@ -1081,7 +1401,7 @@ impl HostedManifest {
             .github_actions
             .as_ref()
             .context("RustGrid execution manifest has no GitHub Actions correlation")?;
-        if self.manifest_version != 3
+        if !(3..=4).contains(&self.manifest_version)
             || self.execution.execution_id != execution_id
             || self.run.id != execution_id
             || self.run.ticket_id != self.ticket_id
@@ -1194,6 +1514,7 @@ impl HostedManifest {
         }
 
         let maximum_cost = self.ai_gateway.maximum_cost_usd.parse::<f64>();
+        let budget = self.budget_audit()?;
         if self.ai_gateway.model.trim().is_empty()
             || self.ai_gateway.model.len() > 100
             || self.ai_gateway.model.chars().any(char::is_whitespace)
@@ -1201,12 +1522,11 @@ impl HostedManifest {
             || self.ai_gateway.maximum_input_tokens < 1
             || self.ai_gateway.maximum_output_tokens < 1
             || !(MINIMUM_HOSTED_MODEL_CALLS as i32..=MAX_MODEL_CALLS_HARD_LIMIT as i32)
-                .contains(&self.ai_gateway.maximum_model_calls)
+                .contains(&budget.worker_received_model_call_budget)
             || maximum_cost.is_err()
             || maximum_cost.is_ok_and(|value| !value.is_finite() || value <= 0.0)
             || self.execution.maximum_input_tokens != Some(self.ai_gateway.maximum_input_tokens)
             || self.execution.maximum_output_tokens != Some(self.ai_gateway.maximum_output_tokens)
-            || self.execution.maximum_model_calls != Some(self.ai_gateway.maximum_model_calls)
             || self.execution.maximum_cost_usd.as_deref()
                 != Some(self.ai_gateway.maximum_cost_usd.as_str())
             || self
@@ -1337,6 +1657,15 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
         Ok(manifest) => manifest,
         Err(error) => {
             let (code, message) = safe_failure(&error, false);
+            let diagnostics = failure_diagnostics(&error, false);
+            let _ = api.append_event(
+                "result",
+                json!({
+                    "status": "failed",
+                    "code": code,
+                    "failure": diagnostics,
+                }),
+            );
             let _ = api.complete(&CompletionRequest {
                 status: "failed".into(),
                 output_summary: None,
@@ -2008,6 +2337,7 @@ struct GatewayAgent<'a> {
     repo: &'a Repo,
     running: &'a Arc<AtomicBool>,
     containment: &'a command::HostedProcessContainment,
+    budget: BudgetAudit,
     phases: PhaseLedger,
     impact_map: Option<ImpactMap>,
     implementation_plan: Option<ImplementationPlan>,
@@ -2022,6 +2352,7 @@ struct GatewayAgent<'a> {
     write_progress_reported: bool,
     write_blocker: Option<String>,
     blocked_plan_recorded_at: Option<usize>,
+    impact_map_failure: Option<ImpactMapFailure>,
     last_successful_action: Value,
 }
 
@@ -2033,7 +2364,10 @@ impl<'a> GatewayAgent<'a> {
         running: &'a Arc<AtomicBool>,
         containment: &'a command::HostedProcessContainment,
     ) -> Self {
-        let total_calls = usize::try_from(manifest.ai_gateway.maximum_model_calls)
+        let budget = manifest
+            .budget_audit()
+            .expect("hosted manifest budget was validated before agent construction");
+        let total_calls = usize::try_from(budget.worker_received_model_call_budget)
             .unwrap_or_default()
             .min(MAX_MODEL_CALLS_HARD_LIMIT);
         let repository_fingerprint =
@@ -2051,7 +2385,7 @@ impl<'a> GatewayAgent<'a> {
                     && (notebook.repository_fingerprint.is_empty()
                         || notebook.repository_fingerprint == repository_fingerprint)
             });
-        let notebook = restored.unwrap_or_else(|| WorkerNotebook {
+        let mut notebook = restored.unwrap_or_else(|| WorkerNotebook {
             schema_version: 1,
             revision: 0,
             goal: manifest.ticket_title.clone(),
@@ -2063,6 +2397,7 @@ impl<'a> GatewayAgent<'a> {
             execution_attempt: manifest.execution.attempt_number,
             architecture_findings: Vec::new(),
             impact_map: Vec::new(),
+            impact_map_artifact: ArtifactCheckpoint::default(),
             files_inspected: Vec::new(),
             searches_completed: Vec::new(),
             planned_changes: Vec::new(),
@@ -2074,6 +2409,26 @@ impl<'a> GatewayAgent<'a> {
             phase_budget: Value::Null,
             last_successful_action: json!({}),
         });
+        if !notebook.impact_map.is_empty()
+            && notebook.impact_map_artifact.semantic_status == ArtifactSemanticStatus::Missing
+        {
+            let restored_map = ImpactMap {
+                can_implement: notebook.blocking_unknowns.is_empty(),
+                impact_map: notebook.impact_map.clone(),
+                files_inspected: notebook.files_inspected.clone(),
+                searches_completed: notebook.searches_completed.clone(),
+                blocking_unknowns: notebook.blocking_unknowns.clone(),
+            };
+            notebook.impact_map_artifact = ArtifactCheckpoint {
+                artifact: "impact_map".into(),
+                semantic_status: ArtifactSemanticStatus::Produced,
+                persistence_status: ArtifactPersistenceStatus::Persisted,
+                artifact_sha256: impact_map_sha256(&restored_map),
+                model_call_index: None,
+                phase: ExecutionPhase::Discovery,
+                safe_error: None,
+            };
+        }
         let (impact_map, implementation_plan, initial_phase) =
             notebook_orchestration_state(&notebook);
         Self {
@@ -2082,6 +2437,7 @@ impl<'a> GatewayAgent<'a> {
             repo,
             running,
             containment,
+            budget,
             phases: PhaseLedger::new(total_calls, initial_phase),
             impact_map,
             implementation_plan,
@@ -2100,6 +2456,7 @@ impl<'a> GatewayAgent<'a> {
             write_progress_reported: false,
             write_blocker: None,
             blocked_plan_recorded_at: None,
+            impact_map_failure: None,
             last_successful_action: json!({}),
         }
     }
@@ -2107,42 +2464,113 @@ impl<'a> GatewayAgent<'a> {
     fn implement(&mut self) -> Result<ImplementationOutcome> {
         let prompt = build_hosted_prompt(self.manifest, self.repo)?;
         self.checkpoint_notebook(false)?;
-        self.api.append_event(
+        self.append_event_recoverable(
             "progress",
             json!({
                 "event_type": "worker.notebook_checkpoint",
                 "phase": self.phases.active(),
                 "notebook": self.notebook,
+                "checkpoint": self.notebook_checkpoint_metadata(None),
+                "budget": self.budget_telemetry(),
                 "resumed": self.manifest.execution.attempt_number > 1
                     && self.impact_map.is_some(),
             }),
-        )?;
+            "initial notebook checkpoint",
+        );
         self.run_session(&prompt, true)
     }
 
     fn budget_telemetry(&self) -> Value {
-        self.phases.telemetry()
+        let mut telemetry = self.phases.telemetry();
+        if let Some(object) = telemetry.as_object_mut() {
+            object.insert(
+                "requested_model_call_budget".into(),
+                json!(self.budget.requested_model_call_budget),
+            );
+            object.insert(
+                "resolved_model_call_budget".into(),
+                json!(self.budget.resolved_model_call_budget),
+            );
+            object.insert(
+                "model_call_budget".into(),
+                json!(self.budget.resolved_model_call_budget),
+            );
+            object.insert(
+                "worker_received_model_call_budget".into(),
+                json!(self.budget.worker_received_model_call_budget),
+            );
+            object.insert("budget_source".into(), json!(self.budget.budget_source));
+            object.insert("clamped".into(), json!(self.budget.clamped));
+            object.insert("clamp_reason".into(), json!(self.budget.clamp_reason));
+            object.insert("budget_contract".into(), json!(self.budget.contract));
+        }
+        telemetry
     }
 
-    fn transition_phase(&mut self, phase: ExecutionPhase, reason: &str) -> Result<()> {
+    fn append_event_recoverable(&self, event_type: &str, data: Value, operation: &str) -> bool {
+        match self.api.append_event(event_type, data) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[warning] {operation} could not be persisted: {error:#}");
+                false
+            }
+        }
+    }
+
+    fn notebook_checkpoint_metadata(&self, artifact_sha256: Option<&str>) -> Value {
+        json!({
+            "execution_id": self.manifest.execution.execution_id,
+            "notebook_revision": self.notebook.revision,
+            "expected_previous_revision": self.notebook.revision.saturating_sub(1),
+            "artifact_hash": artifact_sha256,
+            "model_call_index": self.phases.total_calls(),
+            "phase": self.phases.active(),
+        })
+    }
+
+    fn transition_phase(&mut self, phase: ExecutionPhase, reason: &str) -> Result<Option<String>> {
         let previous = self.phases.active();
         if previous == phase {
-            return Ok(());
+            return Ok(None);
         }
         self.phases.transition(phase);
         self.notebook.phase = phase;
         self.checkpoint_notebook(false)?;
-        self.api.append_event(
-            "progress",
-            json!({
-                "event_type": "worker.phase_transition",
-                "from_phase": previous,
-                "phase": phase,
-                "reason": reason,
-                "budget": self.budget_telemetry(),
-                "notebook": self.notebook,
-            }),
-        )
+        let event = json!({
+            "event_type": "worker.phase_transition",
+            "from_phase": previous,
+            "phase": phase,
+            "reason": reason,
+            "budget": self.budget_telemetry(),
+            "notebook": self.notebook,
+            "checkpoint": self.notebook_checkpoint_metadata(
+                self.notebook.impact_map_artifact.artifact_sha256.as_deref()
+            ),
+        });
+        let persistence_error = self
+            .api
+            .append_event("progress", event)
+            .err()
+            .map(|error| truncate_text(&format!("{error:#}"), 2_000));
+        if let Some(error) = persistence_error.as_deref() {
+            eprintln!("[warning] phase transition could not be persisted: {error}");
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.phase_persistence_failed",
+                    "from_phase": previous,
+                    "phase": phase,
+                    "recoverable": true,
+                    "action": "retry_or_continue",
+                    "safe_error": error,
+                    "checkpoint": self.notebook_checkpoint_metadata(
+                        self.notebook.impact_map_artifact.artifact_sha256.as_deref()
+                    ),
+                }),
+                "phase persistence failure warning",
+            );
+        }
+        Ok(persistence_error)
     }
 
     fn checkpoint_notebook(&mut self, repository_changed: bool) -> Result<()> {
@@ -2155,6 +2583,72 @@ impl<'a> GatewayAgent<'a> {
                 repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         }
         Ok(())
+    }
+
+    fn accept_impact_map(
+        &mut self,
+        map: ImpactMap,
+        recovery_source: &str,
+        triggering_error: Option<&anyhow::Error>,
+    ) -> Result<String> {
+        validate_impact_map(&map)?;
+        let artifact_sha256 = impact_map_sha256(&map);
+        self.notebook.impact_map = map.impact_map.clone();
+        self.notebook.files_inspected = map.files_inspected.clone();
+        self.notebook.searches_completed = map.searches_completed.clone();
+        self.notebook.blocking_unknowns = map.blocking_unknowns.clone();
+        self.notebook.impact_map_artifact = ArtifactCheckpoint {
+            artifact: "impact_map".into(),
+            semantic_status: ArtifactSemanticStatus::Produced,
+            persistence_status: ArtifactPersistenceStatus::PendingRetry,
+            artifact_sha256: artifact_sha256.clone(),
+            model_call_index: Some(self.phases.total_calls()),
+            phase: self.phases.active(),
+            safe_error: triggering_error.map(|error| truncate_text(&format!("{error:#}"), 2_000)),
+        };
+        self.impact_map = Some(map);
+        self.impact_map_failure = None;
+        let persistence_error = self.transition_phase(
+            ExecutionPhase::Planning,
+            "valid discovery impact map accepted",
+        )?;
+        let persisted = persistence_error.is_none();
+        self.notebook.impact_map_artifact.persistence_status = if persisted {
+            ArtifactPersistenceStatus::Persisted
+        } else {
+            ArtifactPersistenceStatus::Failed
+        };
+        self.notebook.impact_map_artifact.phase = ExecutionPhase::Discovery;
+        if let Some(error) = persistence_error.as_ref() {
+            self.notebook.impact_map_artifact.safe_error = Some(error.clone());
+        }
+        if !persisted {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.artifact_persistence_failed",
+                    "artifact": "impact_map",
+                    "semantic_status": ArtifactSemanticStatus::Produced,
+                    "persistence_status": ArtifactPersistenceStatus::Failed,
+                    "recoverable": true,
+                    "action": "retry_or_continue",
+                    "safe_error": persistence_error,
+                    "recovery_source": recovery_source,
+                    "notebook": self.notebook,
+                    "checkpoint": self.notebook_checkpoint_metadata(
+                        artifact_sha256.as_deref()
+                    ),
+                }),
+                "impact-map fallback checkpoint",
+            );
+        }
+        Ok(if persisted {
+            format!("recorded implementation impact map from {recovery_source}")
+        } else {
+            format!(
+                "impact map was semantically accepted from {recovery_source}; persistence is degraded and will be retried without another discovery model call"
+            )
+        })
     }
 
     fn emit_guardrail(&self, code: &str, action: &str, message: &str) -> Result<()> {
@@ -2226,13 +2720,59 @@ impl<'a> GatewayAgent<'a> {
             },
             model_calls_used: self.phases.total_calls(),
             model_calls_limit: self.phases.total_limit(),
+            model_calls_remaining: self
+                .phases
+                .total_limit()
+                .saturating_sub(self.phases.budgeted_calls()),
             phase_calls_used: self.phases.phase_calls(phase),
             phase_calls_limit: self.phases.phase_limit(phase),
             last_successful_action: self.last_successful_action.clone(),
             usage: self.tool_usage.clone(),
             recoverable,
-            resume_phase: phase,
+            resume_phase: phase.as_str().into(),
             recommended_action: recommended_action.to_owned(),
+            artifact: None,
+            semantic_status: None,
+            persistence_status: None,
+        })
+    }
+
+    fn impact_map_execution_failure(
+        &self,
+        code: &str,
+        message: impl Into<String>,
+        semantic_status: ArtifactSemanticStatus,
+        persistence_status: ArtifactPersistenceStatus,
+        recommended_action: &str,
+    ) -> anyhow::Error {
+        let phase = self.phases.active();
+        anyhow!(HostedAgentExecutionFailure {
+            status: "failed",
+            category: "hosted_agent_execution_failed",
+            code: code.to_owned(),
+            phase,
+            message: message.into(),
+            underlying_error: UnderlyingFailure {
+                r#type: "orchestration_guardrail".into(),
+                message: code.to_owned(),
+                stack_reference: None,
+            },
+            model_calls_used: self.phases.total_calls(),
+            model_calls_limit: self.phases.total_limit(),
+            model_calls_remaining: self
+                .phases
+                .total_limit()
+                .saturating_sub(self.phases.budgeted_calls()),
+            phase_calls_used: self.phases.phase_calls(phase),
+            phase_calls_limit: self.phases.phase_limit(phase),
+            last_successful_action: self.last_successful_action.clone(),
+            usage: self.tool_usage.clone(),
+            recoverable: true,
+            resume_phase: "artifact_repair".into(),
+            recommended_action: recommended_action.to_owned(),
+            artifact: Some("impact_map".into()),
+            semantic_status: Some(semantic_status),
+            persistence_status: Some(persistence_status),
         })
     }
 
@@ -2279,20 +2819,54 @@ impl<'a> GatewayAgent<'a> {
                         "discovery impact map completed",
                     )?;
                 }
+                ExecutionPhase::Discovery if self.impact_map_failure.is_some() => {
+                    self.notebook.phase = ExecutionPhase::ArtifactRepair;
+                    self.transition_phase(
+                        ExecutionPhase::ArtifactRepair,
+                        "impact map tool output requires one targeted artifact repair",
+                    )?;
+                }
                 ExecutionPhase::Discovery => {
                     self.emit_guardrail(
                         "discovery_budget_exhausted",
                         "terminate",
                         "Discovery reached its hard limit without an implementation impact map.",
                     )?;
-                    return Err(self.execution_failure(
-                        "discovery_impact_map_missing",
+                    return Err(self.impact_map_execution_failure(
+                        "impact_map_not_produced",
                         format!(
                             "Discovery reached call {limit} without a valid implementation impact map."
                         ),
-                        None,
-                        true,
+                        ArtifactSemanticStatus::Missing,
+                        ArtifactPersistenceStatus::PendingRetry,
                         "Continue with a narrower discovery scope and record the impact map.",
+                    ));
+                }
+                ExecutionPhase::ArtifactRepair if self.impact_map.is_some() => {
+                    self.transition_phase(
+                        ExecutionPhase::Planning,
+                        "impact map recovered without repeating repository discovery",
+                    )?;
+                }
+                ExecutionPhase::ArtifactRepair => {
+                    let failure = self.impact_map_failure.as_ref();
+                    let code = failure
+                        .map(|failure| failure.code)
+                        .unwrap_or("impact_map_invalid");
+                    let detail = failure
+                        .map(|failure| failure.safe_error.as_str())
+                        .unwrap_or("The targeted artifact repair did not produce a valid map.");
+                    self.emit_guardrail(
+                        code,
+                        "resume_artifact_repair",
+                        "The targeted impact-map repair call did not produce a valid artifact.",
+                    )?;
+                    return Err(self.impact_map_execution_failure(
+                        code,
+                        format!("Impact-map repair failed: {detail}"),
+                        ArtifactSemanticStatus::Invalid,
+                        ArtifactPersistenceStatus::PendingRetry,
+                        "Resume from artifact repair with the preserved discovery notebook.",
                     ));
                 }
                 ExecutionPhase::Planning
@@ -2466,20 +3040,22 @@ impl<'a> GatewayAgent<'a> {
                 input.extend(turn.iter().cloned());
             }
             let max_output_tokens = self.manifest.ai_gateway.maximum_output_tokens.min(16_384);
+            let active_phase = self.phases.active();
             let mut request = json!({
                 "model": self.manifest.ai_gateway.model,
                 "input": input,
-                "instructions": hosted_agent_instructions(self.phases.active()),
+                "instructions": hosted_agent_instructions(active_phase),
                 "max_output_tokens": max_output_tokens,
                 "reasoning": {"effort": "medium"},
-                "tools": hosted_tools(),
+                "tools": hosted_tools_for_phase(active_phase),
                 "tool_choice": "auto",
                 "parallel_tool_calls": false,
                 "metadata": {
                     "execution_id": self.manifest.execution.execution_id,
                     "ticket_key": self.manifest.ticket_key,
                     "agent": "rustgrid-agent-hosted",
-                    "phase": self.phases.active().as_str(),
+                    "phase": active_phase.as_str(),
+                    "model_call_budget": self.budget.resolved_model_call_budget,
                 },
                 "store": false,
                 "stream": false
@@ -2626,9 +3202,26 @@ impl<'a> GatewayAgent<'a> {
                 if summary.trim().is_empty() {
                     bail!("AI gateway returned neither tool calls nor a final message");
                 }
+                if matches!(
+                    self.phases.active(),
+                    ExecutionPhase::Discovery | ExecutionPhase::ArtifactRepair
+                ) && self.impact_map.is_none()
+                    && let Ok(map) = recover_impact_map(None, Some(&summary), &self.notebook)
+                {
+                    self.accept_impact_map(
+                        map,
+                        "assistant response",
+                        Some(&anyhow!("record_impact_map was not invoked")),
+                    )?;
+                    turns.push_back(turn);
+                    continue;
+                }
                 let missing_artifact = match self.phases.active() {
                     ExecutionPhase::Discovery if self.impact_map.is_none() => {
                         Some("record the required implementation impact map")
+                    }
+                    ExecutionPhase::ArtifactRepair if self.impact_map.is_none() => {
+                        Some("repair the impact map using only record_impact_map")
                     }
                     ExecutionPhase::Planning if self.implementation_plan.is_none() => {
                         Some("record the required machine-readable implementation plan")
@@ -2708,28 +3301,135 @@ impl<'a> GatewayAgent<'a> {
                         json!({"ok": true, "output": truncate_text(&output, MAX_TOOL_OUTPUT_BYTES)})
                     }
                     Err(error) => {
-                        let error = truncate_text(&format!("{error:#}"), 4_000);
-                        if is_source_mutation_tool(&name) {
-                            self.tool_usage.failed_writes =
-                                self.tool_usage.failed_writes.saturating_add(1);
-                            self.tool_failures.push(ToolFailureRecord {
-                                tool: name.clone(),
-                                target: target.clone(),
-                                error: error.clone(),
-                                recovered: false,
-                                intended_change_sha256: intended_change_sha256.clone(),
-                            });
-                            self.notebook.failed_changes = self.tool_failures.clone();
-                            self.transition_phase(
-                                ExecutionPhase::Repair,
-                                "source-changing tool failed and requires recovery",
-                            )?;
+                        if name == "record_impact_map"
+                            && matches!(
+                                self.phases.active(),
+                                ExecutionPhase::Discovery | ExecutionPhase::ArtifactRepair
+                            )
+                        {
+                            match recover_impact_map(
+                                Some(&arguments),
+                                Some(&summary),
+                                &self.notebook,
+                            ) {
+                                Ok(map) => {
+                                    let output = self.accept_impact_map(
+                                        map,
+                                        "stored tool arguments or assistant response",
+                                        Some(&error),
+                                    )?;
+                                    json!({
+                                        "ok": true,
+                                        "output": output,
+                                        "recovered": true,
+                                        "semantic_status": ArtifactSemanticStatus::Produced,
+                                        "persistence_status": self.notebook
+                                            .impact_map_artifact
+                                            .persistence_status,
+                                    })
+                                }
+                                Err(recovery_error) => {
+                                    let failure = classify_impact_map_failure(&error);
+                                    let safe_error = failure.safe_error.clone();
+                                    self.impact_map_failure = Some(failure);
+                                    self.notebook.impact_map_artifact = ArtifactCheckpoint {
+                                        artifact: "impact_map".into(),
+                                        semantic_status: ArtifactSemanticStatus::Invalid,
+                                        persistence_status: ArtifactPersistenceStatus::PendingRetry,
+                                        artifact_sha256: None,
+                                        model_call_index: Some(self.phases.total_calls()),
+                                        phase: self.phases.active(),
+                                        safe_error: Some(safe_error.clone()),
+                                    };
+                                    self.append_event_recoverable(
+                                        "progress",
+                                        json!({
+                                            "event_type": "worker.artifact_repair_required",
+                                            "artifact": "impact_map",
+                                            "code": self.impact_map_failure.as_ref().map(
+                                                |failure| failure.code
+                                            ),
+                                            "semantic_status": ArtifactSemanticStatus::Invalid,
+                                            "persistence_status":
+                                                ArtifactPersistenceStatus::PendingRetry,
+                                            "recoverable": true,
+                                            "action": "repair_artifact",
+                                            "safe_error": safe_error,
+                                            "recovery_error": truncate_text(
+                                                &recovery_error.to_string(),
+                                                2_000
+                                            ),
+                                            "resume_phase": "artifact_repair",
+                                            "notebook": self.notebook,
+                                            "checkpoint": self.notebook_checkpoint_metadata(None),
+                                        }),
+                                        "impact-map repair checkpoint",
+                                    );
+                                    if self.phases.active() == ExecutionPhase::Discovery {
+                                        self.transition_phase(
+                                            ExecutionPhase::ArtifactRepair,
+                                            "impact map tool failed; repository discovery is preserved",
+                                        )?;
+                                    }
+                                    json!({
+                                        "ok": false,
+                                        "error": safe_error,
+                                        "recoverable": true,
+                                        "resume_phase": "artifact_repair",
+                                    })
+                                }
+                            }
+                        } else {
+                            let error = truncate_text(&format!("{error:#}"), 4_000);
+                            if is_source_mutation_tool(&name) {
+                                self.tool_usage.failed_writes =
+                                    self.tool_usage.failed_writes.saturating_add(1);
+                                self.tool_failures.push(ToolFailureRecord {
+                                    tool: name.clone(),
+                                    target: target.clone(),
+                                    error: error.clone(),
+                                    recovered: false,
+                                    intended_change_sha256: intended_change_sha256.clone(),
+                                });
+                                self.notebook.failed_changes = self.tool_failures.clone();
+                                self.transition_phase(
+                                    ExecutionPhase::Repair,
+                                    "source-changing tool failed and requires recovery",
+                                )?;
+                            }
+                            json!({"ok": false, "error": error})
                         }
-                        json!({"ok": false, "error": error})
                     }
                 };
-                self.checkpoint_notebook(result["ok"] == true && is_source_mutation_tool(&name))?;
-                self.api.append_event(
+                if let Err(error) =
+                    self.checkpoint_notebook(result["ok"] == true && is_source_mutation_tool(&name))
+                {
+                    self.append_event_recoverable(
+                        "progress",
+                        json!({
+                            "event_type": "worker.notebook_persistence_failed",
+                            "phase": self.phases.active(),
+                            "recoverable": true,
+                            "action": "retry_or_continue",
+                            "safe_error": truncate_text(&error.to_string(), 2_000),
+                            "checkpoint": self.notebook_checkpoint_metadata(
+                                self.notebook.impact_map_artifact.artifact_sha256.as_deref()
+                            ),
+                        }),
+                        "notebook persistence warning",
+                    );
+                }
+                let retrying_impact_map_persistence = name == "record_impact_map"
+                    && self.notebook.impact_map_artifact.semantic_status
+                        == ArtifactSemanticStatus::Produced
+                    && self.notebook.impact_map_artifact.persistence_status
+                        != ArtifactPersistenceStatus::Persisted;
+                let mut event_notebook = self.notebook.clone();
+                if retrying_impact_map_persistence {
+                    event_notebook.impact_map_artifact.persistence_status =
+                        ArtifactPersistenceStatus::Persisted;
+                }
+                let tool_event_persisted = self.append_event_recoverable(
                     "tool",
                     json!({
                         "tool": name,
@@ -2739,9 +3439,20 @@ impl<'a> GatewayAgent<'a> {
                         "model_call": self.phases.total_calls(),
                         "usage": self.tool_usage,
                         "budget": self.budget_telemetry(),
-                        "notebook": self.notebook,
+                        "notebook": event_notebook,
+                        "checkpoint": self.notebook_checkpoint_metadata(
+                            self.notebook.impact_map_artifact.artifact_sha256.as_deref()
+                        ),
                     }),
-                )?;
+                    "tool event",
+                );
+                if retrying_impact_map_persistence && tool_event_persisted {
+                    self.notebook.impact_map_artifact.persistence_status =
+                        ArtifactPersistenceStatus::Persisted;
+                } else if retrying_impact_map_persistence {
+                    self.notebook.impact_map_artifact.persistence_status =
+                        ArtifactPersistenceStatus::Failed;
+                }
                 turn.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -2828,6 +3539,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 "ticket_key": self.manifest.ticket_key,
                 "agent": "rustgrid-completion-evaluator",
                 "phase": ExecutionPhase::CompletionEvaluation.as_str(),
+                "model_call_budget": self.budget.resolved_model_call_budget,
             }
         });
         let model_call = self.phases.begin_model_call()?;
@@ -3166,37 +3878,9 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 ))
             }
             "record_impact_map" => {
-                let map: ImpactMap = serde_json::from_value(Value::Object(object.clone()))
+                let map = impact_map_from_value(Value::Object(object.clone()), &self.notebook)
                     .context("impact map is malformed")?;
-                if map.impact_map.is_empty()
-                    || map.files_inspected.is_empty()
-                    || (map.can_implement && !map.blocking_unknowns.is_empty())
-                    || (!map.can_implement && map.blocking_unknowns.is_empty())
-                    || map.impact_map.iter().any(|area| {
-                        area.area.trim().is_empty()
-                            || area.reason.trim().is_empty()
-                            || area.candidate_paths.is_empty()
-                            || area
-                                .candidate_paths
-                                .iter()
-                                .any(|path| path.trim().is_empty())
-                            || area.acceptance_criteria.is_empty()
-                    })
-                {
-                    bail!(
-                        "impact map must identify areas, candidate paths, evidence, inspected files, and acceptance criteria"
-                    );
-                }
-                self.notebook.impact_map = map.impact_map.clone();
-                self.notebook.files_inspected = map.files_inspected.clone();
-                self.notebook.searches_completed = map.searches_completed.clone();
-                self.notebook.blocking_unknowns = map.blocking_unknowns.clone();
-                self.impact_map = Some(map);
-                self.transition_phase(
-                    ExecutionPhase::Planning,
-                    "required discovery impact map recorded",
-                )?;
-                Ok("recorded implementation impact map".into())
+                self.accept_impact_map(map, "record_impact_map arguments", None)
             }
             "record_implementation_plan" => {
                 let plan: ImplementationPlan =
@@ -3436,6 +4120,7 @@ fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "related_tests"
                 | "record_impact_map"
         ),
+        ExecutionPhase::ArtifactRepair => name == "record_impact_map",
         ExecutionPhase::Planning => matches!(
             name,
             "read_file"
@@ -3765,7 +4450,26 @@ fn hosted_tools() -> Vec<Value> {
     ]
 }
 
+fn hosted_tools_for_phase(phase: ExecutionPhase) -> Vec<Value> {
+    hosted_tools()
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| phase_permits_tool(phase, name))
+        })
+        .collect()
+}
+
 fn hosted_agent_instructions(phase: ExecutionPhase) -> String {
+    if phase == ExecutionPhase::ArtifactRepair {
+        return "You are repairing the structured implementation impact map for an ephemeral \
+RustGrid mission. Repository discovery from the previous phase is preserved in the worker \
+notebook. Do not repeat reads or searches. Use only record_impact_map, reconstructing a strict \
+impact map from the inspected files, searches, architecture findings, candidate paths, and \
+acceptance criteria already present. Do not edit source files or perform additional exploration."
+            .into();
+    }
     format!(
         "You are the implementation model inside an ephemeral RustGrid GitHub Actions worker. \
 The active hard execution phase is `{}`. Use only tools admitted for that phase and transition as \
@@ -4546,6 +5250,15 @@ fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, String) {
             ),
         );
     }
+    if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
+        return (failure.code.clone(), failure.message.clone());
+    }
+    if error.downcast_ref::<ExecutionBudgetMismatch>().is_some() {
+        return (
+            "execution_budget_mismatch".into(),
+            "The requested, resolved, and worker-received model-call budgets did not match.".into(),
+        );
+    }
     let text = error.to_string().to_ascii_lowercase();
     if text.contains("validation") {
         (
@@ -4582,6 +5295,26 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
             })
         });
     }
+    if let Some(mismatch) = error.downcast_ref::<ExecutionBudgetMismatch>() {
+        return json!({
+            "status": "failed",
+            "category": "hosted_agent_execution_failed",
+            "code": "execution_budget_mismatch",
+            "phase": "manifest_validation",
+            "message":
+                "The requested, resolved, and worker-received model-call budgets did not match.",
+            "requested_model_call_budget": mismatch.requested,
+            "resolved_model_call_budget": mismatch.resolved,
+            "model_call_budget": mismatch.canonical,
+            "persisted_execution_model_call_budget": mismatch.execution,
+            "worker_received_model_call_budget": mismatch.worker_received,
+            "model_calls_used": 0,
+            "recoverable": true,
+            "resume_phase": "manifest_validation",
+            "recommended_action":
+                "Correct budget propagation and dispatch a manifest with one unchanged canonical value.",
+        });
+    }
     let (code, message) = safe_failure(error, cancelled);
     let (underlying_type, underlying_message, stack_reference) =
         if let Some(http) = error.downcast_ref::<HostedHttpError>() {
@@ -4606,6 +5339,7 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
         },
         "model_calls_used": 0,
         "model_calls_limit": 0,
+        "model_calls_remaining": 0,
         "phase_calls_used": 0,
         "phase_calls_limit": 0,
         "last_successful_action": {},
@@ -5545,6 +6279,12 @@ mod tests {
         let base = format!("/api/v1/executions/{execution_id}");
         HostedManifest {
             manifest_version: 3,
+            model_call_budget: None,
+            requested_model_call_budget: None,
+            resolved_model_call_budget: None,
+            budget_source: None,
+            clamped: None,
+            clamp_reason: None,
             execution: ManifestExecution {
                 execution_id,
                 status: "running".into(),
@@ -6040,6 +6780,94 @@ mod tests {
     }
 
     #[test]
+    fn canonical_forty_call_budget_reaches_the_worker_unchanged() {
+        let execution_id = Uuid::from_u128(0x11111111_1111_4111_8111_111111111111);
+        let mut manifest = test_manifest(execution_id);
+        manifest.manifest_version = 4;
+        manifest.model_call_budget = Some(40);
+        manifest.requested_model_call_budget = Some(40);
+        manifest.resolved_model_call_budget = Some(40);
+        manifest.budget_source = Some(BudgetSource::UserSelected);
+        manifest.clamped = Some(false);
+        manifest.clamp_reason = Some(None);
+        manifest.execution.maximum_model_calls = Some(40);
+        manifest.ai_gateway.maximum_model_calls = 40;
+
+        let budget = manifest.budget_audit().unwrap();
+        assert_eq!(budget.requested_model_call_budget, 40);
+        assert_eq!(budget.resolved_model_call_budget, 40);
+        assert_eq!(budget.worker_received_model_call_budget, 40);
+        assert_eq!(budget.contract, "canonical");
+        let environment = test_environment(execution_id);
+        let api = test_api_client(Url::parse("http://127.0.0.1:8080/").unwrap(), execution_id);
+        manifest.validate(execution_id, &environment, &api).unwrap();
+    }
+
+    #[test]
+    fn budget_mismatch_is_typed_before_model_execution() {
+        let execution_id = Uuid::from_u128(0x11111111_1111_4111_8111_111111111111);
+        let mut manifest = test_manifest(execution_id);
+        manifest.manifest_version = 4;
+        manifest.model_call_budget = Some(40);
+        manifest.requested_model_call_budget = Some(40);
+        manifest.resolved_model_call_budget = Some(40);
+        manifest.budget_source = Some(BudgetSource::UserSelected);
+        manifest.clamped = Some(false);
+        manifest.clamp_reason = Some(None);
+        manifest.execution.maximum_model_calls = Some(20);
+        manifest.ai_gateway.maximum_model_calls = 20;
+
+        let error = manifest.budget_audit().unwrap_err();
+        assert!(error.downcast_ref::<ExecutionBudgetMismatch>().is_some());
+        let (code, message) = safe_failure(&error, false);
+        assert_eq!(code, "execution_budget_mismatch");
+        assert!(message.contains("worker-received"));
+        let diagnostics = failure_diagnostics(&error, false);
+        assert_eq!(diagnostics["requested_model_call_budget"], 40);
+        assert_eq!(diagnostics["resolved_model_call_budget"], 40);
+        assert_eq!(diagnostics["worker_received_model_call_budget"], 20);
+        assert_eq!(diagnostics["model_calls_used"], 0);
+    }
+
+    #[test]
+    fn canonical_budget_distinguishes_a_null_clamp_reason_from_a_missing_field() {
+        #[derive(Deserialize)]
+        struct ClampReasonPresence {
+            #[serde(default, deserialize_with = "deserialize_present_nullable")]
+            clamp_reason: Option<Option<String>>,
+        }
+
+        let missing: ClampReasonPresence = serde_json::from_value(json!({})).unwrap();
+        let explicitly_null: ClampReasonPresence =
+            serde_json::from_value(json!({"clamp_reason": null})).unwrap();
+        assert_eq!(missing.clamp_reason, None);
+        assert_eq!(explicitly_null.clamp_reason, Some(None));
+    }
+
+    #[test]
+    fn explicit_legacy_twenty_call_budget_remains_supported() {
+        let execution_id = Uuid::from_u128(0x11111111_1111_4111_8111_111111111111);
+        let mut manifest = test_manifest(execution_id);
+        manifest.execution.maximum_model_calls = Some(20);
+        manifest.ai_gateway.maximum_model_calls = 20;
+
+        let budget = manifest.budget_audit().unwrap();
+        assert_eq!(budget.worker_received_model_call_budget, 20);
+        assert_eq!(budget.contract, "legacy_signed_manifest");
+        let allocation = phase_budget_allocation(20);
+        assert_eq!(
+            (
+                allocation.discovery_maximum,
+                allocation.planning_maximum,
+                allocation.implementation_repair_reserved,
+                allocation.diff_review_reserved,
+                allocation.completion_evaluation_reserved,
+            ),
+            (4, 2, 10, 2, 2)
+        );
+    }
+
+    #[test]
     fn context_history_is_retained_until_the_input_ceiling_requires_trimming() {
         let initial = json!({"role": "user", "content": "mission"});
         let mut turns = (0..12)
@@ -6086,6 +6914,11 @@ mod tests {
                 reason: "Shared token source".into(),
                 acceptance_criteria: vec!["All surfaces use the theme".into()],
             }],
+            impact_map_artifact: ArtifactCheckpoint {
+                semantic_status: ArtifactSemanticStatus::Produced,
+                persistence_status: ArtifactPersistenceStatus::Persisted,
+                ..ArtifactCheckpoint::default()
+            },
             files_inspected: vec!["src/theme.css".into()],
             searches_completed: vec!["literal:src:theme".into()],
             planned_changes: vec![PlannedChange {
@@ -6257,6 +7090,119 @@ mod tests {
         assert!(body.contains("partial"));
     }
 
+    #[test]
+    fn valid_impact_map_is_recovered_from_tool_arguments_and_notebook_progress() {
+        let notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+        let mut map = test_impact_map();
+        map.files_inspected.clear();
+        map.searches_completed.clear();
+        let arguments = serde_json::to_string(&map).unwrap();
+
+        let recovered = recover_impact_map(Some(&arguments), None, &notebook).unwrap();
+        assert_eq!(recovered.files_inspected, notebook.files_inspected);
+        assert_eq!(recovered.searches_completed, notebook.searches_completed);
+        assert_eq!(recovered.impact_map, map.impact_map);
+    }
+
+    #[test]
+    fn valid_impact_map_is_recovered_from_a_fenced_assistant_response() {
+        let notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+        let response = format!(
+            "```json\n{}\n```",
+            serde_json::to_string(&test_impact_map()).unwrap()
+        );
+
+        let recovered = recover_impact_map(None, Some(&response), &notebook).unwrap();
+        assert_eq!(recovered.impact_map, test_impact_map().impact_map);
+    }
+
+    #[test]
+    fn impact_map_fallback_rejects_unknown_or_invented_fields() {
+        let notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+        let mut value = serde_json::to_value(test_impact_map()).unwrap();
+        value["untrusted_extra"] = json!("do not accept");
+        let arguments = serde_json::to_string(&value).unwrap();
+        assert!(recover_impact_map(Some(&arguments), None, &notebook).is_err());
+    }
+
+    #[test]
+    fn semantic_impact_map_survives_failed_persistence_and_resumes_planning() {
+        let mut notebook = test_discovery_notebook(ExecutionPhase::Planning);
+        let map = test_impact_map();
+        notebook.impact_map = map.impact_map.clone();
+        notebook.impact_map_artifact = ArtifactCheckpoint {
+            artifact: "impact_map".into(),
+            semantic_status: ArtifactSemanticStatus::Produced,
+            persistence_status: ArtifactPersistenceStatus::Failed,
+            artifact_sha256: impact_map_sha256(&map),
+            model_call_index: Some(8),
+            phase: ExecutionPhase::Discovery,
+            safe_error: Some("worker event transport failed".into()),
+        };
+
+        let (restored, plan, phase) = notebook_orchestration_state(&notebook);
+        assert!(restored.is_some());
+        assert!(plan.is_none());
+        assert_eq!(phase, ExecutionPhase::Planning);
+        assert_eq!(
+            notebook.impact_map_artifact.semantic_status,
+            ArtifactSemanticStatus::Produced
+        );
+        assert_eq!(
+            notebook.impact_map_artifact.persistence_status,
+            ArtifactPersistenceStatus::Failed
+        );
+    }
+
+    #[test]
+    fn invalid_impact_map_resume_preserves_discovery_and_targets_artifact_repair() {
+        let notebook = test_discovery_notebook(ExecutionPhase::ArtifactRepair);
+        let (map, plan, phase) = notebook_orchestration_state(&notebook);
+        assert!(map.is_none());
+        assert!(plan.is_none());
+        assert_eq!(phase, ExecutionPhase::ArtifactRepair);
+        assert_eq!(
+            notebook.files_inspected,
+            vec!["src/components/theme/ThemeProvider.tsx"]
+        );
+        assert_eq!(hosted_tools_for_phase(phase).len(), 1);
+        assert_eq!(
+            hosted_tools_for_phase(phase)[0]["name"],
+            "record_impact_map"
+        );
+    }
+
+    fn test_discovery_notebook(phase: ExecutionPhase) -> WorkerNotebook {
+        WorkerNotebook {
+            schema_version: 1,
+            revision: 4,
+            goal: "Apply a complete theme".into(),
+            acceptance_criteria: vec!["All surfaces use the theme".into()],
+            phase,
+            repository_base_sha: "a".repeat(40),
+            branch: "rustgrid/aops-226-deadbeef".into(),
+            repository_fingerprint: "b".repeat(64),
+            execution_attempt: 1,
+            architecture_findings: vec!["Theme tokens are centralized.".into()],
+            impact_map: vec![],
+            impact_map_artifact: ArtifactCheckpoint {
+                semantic_status: ArtifactSemanticStatus::Invalid,
+                persistence_status: ArtifactPersistenceStatus::PendingRetry,
+                ..ArtifactCheckpoint::default()
+            },
+            files_inspected: vec!["src/components/theme/ThemeProvider.tsx".into()],
+            searches_completed: vec!["literal:src:ThemeProvider".into()],
+            planned_changes: vec![],
+            completed_changes: vec![],
+            failed_changes: vec![],
+            remaining_work: vec![],
+            blocking_unknowns: vec![],
+            validation_failures: vec![],
+            phase_budget: json!({}),
+            last_successful_action: json!({"tool": "read_files"}),
+        }
+    }
+
     fn test_impact_map() -> ImpactMap {
         ImpactMap {
             can_implement: true,
@@ -6384,6 +7330,7 @@ mod tests {
             },
             model_calls_used: 7,
             model_calls_limit: 40,
+            model_calls_remaining: 33,
             phase_calls_used: 7,
             phase_calls_limit: 8,
             last_successful_action: json!({"tool": "read_files"}),
@@ -6393,9 +7340,15 @@ mod tests {
                 ..ToolUsage::default()
             },
             recoverable: true,
-            resume_phase: ExecutionPhase::Discovery,
+            resume_phase: "discovery".into(),
             recommended_action: "Record the impact map.".into(),
+            artifact: None,
+            semantic_status: None,
+            persistence_status: None,
         });
+        let (terminal_code, terminal_message) = safe_failure(&error, false);
+        assert_eq!(terminal_code, "search_loop_detected");
+        assert_eq!(terminal_message, "Repeated discovery search was rejected.");
         let diagnostics = failure_diagnostics(&error, false);
         assert_eq!(diagnostics["code"], "search_loop_detected");
         assert_eq!(diagnostics["phase"], "discovery");
@@ -6617,6 +7570,32 @@ mod tests {
         assert!(completion_request.contains("idempotency-key:"));
         assert!(completion_request.contains("\"failure_code\":\"validation_failed\""));
         assert!(!completion_request.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn notebook_events_use_stable_idempotency_keys() {
+        let execution_id = Uuid::from_u128(0x45454545_4545_4545_8545_454545454545);
+        let Some((base, request, server)) = one_request_server("200 OK", json!({})) else {
+            return;
+        };
+        let client = test_api_client(base, execution_id);
+        client
+            .append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.notebook_checkpoint",
+                    "notebook_revision": 7,
+                    "artifact_hash": "a".repeat(64),
+                }),
+            )
+            .unwrap();
+        server.join().unwrap();
+        let request = request.recv().unwrap();
+        assert!(request.starts_with(&format!(
+            "POST /api/v1/executions/{execution_id}/worker-events HTTP/1.1"
+        )));
+        assert!(request.contains("idempotency-key:"));
+        assert!(request.contains("\"notebook_revision\":7"));
     }
 
     #[test]

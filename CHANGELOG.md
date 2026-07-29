@@ -5,6 +5,27 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Accept the canonical hosted `model_call_budget` contract together with
+  requested, resolved, received, source, and clamp audit fields. Manifest v4
+  fails with `execution_budget_mismatch` before the first model request when
+  any value differs, while explicit legacy v3 custom budgets remain supported.
+- Add a one-call `artifact_repair` phase that can only invoke
+  `record_impact_map` and reuses the existing discovery notebook instead of
+  repeating repository reads or searches.
+
+### Fixed
+
+- Recover a valid impact map from stored tool arguments, assistant JSON, or
+  preserved notebook discovery progress when the primary tool invocation
+  fails, and separate semantic production from metadata persistence.
+- Treat phase-transition, notebook, and tool-event persistence failures as
+  recoverable bookkeeping failures. Retry them idempotently without consuming
+  another discovery call, preserve precise artifact diagnostics, and continue
+  to planning whenever the impact map remains valid in memory or checkpoint
+  state.
+
 ## 1.4.6 - 2026-07-29
 
 ### Changed

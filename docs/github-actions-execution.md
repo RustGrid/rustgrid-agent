@@ -17,7 +17,9 @@ UUID and one-time nonce.
 2. exchanges that JWT and dispatch nonce for a 15-minute `rge_` execution
    bearer bound to tenant, project, execution, attempt, repository and workflow
    run;
-3. claims the mission, validates manifest v3 and starts heartbeat/token refresh;
+3. claims the mission, validates manifest v3 or canonical-budget manifest v4,
+   rejects any requested/resolved/received budget mismatch, and starts
+   heartbeat/token refresh;
 4. requires `GITHUB_SHA` to match the manifest's exact 40-hex `base_sha`,
    then reuses the deterministic remote branch or creates it directly from
    that immutable commit already present in the Actions checkout; mutable
@@ -27,6 +29,9 @@ UUID and one-time nonce.
    paged diff-review allocations. The default signed 40-call policy is
    `8/4/20/4/4`; search loops, missing phase artifacts, and missed write
    thresholds produce durable guardrails rather than unrestricted exploration;
+   valid impact maps survive event-persistence failures, while one isolated
+   `artifact_repair` call may repair malformed structured output without
+   repeating repository discovery or spending configured coding capacity;
 6. runs required technical validation without execution or GitHub credentials,
    then uses a reserved fresh model context to evaluate ticket requirements
    against the impact map, implementation plan, versioned worker notebook,

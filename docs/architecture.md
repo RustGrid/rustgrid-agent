@@ -40,6 +40,20 @@ implementation and repair. Validation and publication remain worker-owned
 phases. A versioned notebook, structured impact map and plan, search guard,
 write-progress thresholds, complete paged diff review, and fresh completion
 evaluator prevent technical gates from disguising incomplete functional work.
+Manifest v4 carries one canonical `model_call_budget` plus requested, resolved,
+source, and clamp audit fields. The worker compares that value with both the
+persisted execution limit and the gateway limit before the first model call;
+any difference is `execution_budget_mismatch`, never a silent lower runtime
+budget.
+
+Impact-map semantics are independent from event persistence. A valid map stays
+available in memory and in the versioned notebook even when a phase or tool
+event cannot be written. Event writes use stable idempotency identities and
+revision/hash checkpoint metadata; a failed write is retried without a model
+call. Strict recovery can reuse tool arguments, assistant JSON, and previously
+recorded discovery progress. Only a still-invalid artifact enters the
+supplemental one-call `artifact_repair` phase, where repository reads, searches,
+and mutations are forbidden.
 
 ## Components
 

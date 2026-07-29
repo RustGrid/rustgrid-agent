@@ -10,6 +10,7 @@ pub(super) const MINIMUM_HOSTED_MODEL_CALLS: usize = 10;
 #[serde(rename_all = "snake_case")]
 pub(super) enum ExecutionPhase {
     Discovery,
+    ArtifactRepair,
     Planning,
     Implementation,
     Repair,
@@ -23,6 +24,7 @@ impl ExecutionPhase {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Discovery => "discovery",
+            Self::ArtifactRepair => "artifact_repair",
             Self::Planning => "planning",
             Self::Implementation => "implementation",
             Self::Repair => "repair",
@@ -37,6 +39,7 @@ impl ExecutionPhase {
         matches!(
             self,
             Self::Discovery
+                | Self::ArtifactRepair
                 | Self::Planning
                 | Self::Implementation
                 | Self::Repair
@@ -125,6 +128,7 @@ pub(super) struct PhaseLedger {
     total_limit: usize,
     allocation: PhaseBudgetAllocation,
     discovery_calls: usize,
+    artifact_repair_calls: usize,
     planning_calls: usize,
     implementation_calls: usize,
     repair_calls: usize,
@@ -139,6 +143,7 @@ impl PhaseLedger {
             total_limit,
             allocation: phase_budget_allocation(total_limit),
             discovery_calls: 0,
+            artifact_repair_calls: 0,
             planning_calls: 0,
             implementation_calls: 0,
             repair_calls: 0,
@@ -161,11 +166,17 @@ impl PhaseLedger {
 
     pub(super) const fn total_calls(&self) -> usize {
         self.discovery_calls
+            + self.artifact_repair_calls
             + self.planning_calls
             + self.implementation_calls
             + self.repair_calls
             + self.diff_review_calls
             + self.completion_evaluation_calls
+    }
+
+    pub(super) const fn budgeted_calls(&self) -> usize {
+        self.total_calls()
+            .saturating_sub(self.artifact_repair_calls)
     }
 
     pub(super) const fn implementation_repair_calls(&self) -> usize {
@@ -175,6 +186,7 @@ impl PhaseLedger {
     pub(super) const fn phase_calls(&self, phase: ExecutionPhase) -> usize {
         match phase {
             ExecutionPhase::Discovery => self.discovery_calls,
+            ExecutionPhase::ArtifactRepair => self.artifact_repair_calls,
             ExecutionPhase::Planning => self.planning_calls,
             ExecutionPhase::Implementation => self.implementation_calls,
             ExecutionPhase::Repair => self.repair_calls,
@@ -227,6 +239,7 @@ impl PhaseLedger {
     pub(super) const fn phase_limit(&self, phase: ExecutionPhase) -> usize {
         match phase {
             ExecutionPhase::Discovery => self.allocation.discovery_maximum,
+            ExecutionPhase::ArtifactRepair => 1,
             ExecutionPhase::Planning => self.allocation.planning_maximum,
             ExecutionPhase::Implementation | ExecutionPhase::Repair => {
                 self.implementation_repair_capacity()
@@ -244,7 +257,9 @@ impl PhaseLedger {
                 self.active.as_str()
             );
         }
-        if self.total_calls() >= self.total_limit {
+        if self.active != ExecutionPhase::ArtifactRepair
+            && self.budgeted_calls() >= self.total_limit
+        {
             bail!("execution AI model-call budget was exhausted");
         }
         let used = if matches!(
@@ -265,6 +280,7 @@ impl PhaseLedger {
         }
         let consumed = match self.active {
             ExecutionPhase::Discovery => &mut self.discovery_calls,
+            ExecutionPhase::ArtifactRepair => &mut self.artifact_repair_calls,
             ExecutionPhase::Planning => &mut self.planning_calls,
             ExecutionPhase::Implementation => &mut self.implementation_calls,
             ExecutionPhase::Repair => &mut self.repair_calls,
@@ -278,15 +294,22 @@ impl PhaseLedger {
 
     pub(super) fn telemetry(&self) -> serde_json::Value {
         serde_json::json!({
-            "model_calls_used": self.total_calls(),
+            "model_calls_used": self.budgeted_calls(),
             "model_calls_maximum": self.total_limit,
-            "model_calls_remaining": self.total_limit.saturating_sub(self.total_calls()),
+            "model_calls_remaining": self.total_limit.saturating_sub(self.budgeted_calls()),
+            "worker_model_calls_used": self.total_calls(),
+            "supplemental_artifact_repair_calls": self.artifact_repair_calls,
             "active_phase": self.active,
             "phase_allocation": self.allocation,
             "phases": {
                 "discovery": {
                     "consumed": self.discovery_calls,
                     "limit": self.allocation.discovery_maximum,
+                },
+                "artifact_repair": {
+                    "consumed": self.artifact_repair_calls,
+                    "limit": 1,
+                    "counts_against_configured_budget": false,
                 },
                 "planning": {
                     "consumed": self.planning_calls,
@@ -462,6 +485,26 @@ mod tests {
             ledger.begin_model_call().unwrap();
         }
         assert!(ledger.begin_model_call().is_err());
+    }
+
+    #[test]
+    fn one_artifact_repair_call_is_accounted_without_spending_coding_capacity() {
+        let mut ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
+        for _ in 0..8 {
+            ledger.begin_model_call().unwrap();
+        }
+        let implementation_capacity = ledger.implementation_repair_capacity();
+        ledger.transition(ExecutionPhase::ArtifactRepair);
+        assert_eq!(ledger.begin_model_call().unwrap(), 9);
+        assert!(ledger.begin_model_call().is_err());
+        assert_eq!(ledger.budgeted_calls(), 8);
+        assert_eq!(ledger.total_calls(), 9);
+        assert_eq!(
+            ledger.implementation_repair_capacity(),
+            implementation_capacity
+        );
+        assert_eq!(ledger.telemetry()["supplemental_artifact_repair_calls"], 1);
+        assert_eq!(ledger.telemetry()["model_calls_remaining"], 32);
     }
 
     #[test]
