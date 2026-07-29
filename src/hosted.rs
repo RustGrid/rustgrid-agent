@@ -444,14 +444,7 @@ impl HostedApiClient {
 
     fn complete(&self, completion: &CompletionRequest) -> Result<Value> {
         let body = serde_json::to_value(completion)?;
-        let encoded = serde_json::to_vec(&body)?;
-        let key_material = [
-            b"completion:".as_slice(),
-            self.execution_id.as_bytes().as_slice(),
-            encoded.as_slice(),
-        ]
-        .concat();
-        let key = Uuid::new_v5(&HOSTED_NAMESPACE, &key_material);
+        let key = completion_idempotency_key(self.execution_id, completion)?;
         self.send_json(
             Method::POST,
             &format!("executions/{}/complete", self.execution_id),
@@ -610,6 +603,17 @@ impl HostedApiClient {
     }
 }
 
+fn completion_idempotency_key(execution_id: Uuid, completion: &CompletionRequest) -> Result<Uuid> {
+    let encoded = serde_json::to_vec(completion)?;
+    let key_material = [
+        b"completion:".as_slice(),
+        execution_id.as_bytes().as_slice(),
+        encoded.as_slice(),
+    ]
+    .concat();
+    Ok(Uuid::new_v5(&HOSTED_NAMESPACE, &key_material))
+}
+
 #[derive(Deserialize)]
 struct GithubTokenResponse {
     token: String,
@@ -758,6 +762,7 @@ struct HostedResult {
     commit: String,
     pull_request: PullRequestResult,
     validation: Vec<ValidationResult>,
+    completeness: CompletionEvaluation,
 }
 
 #[derive(Clone, Debug)]
@@ -772,6 +777,118 @@ struct ValidationResult {
     command: String,
     status: String,
     output: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ImplementationCompleteness {
+    Complete,
+    Partial,
+    Incomplete,
+    Uncertain,
+}
+
+impl ImplementationCompleteness {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Incomplete => "incomplete",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompletionEvidence {
+    path: String,
+    description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CriterionEvaluation {
+    criterion: String,
+    status: String,
+    #[serde(default)]
+    evidence: Vec<CompletionEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompletionEvaluation {
+    status: ImplementationCompleteness,
+    confidence: f64,
+    #[serde(default)]
+    criteria: Vec<CriterionEvaluation>,
+    #[serde(default)]
+    unresolved_work: Vec<String>,
+    #[serde(default)]
+    unrecovered_tool_failures: Vec<String>,
+    summary: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImpactMap {
+    #[serde(default)]
+    affected_subsystems: Vec<String>,
+    #[serde(default)]
+    candidate_files: Vec<String>,
+    #[serde(default)]
+    shared_abstractions: Vec<String>,
+    #[serde(default)]
+    expected_tests: Vec<String>,
+    #[serde(default)]
+    criterion_file_mappings: Vec<ImpactCriterionMapping>,
+    #[serde(default)]
+    uncertainties: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImpactCriterionMapping {
+    criterion: String,
+    candidate_files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ImplementationDeclaration {
+    implementation_status: String,
+    #[serde(default)]
+    completed_work: Vec<String>,
+    #[serde(default)]
+    remaining_work: Vec<String>,
+    #[serde(default)]
+    known_risks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ToolFailureRecord {
+    tool: String,
+    target: Option<String>,
+    error: String,
+    recovered: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ImplementationOutcome {
+    summary: String,
+    budget_exhausted: bool,
+    explicit_declaration: Option<ImplementationDeclaration>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ToolUsage {
+    reads: u32,
+    searches: u32,
+    writes: u32,
+    failed_writes: u32,
+    validation_commands: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct PhaseBudgetAllocation {
+    discovery_maximum: usize,
+    planning_maximum: usize,
+    implementation_repair_minimum: usize,
+    completion_review_reserved: usize,
 }
 
 impl HostedManifest {
@@ -1071,7 +1188,7 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
     supervisor.stop();
     let terminal_at = now_rfc3339();
     match result {
-        Ok(result) => {
+        Ok(result) if hosted_result_can_succeed(&result) => {
             send_execution_telemetry(
                 &api,
                 execution_id,
@@ -1088,7 +1205,8 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
                     "head_sha": result.commit,
                     "pull_request_number": result.pull_request.number,
                     "pull_request_url": result.pull_request.url,
-                    "validation": result.validation
+                    "implementation_completeness": result.completeness,
+                    "technical_validation": result.validation
                 }),
             ) {
                 eprintln!(
@@ -1111,6 +1229,51 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             .context("could not complete the hosted execution")?;
             println!(
                 "[complete] Execution {execution_id} opened or reused pull request #{} at {}",
+                result.pull_request.number, result.pull_request.url
+            );
+            Ok(())
+        }
+        Ok(result) => {
+            send_execution_telemetry(
+                &api,
+                execution_id,
+                &started_at,
+                Some(&terminal_at),
+                ExecutionStatus::NeedsContinuation,
+                2,
+            );
+            api.append_event(
+                "result",
+                json!({
+                    "status": "partial_result",
+                    "branch": result.branch,
+                    "head_sha": result.commit,
+                    "pull_request_number": result.pull_request.number,
+                    "pull_request_url": result.pull_request.url,
+                    "implementation_completeness": result.completeness,
+                    "technical_validation": result.validation,
+                    "resumable": true
+                }),
+            )?;
+            api.complete(&CompletionRequest {
+                status: "partial_result".into(),
+                output_summary: Some(truncate_text(
+                    &format!("{}\n\n{}", result.summary, result.completeness.summary),
+                    16_000,
+                )),
+                failure_code: None,
+                failure_message: None,
+                head_branch: Some(result.branch.clone()),
+                head_sha: Some(result.commit.clone()),
+                pull_request_number: Some(
+                    i64::try_from(result.pull_request.number)
+                        .context("pull request number is too large")?,
+                ),
+                pull_request_url: Some(result.pull_request.url.clone()),
+            })
+            .context("could not report resumable partial hosted execution")?;
+            println!(
+                "[partial] Execution {execution_id} preserved resumable work in draft pull request #{} at {}",
                 result.pull_request.number, result.pull_request.url
             );
             Ok(())
@@ -1147,6 +1310,14 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             Err(error)
         }
     }
+}
+
+fn hosted_result_can_succeed(result: &HostedResult) -> bool {
+    result.completeness.status == ImplementationCompleteness::Complete
+        && result
+            .validation
+            .iter()
+            .all(|validation| validation.status == "passed")
 }
 
 pub fn report_emergency_failure(execution_id: Uuid) -> Result<()> {
@@ -1299,9 +1470,29 @@ fn run_hosted_execution(
 
     let mut agent = GatewayAgent::new(api.clone(), manifest, &repo, running, &containment);
     bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment)?;
-    let summary = if existing_pr.is_some() && resumed {
-        "Recovered an existing hosted execution branch and pull request.".to_owned()
+    let implementation = if !should_continue_implementation(
+        existing_pr.is_some(),
+        resumed,
+        manifest.execution.attempt_number,
+    ) {
+        ImplementationOutcome {
+            summary: "Recovered an existing hosted execution branch and pull request.".to_owned(),
+            budget_exhausted: false,
+            explicit_declaration: None,
+        }
     } else {
+        if existing_pr.is_some() && resumed {
+            api.append_event(
+                "progress",
+                json!({
+                    "step": "implementation",
+                    "status": "continuing",
+                    "branch": manifest.github.branch,
+                    "execution_attempt": manifest.execution.attempt_number,
+                    "resumable": true
+                }),
+            )?;
+        }
         agent
             .implement()
             .context("the RustGrid AI gateway implementation session failed")?
@@ -1343,6 +1534,23 @@ fn run_hosted_execution(
     if validation.iter().any(|result| result.status != "passed") {
         bail!("required hosted execution validation failed");
     }
+    let review_paths = completion_changed_paths(&repo, &manifest.github.base_sha)?;
+    let completeness = agent.evaluate_completion(&implementation, &validation, &review_paths);
+    api.append_event(
+        "result",
+        json!({
+            "status": "implementation_evaluated",
+            "implementation_completeness": completeness,
+            "technical_validation": {
+                "status": "passed",
+                "gates": validation
+            },
+            "budget": agent.budget_telemetry(),
+            "tool_usage": agent.tool_usage,
+            "changed_path_count": review_paths.len(),
+            "resumable": completeness.status != ImplementationCompleteness::Complete
+        }),
+    )?;
 
     if repo.hosted_local_config()? != trusted_git_config {
         bail!("repository-controlled execution modified the protected local Git configuration");
@@ -1397,14 +1605,19 @@ fn run_hosted_execution(
     containment.drain()?;
     let publication_token = api.github_token(&manifest.github.repository)?;
     let github = GitHubClient::new(publication_token.expose(), &manifest.github.web_base_url)?;
-    let pull = match existing_pr {
-        Some(pull) => pull,
-        None => find_or_create_hosted_pull_request(&github, &repo_config, manifest, &validation)?,
-    };
+    let partial = completeness.status != ImplementationCompleteness::Complete;
+    let pull = find_or_create_hosted_pull_request(
+        &github,
+        &repo_config,
+        manifest,
+        &validation,
+        &completeness,
+        partial,
+    )?;
     drop(github);
     drop(publication_token);
     Ok(HostedResult {
-        summary,
+        summary: implementation.summary,
         branch: manifest.github.branch.clone(),
         commit,
         pull_request: PullRequestResult {
@@ -1412,6 +1625,7 @@ fn run_hosted_execution(
             url: pull.html_url,
         },
         validation,
+        completeness,
     })
 }
 
@@ -1420,16 +1634,29 @@ fn find_or_create_hosted_pull_request(
     repo_config: &RepoConfig,
     manifest: &HostedManifest,
     validation: &[ValidationResult],
+    completeness: &CompletionEvaluation,
+    draft: bool,
 ) -> Result<crate::github::PullRequest> {
+    let title = hosted_pull_request_title(manifest, draft);
+    let body = hosted_pull_request_body(manifest, validation, completeness);
     if let Some(pull) = github.find_open_pull_request(repo_config, &manifest.github.branch)? {
+        let pull = github.update_pull_request(repo_config, pull.number, &title, &body)?;
+        if pull.draft != draft {
+            let node_id = pull
+                .node_id
+                .as_deref()
+                .context("GitHub pull request response has no node identity")?;
+            github.set_pull_request_draft(node_id, draft)?;
+        }
         return Ok(pull);
     }
-    match github.create_pull_request(
+    match github.create_pull_request_with_draft(
         repo_config,
-        &format!("{}: {}", manifest.ticket_key, manifest.ticket_title),
-        &hosted_pull_request_body(manifest, validation),
+        &title,
+        &body,
         &manifest.github.branch,
         normalized_base_ref(&manifest.github.base_ref)?,
+        draft,
     ) {
         Ok(pull) => Ok(pull),
         Err(create_error) => {
@@ -1442,6 +1669,15 @@ fn find_or_create_hosted_pull_request(
             }
         }
     }
+}
+
+fn hosted_pull_request_title(manifest: &HostedManifest, draft: bool) -> String {
+    format!(
+        "{}{}: {}",
+        if draft { "[INCOMPLETE] " } else { "" },
+        manifest.ticket_key,
+        manifest.ticket_title
+    )
 }
 
 struct HostedPublicationContext<'a> {
@@ -1576,6 +1812,15 @@ struct GatewayAgent<'a> {
     running: &'a Arc<AtomicBool>,
     containment: &'a command::HostedProcessContainment,
     calls_used: usize,
+    impact_map: Option<ImpactMap>,
+    declaration: Option<ImplementationDeclaration>,
+    tool_failures: Vec<ToolFailureRecord>,
+    tool_usage: ToolUsage,
+    diff_reviewed: bool,
+    discovery_calls: usize,
+    planning_calls: usize,
+    implementation_calls: usize,
+    completion_calls: usize,
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -1593,15 +1838,61 @@ impl<'a> GatewayAgent<'a> {
             running,
             containment,
             calls_used: 0,
+            impact_map: None,
+            declaration: None,
+            tool_failures: Vec::new(),
+            tool_usage: ToolUsage::default(),
+            diff_reviewed: false,
+            discovery_calls: 0,
+            planning_calls: 0,
+            implementation_calls: 0,
+            completion_calls: 0,
         }
     }
 
-    fn implement(&mut self) -> Result<String> {
+    fn implement(&mut self) -> Result<ImplementationOutcome> {
         let prompt = build_hosted_prompt(self.manifest, self.repo)?;
         self.run_session(&prompt, true)
     }
 
-    fn repair(&mut self, failures: &[ValidationResult], attempt: usize) -> Result<String> {
+    fn budget_telemetry(&self) -> Value {
+        let total = usize::try_from(self.manifest.ai_gateway.maximum_model_calls)
+            .unwrap_or_default()
+            .min(MAX_MODEL_CALLS_HARD_LIMIT);
+        let allocation = phase_budget_allocation(total);
+        json!({
+            "model_calls_used": self.calls_used,
+            "model_calls_maximum": total,
+            "model_calls_remaining": total.saturating_sub(self.calls_used),
+            "phase_allocation": allocation,
+            "phases": {
+                "discovery": {
+                    "consumed": self.discovery_calls,
+                    "remaining": allocation.discovery_maximum.saturating_sub(self.discovery_calls)
+                },
+                "planning": {
+                    "consumed": self.planning_calls,
+                    "remaining": allocation.planning_maximum.saturating_sub(self.planning_calls)
+                },
+                "implementation_repair": {
+                    "consumed": self.implementation_calls,
+                    "minimum": allocation.implementation_repair_minimum
+                },
+                "completion_review": {
+                    "consumed": self.completion_calls,
+                    "remaining": allocation
+                        .completion_review_reserved
+                        .saturating_sub(self.completion_calls)
+                }
+            }
+        })
+    }
+
+    fn repair(
+        &mut self,
+        failures: &[ValidationResult],
+        attempt: usize,
+    ) -> Result<ImplementationOutcome> {
         let diagnostics = failures
             .iter()
             .map(|failure| {
@@ -1623,14 +1914,50 @@ impl<'a> GatewayAgent<'a> {
         )
     }
 
-    fn run_session(&mut self, prompt: &str, allow_budget_handoff: bool) -> Result<String> {
+    fn run_session(
+        &mut self,
+        prompt: &str,
+        allow_budget_handoff: bool,
+    ) -> Result<ImplementationOutcome> {
         let initial = json!({"role": "user", "content": prompt});
         let mut turns = VecDeque::<Vec<Value>>::new();
         loop {
             ensure_running(self.running)?;
-            let maximum_calls = usize::try_from(self.manifest.ai_gateway.maximum_model_calls)
+            let total_calls = usize::try_from(self.manifest.ai_gateway.maximum_model_calls)
                 .unwrap_or_default()
                 .min(MAX_MODEL_CALLS_HARD_LIMIT);
+            let phase_budgets = phase_budget_allocation(total_calls);
+            let maximum_calls = if allow_budget_handoff {
+                total_calls.saturating_sub(phase_budgets.completion_review_reserved)
+            } else {
+                total_calls.saturating_sub(usize::from(total_calls > 1))
+            };
+            let discovery_limit = phase_budgets.discovery_maximum;
+            if allow_budget_handoff
+                && self.impact_map.is_none()
+                && self.calls_used >= discovery_limit
+            {
+                let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
+                let summary = format!(
+                    "Discovery consumed its {}-call phase budget without producing the required implementation impact map.",
+                    discovery_limit
+                );
+                self.api.append_event(
+                    "message",
+                    json!({
+                        "step": "ai_gateway",
+                        "status": "discovery_budget_exhausted",
+                        "model_calls_used": self.calls_used,
+                        "changed_paths": changed_paths,
+                        "summary": summary
+                    }),
+                )?;
+                return Ok(ImplementationOutcome {
+                    summary,
+                    budget_exhausted: true,
+                    explicit_declaration: self.declaration.clone(),
+                });
+            }
             if self.calls_used >= maximum_calls {
                 let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
                 if let Some(summary) =
@@ -1646,7 +1973,11 @@ impl<'a> GatewayAgent<'a> {
                             "summary": summary
                         }),
                     )?;
-                    return Ok(summary);
+                    return Ok(ImplementationOutcome {
+                        summary,
+                        budget_exhausted: true,
+                        explicit_declaration: self.declaration.clone(),
+                    });
                 }
                 bail!("execution AI model-call budget was exhausted");
             }
@@ -1689,7 +2020,13 @@ impl<'a> GatewayAgent<'a> {
                 bail!("hosted agent context exceeds the execution input-token ceiling");
             }
 
+            let call_started_in_discovery = self.impact_map.is_none();
             self.calls_used += 1;
+            if call_started_in_discovery {
+                self.discovery_calls = self.discovery_calls.saturating_add(1);
+            } else {
+                self.implementation_calls = self.implementation_calls.saturating_add(1);
+            }
             let request_sha = Sha256::digest(serde_json::to_vec(&request)?);
             let call_number = self.calls_used.to_be_bytes();
             let idempotency_material = [
@@ -1709,7 +2046,40 @@ impl<'a> GatewayAgent<'a> {
                     "model": self.manifest.ai_gateway.model
                 }),
             )?;
-            let response = self.api.ai_response(request, idempotency_key)?;
+            let response = match self.api.ai_response(request, idempotency_key) {
+                Ok(response) => response,
+                Err(error) => {
+                    let exhaustion_reason = ai_budget_exhaustion_reason(&error);
+                    let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
+                    if allow_budget_handoff
+                        && !changed_paths.is_empty()
+                        && exhaustion_reason.is_some()
+                    {
+                        let exhaustion_reason = exhaustion_reason.unwrap_or_default();
+                        let summary = format!(
+                            "The implementation model stopped after RustGrid reported `{exhaustion_reason}` with {} changed path(s). The work remains resumable and requires independent completion evaluation.",
+                            changed_paths.len()
+                        );
+                        self.api.append_event(
+                            "message",
+                            json!({
+                                "step": "ai_gateway",
+                                "status": "budget_handoff",
+                                "exhaustion_reason": exhaustion_reason,
+                                "model_calls_used": self.calls_used,
+                                "changed_paths": changed_paths,
+                                "summary": summary
+                            }),
+                        )?;
+                        return Ok(ImplementationOutcome {
+                            summary,
+                            budget_exhausted: true,
+                            explicit_declaration: self.declaration.clone(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             let output = response
                 .get("output")
                 .and_then(Value::as_array)
@@ -1782,24 +2152,54 @@ impl<'a> GatewayAgent<'a> {
                         "summary": truncate_text(&summary, 4_000)
                     }),
                 )?;
-                return Ok(truncate_text(&summary, 16_000));
+                return Ok(ImplementationOutcome {
+                    summary: truncate_text(&summary, 16_000),
+                    budget_exhausted: false,
+                    explicit_declaration: self.declaration.clone(),
+                });
             }
             for (call_id, name, arguments) in function_calls {
                 ensure_running(self.running)?;
+                let target = tool_target(&arguments);
                 let result = match self.execute_tool(&name, &arguments) {
                     Ok(output) => {
+                        if is_source_mutation_tool(&name) {
+                            self.diff_reviewed = false;
+                            self.declaration = None;
+                            for failure in &mut self.tool_failures {
+                                if !failure.recovered
+                                    && failure.tool == name
+                                    && failure.target.is_some()
+                                    && failure.target == target
+                                {
+                                    failure.recovered = true;
+                                }
+                            }
+                        }
                         json!({"ok": true, "output": truncate_text(&output, MAX_TOOL_OUTPUT_BYTES)})
                     }
-                    Err(error) => json!({
-                        "ok": false,
-                        "error": truncate_text(&format!("{error:#}"), 4_000)
-                    }),
+                    Err(error) => {
+                        let error = truncate_text(&format!("{error:#}"), 4_000);
+                        if is_source_mutation_tool(&name) {
+                            self.tool_usage.failed_writes =
+                                self.tool_usage.failed_writes.saturating_add(1);
+                            self.tool_failures.push(ToolFailureRecord {
+                                tool: name.clone(),
+                                target: target.clone(),
+                                error: error.clone(),
+                                recovered: false,
+                            });
+                        }
+                        json!({"ok": false, "error": error})
+                    }
                 };
                 self.api.append_event(
                     "tool",
                     json!({
                         "tool": name,
-                        "status": if result["ok"] == true { "completed" } else { "failed" }
+                        "target": target,
+                        "status": if result["ok"] == true { "completed" } else { "failed" },
+                        "usage": self.tool_usage
                     }),
                 )?;
                 turn.push(json!({
@@ -1808,6 +2208,10 @@ impl<'a> GatewayAgent<'a> {
                     "output": serde_json::to_string(&result)?
                 }));
             }
+            if call_started_in_discovery && self.impact_map.is_some() {
+                self.discovery_calls = self.discovery_calls.saturating_sub(1);
+                self.planning_calls = self.planning_calls.saturating_add(1);
+            }
             turns.push_back(turn);
             while turns.len() > 8 {
                 turns.pop_front();
@@ -1815,20 +2219,121 @@ impl<'a> GatewayAgent<'a> {
         }
     }
 
-    fn execute_tool(&self, name: &str, raw_arguments: &str) -> Result<String> {
+    fn evaluate_completion(
+        &mut self,
+        implementation: &ImplementationOutcome,
+        validation: &[ValidationResult],
+        changed_paths: &[String],
+    ) -> CompletionEvaluation {
+        let unrecovered = self
+            .tool_failures
+            .iter()
+            .filter(|failure| !failure.recovered)
+            .cloned()
+            .collect::<Vec<_>>();
+        let fallback = completion_fallback(
+            implementation,
+            self.impact_map.as_ref(),
+            &unrecovered,
+            changed_paths,
+        );
+        let maximum_calls = usize::try_from(self.manifest.ai_gateway.maximum_model_calls)
+            .unwrap_or_default()
+            .min(MAX_MODEL_CALLS_HARD_LIMIT);
+        if self.calls_used >= maximum_calls || changed_paths.is_empty() {
+            return fallback;
+        }
+
+        let diff = match completion_review_diff(
+            &self.repo.root,
+            changed_paths,
+            &self.manifest.github.base_sha,
+        ) {
+            Ok(diff) => diff,
+            Err(_) => return fallback,
+        };
+        let prompt = format!(
+            "Independently evaluate whether this repository diff fully implements the ticket. \
+Regression gates are only technical validation and cannot by themselves satisfy functional \
+criteria. Every satisfied criterion must cite concrete diff evidence. Missing evidence is \
+uncertain or incomplete. An unrecovered edit failure blocks complete. A broad task with a narrow \
+diff needs explicit architectural evidence. Return only one JSON object matching the requested \
+schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nImpact map:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nUnrecovered tool failures:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
+            self.manifest.ticket_title,
+            self.manifest.run.input_prompt,
+            serde_json::to_string(&self.impact_map).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&implementation.explicit_declaration)
+                .unwrap_or_else(|_| "null".into()),
+            implementation.budget_exhausted,
+            changed_paths.join("\n"),
+            serde_json::to_string(&unrecovered).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(validation).unwrap_or_else(|_| "[]".into()),
+            truncate_text(&diff, 96 * 1024),
+        );
+        let request = json!({
+            "model": self.manifest.ai_gateway.model,
+            "input": [{"role": "user", "content": prompt}],
+            "instructions": completion_evaluator_instructions(),
+            "max_output_tokens": self.manifest.ai_gateway.maximum_output_tokens.min(8_192),
+            "reasoning": {"effort": "medium"},
+            "store": false,
+            "stream": false,
+            "metadata": {
+                "execution_id": self.manifest.execution.execution_id,
+                "ticket_key": self.manifest.ticket_key,
+                "agent": "rustgrid-completion-evaluator"
+            }
+        });
+        self.calls_used = self.calls_used.saturating_add(1);
+        self.completion_calls = self.completion_calls.saturating_add(1);
+        let request_sha = Sha256::digest(serde_json::to_vec(&request).unwrap_or_default());
+        let idempotency_key = Uuid::new_v5(
+            &HOSTED_NAMESPACE,
+            &[
+                b"completion-evaluator:".as_slice(),
+                self.manifest.execution.execution_id.as_bytes().as_slice(),
+                request_sha.as_slice(),
+            ]
+            .concat(),
+        );
+        let evaluated = self
+            .api
+            .ai_response(request, idempotency_key)
+            .ok()
+            .and_then(|response| response_message_text(&response))
+            .and_then(|text| parse_completion_evaluation(&text).ok())
+            .and_then(|evaluation| {
+                validate_completion_evaluation(
+                    evaluation,
+                    implementation,
+                    self.impact_map.as_ref(),
+                    &unrecovered,
+                    changed_paths,
+                )
+                .ok()
+            });
+        evaluated.unwrap_or(fallback)
+    }
+
+    fn execute_tool(&mut self, name: &str, raw_arguments: &str) -> Result<String> {
         let arguments: Value =
             serde_json::from_str(raw_arguments).context("tool arguments are not valid JSON")?;
         let object = arguments
             .as_object()
             .context("tool arguments must be an object")?;
+        if is_source_mutation_tool(name) && self.impact_map.is_none() {
+            bail!("record_impact_map is required before source-changing tools");
+        }
         match name {
             "list_files" => {
+                self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
                 let path = object.get("path").and_then(Value::as_str).unwrap_or(".");
                 let root = safe_repo_path(&self.repo.root, path, false)?;
                 let files = collect_repo_files(&self.repo.root, &root, 1_000)?;
                 Ok(files.join("\n"))
             }
             "read_file" => {
+                self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let start_line = object
                     .get("start_line")
@@ -1842,12 +2347,40 @@ impl<'a> GatewayAgent<'a> {
                     .min(start_line.saturating_add(999));
                 read_repo_file(&self.repo.root, path, start_line, end_line)
             }
+            "read_files" => {
+                self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
+                let paths = object
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .context("tool argument `paths` is missing")?;
+                if paths.is_empty() || paths.len() > 20 {
+                    bail!("read_files requires between 1 and 20 paths");
+                }
+                let mut output = String::new();
+                for path in paths {
+                    let path = path
+                        .as_str()
+                        .filter(|path| !path.is_empty() && path.len() <= 4_096)
+                        .context("read_files path is malformed")?;
+                    if !output.is_empty() {
+                        output.push_str("\n\n");
+                    }
+                    output.push_str(&format!("===== {path} =====\n"));
+                    output.push_str(&read_repo_file(&self.repo.root, path, 1, 800)?);
+                    if output.len() > MAX_TOOL_OUTPUT_BYTES {
+                        break;
+                    }
+                }
+                Ok(truncate_text(&output, MAX_TOOL_OUTPUT_BYTES))
+            }
             "search_text" => {
+                self.tool_usage.searches = self.tool_usage.searches.saturating_add(1);
                 let query = required_tool_string(object, "query", 200)?;
                 let path = object.get("path").and_then(Value::as_str).unwrap_or(".");
                 search_repo(&self.repo.root, path, query)
             }
             "write_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
                 let target = safe_repo_path(&self.repo.root, path, true)?;
@@ -1864,6 +2397,7 @@ impl<'a> GatewayAgent<'a> {
                 Ok(format!("wrote {} bytes to {path}", content.len()))
             }
             "replace_text" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let old_text = required_tool_string(object, "old_text", MAX_MODEL_FILE_BYTES)?;
                 let new_text = object
@@ -1874,6 +2408,7 @@ impl<'a> GatewayAgent<'a> {
                 replace_unique_repo_text(&self.repo.root, path, old_text, new_text)
             }
             "delete_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let target = safe_repo_path(&self.repo.root, path, false)?;
                 if !target.is_file() {
@@ -1884,6 +2419,8 @@ impl<'a> GatewayAgent<'a> {
                 Ok(format!("deleted {path}"))
             }
             "run_focused_command" => {
+                self.tool_usage.validation_commands =
+                    self.tool_usage.validation_commands.saturating_add(1);
                 let command_text = required_tool_string(object, "command", 8 * 1024)?;
                 validate_model_command(command_text)?;
                 let allowlist = self.manifest.execution_policy.child_environment_allowlist();
@@ -1912,6 +2449,59 @@ impl<'a> GatewayAgent<'a> {
                     truncate_text(&output.stderr, MAX_TOOL_OUTPUT_BYTES / 2)
                 ))
             }
+            "repository_snapshot" => {
+                self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
+                let paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+                let diff = completion_review_diff(
+                    &self.repo.root,
+                    &paths,
+                    &self.manifest.github.base_sha,
+                )?;
+                self.diff_reviewed = true;
+                Ok(format!(
+                    "changed_paths:\n{}\n\ncomplete_diff:\n{}",
+                    paths.join("\n"),
+                    truncate_text(&diff, MAX_TOOL_OUTPUT_BYTES)
+                ))
+            }
+            "record_impact_map" => {
+                let map: ImpactMap = serde_json::from_value(Value::Object(object.clone()))
+                    .context("impact map is malformed")?;
+                if map.affected_subsystems.is_empty()
+                    || map.candidate_files.is_empty()
+                    || map.criterion_file_mappings.is_empty()
+                    || map.criterion_file_mappings.iter().any(|mapping| {
+                        mapping.criterion.trim().is_empty()
+                            || mapping.candidate_files.is_empty()
+                            || mapping
+                                .candidate_files
+                                .iter()
+                                .any(|path| path.trim().is_empty())
+                    })
+                {
+                    bail!("impact map must identify subsystems, files, and criterion mappings");
+                }
+                self.impact_map = Some(map);
+                Ok("recorded implementation impact map".into())
+            }
+            "declare_implementation" => {
+                if !self.diff_reviewed {
+                    bail!(
+                        "repository_snapshot is required after the final source change and before implementation declaration"
+                    );
+                }
+                let declaration: ImplementationDeclaration =
+                    serde_json::from_value(Value::Object(object.clone()))
+                        .context("implementation declaration is malformed")?;
+                if !matches!(
+                    declaration.implementation_status.as_str(),
+                    "complete" | "partial" | "blocked"
+                ) {
+                    bail!("implementation declaration has an unsupported status");
+                }
+                self.declaration = Some(declaration);
+                Ok("recorded implementation declaration".into())
+            }
             _ => bail!("unsupported hosted model tool `{name}`"),
         }
     }
@@ -1919,6 +2509,40 @@ impl<'a> GatewayAgent<'a> {
 
 fn hosted_tools() -> Vec<Value> {
     vec![
+        json!({
+            "type": "function",
+            "name": "record_impact_map",
+            "description": "Record the repository-level implementation impact map before making source changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "affected_subsystems": {"type": "array", "items": {"type": "string"}},
+                    "candidate_files": {"type": "array", "items": {"type": "string"}},
+                    "shared_abstractions": {"type": "array", "items": {"type": "string"}},
+                    "expected_tests": {"type": "array", "items": {"type": "string"}},
+                    "criterion_file_mappings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "criterion": {"type": "string"},
+                                "candidate_files": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1
+                                }
+                            },
+                            "required": ["criterion", "candidate_files"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "uncertainties": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["affected_subsystems", "candidate_files", "shared_abstractions", "expected_tests", "criterion_file_mappings", "uncertainties"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
         json!({
             "type": "function",
             "name": "list_files",
@@ -1943,6 +2567,25 @@ fn hosted_tools() -> Vec<Value> {
                     "end_line": {"type": ["integer", "null"], "minimum": 1}
                 },
                 "required": ["path", "start_line", "end_line"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "read_files",
+            "description": "Read up to 20 selected UTF-8 repository files in one batched operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20
+                    }
+                },
+                "required": ["paths"],
                 "additionalProperties": false
             },
             "strict": true
@@ -2017,19 +2660,52 @@ fn hosted_tools() -> Vec<Value> {
             },
             "strict": true
         }),
+        json!({
+            "type": "function",
+            "name": "repository_snapshot",
+            "description": "Inspect current changed paths and the complete bounded repository diff before declaring implementation status.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "declare_implementation",
+            "description": "After reviewing repository status and the complete diff, declare whether implementation is complete, partial, or blocked.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "implementation_status": {"type": "string", "enum": ["complete", "partial", "blocked"]},
+                    "completed_work": {"type": "array", "items": {"type": "string"}},
+                    "remaining_work": {"type": "array", "items": {"type": "string"}},
+                    "known_risks": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["implementation_status", "completed_work", "remaining_work", "known_risks"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
     ]
 }
 
 fn hosted_agent_instructions() -> &'static str {
     "You are the implementation model inside an ephemeral RustGrid GitHub Actions worker. \
 Use only the provided repository tools. Inspect the smallest relevant scope, follow repository \
-instructions, implement the mission, add focused tests, and inspect your final changes. Use \
+instructions, and record a repository-level impact map before editing. Batch repository discovery \
+within each response instead of spending one model call per file. Implement the mission, add focused \
+tests, and inspect repository status plus the complete diff before finishing. Use \
 replace_text for targeted edits and write_file only when replacing a complete file is appropriate. \
 run_focused_command starts one executable directly without a shell; never pass shell operators, \
 pipelines, redirects, heredocs, or chained commands to it, and never use it to mutate files. Never \
 commit, push, switch branches, modify Git remotes, open pull requests, read environment variables, \
 read files outside the repository, or attempt to discover credentials. The RustGrid worker owns \
-full quality gates and publication. End with a concise implementation and focused-validation summary."
+full quality gates and publication. Call declare_implementation after diff review, then end with a \
+concise implementation and focused-validation summary. Never declare complete while planned work, \
+acceptance criteria, or an unrecovered source-changing tool failure remains."
 }
 
 fn build_hosted_prompt(manifest: &HostedManifest, repo: &Repo) -> Result<String> {
@@ -2043,10 +2719,14 @@ fn build_hosted_prompt(manifest: &HostedManifest, repo: &Repo) -> Result<String>
             )
         })
         .collect::<String>();
+    let visual_guidance = visual_impact_guidance(&format!(
+        "{}\n{}",
+        manifest.ticket_title, manifest.run.input_prompt
+    ));
     Ok(format!(
         "Implement RustGrid ticket {key}: {title}\n\nMission instructions:\n{prompt}\n\n\
 Execution attempt: {attempt}\nDeterministic branch: {branch}\nResolved model: {model}\n\
-Maximum model calls: {calls}\nMaximum cost USD: {cost}\n\nRepository files:\n{files}{instructions}",
+Maximum model calls: {calls}\nMaximum cost USD: {cost}{visual_guidance}\n\nRepository files:\n{files}{instructions}",
         key = manifest.ticket_key,
         title = manifest.ticket_title,
         prompt = manifest.run.input_prompt,
@@ -2055,8 +2735,32 @@ Maximum model calls: {calls}\nMaximum cost USD: {cost}\n\nRepository files:\n{fi
         model = manifest.ai_gateway.model,
         calls = manifest.ai_gateway.maximum_model_calls,
         cost = manifest.ai_gateway.maximum_cost_usd,
+        visual_guidance = visual_guidance,
         files = files.join("\n"),
     ))
+}
+
+fn visual_impact_guidance(ticket: &str) -> &'static str {
+    let ticket = ticket.to_ascii_lowercase();
+    if [
+        "theme",
+        "dark mode",
+        "light mode",
+        "design system",
+        "color palette",
+        "visual system",
+    ]
+    .iter()
+    .any(|needle| ticket.contains(needle))
+    {
+        "\n\nVisual-system impact-map minimums: inspect the theme provider; design tokens \
+and CSS variables; global styles; Tailwind or component-library configuration; shared \
+components; layouts and navigation; hardcoded colors; charts; illustrations and assets; \
+light/dark behavior; and tests or visual snapshots. Record explicit evidence when an area \
+is not applicable or one shared abstraction is sufficient."
+    } else {
+        ""
+    }
 }
 
 fn bootstrap_hosted_dependencies(
@@ -2792,7 +3496,11 @@ fn unsuccessful_completion(
     }
 }
 
-fn hosted_pull_request_body(manifest: &HostedManifest, validation: &[ValidationResult]) -> String {
+fn hosted_pull_request_body(
+    manifest: &HostedManifest,
+    validation: &[ValidationResult],
+    completeness: &CompletionEvaluation,
+) -> String {
     let checks = validation
         .iter()
         .map(|result| {
@@ -2808,15 +3516,37 @@ fn hosted_pull_request_body(manifest: &HostedManifest, validation: &[ValidationR
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let completeness_heading = if completeness.status == ImplementationCompleteness::Complete {
+        "Implementation completeness: **complete**"
+    } else {
+        "⚠️ **INCOMPLETE — continue implementation before review or merge**"
+    };
+    let unresolved = if completeness.unresolved_work.is_empty() {
+        "- None reported.".into()
+    } else {
+        completeness
+            .unresolved_work
+            .iter()
+            .map(|work| format!("- {work}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
-        "Implements RustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
+        "{}\n\nRustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
 Execution: `{}` (attempt {})\nModel: `{}`\nMaximum cost: `${}`\n\n\
-Validation:\n{}\n\n_The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
+Completion evaluator: `{}` at {:.0}% confidence\n\n{}\n\n\
+Remaining work:\n{}\n\nTechnical validation:\n{}\n\n\
+_The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
+        completeness_heading,
         manifest.ticket_key,
         manifest.execution.execution_id,
         manifest.execution.attempt_number,
         manifest.ai_gateway.model,
         manifest.ai_gateway.maximum_cost_usd,
+        completeness.status.as_str(),
+        completeness.confidence * 100.0,
+        completeness.summary,
+        unresolved,
         if checks.is_empty() {
             "- No required validation commands configured.".into()
         } else {
@@ -2844,6 +3574,257 @@ fn sanitized_message_content(item: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn completion_evaluator_instructions() -> &'static str {
+    "You are an independent implementation-completeness evaluator. Return only JSON with keys \
+status, confidence, criteria, unresolved_work, unrecovered_tool_failures, and summary. Status is \
+complete, partial, incomplete, or uncertain. Each criterion contains criterion, status, and \
+evidence; criterion status is satisfied, unsatisfied, uncertain, or not_applicable. Evidence \
+contains repository-relative path and description. Never use passing tests or builds alone as \
+functional evidence and never infer missing implementation optimistically. Include exactly one \
+criterion result for every criterion in the impact map, preserving the criterion text verbatim."
+}
+
+fn response_message_text(response: &Value) -> Option<String> {
+    let mut text = String::new();
+    for item in response.get("output")?.as_array()? {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        for content in item.get("content")?.as_array()? {
+            if content.get("type").and_then(Value::as_str) == Some("output_text") {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(content.get("text")?.as_str()?);
+            }
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn parse_completion_evaluation(text: &str) -> Result<CompletionEvaluation> {
+    let trimmed = text.trim();
+    let json_text = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(json_text).context("completion evaluator returned malformed JSON")
+}
+
+fn validate_completion_evaluation(
+    mut evaluation: CompletionEvaluation,
+    implementation: &ImplementationOutcome,
+    impact_map: Option<&ImpactMap>,
+    unrecovered: &[ToolFailureRecord],
+    changed_paths: &[String],
+) -> Result<CompletionEvaluation> {
+    let authoritative_failures = unrecovered
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}{}: {}",
+                failure.tool,
+                failure
+                    .target
+                    .as_deref()
+                    .map(|target| format!(" ({target})"))
+                    .unwrap_or_default(),
+                failure.error
+            )
+        })
+        .collect::<Vec<_>>();
+    evaluation.unrecovered_tool_failures = authoritative_failures;
+    if let Some(declaration) = &implementation.explicit_declaration {
+        for work in &declaration.remaining_work {
+            if !evaluation.unresolved_work.contains(work) {
+                evaluation.unresolved_work.push(work.clone());
+            }
+        }
+    }
+    if !evaluation.confidence.is_finite()
+        || !(0.0..=1.0).contains(&evaluation.confidence)
+        || evaluation.summary.trim().is_empty()
+        || evaluation.criteria.is_empty()
+    {
+        bail!("completion evaluation is incomplete");
+    }
+    let valid_paths = changed_paths.iter().collect::<BTreeSet<_>>();
+    let mut evaluated_criteria = BTreeSet::new();
+    for criterion in &evaluation.criteria {
+        if criterion.criterion.trim().is_empty()
+            || !evaluated_criteria.insert(criterion.criterion.trim())
+            || !matches!(
+                criterion.status.as_str(),
+                "satisfied" | "unsatisfied" | "uncertain" | "not_applicable"
+            )
+        {
+            bail!("completion evaluation contains an invalid criterion");
+        }
+        if criterion.status == "satisfied"
+            && (criterion.evidence.is_empty()
+                || criterion.evidence.iter().any(|evidence| {
+                    evidence.description.trim().is_empty() || !valid_paths.contains(&evidence.path)
+                }))
+        {
+            bail!("satisfied completion criterion lacks concrete diff evidence");
+        }
+    }
+    if impact_map.is_some_and(|map| {
+        map.criterion_file_mappings.iter().any(|mapping| {
+            mapping.criterion.trim().is_empty()
+                || mapping.candidate_files.is_empty()
+                || !evaluated_criteria.contains(mapping.criterion.trim())
+        })
+    }) {
+        bail!("completion evaluation does not cover every mapped acceptance criterion");
+    }
+    if evaluation.status == ImplementationCompleteness::Complete
+        && (impact_map.is_none()
+            || !unrecovered.is_empty()
+            || implementation
+                .explicit_declaration
+                .as_ref()
+                .is_none_or(|declaration| declaration.implementation_status != "complete")
+            || !evaluation.unresolved_work.is_empty()
+            || evaluation.criteria.iter().any(|criterion| {
+                !matches!(criterion.status.as_str(), "satisfied" | "not_applicable")
+            }))
+    {
+        bail!("completion evaluator cannot prove implementation completeness");
+    }
+    Ok(evaluation)
+}
+
+fn completion_fallback(
+    implementation: &ImplementationOutcome,
+    impact_map: Option<&ImpactMap>,
+    unrecovered: &[ToolFailureRecord],
+    changed_paths: &[String],
+) -> CompletionEvaluation {
+    let (status, summary) = if changed_paths.is_empty() {
+        (
+            ImplementationCompleteness::Incomplete,
+            "The implementation produced no reviewable repository changes.",
+        )
+    } else if !unrecovered.is_empty() {
+        (
+            ImplementationCompleteness::Incomplete,
+            "One or more source-changing tool failures remain unrecovered.",
+        )
+    } else if impact_map.is_none() || implementation.explicit_declaration.is_none() {
+        (
+            ImplementationCompleteness::Uncertain,
+            "The implementation lacks the required impact map or explicit diff-review declaration.",
+        )
+    } else if implementation.budget_exhausted
+        || implementation
+            .explicit_declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.implementation_status != "complete")
+    {
+        (
+            ImplementationCompleteness::Partial,
+            "The implementation is valid resumable work but was not declared complete.",
+        )
+    } else {
+        (
+            ImplementationCompleteness::Uncertain,
+            "Independent requirement-to-diff evaluation was unavailable.",
+        )
+    };
+    CompletionEvaluation {
+        status,
+        confidence: 1.0,
+        criteria: Vec::new(),
+        unresolved_work: implementation
+            .explicit_declaration
+            .as_ref()
+            .map(|declaration| declaration.remaining_work.clone())
+            .unwrap_or_default(),
+        unrecovered_tool_failures: unrecovered
+            .iter()
+            .map(|failure| {
+                format!(
+                    "{}{}: {}",
+                    failure.tool,
+                    failure
+                        .target
+                        .as_deref()
+                        .map(|target| format!(" ({target})"))
+                        .unwrap_or_default(),
+                    failure.error
+                )
+            })
+            .collect(),
+        summary: summary.into(),
+    }
+}
+
+fn completion_review_diff(root: &Path, changed_paths: &[String], base_sha: &str) -> Result<String> {
+    let dirty = command::capture("git", ["status", "--porcelain=v1"], root)?;
+    let diff = if dirty.stdout.trim().is_empty() {
+        command::capture(
+            "git",
+            ["diff", "--no-ext-diff", "--binary", base_sha, "HEAD", "--"],
+            root,
+        )?
+    } else {
+        command::capture("git", ["diff", "--no-ext-diff", "--binary", "--"], root)?
+    };
+    if !diff.status.success() {
+        bail!("git diff exited with {}: {}", diff.status, diff.stderr);
+    }
+    let mut review = diff.stdout;
+    for path in changed_paths {
+        let target = safe_repo_path(root, path, false)?;
+        let tracked = command::capture("git", ["ls-files", "--error-unmatch", "--", path], root)?
+            .status
+            .success();
+        if tracked || !target.is_file() {
+            continue;
+        }
+        review.push_str(&format!("\n\n--- /dev/null\n+++ b/{path}\n"));
+        match fs::read(&target) {
+            Ok(bytes) if bytes.len() <= MAX_MODEL_FILE_BYTES && !bytes.contains(&0) => {
+                review.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            Ok(bytes) => review.push_str(&format!(
+                "[new binary or large file: {} bytes]",
+                bytes.len()
+            )),
+            Err(error) => review.push_str(&format!("[could not read new file: {error}]")),
+        }
+    }
+    Ok(review)
+}
+
+fn completion_changed_paths(repo: &Repo, base_sha: &str) -> Result<Vec<String>> {
+    let dirty = repo.new_agent_paths(&BTreeSet::new())?;
+    if !dirty.is_empty() {
+        return Ok(dirty);
+    }
+    let output = command::capture(
+        "git",
+        ["diff", "--name-only", "-z", base_sha, "HEAD", "--"],
+        &repo.root,
+    )?;
+    if !output.status.success() {
+        bail!(
+            "git diff --name-only exited with {}: {}",
+            output.status,
+            output.stderr
+        );
+    }
+    Ok(output
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 fn required_tool_string<'a>(
     object: &'a serde_json::Map<String, Value>,
     name: &str,
@@ -2856,13 +3837,61 @@ fn required_tool_string<'a>(
         .with_context(|| format!("tool argument `{name}` is missing or too large"))
 }
 
+fn is_source_mutation_tool(name: &str) -> bool {
+    matches!(name, "write_file" | "replace_text" | "delete_file")
+}
+
+fn tool_target(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(|path| truncate_text(path, 4_096))
+}
+
 fn model_budget_handoff_summary(allowed: bool, changed_paths: &[String]) -> Option<String> {
     (allowed && !changed_paths.is_empty()).then(|| {
         format!(
-            "The implementation model used its configured call budget after changing {} path(s). RustGrid is continuing with authoritative quality gates to determine whether the implementation is complete.",
+            "The implementation model used its configured call budget after changing {} path(s). RustGrid will preserve the work, run useful technical gates, and classify it through an independent completion evaluation; passing gates alone cannot mark it complete.",
             changed_paths.len()
         )
     })
+}
+
+fn ai_budget_exhaustion_reason(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<HostedHttpError>()
+        .filter(|failure| failure.code == "execution_ai_budget_exceeded")
+        .map(|failure| failure.code.clone())
+}
+
+fn phase_budget_allocation(total: usize) -> PhaseBudgetAllocation {
+    if total == 0 {
+        return PhaseBudgetAllocation {
+            discovery_maximum: 0,
+            planning_maximum: 0,
+            implementation_repair_minimum: 0,
+            completion_review_reserved: 0,
+        };
+    }
+    PhaseBudgetAllocation {
+        discovery_maximum: total.div_ceil(4),
+        planning_maximum: total.div_ceil(10),
+        implementation_repair_minimum: total.div_ceil(2),
+        completion_review_reserved: if total > 1 {
+            total.saturating_mul(15).div_ceil(100).max(1)
+        } else {
+            0
+        },
+    }
+}
+
+fn should_continue_implementation(
+    existing_pull_request: bool,
+    resumed_branch: bool,
+    execution_attempt: i32,
+) -> bool {
+    !existing_pull_request || !resumed_branch || execution_attempt > 1
 }
 
 fn replace_unique_repo_text(
@@ -3690,16 +4719,215 @@ mod tests {
     }
 
     #[test]
-    fn model_budget_handoff_salvages_only_nonempty_initial_implementations() {
+    fn model_budget_handoff_preserves_work_without_claiming_completion() {
         let empty = Vec::new();
         assert!(model_budget_handoff_summary(true, &empty).is_none());
 
         let changed = vec!["src/theme.css".to_owned()];
         assert!(model_budget_handoff_summary(false, &changed).is_none());
         assert!(
-            model_budget_handoff_summary(true, &changed)
-                .is_some_and(|summary| summary.contains("authoritative quality gates"))
+            model_budget_handoff_summary(true, &changed).is_some_and(
+                |summary| summary.contains("passing gates alone cannot mark it complete")
+            )
         );
+        let implementation = ImplementationOutcome {
+            summary: "partial edit".into(),
+            budget_exhausted: true,
+            explicit_declaration: None,
+        };
+        let result = completion_fallback(&implementation, None, &[], &changed);
+        assert_ne!(result.status, ImplementationCompleteness::Complete);
+        let hosted_result = HostedResult {
+            summary: "partial edit".into(),
+            branch: "rustgrid/partial".into(),
+            commit: "a".repeat(40),
+            pull_request: PullRequestResult {
+                number: 1,
+                url: "https://github.com/RustGrid/example/pull/1".into(),
+            },
+            validation: vec![ValidationResult {
+                id: "test".into(),
+                command: "cargo test".into(),
+                status: "passed".into(),
+                output: String::new(),
+            }],
+            completeness: result,
+        };
+        assert!(!hosted_result_can_succeed(&hosted_result));
+    }
+
+    #[test]
+    fn phase_budget_reserves_completion_review_without_starving_small_runs() {
+        let normal = phase_budget_allocation(20);
+        assert_eq!(normal.discovery_maximum, 5);
+        assert_eq!(normal.planning_maximum, 2);
+        assert_eq!(normal.implementation_repair_minimum, 10);
+        assert_eq!(normal.completion_review_reserved, 3);
+
+        let minimal = phase_budget_allocation(1);
+        assert_eq!(minimal.completion_review_reserved, 0);
+        assert_eq!(minimal.implementation_repair_minimum, 1);
+    }
+
+    #[test]
+    fn later_attempt_continues_on_the_same_preserved_branch() {
+        assert!(!should_continue_implementation(true, true, 1));
+        assert!(should_continue_implementation(true, true, 2));
+        assert!(should_continue_implementation(false, true, 1));
+        assert!(should_continue_implementation(true, false, 1));
+    }
+
+    #[test]
+    fn unrecovered_source_edit_failure_blocks_completion() {
+        let implementation = ImplementationOutcome {
+            summary: "claimed complete".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["theme".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+            }),
+        };
+        let failures = vec![ToolFailureRecord {
+            tool: "replace_text".into(),
+            target: Some("src/theme.css".into()),
+            error: "found zero matches".into(),
+            recovered: false,
+        }];
+        let result = completion_fallback(
+            &implementation,
+            Some(&test_impact_map()),
+            &failures,
+            &["src/theme.css".into()],
+        );
+        assert_eq!(result.status, ImplementationCompleteness::Incomplete);
+        assert_eq!(result.unrecovered_tool_failures.len(), 1);
+    }
+
+    #[test]
+    fn complete_evaluation_requires_concrete_evidence_for_every_applicable_criterion() {
+        let implementation = ImplementationOutcome {
+            summary: "complete".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["theme".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+            }),
+        };
+        let evaluation = CompletionEvaluation {
+            status: ImplementationCompleteness::Complete,
+            confidence: 0.95,
+            criteria: vec![CriterionEvaluation {
+                criterion: "Theme can be selected".into(),
+                status: "satisfied".into(),
+                evidence: vec![CompletionEvidence {
+                    path: "src/theme.css".into(),
+                    description: "Adds the complete theme token set.".into(),
+                }],
+            }],
+            unresolved_work: vec![],
+            unrecovered_tool_failures: vec![],
+            summary: "All criteria have diff evidence.".into(),
+        };
+        assert!(
+            validate_completion_evaluation(
+                evaluation.clone(),
+                &implementation,
+                Some(&test_impact_map()),
+                &[],
+                &["src/theme.css".into()],
+            )
+            .is_ok()
+        );
+        let hosted_result = HostedResult {
+            summary: "complete".into(),
+            branch: "rustgrid/complete".into(),
+            commit: "b".repeat(40),
+            pull_request: PullRequestResult {
+                number: 2,
+                url: "https://github.com/RustGrid/example/pull/2".into(),
+            },
+            validation: vec![ValidationResult {
+                id: "test".into(),
+                command: "cargo test".into(),
+                status: "passed".into(),
+                output: String::new(),
+            }],
+            completeness: evaluation.clone(),
+        };
+        assert!(hosted_result_can_succeed(&hosted_result));
+        let mut missing_evidence = evaluation;
+        missing_evidence.criteria[0].evidence.clear();
+        assert!(
+            validate_completion_evaluation(
+                missing_evidence,
+                &implementation,
+                Some(&test_impact_map()),
+                &[],
+                &["src/theme.css".into()],
+            )
+            .is_err()
+        );
+
+        let missing_criterion = CompletionEvaluation {
+            status: ImplementationCompleteness::Complete,
+            confidence: 0.9,
+            criteria: vec![CriterionEvaluation {
+                criterion: "A different criterion".into(),
+                status: "satisfied".into(),
+                evidence: vec![CompletionEvidence {
+                    path: "src/theme.css".into(),
+                    description: "Changed theme code.".into(),
+                }],
+            }],
+            unresolved_work: vec![],
+            unrecovered_tool_failures: vec![],
+            summary: "Incomplete mapping.".into(),
+        };
+        assert!(
+            validate_completion_evaluation(
+                missing_criterion,
+                &implementation,
+                Some(&test_impact_map()),
+                &[],
+                &["src/theme.css".into()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_pull_request_is_prominently_marked_incomplete_and_resumable() {
+        let manifest = test_manifest(Uuid::from_u128(0x11111111_1111_4111_8111_111111111111));
+        let completeness = CompletionEvaluation {
+            status: ImplementationCompleteness::Partial,
+            confidence: 1.0,
+            criteria: vec![],
+            unresolved_work: vec!["Add settings integration".into()],
+            unrecovered_tool_failures: vec![],
+            summary: "Budget exhausted after one theme-provider edit.".into(),
+        };
+        let body = hosted_pull_request_body(&manifest, &[], &completeness);
+        assert!(body.contains("INCOMPLETE"));
+        assert!(body.contains("Add settings integration"));
+        assert!(body.contains("partial"));
+    }
+
+    fn test_impact_map() -> ImpactMap {
+        ImpactMap {
+            affected_subsystems: vec!["theme".into()],
+            candidate_files: vec!["src/theme.css".into()],
+            shared_abstractions: vec!["tokens".into()],
+            expected_tests: vec!["theme test".into()],
+            criterion_file_mappings: vec![ImpactCriterionMapping {
+                criterion: "Theme can be selected".into(),
+                candidate_files: vec!["src/theme.css".into()],
+            }],
+            uncertainties: vec![],
+        }
     }
 
     #[test]
@@ -3966,6 +5194,31 @@ mod tests {
         assert!(completion_request.contains("idempotency-key:"));
         assert!(completion_request.contains("\"failure_code\":\"validation_failed\""));
         assert!(!completion_request.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn duplicate_partial_completions_have_the_same_idempotency_identity() {
+        let execution_id = Uuid::from_u128(0x50505050_5050_4050_8050_505050505050);
+        let completion = CompletionRequest {
+            status: "partial_result".into(),
+            output_summary: Some("Continue implementation.".into()),
+            failure_code: None,
+            failure_message: None,
+            head_branch: Some("rustgrid/continuation".into()),
+            head_sha: Some("a".repeat(40)),
+            pull_request_number: Some(17),
+            pull_request_url: Some("https://github.com/RustGrid/example/pull/17".into()),
+        };
+        let first = completion_idempotency_key(execution_id, &completion).unwrap();
+        let second = completion_idempotency_key(execution_id, &completion).unwrap();
+        assert_eq!(first, second);
+
+        let mut changed = completion;
+        changed.output_summary = Some("Different remaining work.".into());
+        assert_ne!(
+            first,
+            completion_idempotency_key(execution_id, &changed).unwrap()
+        );
     }
 
     #[test]

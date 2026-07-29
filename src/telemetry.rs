@@ -92,6 +92,7 @@ pub struct ExecutionSnapshot {
 pub enum ExecutionStatus {
     Running,
     Succeeded,
+    NeedsContinuation,
     Failed,
     Cancelled,
 }

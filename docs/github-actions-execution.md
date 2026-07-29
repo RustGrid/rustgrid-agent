@@ -24,16 +24,27 @@ UUID and one-time nonce.
    `base_ref` is never fetched to seed a fresh execution;
 5. calls the RustGrid AI gateway through the bounded internal repository-tool
    adapter;
-6. runs required validation without execution or GitHub credentials;
+6. runs required technical validation without execution or GitHub credentials,
+   then uses a reserved fresh model context to evaluate ticket requirements
+   against the impact map, complete diff, changed paths, implementation
+   declaration, validation evidence, and unresolved tool failures;
 7. obtains a short-lived repository-scoped GitHub App token, pushes without
-   force, and creates or locates the pull request. Remote branch state is
+   force, and creates or locates the pull request. Complete work opens a normal
+   pull request; partial, incomplete, or uncertain work is preserved in a
+   prominently marked draft pull request for continuation. Remote branch state is
    reconciled with bounded retries and revalidated before publication. Before
    the token is used, the agent rechecks the exact credential-free HTTPS
    origin, unchanged Git config and unchanged branch history; tokenized Git
    disables hooks, external protocols, credential helpers, and ambient Git
    configuration;
-8. reports events plus deterministic `quality_gate:*` phase telemetry,
-   completes idempotently only after successful validation evidence, and exits.
+8. reports technical validation and implementation completeness independently,
+   and completes successfully only when every applicable criterion has concrete
+   diff evidence and all required technical gates pass.
+
+Continuation attempts reuse the deterministic branch and draft pull request,
+rerun implementation in a fresh model context, and reconcile the pull-request
+title, body, and draft state. A completed continuation removes the incomplete
+marker and marks the pull request ready for review.
 
 RustGrid revokes AI access when the execution becomes terminal, cancelled,
 timed out or lost. A revoked token stops the heartbeat supervisor and cancels

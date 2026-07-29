@@ -47,14 +47,27 @@ mission. A retry may fetch only its deterministic remote execution branch.
 Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
 internal function-tool adapter so the execution bearer never enters Codex,
 `OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
-RustGrid is authoritative for model-call usage and cost; the agent sends
-non-model execution telemetry only. Each required quality gate emits
+RustGrid is authoritative for model-call usage and cost. The hosted worker
+reserves a fresh model context for independent completion evaluation, caps
+discovery at 25 percent of the call budget, and reports implementation
+completeness separately from technical validation. Each required quality gate emits
 deterministic `phase.started` and `phase.completed` telemetry with a
 `quality_gate:*` phase name so successful completion has durable validation
 evidence.
 
-Successful completion requires the deterministic branch, 40-character head
-SHA, pull-request number and URL. The completion idempotency key is derived
+Successful completion requires implementation completeness to be `complete`
+as well as passing required gates. Partial, incomplete, or uncertain work is
+preserved on the deterministic branch and a clearly marked draft pull request
+for continuation; passing regression gates alone cannot make it successful.
+The completion endpoint must accept `partial_result` as a distinct resumable
+terminal result with branch, commit, and draft-pull-request metadata. It must
+leave the ticket out of review-ready state and expose a continuation that
+increments the execution attempt while retaining the deterministic branch.
+Deploy that control-plane contract before deploying a worker that can emit
+`partial_result`; older endpoints accept only `completed`, `failed`, and
+`cancelled` and will reject the resumable result.
+Successful completion also requires the deterministic branch, 40-character
+head SHA, pull-request number and URL. The completion idempotency key is derived
 from the complete request. Failures use stable machine-readable codes and never
 include provider response bodies. Cancellation or token revocation stops
 repository commands and suppresses unsafe publication.

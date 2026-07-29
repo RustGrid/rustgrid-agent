@@ -1033,7 +1033,12 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         RecoveryPlan::Fresh | RecoveryPlan::ResumeFromCommit { .. } => None,
     };
     let pr = if let Some((html_url, number)) = recovered_pr {
-        crate::github::PullRequest { number, html_url }
+        crate::github::PullRequest {
+            number,
+            html_url,
+            node_id: None,
+            draft: false,
+        }
     } else {
         let pr_token = tokens.token()?;
         let github = GitHubClient::new(&pr_token, &manifest.web_base_url)?;

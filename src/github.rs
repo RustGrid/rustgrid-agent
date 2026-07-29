@@ -21,6 +21,10 @@ pub struct GitHubClient {
 pub struct PullRequest {
     pub number: u64,
     pub html_url: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,11 +187,24 @@ impl GitHubClient {
         head: &str,
         base: &str,
     ) -> Result<PullRequest> {
+        self.create_pull_request_with_draft(repo, title, body, head, base, false)
+    }
+
+    pub fn create_pull_request_with_draft(
+        &self,
+        repo: &RepoConfig,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+        draft: bool,
+    ) -> Result<PullRequest> {
         let url = format!(
             "{}/repos/{}/{}/pulls",
             self.api_base_url, repo.owner, repo.name
         );
-        let payload = json!({"title": title, "body": body, "head": head, "base": base});
+        let payload =
+            json!({"title": title, "body": body, "head": head, "base": base, "draft": draft});
         let response = self.send_with_retry("create pull request", || {
             self.http
                 .post(&url)
@@ -238,6 +255,75 @@ impl GitHubClient {
         let mut pulls: Vec<PullRequest> =
             serde_json::from_str(&text).context("GitHub returned invalid pull request results")?;
         Ok(pulls.pop())
+    }
+
+    pub fn update_pull_request(
+        &self,
+        repo: &RepoConfig,
+        number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{number}",
+            self.api_base_url, repo.owner, repo.name
+        );
+        let payload = json!({"title": title, "body": body});
+        let response = self.send_with_retry("update pull request", || {
+            self.http
+                .patch(&url)
+                .bearer_auth(self.token.as_str())
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+        })?;
+        let status = response.status();
+        let text = response.text().context("could not read GitHub response")?;
+        if !status.is_success() {
+            bail!(
+                "GitHub update pull request returned {status}: {}",
+                truncate(&text, 2_000)
+            );
+        }
+        serde_json::from_str(&text).context("GitHub returned an invalid pull request response")
+    }
+
+    pub fn set_pull_request_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        let graphql_url = if self.api_base_url == "https://api.github.com" {
+            "https://api.github.com/graphql".to_owned()
+        } else {
+            format!(
+                "{}/api/graphql",
+                self.api_base_url
+                    .strip_suffix("/api/v3")
+                    .unwrap_or(&self.api_base_url)
+            )
+        };
+        let field = if draft {
+            "convertPullRequestToDraft"
+        } else {
+            "markPullRequestReadyForReview"
+        };
+        let query = format!(
+            "mutation($id:ID!){{{field}(input:{{pullRequestId:$id}}){{pullRequest{{id}}}}}}"
+        );
+        let payload = json!({"query": query, "variables": {"id": node_id}});
+        let response = self.send_with_retry("update pull request draft state", || {
+            self.http
+                .post(&graphql_url)
+                .bearer_auth(self.token.as_str())
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .json(&payload)
+        })?;
+        let status = response.status();
+        let body: serde_json::Value = response
+            .json()
+            .context("GitHub returned an invalid GraphQL response")?;
+        if !status.is_success() || body.get("errors").is_some() {
+            bail!("GitHub could not update pull request draft state ({status})");
+        }
+        Ok(())
     }
 
     pub fn check_runs(&self, repo: &RepoConfig, reference: &str) -> Result<Vec<CheckRun>> {
