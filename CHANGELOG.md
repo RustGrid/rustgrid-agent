@@ -5,6 +5,21 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.4 - 2026-07-29
+
+### Changed
+
+- Attribute hosted-execution commits to the GitHub account that initiated the
+  workflow using GitHub's ID-based private commit email format.
+
+### Fixed
+
+- Replace the unmatched `rustgrid-agent@users.noreply.github.com` commit email
+  that caused downstream deployment providers to reject agent-created commits.
+- Validate the GitHub actor login and numeric account ID before repository work,
+  including GitHub App bot identities, and fail closed when either value is
+  missing or malformed.
+
 ## 1.4.3 - 2026-07-29
 
 ### Added
