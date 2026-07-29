@@ -1051,15 +1051,14 @@ fn notebook_orchestration_state(
         searches_completed: notebook.searches_completed.clone(),
         blocking_unknowns: notebook.blocking_unknowns.clone(),
     });
-    let implementation_plan =
-        (!notebook.planned_changes.is_empty()).then(|| ImplementationPlan {
-            implementation_status: "ready".into(),
-            planned_changes: notebook.planned_changes.clone(),
-            planned_new_files: Vec::new(),
-            planned_test_changes: Vec::new(),
-            remaining_unknowns: Vec::new(),
-            blocking_unknowns: notebook.blocking_unknowns.clone(),
-        });
+    let implementation_plan = (!notebook.planned_changes.is_empty()).then(|| ImplementationPlan {
+        implementation_status: "ready".into(),
+        planned_changes: notebook.planned_changes.clone(),
+        planned_new_files: Vec::new(),
+        planned_test_changes: Vec::new(),
+        remaining_unknowns: Vec::new(),
+        blocking_unknowns: notebook.blocking_unknowns.clone(),
+    });
     let phase = if implementation_plan.is_some() {
         ExecutionPhase::Implementation
     } else if impact_map.is_some() {
@@ -2699,8 +2698,7 @@ impl<'a> GatewayAgent<'a> {
                                 if !failure.recovered
                                     && failure.target.is_some()
                                     && failure.target == target
-                                    && failure.intended_change_sha256
-                                        == intended_change_sha256
+                                    && failure.intended_change_sha256 == intended_change_sha256
                                 {
                                     failure.recovered = true;
                                 }
@@ -6308,10 +6306,7 @@ mod tests {
             ExecutionPhase::Discovery,
             "record_impact_map"
         ));
-        assert!(!phase_permits_tool(
-            ExecutionPhase::Discovery,
-            "write_file"
-        ));
+        assert!(!phase_permits_tool(ExecutionPhase::Discovery, "write_file"));
         assert!(phase_permits_tool(
             ExecutionPhase::Planning,
             "record_implementation_plan"

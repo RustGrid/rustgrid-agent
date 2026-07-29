@@ -422,7 +422,7 @@ mod tests {
             ledger.begin_model_call().unwrap();
         }
         assert!(ledger.begin_model_call().is_err());
-        assert_eq!(ledger.allocation().implementation_repair_reserved, 20);
+        assert_eq!(ledger.allocation.implementation_repair_reserved, 20);
     }
 
     #[test]

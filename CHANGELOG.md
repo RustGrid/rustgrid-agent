@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.6 - 2026-07-29
+
 ### Changed
 
 - Enforce hosted model-call budgets through explicit discovery, planning,
