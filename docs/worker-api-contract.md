@@ -48,8 +48,12 @@ Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
 internal function-tool adapter so the execution bearer never enters Codex,
 `OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
 RustGrid is authoritative for model-call usage and cost. The hosted worker
-reserves a fresh model context for independent completion evaluation, caps
-discovery at 25 percent of the call budget, and reports implementation
+reserves a fresh model context for independent completion evaluation, reports a
+25 percent discovery target for phase telemetry, and allows discovery to
+continue past that target until the required implementation impact map is
+complete. It retains the gathered turn history until the signed input ceiling
+requires trimming the oldest turns. The signed overall model-call, cost, token,
+and duration limits remain authoritative. The worker reports implementation
 completeness separately from technical validation. Each required quality gate emits
 deterministic `phase.started` and `phase.completed` telemetry with a
 `quality_gate:*` phase name so successful completion has durable validation

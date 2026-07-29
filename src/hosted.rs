@@ -916,8 +916,8 @@ struct ToolUsage {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct PhaseBudgetAllocation {
-    discovery_maximum: usize,
-    planning_maximum: usize,
+    discovery_target: usize,
+    planning_target: usize,
     implementation_repair_minimum: usize,
     completion_review_reserved: usize,
 }
@@ -1901,11 +1901,13 @@ impl<'a> GatewayAgent<'a> {
             "phases": {
                 "discovery": {
                     "consumed": self.discovery_calls,
-                    "remaining": allocation.discovery_maximum.saturating_sub(self.discovery_calls)
+                    "target": allocation.discovery_target,
+                    "over_target": self.discovery_calls.saturating_sub(allocation.discovery_target)
                 },
                 "planning": {
                     "consumed": self.planning_calls,
-                    "remaining": allocation.planning_maximum.saturating_sub(self.planning_calls)
+                    "target": allocation.planning_target,
+                    "over_target": self.planning_calls.saturating_sub(allocation.planning_target)
                 },
                 "implementation_repair": {
                     "consumed": self.implementation_calls,
@@ -1960,37 +1962,8 @@ impl<'a> GatewayAgent<'a> {
                 .unwrap_or_default()
                 .min(MAX_MODEL_CALLS_HARD_LIMIT);
             let phase_budgets = phase_budget_allocation(total_calls);
-            let maximum_calls = if allow_budget_handoff {
-                total_calls.saturating_sub(phase_budgets.completion_review_reserved)
-            } else {
-                total_calls.saturating_sub(usize::from(total_calls > 1))
-            };
-            let discovery_limit = phase_budgets.discovery_maximum;
-            if allow_budget_handoff
-                && self.impact_map.is_none()
-                && self.calls_used >= discovery_limit
-            {
-                let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
-                let summary = format!(
-                    "Discovery consumed its {}-call phase budget without producing the required implementation impact map.",
-                    discovery_limit
-                );
-                self.api.append_event(
-                    "message",
-                    json!({
-                        "step": "ai_gateway",
-                        "status": "discovery_budget_exhausted",
-                        "model_calls_used": self.calls_used,
-                        "changed_paths": changed_paths,
-                        "summary": summary
-                    }),
-                )?;
-                return Ok(ImplementationOutcome {
-                    summary,
-                    budget_exhausted: true,
-                    explicit_declaration: self.declaration.clone(),
-                });
-            }
+            let maximum_calls =
+                session_model_call_limit(total_calls, &phase_budgets, allow_budget_handoff);
             if self.calls_used >= maximum_calls {
                 let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
                 if let Some(summary) =
@@ -2036,22 +2009,12 @@ impl<'a> GatewayAgent<'a> {
                 "store": false,
                 "stream": false
             });
-            while serde_json::to_vec(&request)?.len()
-                > usize::try_from(self.manifest.ai_gateway.maximum_input_tokens).unwrap_or_default()
-                && !turns.is_empty()
-            {
-                turns.pop_front();
-                let mut reduced = vec![initial.clone()];
-                for turn in &turns {
-                    reduced.extend(turn.iter().cloned());
-                }
-                request["input"] = Value::Array(reduced);
-            }
-            if serde_json::to_vec(&request)?.len()
-                > usize::try_from(self.manifest.ai_gateway.maximum_input_tokens).unwrap_or_default()
-            {
-                bail!("hosted agent context exceeds the execution input-token ceiling");
-            }
+            fit_request_to_input_ceiling(
+                &mut request,
+                &initial,
+                &mut turns,
+                usize::try_from(self.manifest.ai_gateway.maximum_input_tokens).unwrap_or_default(),
+            )?;
 
             let call_started_in_discovery = self.impact_map.is_none();
             self.calls_used += 1;
@@ -2246,9 +2209,6 @@ impl<'a> GatewayAgent<'a> {
                 self.planning_calls = self.planning_calls.saturating_add(1);
             }
             turns.push_back(turn);
-            while turns.len() > 8 {
-                turns.pop_front();
-            }
         }
     }
 
@@ -3912,15 +3872,15 @@ fn ai_budget_exhaustion_reason(error: &anyhow::Error) -> Option<String> {
 fn phase_budget_allocation(total: usize) -> PhaseBudgetAllocation {
     if total == 0 {
         return PhaseBudgetAllocation {
-            discovery_maximum: 0,
-            planning_maximum: 0,
+            discovery_target: 0,
+            planning_target: 0,
             implementation_repair_minimum: 0,
             completion_review_reserved: 0,
         };
     }
     PhaseBudgetAllocation {
-        discovery_maximum: total.div_ceil(4),
-        planning_maximum: total.div_ceil(10),
+        discovery_target: total.div_ceil(4),
+        planning_target: total.div_ceil(10),
         implementation_repair_minimum: total.div_ceil(2),
         completion_review_reserved: if total > 1 {
             total.saturating_mul(15).div_ceil(100).max(1)
@@ -3928,6 +3888,38 @@ fn phase_budget_allocation(total: usize) -> PhaseBudgetAllocation {
             0
         },
     }
+}
+
+fn session_model_call_limit(
+    total: usize,
+    allocation: &PhaseBudgetAllocation,
+    allow_budget_handoff: bool,
+) -> usize {
+    if allow_budget_handoff {
+        total.saturating_sub(allocation.completion_review_reserved)
+    } else {
+        total.saturating_sub(usize::from(total > 1))
+    }
+}
+
+fn fit_request_to_input_ceiling(
+    request: &mut Value,
+    initial: &Value,
+    turns: &mut VecDeque<Vec<Value>>,
+    maximum_input: usize,
+) -> Result<()> {
+    while serde_json::to_vec(&request)?.len() > maximum_input && !turns.is_empty() {
+        turns.pop_front();
+        let mut reduced = vec![initial.clone()];
+        for turn in turns.iter() {
+            reduced.extend(turn.iter().cloned());
+        }
+        request["input"] = Value::Array(reduced);
+    }
+    if serde_json::to_vec(&request)?.len() > maximum_input {
+        bail!("hosted agent context exceeds the execution input-token ceiling");
+    }
+    Ok(())
 }
 
 fn should_continue_implementation(
@@ -4825,16 +4817,38 @@ mod tests {
     }
 
     #[test]
-    fn phase_budget_reserves_completion_review_without_starving_small_runs() {
+    fn discovery_target_is_advisory_while_completion_review_remains_reserved() {
         let normal = phase_budget_allocation(20);
-        assert_eq!(normal.discovery_maximum, 5);
-        assert_eq!(normal.planning_maximum, 2);
+        assert_eq!(normal.discovery_target, 5);
+        assert_eq!(normal.planning_target, 2);
         assert_eq!(normal.implementation_repair_minimum, 10);
         assert_eq!(normal.completion_review_reserved, 3);
+        assert_eq!(session_model_call_limit(20, &normal, true), 17);
+        assert!(normal.discovery_target < session_model_call_limit(20, &normal, true));
 
         let minimal = phase_budget_allocation(1);
         assert_eq!(minimal.completion_review_reserved, 0);
         assert_eq!(minimal.implementation_repair_minimum, 1);
+    }
+
+    #[test]
+    fn context_history_is_retained_until_the_input_ceiling_requires_trimming() {
+        let initial = json!({"role": "user", "content": "mission"});
+        let mut turns = (0..12)
+            .map(|index| vec![json!({"role": "assistant", "content": format!("turn-{index}")})])
+            .collect::<VecDeque<_>>();
+        let mut input = vec![initial.clone()];
+        input.extend(turns.iter().flatten().cloned());
+        let mut request = json!({
+            "model": "gpt-5.6-sol",
+            "input": input
+        });
+        fit_request_to_input_ceiling(&mut request, &initial, &mut turns, 100_000).unwrap();
+        assert_eq!(turns.len(), 12);
+
+        fit_request_to_input_ceiling(&mut request, &initial, &mut turns, 300).unwrap();
+        assert!(turns.len() < 12);
+        assert_eq!(request["input"].as_array().unwrap().first(), Some(&initial));
     }
 
     #[test]
