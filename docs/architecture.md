@@ -31,6 +31,16 @@ reason; documentation-only changes may record why automated focused validation
 is not applicable. Gates, publication, lease renewal, audit persistence, and
 cleanup are never skipped or interrupted by a Codex budget.
 
+The ephemeral GitHub Actions executor uses a separate hard phase controller.
+Its signed hosted coding budget is divided into discovery, planning,
+implementation/repair, diff-review, and completion-evaluation allocations.
+For the 40-call default these are `8/4/20/4/4`; earlier phases cannot consume
+later reservations, while unused discovery/planning calls roll forward only to
+implementation and repair. Validation and publication remain worker-owned
+phases. A versioned notebook, structured impact map and plan, search guard,
+write-progress thresholds, complete paged diff review, and fresh completion
+evaluator prevent technical gates from disguising incomplete functional work.
+
 ## Components
 
 - **Coordinator:** connects to a pre-announced worker identity, consumes the durable assignment queue, reconciles runs assigned by RustGrid, and drains on shutdown.

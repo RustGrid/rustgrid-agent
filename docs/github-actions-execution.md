@@ -23,11 +23,15 @@ UUID and one-time nonce.
    that immutable commit already present in the Actions checkout; mutable
    `base_ref` is never fetched to seed a fresh execution;
 5. calls the RustGrid AI gateway through the bounded internal repository-tool
-   adapter;
+   adapter and enforces hard discovery, planning, implementation/repair, and
+   paged diff-review allocations. The default signed 40-call policy is
+   `8/4/20/4/4`; search loops, missing phase artifacts, and missed write
+   thresholds produce durable guardrails rather than unrestricted exploration;
 6. runs required technical validation without execution or GitHub credentials,
    then uses a reserved fresh model context to evaluate ticket requirements
-   against the impact map, complete diff, changed paths, implementation
-   declaration, validation evidence, and unresolved tool failures;
+   against the impact map, implementation plan, versioned worker notebook,
+   complete diff, changed paths, implementation declaration, validation
+   evidence, and unresolved tool failures;
 7. obtains a short-lived repository-scoped GitHub App token, pushes without
    force, and creates or locates the pull request. Complete work opens a normal
    pull request; partial, incomplete, or uncertain work is preserved in a
@@ -44,7 +48,9 @@ UUID and one-time nonce.
 Continuation attempts reuse the deterministic branch and draft pull request,
 rerun implementation in a fresh model context, and reconcile the pull-request
 title, body, and draft state. A completed continuation removes the incomplete
-marker and marks the pull request ready for review.
+marker and marks the pull request ready for review. When the manifest contains
+`run.metadata.worker_notebook`, the agent skips completed discovery only if the
+base SHA, branch, and repository-diff fingerprint match the checkpoint.
 
 RustGrid revokes AI access when the execution becomes terminal, cancelled,
 timed out or lost. A revoked token stops the heartbeat supervisor and cancels
@@ -124,6 +130,14 @@ error code and request ID. They do not include response bodies for failed
 provider calls, OIDC JWTs, dispatch nonces, execution tokens or GitHub tokens.
 Cancelled completion deliberately omits failure fields, matching the terminal
 worker API contract; typed failure fields are sent only for `failed`.
+
+Failed result events retain a bounded structured diagnostic containing the
+specific failure code, active phase, total and phase call usage, tool-operation
+counts, last successful action, safe underlying error class/message, request ID
+when available, recoverability, resume phase, and recommended action. The
+legacy completion request continues sending the stable `failure_code` and
+sanitized `failure_message` until the control plane accepts the additive
+structured fields directly.
 
 Common failures:
 

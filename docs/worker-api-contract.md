@@ -47,17 +47,63 @@ mission. A retry may fetch only its deterministic remote execution branch.
 Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
 internal function-tool adapter so the execution bearer never enters Codex,
 `OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
-RustGrid is authoritative for model-call usage and cost. The hosted worker
-reserves a fresh model context for independent completion evaluation, reports a
-25 percent discovery target for phase telemetry, and allows discovery to
-continue past that target until the required implementation impact map is
-complete. It retains the gathered turn history until the signed input ceiling
-requires trimming the oldest turns. The signed overall model-call, cost, token,
-and duration limits remain authoritative. The worker reports implementation
-completeness separately from technical validation. Each required quality gate emits
-deterministic `phase.started` and `phase.completed` telemetry with a
-`quality_gate:*` phase name so successful completion has durable validation
-evidence.
+RustGrid is authoritative for model-call usage and cost. Hosted coding missions
+must carry a signed budget of at least 10 calls. The control-plane default is 40
+calls, allocated by the worker as eight discovery calls, four planning calls,
+at least 20 implementation/repair calls, four diff-review calls, and four
+completion-evaluation calls. Discovery and planning are hard maxima and cannot
+borrow later reservations. If either phase finishes early, its unused calls
+roll forward only into implementation/repair. Non-default totals use
+deterministic `20/10/50/10/10` proportional allocation with implementation and
+repair receiving at least half.
+
+Every AI request identifies one of `discovery`, `planning`, `implementation`,
+`repair`, `diff_review`, or `completion_evaluation`; worker-owned actions use
+`validation` and `publication`. The RustGrid gateway must validate this
+internal phase metadata, omit it from the upstream provider request, persist it
+on the authoritative model-call usage row, and enforce both the total and
+phase allocation. The worker emits durable phase-transition, phase-budget
+warning, search-loop guardrail, tool-usage, and notebook-checkpoint events.
+
+Discovery must produce a structured implementation impact map. Planning must
+produce a structured implementation plan before mutation tools are admitted.
+The default progress deadlines are the impact map by call 8, plan by call 12,
+first write attempt by call 16, successful write by call 20, and diff review
+starting at call 33. Search duplicates and a fourth consecutive search are
+rejected. After discovery, broad root or `src` searches are rejected and
+targeted reads must map to a planned edit, acceptance criterion, or failed
+write.
+
+The compact versioned worker notebook is included in durable worker events and
+in every subsequent model request. A continuation manifest may return it under
+`run.metadata.worker_notebook`; the worker reuses it only when the base SHA,
+deterministic branch, and repository-diff fingerprint still match. The control
+plane must checkpoint the newest notebook revision and copy it into a
+continuation execution. It must not store source excerpts, edit contents,
+credentials, or raw command output in that notebook.
+
+The implementation model must page through the complete immutable diff,
+declare changed paths and criterion evidence, and leave no unrecovered write
+failure. A fresh reserved evaluator then receives the ticket, impact map,
+implementation plan, notebook, declaration, validation outcomes, changed
+paths, failures, and complete diff. It retains the gathered turn history until
+the signed input ceiling requires trimming the oldest turns. The signed overall
+model-call, cost, token, and duration limits remain authoritative. The worker
+reports implementation completeness separately from technical validation.
+Each required quality gate emits deterministic `phase.started` and
+`phase.completed` telemetry with a `quality_gate:*` phase name so successful
+completion has durable validation evidence.
+
+This repository does not own the execution-policy default, gateway reservation
+rows, continuation checkpoint storage, generated OpenAPI clients, or AgentOps
+forms. Deploy the matching RustGrid backend contract first: default and
+validation changes, signed phase policy, gateway phase enforcement, notebook
+checkpointing, structured completion diagnostics, and resumable
+`partial_result`. Regenerate AgentOps from that OpenAPI contract and deploy its
+40-call selector and phase/continuation UI before pinning canonical workflows
+to this worker. The canonical workflow must continue accepting only
+`execution_id` and `dispatch_nonce`; model-call budgets remain authenticated
+manifest policy rather than unsigned workflow inputs.
 
 Successful completion requires implementation completeness to be `complete`
 as well as passing required gates. Partial, incomplete, or uncertain work is

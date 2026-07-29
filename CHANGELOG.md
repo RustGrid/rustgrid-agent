@@ -5,6 +5,33 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Enforce hosted model-call budgets through explicit discovery, planning,
+  implementation/repair, diff-review, completion-evaluation, validation, and
+  publication phases. A signed 40-call mission receives the hard
+  `8/4/20/4/4` allocation, while custom budgets use proportional allocation
+  and retain at least half of their calls for implementation and repair.
+- Require a machine-readable implementation plan between discovery and source
+  mutation, and preserve a versioned worker notebook in durable execution
+  events for context compaction and continuation.
+- Group repository search results by file, reject duplicate and repeated search
+  loops, restrict post-discovery inspection to mapped paths, and page complete
+  diff review before an implementation declaration can be accepted.
+- Require hosted coding missions to provide at least 10 model calls so every
+  mandatory phase has viable capacity.
+
+### Fixed
+
+- Prevent discovery and planning from borrowing reserved implementation calls,
+  prevent a final model message from bypassing missing phase artifacts, and
+  stop zero-write runs at the implementation progress deadline with a precise
+  structured blocker.
+- Preserve specific AI gateway error codes, active phase, budget consumption,
+  tool usage, last successful action, recoverability, and safe underlying
+  request diagnostics instead of collapsing every failure into a generic
+  `hosted_agent_execution_failed` result.
+
 ## 1.4.5 - 2026-07-29
 
 ### Changed
