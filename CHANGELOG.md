@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.3 - 2026-07-29
+
+### Added
+
+- Add a structured implementation impact map, final diff-review declaration,
+  independent completion evaluator, and per-phase model-budget telemetry for
+  hosted GitHub Actions executions.
+- Preserve partial work in a clearly marked draft pull request and support a
+  later continuation attempt on the same deterministic branch.
+
+### Changed
+
+- Separate implementation completeness from technical validation. A hosted
+  execution succeeds only when the evaluator proves every mapped acceptance
+  criterion from concrete diff evidence and every required technical gate
+  passes.
+- Reserve model-call capacity for completion review, batch repository
+  discovery, reconcile pull-request draft state after continuation, and report
+  `partial_result` instead of overloading failure for valid resumable work.
+
+### Fixed
+
+- Prevent passing regression tests or builds from turning a budget-exhausted,
+  partial implementation into a successful execution.
+- Block automatic success after an unrecovered source-changing tool failure,
+  a missing impact map, a stale implementation declaration, or acceptance
+  criteria without changed-path evidence.
+
 ## 1.4.2 - 2026-07-28
 
 ### Added
