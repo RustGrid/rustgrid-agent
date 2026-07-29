@@ -52,7 +52,8 @@ active repository commands.
 
 ## Required workflow environment
 
-Only the canonical workflow should populate:
+Hosted execution accepts only the canonical workflow values and GitHub-provided
+default identity values:
 
 ```text
 RUSTGRID_API_URL
@@ -64,10 +65,20 @@ GITHUB_REPOSITORY
 GITHUB_REPOSITORY_ID
 GITHUB_RUN_ID
 GITHUB_RUN_ATTEMPT
+GITHUB_ACTOR
+GITHUB_ACTOR_ID
 GITHUB_WORKFLOW_REF
 GITHUB_SHA
 GITHUB_REF
 ```
+
+GitHub provides `GITHUB_ACTOR` and `GITHUB_ACTOR_ID` as immutable default
+variables for the account that initiated the workflow. The agent validates that
+pair and configures commits as
+`<id>+<login>@users.noreply.github.com`, so GitHub and downstream deployment
+providers can associate the commit with the initiating account. Workflow reruns
+retain the original actor identity and privileges rather than attributing
+commits to a different rerun initiator.
 
 Do not add `OPENAI_API_KEY`, `CODEX_API_KEY`, `CHATGPT_TOKEN`, a permanent
 RustGrid token, or a GitHub App token. The agent fails closed if it inherits an

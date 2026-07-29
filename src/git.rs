@@ -143,20 +143,11 @@ impl Repo {
         std::fs::read(config).context("could not snapshot hosted checkout Git config")
     }
 
-    pub fn configure_hosted_author(&self) -> Result<()> {
+    pub fn configure_hosted_author(&self, name: &str, email: &str) -> Result<()> {
+        command::checked("git", ["config", "--local", "user.name", name], &self.root)?;
         command::checked(
             "git",
-            ["config", "--local", "user.name", "RustGrid Agent"],
-            &self.root,
-        )?;
-        command::checked(
-            "git",
-            [
-                "config",
-                "--local",
-                "user.email",
-                "rustgrid-agent@users.noreply.github.com",
-            ],
+            ["config", "--local", "user.email", email],
             &self.root,
         )?;
         Ok(())
@@ -1116,14 +1107,15 @@ mod tests {
             command::checked("git", ["branch", "--show-current"], &repo.root).unwrap(),
             "rustgrid/rg-1-11111111"
         );
-        repo.configure_hosted_author().unwrap();
+        repo.configure_hosted_author("octocat", "583231+octocat@users.noreply.github.com")
+            .unwrap();
         assert_eq!(
             command::checked("git", ["config", "--local", "user.name"], &repo.root).unwrap(),
-            "RustGrid Agent"
+            "octocat"
         );
         assert_eq!(
             command::checked("git", ["config", "--local", "user.email"], &repo.root).unwrap(),
-            "rustgrid-agent@users.noreply.github.com"
+            "583231+octocat@users.noreply.github.com"
         );
     }
 

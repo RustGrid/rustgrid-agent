@@ -104,6 +104,13 @@ struct GithubActionsEnvironment {
     sha: Option<String>,
     workflow_run_id: Option<i64>,
     workflow_run_attempt: Option<i32>,
+    actor: Option<String>,
+    actor_id: Option<u64>,
+}
+
+struct GithubActionsAuthor {
+    name: String,
+    email: String,
 }
 
 impl GithubActionsEnvironment {
@@ -147,6 +154,11 @@ impl GithubActionsEnvironment {
             .map(|value| value.parse::<i32>())
             .transpose()
             .context("GITHUB_RUN_ATTEMPT must be an integer")?;
+        let actor = optional_env("GITHUB_ACTOR");
+        let actor_id = optional_env("GITHUB_ACTOR_ID")
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("GITHUB_ACTOR_ID must be an integer")?;
         Ok(Self {
             api_root,
             audience,
@@ -158,6 +170,8 @@ impl GithubActionsEnvironment {
             sha,
             workflow_run_id,
             workflow_run_attempt,
+            actor,
+            actor_id,
         })
     }
 
@@ -172,7 +186,24 @@ impl GithubActionsEnvironment {
                 "GitHub Actions execution requires repository, repository ID, run ID, and run-attempt context"
             );
         }
+        self.git_author()?;
         Ok(())
+    }
+
+    fn git_author(&self) -> Result<GithubActionsAuthor> {
+        let name = self
+            .actor
+            .as_deref()
+            .filter(|value| valid_github_actor(value))
+            .context("GITHUB_ACTOR must identify a valid GitHub account")?;
+        let actor_id = self
+            .actor_id
+            .filter(|value| *value > 0)
+            .context("GITHUB_ACTOR_ID must identify a valid GitHub account")?;
+        Ok(GithubActionsAuthor {
+            name: name.to_owned(),
+            email: format!("{actor_id}+{name}@users.noreply.github.com"),
+        })
     }
 }
 
@@ -1128,6 +1159,7 @@ impl HostedExecutionPolicy {
 pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
     let environment = GithubActionsEnvironment::load(execution_id)?;
     environment.require_execute_context()?;
+    let git_author = environment.git_author()?;
     harden_hosted_process()?;
     let http = hosted_http_client()?;
     let oidc_token = request_github_oidc(&http, &environment)?;
@@ -1184,7 +1216,7 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
         1,
     );
 
-    let result = run_hosted_execution(&api, &manifest, &running);
+    let result = run_hosted_execution(&api, &manifest, &git_author, &running);
     supervisor.stop();
     let terminal_at = now_rfc3339();
     match result {
@@ -1409,6 +1441,7 @@ impl HostedSupervisor {
 fn run_hosted_execution(
     api: &HostedApiClient,
     manifest: &HostedManifest,
+    git_author: &GithubActionsAuthor,
     running: &Arc<AtomicBool>,
 ) -> Result<HostedResult> {
     ensure_running(running)?;
@@ -1445,7 +1478,7 @@ fn run_hosted_execution(
         &manifest.github.web_base_url,
     )?;
     drop(branch_token);
-    repo.configure_hosted_author()?;
+    repo.configure_hosted_author(&git_author.name, &git_author.email)?;
     let trusted_git_config = repo.hosted_local_config()?;
     let trusted_head = command::checked("git", ["rev-parse", "HEAD"], &repo.root)?;
     let baseline = BTreeSet::new();
@@ -3170,6 +3203,17 @@ fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
+fn valid_github_actor(value: &str) -> bool {
+    if value.is_empty() || value.len() > 100 || !value.is_ascii() {
+        return false;
+    }
+    let login = value.strip_suffix("[bot]").unwrap_or(value);
+    !login.is_empty()
+        && login
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn reject_inherited_provider_credentials() -> Result<()> {
     let forbidden = [
         "OPENAI_API_KEY",
@@ -4278,6 +4322,8 @@ mod tests {
             sha: Some("a".repeat(40)),
             workflow_run_id: Some(88),
             workflow_run_attempt: Some(1),
+            actor: Some("octocat".into()),
+            actor_id: Some(583_231),
         }
     }
 
@@ -4429,6 +4475,28 @@ mod tests {
         let mut missing_sha = test_environment(execution_id);
         missing_sha.sha = None;
         assert!(missing_sha.require_execute_context().is_err());
+        let mut missing_actor = test_environment(execution_id);
+        missing_actor.actor = None;
+        assert!(missing_actor.require_execute_context().is_err());
+        let mut invalid_actor = test_environment(execution_id);
+        invalid_actor.actor = Some("octocat@example.com".into());
+        assert!(invalid_actor.require_execute_context().is_err());
+        let mut missing_actor_id = test_environment(execution_id);
+        missing_actor_id.actor_id = None;
+        assert!(missing_actor_id.require_execute_context().is_err());
+
+        let author = test_environment(execution_id).git_author().unwrap();
+        assert_eq!(author.name, "octocat");
+        assert_eq!(author.email, "583231+octocat@users.noreply.github.com");
+        let mut bot_environment = test_environment(execution_id);
+        bot_environment.actor = Some("rustgrid[bot]".into());
+        bot_environment.actor_id = Some(123_456);
+        let bot_author = bot_environment.git_author().unwrap();
+        assert_eq!(bot_author.name, "rustgrid[bot]");
+        assert_eq!(
+            bot_author.email,
+            "123456+rustgrid[bot]@users.noreply.github.com"
+        );
 
         let mut wrong_permissions = exchange_response(execution_id);
         wrong_permissions.permissions.pop();
@@ -5008,6 +5076,8 @@ mod tests {
             sha: None,
             workflow_run_id: None,
             workflow_run_attempt: None,
+            actor: None,
+            actor_id: None,
         };
         let token = request_github_oidc(&hosted_http_client().unwrap(), &environment).unwrap();
         server.join().unwrap();
@@ -5053,6 +5123,8 @@ mod tests {
             sha: None,
             workflow_run_id: None,
             workflow_run_attempt: None,
+            actor: None,
+            actor_id: None,
         };
         let jwt = SecretString::new(
             format!("{}.{}.{}", "a".repeat(30), "b".repeat(30), "c".repeat(30)),
