@@ -5,6 +5,23 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.5 - 2026-07-29
+
+### Changed
+
+- Treat the 25 percent hosted discovery allocation as an advisory telemetry
+  target instead of stopping execution when it is reached.
+- Retain the complete hosted model turn history until the signed input ceiling
+  requires trimming the oldest turns.
+- Report discovery and planning consumption against targets, including calls
+  consumed beyond each target.
+
+### Fixed
+
+- Allow hosted discovery to continue past the former five-call default until
+  the required implementation impact map is complete, while preserving the
+  signed overall mission budget and independent completion-review reserve.
+
 ## 1.4.4 - 2026-07-29
 
 ### Changed
