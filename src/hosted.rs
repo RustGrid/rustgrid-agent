@@ -62,6 +62,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
 const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_CALLS_HARD_LIMIT: usize = 64;
 const MAX_REPAIR_ATTEMPTS: usize = 2;
+const MAX_AI_REGISTRATION_RETRIES: usize = 2;
 const HOSTED_NAMESPACE: Uuid = Uuid::from_u128(0xc4e820c0_9ee5_4d13_87d0_05582a548e76);
 const EXECUTION_PERMISSIONS: [&str; 7] = [
     "ai:invoke",
@@ -274,6 +275,12 @@ struct HostedHttpError {
     path: String,
     code: String,
     request_id: Option<String>,
+    upstream_provider_status: Option<u16>,
+    failure_stage: Option<String>,
+    provider_contacted: Option<bool>,
+    call_budget_consumed: Option<bool>,
+    reservation_reconciliation_state: Option<String>,
+    retryable: Option<bool>,
 }
 
 impl HostedHttpError {
@@ -288,6 +295,51 @@ impl HostedHttpError {
                     | "execution_timed_out"
                     | "execution_lost"
             )
+    }
+
+    fn is_legacy_failed_request_replay(&self) -> bool {
+        self.status == StatusCode::CONFLICT && self.code == "ai_provider_request_failed"
+    }
+
+    fn effective_code(&self) -> &str {
+        if self.is_legacy_failed_request_replay() {
+            "ai_request_idempotency_conflict"
+        } else {
+            &self.code
+        }
+    }
+
+    fn failure_stage(&self) -> Option<&str> {
+        self.failure_stage.as_deref().or_else(|| {
+            self.is_legacy_failed_request_replay()
+                .then_some("request_registration")
+        })
+    }
+
+    fn provider_contacted(&self) -> Option<bool> {
+        self.provider_contacted
+            .or_else(|| self.is_legacy_failed_request_replay().then_some(false))
+    }
+
+    fn call_budget_consumed(&self) -> Option<bool> {
+        self.call_budget_consumed
+            .or_else(|| self.is_legacy_failed_request_replay().then_some(false))
+    }
+
+    fn reservation_reconciliation_state(&self) -> Option<&str> {
+        self.reservation_reconciliation_state
+            .as_deref()
+            .or_else(|| {
+                self.is_legacy_failed_request_replay()
+                    .then_some("previous_request_settled")
+            })
+    }
+
+    fn retryable_registration_failure(&self) -> bool {
+        self.retryable == Some(true)
+            && self.failure_stage() == Some("request_registration")
+            && self.provider_contacted() == Some(false)
+            && self.call_budget_consumed() == Some(false)
     }
 }
 
@@ -594,6 +646,14 @@ impl HostedApiClient {
         )
     }
 
+    fn session_id(&self) -> Result<Uuid> {
+        Ok(self
+            .auth
+            .lock()
+            .map_err(|_| anyhow!("execution-token lock is poisoned"))?
+            .session_id)
+    }
+
     fn send_json<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -662,6 +722,25 @@ fn completion_idempotency_key(execution_id: Uuid, completion: &CompletionRequest
     ]
     .concat();
     Ok(Uuid::new_v5(&HOSTED_NAMESPACE, &key_material))
+}
+
+fn ai_response_idempotency_key(
+    execution_id: Uuid,
+    execution_attempt: i32,
+    worker_session_id: Uuid,
+    call_index: usize,
+) -> Uuid {
+    let attempt = execution_attempt.to_be_bytes();
+    let call_index = call_index.to_be_bytes();
+    let key_material = [
+        b"ai-registration:".as_slice(),
+        execution_id.as_bytes().as_slice(),
+        attempt.as_slice(),
+        worker_session_id.as_bytes().as_slice(),
+        call_index.as_slice(),
+    ]
+    .concat();
+    Uuid::new_v5(&HOSTED_NAMESPACE, &key_material)
 }
 
 #[derive(Deserialize)]
@@ -1162,6 +1241,18 @@ struct HostedAgentExecutionFailure {
     semantic_status: Option<ArtifactSemanticStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     persistence_status: Option<ArtifactPersistenceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rustgrid_gateway_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_provider_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_contacted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_budget_consumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reservation_reconciliation_state: Option<String>,
 }
 
 impl std::fmt::Display for HostedAgentExecutionFailure {
@@ -2690,9 +2781,8 @@ impl<'a> GatewayAgent<'a> {
         recommended_action: &str,
     ) -> anyhow::Error {
         let phase = self.phases.active();
-        let (underlying_type, underlying_message, stack_reference) = if let Some(http) =
-            underlying.and_then(|error| error.downcast_ref::<HostedHttpError>())
-        {
+        let http = underlying.and_then(|error| error.downcast_ref::<HostedHttpError>());
+        let (underlying_type, underlying_message, stack_reference) = if let Some(http) = http {
             (
                 "rustgrid_http_error".to_owned(),
                 http.to_string(),
@@ -2734,6 +2824,16 @@ impl<'a> GatewayAgent<'a> {
             artifact: None,
             semantic_status: None,
             persistence_status: None,
+            rustgrid_gateway_status: http.map(|failure| failure.status.as_u16()),
+            upstream_provider_status: http.and_then(|failure| failure.upstream_provider_status),
+            failure_stage: http
+                .and_then(HostedHttpError::failure_stage)
+                .map(str::to_owned),
+            provider_contacted: http.and_then(HostedHttpError::provider_contacted),
+            call_budget_consumed: http.and_then(HostedHttpError::call_budget_consumed),
+            reservation_reconciliation_state: http
+                .and_then(HostedHttpError::reservation_reconciliation_state)
+                .map(str::to_owned),
         })
     }
 
@@ -2773,6 +2873,12 @@ impl<'a> GatewayAgent<'a> {
             artifact: Some("impact_map".into()),
             semantic_status: Some(semantic_status),
             persistence_status: Some(persistence_status),
+            rustgrid_gateway_status: None,
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_reconciliation_state: None,
         })
     }
 
@@ -3026,6 +3132,7 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<ImplementationOutcome> {
         let mut initial = json!({"role": "user", "content": prompt});
         let mut turns = VecDeque::<Vec<Value>>::new();
+        let mut registration_retries = 0;
         loop {
             ensure_running(self.running)?;
             if let Some(outcome) = self.prepare_next_model_call(allow_budget_handoff)? {
@@ -3069,16 +3176,12 @@ impl<'a> GatewayAgent<'a> {
 
             let call_phase = self.phases.active();
             let model_call = self.phases.begin_model_call()?;
-            let request_sha = Sha256::digest(serde_json::to_vec(&request)?);
-            let call_number = model_call.to_be_bytes();
-            let idempotency_material = [
-                b"ai:".as_slice(),
-                self.manifest.execution.execution_id.as_bytes().as_slice(),
-                call_number.as_slice(),
-                request_sha.as_slice(),
-            ]
-            .concat();
-            let idempotency_key = Uuid::new_v5(&HOSTED_NAMESPACE, &idempotency_material);
+            let idempotency_key = ai_response_idempotency_key(
+                self.manifest.execution.execution_id,
+                self.api.execution_attempt,
+                self.api.session_id()?,
+                model_call.saturating_sub(1),
+            );
             self.api.append_event(
                 "progress",
                 json!({
@@ -3092,8 +3195,58 @@ impl<'a> GatewayAgent<'a> {
                 }),
             )?;
             let response = match self.api.ai_response(request, idempotency_key) {
-                Ok(response) => response,
+                Ok(response) => {
+                    registration_retries = 0;
+                    response
+                }
                 Err(error) => {
+                    let http = error.downcast_ref::<HostedHttpError>();
+                    let call_was_not_consumed =
+                        http.and_then(HostedHttpError::call_budget_consumed) == Some(false);
+                    if call_was_not_consumed {
+                        self.phases.rollback_model_call(call_phase)?;
+                        let retryable = http
+                            .is_some_and(HostedHttpError::retryable_registration_failure)
+                            && registration_retries < MAX_AI_REGISTRATION_RETRIES;
+                        self.append_event_recoverable(
+                            "progress",
+                            json!({
+                                "event_type": if retryable {
+                                    "execution.ai.retryable_failure"
+                                } else {
+                                    "execution.ai.registration_failure"
+                                },
+                                "call_index": model_call.saturating_sub(1),
+                                "execution_attempt": self.api.execution_attempt,
+                                "worker_session_id": self.api.session_id()?,
+                                "failure_stage": http
+                                    .and_then(HostedHttpError::failure_stage)
+                                    .unwrap_or("request_registration"),
+                                "rustgrid_gateway_status": http
+                                    .map(|failure| failure.status.as_u16()),
+                                "upstream_provider_status": http
+                                    .and_then(|failure| failure.upstream_provider_status),
+                                "provider_contacted": http
+                                    .and_then(HostedHttpError::provider_contacted)
+                                    .unwrap_or(false),
+                                "call_budget_consumed": false,
+                                "reservation_reconciliation_state": http
+                                    .and_then(
+                                        HostedHttpError::reservation_reconciliation_state
+                                    ),
+                                "retryable": retryable,
+                                "registration_retry": registration_retries,
+                                "budget": self.budget_telemetry(),
+                                "notebook": self.notebook,
+                            }),
+                            "AI request registration failure telemetry",
+                        );
+                        if retryable {
+                            thread::sleep(retry_delay(registration_retries));
+                            registration_retries = registration_retries.saturating_add(1);
+                            continue;
+                        }
+                    }
                     let exhaustion_reason = ai_budget_exhaustion_reason(&error);
                     let changed_paths = self.repo.new_agent_paths(&BTreeSet::new())?;
                     if allow_budget_handoff
@@ -3123,19 +3276,31 @@ impl<'a> GatewayAgent<'a> {
                             explicit_declaration: self.declaration.clone(),
                         });
                     }
-                    let code = error
-                        .downcast_ref::<HostedHttpError>()
-                        .map(|failure| failure.code.as_str())
+                    let code = http
+                        .map(HostedHttpError::effective_code)
                         .unwrap_or("ai_gateway_request_failed");
+                    let registration_failure = http.and_then(HostedHttpError::failure_stage)
+                        == Some("request_registration");
                     return Err(self.execution_failure(
                         code,
-                        format!(
-                            "The hosted model call failed during phase `{}`.",
-                            self.phases.active().as_str()
-                        ),
+                        if registration_failure {
+                            format!(
+                                "AI request registration conflicted before provider dispatch. No model tokens or actual cost were consumed. The mission can resume from `{}`.",
+                                self.phases.active().as_str()
+                            )
+                        } else {
+                            format!(
+                                "The hosted model call failed during phase `{}`.",
+                                self.phases.active().as_str()
+                            )
+                        },
                         Some(&error),
                         true,
-                        "Retry from the persisted phase and notebook after resolving the reported cause.",
+                        if registration_failure {
+                            "Retry from the persisted phase and notebook; do not repeat repository bootstrap or discovery."
+                        } else {
+                            "Retry from the persisted phase and notebook after resolving the reported cause."
+                        },
                     ));
                 }
             };
@@ -4799,21 +4964,42 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
         .map(str::to_owned);
     if !status.is_success() {
         let bytes = read_bounded_response(response, MAX_HTTP_ERROR_BYTES).unwrap_or_default();
-        let code = serde_json::from_slice::<Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .filter(|value| safe_identifier(value, 100))
-                    .map(str::to_owned)
-            })
+        let error = serde_json::from_slice::<Value>(&bytes).ok();
+        let code = error
+            .as_ref()
+            .and_then(|value| hosted_error_field(value, "code"))
+            .and_then(Value::as_str)
+            .filter(|value| safe_identifier(value, 100))
+            .map(str::to_owned)
             .unwrap_or_else(|| format!("http_{}", status.as_u16()));
         return Err(HostedHttpError {
             status,
             path: path.to_owned(),
             code,
             request_id,
+            upstream_provider_status: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "upstream_provider_status"))
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .filter(|value| (100..=599).contains(value)),
+            failure_stage: safe_hosted_error_identifier(error.as_ref(), "failure_stage"),
+            provider_contacted: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "provider_contacted"))
+                .and_then(Value::as_bool),
+            call_budget_consumed: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "call_budget_consumed"))
+                .and_then(Value::as_bool),
+            reservation_reconciliation_state: safe_hosted_error_identifier(
+                error.as_ref(),
+                "reservation_reconciliation_state",
+            ),
+            retryable: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "retryable"))
+                .and_then(Value::as_bool),
         }
         .into());
     }
@@ -4823,6 +5009,22 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
     );
     serde_json::from_slice(&bytes)
         .with_context(|| format!("RustGrid {path} response did not match its contract"))
+}
+
+fn hosted_error_field<'a>(error: &'a Value, field: &str) -> Option<&'a Value> {
+    error.get(field).or_else(|| {
+        ["details", "diagnostics", "error"]
+            .into_iter()
+            .find_map(|container| error.get(container).and_then(|value| value.get(field)))
+    })
+}
+
+fn safe_hosted_error_identifier(error: Option<&Value>, field: &str) -> Option<String> {
+    error
+        .and_then(|value| hosted_error_field(value, field))
+        .and_then(Value::as_str)
+        .filter(|value| safe_identifier(value, 100))
+        .map(str::to_owned)
 }
 
 fn decode_success<T: DeserializeOwned>(response: Response, label: &str) -> Result<T> {
@@ -7305,6 +7507,12 @@ mod tests {
             path: "executions/id/ai/responses".into(),
             code: "ai_provider_unavailable".into(),
             request_id: Some("request-1".into()),
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_reconciliation_state: None,
+            retryable: None,
         });
         let (code, message) = safe_failure(&error, false);
         assert_eq!(code, "ai_provider_unavailable");
@@ -7345,6 +7553,12 @@ mod tests {
             artifact: None,
             semantic_status: None,
             persistence_status: None,
+            rustgrid_gateway_status: None,
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_reconciliation_state: None,
         });
         let (terminal_code, terminal_message) = safe_failure(&error, false);
         assert_eq!(terminal_code, "search_loop_detected");
@@ -7512,6 +7726,100 @@ mod tests {
         server.join().unwrap();
         let state = client.auth.lock().unwrap();
         assert_eq!(state.refresh_after, state.expires_at);
+    }
+
+    #[test]
+    fn ai_registration_idempotency_is_scoped_to_attempt_session_and_call() {
+        let execution_id = Uuid::from_u128(44);
+        let session_id = Uuid::from_u128(45);
+        let key = ai_response_idempotency_key(execution_id, 9, session_id, 0);
+
+        assert_eq!(
+            key,
+            ai_response_idempotency_key(execution_id, 9, session_id, 0)
+        );
+        assert_ne!(
+            key,
+            ai_response_idempotency_key(execution_id, 10, session_id, 0)
+        );
+        assert_ne!(
+            key,
+            ai_response_idempotency_key(execution_id, 9, Uuid::from_u128(46), 0)
+        );
+        assert_ne!(
+            key,
+            ai_response_idempotency_key(execution_id, 9, session_id, 1)
+        );
+    }
+
+    #[test]
+    fn gateway_failure_contract_separates_registration_from_provider_status() {
+        let execution_id = Uuid::from_u128(47);
+        let Some((base, _request, server)) = one_request_server(
+            "409 Conflict",
+            json!({
+                "code": "ai_call_index_conflict",
+                "details": {
+                    "failure_stage": "request_registration",
+                    "provider_contacted": false,
+                    "call_budget_consumed": false,
+                    "reservation_reconciliation_state": "released",
+                    "retryable": true
+                }
+            }),
+        ) else {
+            return;
+        };
+        let client = test_api_client(base, execution_id);
+        let error = client
+            .ai_response(
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "bounded",
+                    "max_output_tokens": 100,
+                    "store": false,
+                    "stream": false
+                }),
+                Uuid::from_u128(48),
+            )
+            .unwrap_err();
+        server.join().unwrap();
+
+        let failure = error.downcast_ref::<HostedHttpError>().unwrap();
+        assert_eq!(failure.status, StatusCode::CONFLICT);
+        assert_eq!(failure.effective_code(), "ai_call_index_conflict");
+        assert_eq!(failure.failure_stage(), Some("request_registration"));
+        assert_eq!(failure.upstream_provider_status, None);
+        assert_eq!(failure.provider_contacted(), Some(false));
+        assert_eq!(failure.call_budget_consumed(), Some(false));
+        assert_eq!(failure.reservation_reconciliation_state(), Some("released"));
+        assert!(failure.retryable_registration_failure());
+    }
+
+    #[test]
+    fn legacy_failed_replay_is_reported_as_an_idempotency_conflict() {
+        let failure = HostedHttpError {
+            status: StatusCode::CONFLICT,
+            path: "executions/id/ai/responses".into(),
+            code: "ai_provider_request_failed".into(),
+            request_id: Some("24162c59-38d5-4705-80f9-717c8c26ee29".into()),
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_reconciliation_state: None,
+            retryable: None,
+        };
+
+        assert_eq!(failure.effective_code(), "ai_request_idempotency_conflict");
+        assert_eq!(failure.failure_stage(), Some("request_registration"));
+        assert_eq!(failure.provider_contacted(), Some(false));
+        assert_eq!(failure.call_budget_consumed(), Some(false));
+        assert_eq!(
+            failure.reservation_reconciliation_state(),
+            Some("previous_request_settled")
+        );
+        assert!(!failure.retryable_registration_failure());
     }
 
     #[test]

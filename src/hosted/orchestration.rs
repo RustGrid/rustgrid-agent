@@ -292,6 +292,33 @@ impl PhaseLedger {
         Ok(self.total_calls())
     }
 
+    pub(super) fn rollback_model_call(&mut self, phase: ExecutionPhase) -> Result<()> {
+        if phase != self.active || !phase.permits_model_call() {
+            bail!(
+                "cannot roll back model call for inactive phase `{}`",
+                phase.as_str()
+            );
+        }
+        let consumed = match phase {
+            ExecutionPhase::Discovery => &mut self.discovery_calls,
+            ExecutionPhase::ArtifactRepair => &mut self.artifact_repair_calls,
+            ExecutionPhase::Planning => &mut self.planning_calls,
+            ExecutionPhase::Implementation => &mut self.implementation_calls,
+            ExecutionPhase::Repair => &mut self.repair_calls,
+            ExecutionPhase::DiffReview => &mut self.diff_review_calls,
+            ExecutionPhase::CompletionEvaluation => &mut self.completion_evaluation_calls,
+            ExecutionPhase::Validation | ExecutionPhase::Publication => unreachable!(),
+        };
+        if *consumed == 0 {
+            bail!(
+                "cannot roll back an unconsumed model call for phase `{}`",
+                phase.as_str()
+            );
+        }
+        *consumed -= 1;
+        Ok(())
+    }
+
     pub(super) fn telemetry(&self) -> serde_json::Value {
         serde_json::json!({
             "model_calls_used": self.budgeted_calls(),
@@ -505,6 +532,21 @@ mod tests {
         );
         assert_eq!(ledger.telemetry()["supplemental_artifact_repair_calls"], 1);
         assert_eq!(ledger.telemetry()["model_calls_remaining"], 32);
+    }
+
+    #[test]
+    fn failed_registration_can_restore_the_semantic_call_budget() {
+        let mut ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
+        assert_eq!(ledger.begin_model_call().unwrap(), 1);
+        assert_eq!(ledger.budgeted_calls(), 1);
+
+        ledger
+            .rollback_model_call(ExecutionPhase::Discovery)
+            .unwrap();
+
+        assert_eq!(ledger.budgeted_calls(), 0);
+        assert_eq!(ledger.total_calls(), 0);
+        assert_eq!(ledger.begin_model_call().unwrap(), 1);
     }
 
     #[test]

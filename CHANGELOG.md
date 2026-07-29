@@ -5,6 +5,22 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Scope hosted AI registration idempotency to execution ID, execution attempt,
+  worker session, and semantic call index so a later attempt cannot replay a
+  failed request from an earlier session.
+
+### Fixed
+
+- Restore the worker's phase ledger when RustGrid confirms an AI request failed
+  before provider dispatch without consuming call budget, retry only explicitly
+  retryable registration failures, and preserve the notebook and active phase.
+- Report RustGrid gateway status, upstream provider status, failure stage,
+  provider contact, budget consumption, and reservation reconciliation as
+  separate safe diagnostics. Legacy `409 ai_provider_request_failed` replays
+  are surfaced as `ai_request_idempotency_conflict`.
+
 ## 1.4.7 - 2026-07-29
 
 ### Changed

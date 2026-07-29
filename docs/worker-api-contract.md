@@ -47,6 +47,21 @@ mission. A retry may fetch only its deterministic remote execution branch.
 Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
 internal function-tool adapter so the execution bearer never enters Codex,
 `OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
+The idempotency identity is derived from execution ID, execution attempt,
+ephemeral worker session, and zero-based semantic call index. It deliberately
+does not include the request payload: an identical replay can return the
+existing registration or result, while a different payload under the same
+semantic identity must be rejected by the gateway.
+
+When RustGrid reports `failure_stage=request_registration`,
+`provider_contacted=false`, and `call_budget_consumed=false`, the worker restores
+the phase ledger and retains the current notebook and phase. It retries only
+when the gateway also marks the failure retryable, with bounded exponential
+backoff. Failure diagnostics keep `rustgrid_gateway_status` separate from
+`upstream_provider_status` and include reservation reconciliation state.
+Historical `409 ai_provider_request_failed` failed-row replays are reported as
+`ai_request_idempotency_conflict`; they are not blindly retried.
+
 RustGrid is authoritative for model-call usage and cost. Hosted coding missions
 must carry a signed budget of at least 10 calls. The control-plane default is 40
 calls, allocated by the worker as eight discovery calls, four planning calls,
