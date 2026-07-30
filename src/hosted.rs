@@ -47,9 +47,10 @@ use crate::{
 mod orchestration;
 
 #[cfg(test)]
-use orchestration::{DEFAULT_HOSTED_MODEL_CALLS, phase_budget_allocation};
+use orchestration::phase_budget_allocation;
 use orchestration::{
-    ExecutionPhase, MINIMUM_HOSTED_MODEL_CALLS, PhaseLedger, SearchGuard, SearchSignature,
+    DEFAULT_HOSTED_MODEL_CALLS, ExecutionPhase, MINIMUM_HOSTED_MODEL_CALLS, PhaseLedger,
+    SearchGuard, SearchSignature,
 };
 
 const EXECUTION_LEASE_SECONDS: i64 = 900;
@@ -57,7 +58,10 @@ const EXECUTION_TOKEN_TTL_SECONDS: i64 = 900;
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(180);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_HTTP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_HTTP_ERROR_BYTES: usize = 16 * 1024;
+const MAX_HTTP_ERROR_BYTES: usize = 128 * 1024;
+const MAX_PROVIDER_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
+const MAX_PROVIDER_ERROR_PARAMETER_BYTES: usize = 512;
+const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 48 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
 const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_CALLS_HARD_LIMIT: usize = 64;
@@ -269,18 +273,77 @@ struct HostedApiClient {
     refresh_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ProviderErrorDiagnostic {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameter: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiFailureClass {
+    RegistrationConflict,
+    RequestValidation,
+    Gateway,
+    ProviderValidation,
+    ProviderRateLimit,
+    ProviderAuthentication,
+    ProviderServer,
+    ProviderTimeout,
+    ProviderDispatchUncertain,
+}
+
+impl AiFailureClass {
+    const fn is_provider_failure(self) -> bool {
+        matches!(
+            self,
+            Self::ProviderValidation
+                | Self::ProviderRateLimit
+                | Self::ProviderAuthentication
+                | Self::ProviderServer
+                | Self::ProviderTimeout
+                | Self::ProviderDispatchUncertain
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiBudgetDisposition {
+    Restore,
+    Consumed,
+    Unknown,
+}
+
 #[derive(Debug)]
 struct HostedHttpError {
     status: StatusCode,
     path: String,
     code: String,
     request_id: Option<String>,
+    rustgrid_gateway_status: Option<Option<u16>>,
     upstream_provider_status: Option<u16>,
     failure_stage: Option<String>,
     provider_contacted: Option<bool>,
     call_budget_consumed: Option<bool>,
+    reservation_state: Option<String>,
     reservation_reconciliation_state: Option<String>,
     retryable: Option<bool>,
+    rustgrid_request_id: Option<String>,
+    transport_request_id: Option<String>,
+    provider_request_id: Option<String>,
+    provider_error: Option<ProviderErrorDiagnostic>,
+    provider_response_body: Option<Value>,
+    model_alias: Option<String>,
+    resolved_provider_model: Option<String>,
+    adapter_version: Option<String>,
+    payload_schema_version: Option<String>,
+    provider_attempts: Option<u64>,
+    actual_cost_micros: Option<u64>,
 }
 
 impl HostedHttpError {
@@ -297,23 +360,32 @@ impl HostedHttpError {
             )
     }
 
-    fn is_legacy_failed_request_replay(&self) -> bool {
-        self.status == StatusCode::CONFLICT && self.code == "ai_provider_request_failed"
-    }
-
     fn effective_code(&self) -> &str {
-        if self.is_legacy_failed_request_replay() {
-            "ai_request_idempotency_conflict"
-        } else {
-            &self.code
+        match self.failure_class() {
+            AiFailureClass::ProviderValidation => "ai_provider_invalid_request",
+            AiFailureClass::ProviderRateLimit if self.code == "ai_provider_request_failed" => {
+                "ai_provider_rate_limited"
+            }
+            AiFailureClass::ProviderAuthentication if self.code == "ai_provider_request_failed" => {
+                "ai_provider_authentication_failed"
+            }
+            AiFailureClass::ProviderServer if self.code == "ai_provider_request_failed" => {
+                "ai_provider_unavailable"
+            }
+            AiFailureClass::ProviderTimeout if self.code == "ai_provider_request_failed" => {
+                "ai_provider_timeout"
+            }
+            AiFailureClass::ProviderDispatchUncertain => "ai_request_dispatch_uncertain",
+            _ => &self.code,
         }
     }
 
     fn failure_stage(&self) -> Option<&str> {
-        self.failure_stage.as_deref().or_else(|| {
-            self.is_legacy_failed_request_replay()
-                .then_some("request_registration")
-        })
+        if self.failure_class().is_provider_failure() {
+            Some("provider_dispatch")
+        } else {
+            self.failure_stage.as_deref()
+        }
     }
 
     fn provider_contacted(&self) -> Option<bool> {
@@ -324,13 +396,176 @@ impl HostedHttpError {
         self.call_budget_consumed
     }
 
-    fn reservation_reconciliation_state(&self) -> Option<&str> {
-        self.reservation_reconciliation_state
+    fn reservation_state(&self) -> Option<&str> {
+        self.reservation_state
             .as_deref()
-            .or_else(|| {
-                self.is_legacy_failed_request_replay()
-                    .then_some("previous_request_settled")
-            })
+            .or(self.reservation_reconciliation_state.as_deref())
+    }
+
+    fn reservation_reconciliation_state(&self) -> Option<&str> {
+        self.reservation_reconciliation_state.as_deref()
+    }
+
+    fn has_definite_provider_response(&self) -> bool {
+        self.provider_contacted == Some(true) && self.upstream_provider_status.is_some()
+    }
+
+    fn failure_class(&self) -> AiFailureClass {
+        if self.code == "ai_request_dispatch_uncertain" && !self.has_definite_provider_response() {
+            return AiFailureClass::ProviderDispatchUncertain;
+        }
+        if self.has_definite_provider_response()
+            && (self.code == "ai_provider_invalid_request"
+                || matches!(self.upstream_provider_status, Some(400 | 404 | 409 | 422)))
+        {
+            return AiFailureClass::ProviderValidation;
+        }
+        if self.code == "ai_provider_rate_limited"
+            || (self.has_definite_provider_response() && self.upstream_provider_status == Some(429))
+        {
+            return AiFailureClass::ProviderRateLimit;
+        }
+        if matches!(
+            self.code.as_str(),
+            "ai_provider_authentication_failed" | "ai_provider_authentication_error"
+        ) || (self.has_definite_provider_response()
+            && matches!(self.upstream_provider_status, Some(401 | 403)))
+        {
+            return AiFailureClass::ProviderAuthentication;
+        }
+        if self.code == "ai_provider_timeout"
+            || (self.has_definite_provider_response() && self.upstream_provider_status == Some(408))
+        {
+            return AiFailureClass::ProviderTimeout;
+        }
+        if matches!(
+            self.code.as_str(),
+            "ai_provider_server_error" | "ai_provider_unavailable"
+        ) || (self.has_definite_provider_response()
+            && self
+                .upstream_provider_status
+                .is_some_and(|status| status >= 500))
+        {
+            return AiFailureClass::ProviderServer;
+        }
+        if self.has_definite_provider_response() {
+            return AiFailureClass::ProviderServer;
+        }
+        if self.failure_stage.as_deref() == Some("request_validation")
+            && self.provider_contacted == Some(false)
+        {
+            return AiFailureClass::RequestValidation;
+        }
+        if self.failure_stage.as_deref() == Some("request_registration") {
+            return AiFailureClass::RegistrationConflict;
+        }
+        AiFailureClass::Gateway
+    }
+
+    fn rustgrid_gateway_status(&self) -> Option<Option<u16>> {
+        if self.failure_class().is_provider_failure() {
+            self.rustgrid_gateway_status
+        } else {
+            self.rustgrid_gateway_status
+                .or(Some(Some(self.status.as_u16())))
+        }
+    }
+
+    fn terminal_message(&self) -> &'static str {
+        match self.failure_class() {
+            AiFailureClass::RegistrationConflict => {
+                "AI request registration conflicted before provider dispatch."
+            }
+            AiFailureClass::RequestValidation => {
+                "RustGrid rejected the AI request during adapter validation."
+            }
+            AiFailureClass::Gateway => "The RustGrid AI gateway rejected the model call.",
+            AiFailureClass::ProviderValidation => {
+                "The upstream model provider rejected the request as invalid."
+            }
+            AiFailureClass::ProviderRateLimit => {
+                "The upstream model provider rate-limited the request."
+            }
+            AiFailureClass::ProviderAuthentication => {
+                "The upstream model provider rejected RustGrid's credentials or access."
+            }
+            AiFailureClass::ProviderServer => {
+                "The upstream model provider failed while processing the request."
+            }
+            AiFailureClass::ProviderTimeout => {
+                "The upstream model provider did not respond before the request deadline."
+            }
+            AiFailureClass::ProviderDispatchUncertain => {
+                "RustGrid could not determine whether the upstream provider accepted the request."
+            }
+        }
+    }
+
+    fn recommended_action(&self) -> &'static str {
+        match self.failure_class() {
+            AiFailureClass::RegistrationConflict => {
+                "Retry from the persisted phase and notebook; do not repeat repository bootstrap or discovery."
+            }
+            AiFailureClass::RequestValidation => {
+                "Correct the reported model, parameter, or schema before retrying; do not resend the unchanged invalid payload."
+            }
+            AiFailureClass::ProviderValidation => {
+                "Correct the reported provider parameter or schema before retrying; do not resend the unchanged invalid payload."
+            }
+            AiFailureClass::ProviderDispatchUncertain => {
+                "Reconcile the provider attempt before retrying to avoid duplicate model work."
+            }
+            _ => "Retry from the persisted phase and notebook after resolving the reported cause.",
+        }
+    }
+
+    fn budget_disposition(&self) -> AiBudgetDisposition {
+        if self.call_budget_consumed == Some(true) {
+            return AiBudgetDisposition::Consumed;
+        }
+        let safe_registration_release = self.failure_class()
+            == AiFailureClass::RegistrationConflict
+            && self.provider_contacted == Some(false)
+            && self.call_budget_consumed == Some(false);
+        let safe_preflight_rejection = self.failure_class() == AiFailureClass::RequestValidation
+            && self.provider_contacted == Some(false)
+            && self.call_budget_consumed == Some(false)
+            && self.actual_cost_micros == Some(0)
+            && self.reservation_state() == Some("not_created");
+        let confirmed_pre_dispatch_release = self.provider_contacted == Some(false)
+            && self.upstream_provider_status.is_none()
+            && self.call_budget_consumed == Some(false)
+            && self.actual_cost_micros == Some(0)
+            && matches!(
+                self.reservation_state(),
+                Some(
+                    "not_created"
+                        | "released"
+                        | "reconciled"
+                        | "failed_before_dispatch"
+                        | "previous_request_settled"
+                )
+            );
+        let confirmed_non_billable_validation = self.failure_class()
+            == AiFailureClass::ProviderValidation
+            && self.has_definite_provider_response()
+            && self.call_budget_consumed == Some(false)
+            && self.actual_cost_micros == Some(0);
+        if safe_registration_release
+            || safe_preflight_rejection
+            || confirmed_pre_dispatch_release
+            || confirmed_non_billable_validation
+        {
+            AiBudgetDisposition::Restore
+        } else {
+            AiBudgetDisposition::Unknown
+        }
+    }
+
+    fn retryable_gateway_transport_failure(&self) -> bool {
+        !self.has_definite_provider_response()
+            && self.failure_class() == AiFailureClass::Gateway
+            && retryable_status(self.status)
     }
 
     fn retryable_registration_failure(&self) -> bool {
@@ -563,10 +798,21 @@ impl HostedApiClient {
                 .json(&body)
                 .send();
             match response {
-                Ok(response) if retryable_status(response.status()) && attempt < 2 => {
-                    thread::sleep(retry_delay(attempt));
+                Ok(response) if response.status().is_success() => {
+                    return decode_response(response, &path);
                 }
-                Ok(response) => return decode_response(response, &path),
+                Ok(response) => {
+                    let error = decode_response::<Value>(response, &path)
+                        .expect_err("non-success AI gateway responses must decode as failures");
+                    let can_retry_transport = error
+                        .downcast_ref::<HostedHttpError>()
+                        .is_some_and(HostedHttpError::retryable_gateway_transport_failure);
+                    if can_retry_transport && attempt < 2 {
+                        thread::sleep(retry_delay(attempt));
+                    } else {
+                        return Err(error);
+                    }
+                }
                 Err(_) if attempt < 2 => thread::sleep(retry_delay(attempt)),
                 Err(_) => bail!("RustGrid {path} transport failed"),
             }
@@ -962,6 +1208,40 @@ impl std::fmt::Display for ExecutionBudgetMismatch {
 
 impl std::error::Error for ExecutionBudgetMismatch {}
 
+#[derive(Debug)]
+struct HostedProviderContractFailure {
+    code: String,
+    message: String,
+}
+
+impl HostedProviderContractFailure {
+    fn from_validation(error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        let code = message
+            .split_once(':')
+            .map(|(code, _)| code)
+            .filter(|code| {
+                matches!(
+                    *code,
+                    "ai_provider_request_invalid"
+                        | "ai_tool_schema_invalid"
+                        | "ai_response_schema_invalid"
+                )
+            })
+            .unwrap_or("ai_provider_request_invalid")
+            .to_owned();
+        Self { code, message }
+    }
+}
+
+impl std::fmt::Display for HostedProviderContractFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostedProviderContractFailure {}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HostedExecutionPolicy {
     policy_version: i32,
@@ -1309,7 +1589,7 @@ struct HostedAgentExecutionFailure {
     #[serde(skip_serializing_if = "Option::is_none")]
     persistence_status: Option<ArtifactPersistenceStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rustgrid_gateway_status: Option<u16>,
+    rustgrid_gateway_status: Option<Option<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_provider_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1319,7 +1599,31 @@ struct HostedAgentExecutionFailure {
     #[serde(skip_serializing_if = "Option::is_none")]
     call_budget_consumed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reservation_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reservation_reconciliation_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rustgrid_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_error: Option<ProviderErrorDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_response_body: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_provider_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_schema_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_attempts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_cost_micros: Option<u64>,
 }
 
 impl std::fmt::Display for HostedAgentExecutionFailure {
@@ -2084,6 +2388,9 @@ fn run_hosted_execution(
     running: &Arc<AtomicBool>,
 ) -> Result<HostedResult> {
     ensure_running(running)?;
+    if let Err(error) = validate_hosted_provider_startup_contract(manifest) {
+        return Err(HostedProviderContractFailure::from_validation(error).into());
+    }
     let containment = command::HostedProcessContainment::new()
         .context("hosted repository process containment is unavailable")?;
     let repo = Repo::discover()?;
@@ -2875,7 +3182,7 @@ impl<'a> GatewayAgent<'a> {
                 message: underlying_message,
                 stack_reference,
             },
-            model_calls_used: self.phases.total_calls(),
+            model_calls_used: self.phases.budgeted_calls(),
             model_calls_limit: self.phases.total_limit(),
             model_calls_remaining: self
                 .phases
@@ -2891,16 +3198,31 @@ impl<'a> GatewayAgent<'a> {
             artifact: None,
             semantic_status: None,
             persistence_status: None,
-            rustgrid_gateway_status: http.map(|failure| failure.status.as_u16()),
+            rustgrid_gateway_status: http.and_then(HostedHttpError::rustgrid_gateway_status),
             upstream_provider_status: http.and_then(|failure| failure.upstream_provider_status),
             failure_stage: http
                 .and_then(HostedHttpError::failure_stage)
                 .map(str::to_owned),
             provider_contacted: http.and_then(HostedHttpError::provider_contacted),
             call_budget_consumed: http.and_then(HostedHttpError::call_budget_consumed),
+            reservation_state: http
+                .and_then(HostedHttpError::reservation_state)
+                .map(str::to_owned),
             reservation_reconciliation_state: http
                 .and_then(HostedHttpError::reservation_reconciliation_state)
                 .map(str::to_owned),
+            rustgrid_request_id: http.and_then(|failure| failure.rustgrid_request_id.clone()),
+            transport_request_id: http.and_then(|failure| failure.transport_request_id.clone()),
+            provider_request_id: http.and_then(|failure| failure.provider_request_id.clone()),
+            provider_error: http.and_then(|failure| failure.provider_error.clone()),
+            provider_response_body: http.and_then(|failure| failure.provider_response_body.clone()),
+            model_alias: http.and_then(|failure| failure.model_alias.clone()),
+            resolved_provider_model: http
+                .and_then(|failure| failure.resolved_provider_model.clone()),
+            adapter_version: http.and_then(|failure| failure.adapter_version.clone()),
+            payload_schema_version: http.and_then(|failure| failure.payload_schema_version.clone()),
+            provider_attempts: http.and_then(|failure| failure.provider_attempts),
+            actual_cost_micros: http.and_then(|failure| failure.actual_cost_micros),
         })
     }
 
@@ -2945,7 +3267,19 @@ impl<'a> GatewayAgent<'a> {
             failure_stage: None,
             provider_contacted: None,
             call_budget_consumed: None,
+            reservation_state: None,
             reservation_reconciliation_state: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
         })
     }
 
@@ -3224,13 +3558,13 @@ impl<'a> GatewayAgent<'a> {
                 "tools": hosted_tools_for_phase(active_phase),
                 "tool_choice": "auto",
                 "parallel_tool_calls": false,
-                "metadata": {
-                    "execution_id": self.manifest.execution.execution_id,
-                    "ticket_key": self.manifest.ticket_key,
-                    "agent": "rustgrid-agent-hosted",
-                    "phase": active_phase.as_str(),
-                    "model_call_budget": self.budget.resolved_model_call_budget,
-                },
+                "metadata": provider_request_metadata(
+                    self.manifest.execution.execution_id,
+                    self.manifest.ticket_key.as_str(),
+                    "rustgrid-agent-hosted",
+                    active_phase,
+                    self.budget.resolved_model_call_budget,
+                ),
                 "store": false,
                 "stream": false
             });
@@ -3240,6 +3574,7 @@ impl<'a> GatewayAgent<'a> {
                 &mut turns,
                 usize::try_from(self.manifest.ai_gateway.maximum_input_tokens).unwrap_or_default(),
             )?;
+            validate_provider_request_envelope(&request)?;
 
             let call_phase = self.phases.active();
             let model_call = self.phases.begin_model_call()?;
@@ -3270,69 +3605,88 @@ impl<'a> GatewayAgent<'a> {
                 }
                 Err(error) => {
                     let http = error.downcast_ref::<HostedHttpError>();
-                    let call_was_not_consumed =
-                        http.and_then(HostedHttpError::call_budget_consumed) == Some(false);
-                    if call_was_not_consumed {
+                    let budget_disposition = http
+                        .map(HostedHttpError::budget_disposition)
+                        .unwrap_or(AiBudgetDisposition::Unknown);
+                    if budget_disposition == AiBudgetDisposition::Restore {
                         self.phases.rollback_model_call(call_phase)?;
-                        let registration_can_retry =
-                            http.is_some_and(HostedHttpError::retryable_registration_failure);
-                        let retryable = registration_can_retry
-                            && registration_attempt + 1 < MAX_AI_REGISTRATION_ATTEMPTS;
-                        let retries_exhausted = registration_can_retry && !retryable;
-                        self.append_event_recoverable(
-                            "progress",
-                            json!({
-                                "event_type": if retryable {
-                                    "execution.ai.registration_retry"
-                                } else {
-                                    "execution.ai.registration_failure"
-                                },
-                                "semantic_call_id": registration.semantic_call_id,
-                                "call_index": model_call.saturating_sub(1),
-                                "execution_attempt": self.api.execution_attempt,
-                                "worker_session_id": self.api.session_id()?,
-                                "failure_stage": http
-                                    .and_then(HostedHttpError::failure_stage)
-                                    .unwrap_or("request_registration"),
-                                "rustgrid_gateway_status": http
-                                    .map(|failure| failure.status.as_u16()),
-                                "upstream_provider_status": http
-                                    .and_then(|failure| failure.upstream_provider_status),
-                                "provider_contacted": http
-                                    .and_then(HostedHttpError::provider_contacted)
-                                    .unwrap_or(false),
-                                "call_budget_consumed": false,
-                                "reservation_reconciliation_state": http
-                                    .and_then(
-                                        HostedHttpError::reservation_reconciliation_state
+                        if http.is_some_and(|failure| {
+                            failure.failure_class() == AiFailureClass::RegistrationConflict
+                        }) {
+                            let registration_can_retry =
+                                http.is_some_and(HostedHttpError::retryable_registration_failure);
+                            let retryable = registration_can_retry
+                                && registration_attempt + 1 < MAX_AI_REGISTRATION_ATTEMPTS;
+                            let retries_exhausted = registration_can_retry && !retryable;
+                            self.append_event_recoverable(
+                                "progress",
+                                json!({
+                                    "event_type": if retryable {
+                                        "execution.ai.registration_retry"
+                                    } else {
+                                        "execution.ai.registration_failure"
+                                    },
+                                    "semantic_call_id": registration.semantic_call_id,
+                                    "call_index": model_call.saturating_sub(1),
+                                    "execution_attempt": self.api.execution_attempt,
+                                    "worker_session_id": self.api.session_id()?,
+                                    "failure_stage": "request_registration",
+                                    "rustgrid_gateway_status": http
+                                        .and_then(HostedHttpError::rustgrid_gateway_status),
+                                    "upstream_provider_status": Value::Null,
+                                    "provider_contacted": false,
+                                    "call_budget_consumed": false,
+                                    "reservation_state": http
+                                        .and_then(HostedHttpError::reservation_state),
+                                    "reservation_reconciliation_state": http
+                                        .and_then(
+                                            HostedHttpError::reservation_reconciliation_state
+                                        ),
+                                    "reason": http
+                                        .and_then(
+                                            HostedHttpError::reservation_reconciliation_state
+                                        )
+                                        .unwrap_or("failed_before_dispatch"),
+                                    "retryable": retryable,
+                                    "registration_attempt": if retryable {
+                                        registration_attempt.saturating_add(1)
+                                    } else {
+                                        registration_attempt
+                                    },
+                                    "registration_attempts_exhausted": retries_exhausted,
+                                    "message": retries_exhausted.then_some(
+                                        "The AI request could not be registered after 3 attempts. No provider call, model budget, or actual cost was consumed."
                                     ),
-                                "reason": http
-                                    .and_then(
-                                        HostedHttpError::reservation_reconciliation_state
-                                    )
-                                    .unwrap_or("failed_before_dispatch"),
-                                "retryable": retryable,
-                                "registration_attempt": if retryable {
-                                    registration_attempt.saturating_add(1)
-                                } else {
-                                    registration_attempt
-                                },
-                                "registration_attempts_exhausted": retries_exhausted,
-                                "message": retries_exhausted.then_some(
-                                    "The AI request could not be registered after 3 attempts. No provider call, model budget, or actual cost was consumed."
+                                    "budget": self.budget_telemetry(),
+                                    "notebook": self.notebook,
+                                }),
+                                "AI request registration failure telemetry",
+                            );
+                            if retryable {
+                                thread::sleep(registration_retry_delay(
+                                    registration_attempt,
+                                    registration.semantic_call_id,
+                                ));
+                                registration_attempt = registration_attempt.saturating_add(1);
+                                continue;
+                            }
+                        } else if let Some(failure) = http.filter(|failure| {
+                            failure.failure_class() == AiFailureClass::ProviderValidation
+                        }) {
+                            self.append_event_recoverable(
+                                "progress",
+                                provider_rejected_event(
+                                    failure,
+                                    &registration,
+                                    self.api.execution_attempt,
+                                    model_call,
+                                    self.manifest.ai_gateway.model.as_str(),
+                                    self.phases.budgeted_calls(),
+                                    self.budget_telemetry(),
+                                    json!(&self.notebook),
                                 ),
-                                "budget": self.budget_telemetry(),
-                                "notebook": self.notebook,
-                            }),
-                            "AI request registration failure telemetry",
-                        );
-                        if retryable {
-                            thread::sleep(registration_retry_delay(
-                                registration_attempt,
-                                registration.semantic_call_id,
-                            ));
-                            registration_attempt = registration_attempt.saturating_add(1);
-                            continue;
+                                "AI provider rejection telemetry",
+                            );
                         }
                     }
                     let exhaustion_reason = ai_budget_exhaustion_reason(&error);
@@ -3367,28 +3721,15 @@ impl<'a> GatewayAgent<'a> {
                     let code = http
                         .map(HostedHttpError::effective_code)
                         .unwrap_or("ai_gateway_request_failed");
-                    let registration_failure = http.and_then(HostedHttpError::failure_stage)
-                        == Some("request_registration");
                     return Err(self.execution_failure(
                         code,
-                        if registration_failure {
-                            format!(
-                                "AI request registration conflicted before provider dispatch. No model tokens or actual cost were consumed. The mission can resume from `{}`.",
-                                self.phases.active().as_str()
-                            )
-                        } else {
-                            format!(
-                                "The hosted model call failed during phase `{}`.",
-                                self.phases.active().as_str()
-                            )
-                        },
+                        http.map(HostedHttpError::terminal_message)
+                            .unwrap_or("The hosted model call failed."),
                         Some(&error),
                         true,
-                        if registration_failure {
-                            "Retry from the persisted phase and notebook; do not repeat repository bootstrap or discovery."
-                        } else {
-                            "Retry from the persisted phase and notebook after resolving the reported cause."
-                        },
+                        http.map(HostedHttpError::recommended_action).unwrap_or(
+                            "Retry from the persisted phase and notebook after resolving the reported cause.",
+                        ),
                     ));
                 }
             };
@@ -3787,14 +4128,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             "reasoning": {"effort": "medium"},
             "store": false,
             "stream": false,
-            "metadata": {
-                "execution_id": self.manifest.execution.execution_id,
-                "ticket_key": self.manifest.ticket_key,
-                "agent": "rustgrid-completion-evaluator",
-                "phase": ExecutionPhase::CompletionEvaluation.as_str(),
-                "model_call_budget": self.budget.resolved_model_call_budget,
-            }
+            "metadata": provider_request_metadata(
+                self.manifest.execution.execution_id,
+                self.manifest.ticket_key.as_str(),
+                "rustgrid-completion-evaluator",
+                ExecutionPhase::CompletionEvaluation,
+                self.budget.resolved_model_call_budget,
+            )
         });
+        validate_provider_request_envelope(&request)?;
         let model_call = self.phases.begin_model_call()?;
         self.api.append_event(
             "progress",
@@ -3814,10 +4156,38 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             ExecutionPhase::CompletionEvaluation,
             0,
         );
-        let evaluated = self
-            .api
-            .ai_response(request, &registration)
-            .ok()
+        let evaluated_response = match self.api.ai_response(request, &registration) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                let http = error.downcast_ref::<HostedHttpError>();
+                if http.map(HostedHttpError::budget_disposition)
+                    == Some(AiBudgetDisposition::Restore)
+                {
+                    self.phases
+                        .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
+                    if let Some(failure) = http.filter(|failure| {
+                        failure.failure_class() == AiFailureClass::ProviderValidation
+                    }) {
+                        self.append_event_recoverable(
+                            "progress",
+                            provider_rejected_event(
+                                failure,
+                                &registration,
+                                self.api.execution_attempt,
+                                model_call,
+                                self.manifest.ai_gateway.model.as_str(),
+                                self.phases.budgeted_calls(),
+                                self.budget_telemetry(),
+                                json!(&self.notebook),
+                            ),
+                            "completion evaluator provider rejection telemetry",
+                        );
+                    }
+                }
+                None
+            }
+        };
+        let evaluated = evaluated_response
             .and_then(|response| response_message_text(&response))
             .and_then(|text| parse_completion_evaluation(&text).ok())
             .and_then(|evaluation| {
@@ -5049,7 +5419,8 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
         .filter(|value| safe_identifier(value, 200))
         .map(str::to_owned);
     if !status.is_success() {
-        let bytes = read_bounded_response(response, MAX_HTTP_ERROR_BYTES).unwrap_or_default();
+        let bytes = read_bounded_response(response, MAX_HTTP_ERROR_BYTES)
+            .with_context(|| format!("could not read bounded RustGrid {path} error response"))?;
         let error = serde_json::from_slice::<Value>(&bytes).ok();
         let code = error
             .as_ref()
@@ -5063,6 +5434,10 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
             path: path.to_owned(),
             code,
             request_id,
+            rustgrid_gateway_status: optional_hosted_http_status(
+                error.as_ref(),
+                "rustgrid_gateway_status",
+            ),
             upstream_provider_status: error
                 .as_ref()
                 .and_then(|value| hosted_error_field(value, "upstream_provider_status"))
@@ -5078,6 +5453,7 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
                 .as_ref()
                 .and_then(|value| hosted_error_field(value, "call_budget_consumed"))
                 .and_then(Value::as_bool),
+            reservation_state: safe_hosted_error_identifier(error.as_ref(), "reservation_state"),
             reservation_reconciliation_state: safe_hosted_error_identifier(
                 error.as_ref(),
                 "reservation_reconciliation_state",
@@ -5086,6 +5462,39 @@ fn decode_response<T: DeserializeOwned>(response: Response, path: &str) -> Resul
                 .as_ref()
                 .and_then(|value| hosted_error_field(value, "retryable"))
                 .and_then(Value::as_bool),
+            rustgrid_request_id: safe_hosted_error_identifier(
+                error.as_ref(),
+                "rustgrid_request_id",
+            ),
+            transport_request_id: safe_hosted_error_identifier(
+                error.as_ref(),
+                "transport_request_id",
+            ),
+            provider_request_id: safe_hosted_error_identifier(
+                error.as_ref(),
+                "provider_request_id",
+            ),
+            provider_error: safe_provider_error(error.as_ref()),
+            provider_response_body: safe_provider_response_body(error.as_ref()),
+            model_alias: safe_hosted_error_identifier(error.as_ref(), "model_alias"),
+            resolved_provider_model: safe_hosted_error_identifier(
+                error.as_ref(),
+                "resolved_provider_model",
+            ),
+            adapter_version: safe_hosted_error_identifier(error.as_ref(), "adapter_version"),
+            payload_schema_version: safe_hosted_error_identifier(
+                error.as_ref(),
+                "payload_schema_version",
+            ),
+            provider_attempts: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "provider_attempts"))
+                .and_then(Value::as_u64)
+                .filter(|value| *value <= 100),
+            actual_cost_micros: error
+                .as_ref()
+                .and_then(|value| hosted_error_field(value, "actual_cost_micros"))
+                .and_then(Value::as_u64),
         }
         .into());
     }
@@ -5105,12 +5514,81 @@ fn hosted_error_field<'a>(error: &'a Value, field: &str) -> Option<&'a Value> {
     })
 }
 
+fn optional_hosted_http_status(error: Option<&Value>, field: &str) -> Option<Option<u16>> {
+    let value = error.and_then(|value| hosted_error_field(value, field))?;
+    if value.is_null() {
+        return Some(None);
+    }
+    value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| (100..=599).contains(value))
+        .map(Some)
+}
+
 fn safe_hosted_error_identifier(error: Option<&Value>, field: &str) -> Option<String> {
     error
         .and_then(|value| hosted_error_field(value, field))
         .and_then(Value::as_str)
         .filter(|value| safe_identifier(value, 100))
         .map(str::to_owned)
+}
+
+fn safe_hosted_error_text(value: Option<&Value>, maximum: usize) -> Option<String> {
+    let value = value.and_then(Value::as_str)?;
+    let sanitized = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    (!sanitized.is_empty()).then(|| truncate_text(&sanitized, maximum))
+}
+
+fn safe_provider_error(error: Option<&Value>) -> Option<ProviderErrorDiagnostic> {
+    let provider_error = error
+        .and_then(|value| hosted_error_field(value, "provider_error"))
+        .and_then(Value::as_object)?;
+    let diagnostic = ProviderErrorDiagnostic {
+        error_type: provider_error
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| safe_identifier(value, 200))
+            .map(str::to_owned),
+        code: provider_error
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|value| safe_identifier(value, 200))
+            .map(str::to_owned),
+        message: safe_hosted_error_text(
+            provider_error.get("message"),
+            MAX_PROVIDER_ERROR_MESSAGE_BYTES,
+        ),
+        parameter: safe_hosted_error_text(
+            provider_error.get("parameter"),
+            MAX_PROVIDER_ERROR_PARAMETER_BYTES,
+        ),
+    };
+    (diagnostic.error_type.is_some()
+        || diagnostic.code.is_some()
+        || diagnostic.message.is_some()
+        || diagnostic.parameter.is_some())
+    .then_some(diagnostic)
+}
+
+fn safe_provider_response_body(error: Option<&Value>) -> Option<Value> {
+    let body = error
+        .and_then(|value| value.get("details"))
+        .and_then(|details| details.get("provider_response_body"))?;
+    let encoded = serde_json::to_vec(body).ok()?;
+    if encoded.len() <= MAX_PROVIDER_RESPONSE_BODY_BYTES {
+        return Some(body.clone());
+    }
+    Some(json!({
+        "truncated": true,
+        "preview": truncate_text(
+            &String::from_utf8_lossy(&encoded),
+            MAX_PROVIDER_RESPONSE_BODY_BYTES,
+        ),
+    }))
 }
 
 fn decode_success<T: DeserializeOwned>(response: Response, label: &str) -> Result<T> {
@@ -5541,15 +6019,22 @@ fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, String) {
         );
     }
     if let Some(failure) = error.downcast_ref::<HostedHttpError>() {
+        let code = failure.effective_code().to_owned();
+        if failure.failure_class() != AiFailureClass::Gateway {
+            return (code, failure.terminal_message().to_owned());
+        }
         return (
-            failure.code.clone(),
+            code.clone(),
             format!(
                 "RustGrid rejected a hosted execution operation with {}.",
-                failure.code
+                code
             ),
         );
     }
     if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
+        return (failure.code.clone(), failure.message.clone());
+    }
+    if let Some(failure) = error.downcast_ref::<HostedProviderContractFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
     if error.downcast_ref::<ExecutionBudgetMismatch>().is_some() {
@@ -5592,6 +6077,36 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
                 "phase": failure.phase,
                 "message": failure.message,
             })
+        });
+    }
+    if let Some(failure) = error.downcast_ref::<HostedProviderContractFailure>() {
+        return json!({
+            "status": "failed",
+            "category": "hosted_agent_execution_failed",
+            "code": failure.code,
+            "phase": "request_validation",
+            "message": failure.message,
+            "underlying_error": {
+                "type": "provider_contract_validation",
+                "message": failure.message,
+                "stack_reference": null,
+            },
+            "failure_stage": "request_validation",
+            "provider_contacted": false,
+            "reservation_state": "not_created",
+            "call_budget_consumed": false,
+            "actual_cost_micros": 0,
+            "model_calls_used": 0,
+            "model_calls_limit": 0,
+            "model_calls_remaining": 0,
+            "phase_calls_used": 0,
+            "phase_calls_limit": 0,
+            "last_successful_action": {},
+            "usage": ToolUsage::default(),
+            "recoverable": true,
+            "resume_phase": "request_validation",
+            "recommended_action":
+                "Correct the exact reported provider tool, schema, or request path before dispatch.",
         });
     }
     if let Some(mismatch) = error.downcast_ref::<ExecutionBudgetMismatch>() {
@@ -6064,6 +6579,572 @@ fn ai_budget_exhaustion_reason(error: &anyhow::Error) -> Option<String> {
         .map(|failure| failure.code.clone())
 }
 
+fn provider_request_metadata(
+    execution_id: Uuid,
+    ticket_key: &str,
+    agent: &str,
+    phase: ExecutionPhase,
+    model_call_budget: i32,
+) -> Value {
+    json!({
+        "execution_id": execution_id.to_string(),
+        "ticket_key": ticket_key,
+        "agent": agent,
+        "phase": phase.as_str(),
+        "model_call_budget": model_call_budget.to_string(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_rejected_event(
+    failure: &HostedHttpError,
+    registration: &AiCallRegistration,
+    execution_attempt: i32,
+    model_call: usize,
+    configured_model: &str,
+    model_calls_used: usize,
+    budget: Value,
+    notebook: Value,
+) -> Value {
+    json!({
+        "event_type": "execution.ai.provider_rejected",
+        "semantic_call_id": registration.semantic_call_id,
+        "call_index": model_call.saturating_sub(1),
+        "execution_attempt": execution_attempt,
+        "failure_stage": "provider_dispatch",
+        "rustgrid_gateway_status": failure.rustgrid_gateway_status(),
+        "upstream_provider_status": failure.upstream_provider_status,
+        "provider_contacted": true,
+        "rustgrid_request_id": failure.rustgrid_request_id.as_deref(),
+        "transport_request_id": failure.transport_request_id.as_deref(),
+        "provider_request_id": failure.provider_request_id.as_deref(),
+        "reservation_state": failure.reservation_state(),
+        "reservation_reconciliation_state": failure.reservation_reconciliation_state(),
+        "provider_error": failure.provider_error.as_ref(),
+        "provider_response_body": failure.provider_response_body.as_ref(),
+        "provider_error_code": failure
+            .provider_error
+            .as_ref()
+            .and_then(|provider| provider.code.as_deref()),
+        "provider_error_parameter": failure
+            .provider_error
+            .as_ref()
+            .and_then(|provider| provider.parameter.as_deref()),
+        "model_alias": failure.model_alias.as_deref().unwrap_or(configured_model),
+        "resolved_provider_model": failure.resolved_provider_model.as_deref(),
+        "adapter_version": failure.adapter_version.as_deref(),
+        "payload_schema_version": failure.payload_schema_version.as_deref(),
+        "provider_attempts": failure.provider_attempts.unwrap_or(1),
+        "model_calls_used": model_calls_used,
+        "call_budget_consumed": false,
+        "actual_cost_micros": failure.actual_cost_micros.unwrap_or(0),
+        "retryable": false,
+        "message": failure.terminal_message(),
+        "budget": budget,
+        "notebook": notebook,
+    })
+}
+
+fn validate_provider_request_envelope(request: &Value) -> Result<()> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "model",
+        "input",
+        "instructions",
+        "max_output_tokens",
+        "reasoning",
+        "text",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "temperature",
+        "top_p",
+        "metadata",
+        "store",
+        "stream",
+    ];
+    let object = request
+        .as_object()
+        .ok_or_else(|| anyhow!("ai_provider_request_invalid: request must be an object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        bail!("ai_provider_request_invalid: unsupported request field `{field}`");
+    }
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty() && model.len() <= 200)
+        .ok_or_else(|| anyhow!("ai_provider_request_invalid: model must be a bounded string"))?;
+    if !safe_identifier(model, 200) {
+        bail!("ai_provider_request_invalid: model contains unsupported characters");
+    }
+    if request.get("input").is_none() {
+        bail!("ai_provider_request_invalid: input is required");
+    }
+    if request
+        .get("max_output_tokens")
+        .is_none_or(|value| value.as_i64().is_none_or(|value| value <= 0))
+    {
+        bail!("ai_provider_request_invalid: max_output_tokens must be a positive integer");
+    }
+    if request
+        .get("store")
+        .is_some_and(|value| value != &json!(false))
+    {
+        bail!("ai_provider_request_invalid: provider-side storage is not allowed");
+    }
+    if request
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        bail!("ai_provider_request_invalid: stream must be boolean");
+    }
+    if request
+        .get("parallel_tool_calls")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        bail!("ai_provider_request_invalid: parallel_tool_calls must be boolean");
+    }
+    if let Some(reasoning) = request.get("reasoning") {
+        let reasoning = reasoning
+            .as_object()
+            .ok_or_else(|| anyhow!("ai_provider_request_invalid: reasoning must be an object"))?;
+        if reasoning.keys().any(|key| key != "effort")
+            || reasoning.get("effort").is_some_and(|effort| {
+                !matches!(
+                    effort.as_str(),
+                    Some("none" | "low" | "medium" | "high" | "xhigh" | "max")
+                )
+            })
+        {
+            bail!("ai_provider_request_invalid: reasoning configuration is unsupported");
+        }
+    }
+    if let Some(tools) = request.get("tools") {
+        validate_provider_tool_definitions(tools)?;
+    }
+    if let Some(tool_choice) = request.get("tool_choice") {
+        validate_provider_tool_choice(tool_choice, request.get("tools"))?;
+    }
+    if let Some(text) = request.get("text") {
+        validate_provider_text_configuration(text)?;
+    }
+    if let Some(metadata) = request.get("metadata") {
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| anyhow!("ai_provider_request_invalid: metadata must be an object"))?;
+        if metadata.len() > 16 {
+            bail!("ai_provider_request_invalid: metadata cannot contain more than 16 entries");
+        }
+        for (key, value) in metadata {
+            if key.is_empty() || key.len() > 64 || key.chars().any(char::is_control) {
+                bail!("ai_provider_request_invalid: metadata keys must contain 1 to 64 safe bytes");
+            }
+            let value = value.as_str().ok_or_else(|| {
+                anyhow!("ai_provider_request_invalid: metadata value `{key}` must be a string")
+            })?;
+            if value.len() > 512 {
+                bail!(
+                    "ai_provider_request_invalid: metadata value `{key}` cannot exceed 512 bytes"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_hosted_provider_startup_contract(manifest: &HostedManifest) -> Result<()> {
+    let request = json!({
+        "model": manifest.ai_gateway.model,
+        "input": [{"role": "user", "content": "startup contract validation"}],
+        "max_output_tokens": manifest.ai_gateway.maximum_output_tokens.min(16_384),
+        "reasoning": {"effort": "medium"},
+        "tools": hosted_tools(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "metadata": provider_request_metadata(
+            manifest.execution.execution_id,
+            manifest.ticket_key.as_str(),
+            "rustgrid-agent-hosted",
+            ExecutionPhase::Discovery,
+            manifest
+                .model_call_budget
+                .unwrap_or(DEFAULT_HOSTED_MODEL_CALLS as i32),
+        ),
+        "store": false,
+        "stream": false,
+    });
+    validate_provider_request_envelope(&request)
+}
+
+fn validate_provider_tool_definitions(tools: &Value) -> Result<()> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| anyhow!("ai_tool_schema_invalid: tools must be an array"))?;
+    if tools.len() > 64 {
+        bail!("ai_tool_schema_invalid: tools cannot contain more than 64 functions");
+    }
+    let mut names = BTreeSet::new();
+    for (index, tool) in tools.iter().enumerate() {
+        let path = format!("tools[{index}]");
+        let object = tool
+            .as_object()
+            .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path} must be an object"))?;
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "type" | "name" | "description" | "parameters" | "strict"
+            )
+        }) || object.get("type").and_then(Value::as_str) != Some("function")
+        {
+            bail!("ai_tool_schema_invalid: {path} has an unsupported function shape");
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+            .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path}.name is invalid"))?;
+        if !names.insert(name.to_owned()) {
+            bail!("ai_tool_schema_invalid: duplicate tool name `{name}`");
+        }
+        if object
+            .get("description")
+            .is_some_and(|value| value.as_str().is_none_or(|value| value.len() > 8 * 1024))
+        {
+            bail!("ai_tool_schema_invalid: {path}.description is invalid");
+        }
+        let strict = match object.get("strict") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => bail!("ai_tool_schema_invalid: {path}.strict must be boolean"),
+        };
+        let parameters = object
+            .get("parameters")
+            .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path}.parameters is required"))?;
+        validate_provider_json_schema(parameters, &format!("{path}.parameters"), 0, strict, true)?;
+    }
+    Ok(())
+}
+
+fn validate_provider_tool_choice(tool_choice: &Value, tools: Option<&Value>) -> Result<()> {
+    if tool_choice
+        .as_str()
+        .is_some_and(|choice| matches!(choice, "auto" | "none" | "required"))
+    {
+        return Ok(());
+    }
+    let choice = tool_choice.as_object().ok_or_else(|| {
+        anyhow!("ai_provider_request_invalid: tool_choice must be a supported string or object")
+    })?;
+    if choice.len() != 2
+        || choice.get("type").and_then(Value::as_str) != Some("function")
+        || choice.get("name").and_then(Value::as_str).is_none()
+    {
+        bail!("ai_provider_request_invalid: forced tool_choice must identify one function");
+    }
+    let selected = choice["name"].as_str().unwrap_or_default();
+    let declared = tools.and_then(Value::as_array).is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(selected))
+    });
+    if !declared {
+        bail!("ai_provider_request_invalid: forced tool_choice is not declared");
+    }
+    Ok(())
+}
+
+fn validate_provider_text_configuration(text: &Value) -> Result<()> {
+    let text = text
+        .as_object()
+        .ok_or_else(|| anyhow!("ai_response_schema_invalid: text must be an object"))?;
+    if text
+        .keys()
+        .any(|key| !matches!(key.as_str(), "format" | "verbosity"))
+        || text
+            .get("verbosity")
+            .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high")))
+    {
+        bail!("ai_response_schema_invalid: text configuration is unsupported");
+    }
+    let Some(format) = text.get("format") else {
+        return Ok(());
+    };
+    let format = format
+        .as_object()
+        .ok_or_else(|| anyhow!("ai_response_schema_invalid: text.format must be an object"))?;
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") if format.len() == 1 => Ok(()),
+        Some("json_schema") => {
+            if format.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "type" | "name" | "description" | "schema" | "strict"
+                )
+            }) {
+                bail!("ai_response_schema_invalid: text.format contains an unsupported field");
+            }
+            format
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+                .ok_or_else(|| {
+                    anyhow!("ai_response_schema_invalid: text.format.name is invalid")
+                })?;
+            let strict = match format.get("strict") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    bail!("ai_response_schema_invalid: text.format.strict must be boolean")
+                }
+            };
+            let schema = format.get("schema").ok_or_else(|| {
+                anyhow!("ai_response_schema_invalid: text.format.schema is required")
+            })?;
+            validate_provider_json_schema(schema, "text.format.schema", 0, strict, true)
+                .map_err(|error| anyhow!("ai_response_schema_invalid: {error}"))
+        }
+        _ => bail!("ai_response_schema_invalid: text.format.type is unsupported"),
+    }
+}
+
+fn validate_provider_json_schema(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    strict: bool,
+    require_object: bool,
+) -> Result<()> {
+    const MAX_DEPTH: usize = 10;
+    const ALLOWED_KEYWORDS: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "description",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+    ];
+    if depth >= MAX_DEPTH {
+        bail!("ai_tool_schema_invalid: {path} exceeds the supported nesting depth");
+    }
+    let object = schema
+        .as_object()
+        .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path} must be an object"))?;
+    if let Some(keyword) = object
+        .keys()
+        .find(|keyword| !ALLOWED_KEYWORDS.contains(&keyword.as_str()))
+    {
+        bail!("ai_tool_schema_invalid: {path}.{keyword} is unsupported");
+    }
+    let schema_type = provider_schema_type(object.get("type"), path)?;
+    if require_object && schema_type.as_deref() != Some("object") {
+        bail!("ai_tool_schema_invalid: {path}.type must be object");
+    }
+    if object
+        .get("description")
+        .is_some_and(|value| !value.is_string())
+    {
+        bail!("ai_tool_schema_invalid: {path}.description must be a string");
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .filter(|values| !values.is_empty())
+            .ok_or_else(|| {
+                anyhow!("ai_tool_schema_invalid: {path}.enum must be a non-empty array")
+            })?;
+        let unique = values.iter().map(Value::to_string).collect::<BTreeSet<_>>();
+        if unique.len() != values.len() {
+            bail!("ai_tool_schema_invalid: {path}.enum contains duplicate values");
+        }
+        if values
+            .iter()
+            .any(|value| !provider_schema_type_accepts(object.get("type"), value))
+        {
+            bail!("ai_tool_schema_invalid: {path}.enum contains a value outside its declared type");
+        }
+    }
+    let has_numeric_bounds = object.contains_key("minimum") || object.contains_key("maximum");
+    if has_numeric_bounds && !matches!(schema_type.as_deref(), Some("integer" | "number")) {
+        bail!("ai_tool_schema_invalid: {path} uses numeric bounds without a numeric type");
+    }
+    for keyword in ["minimum", "maximum"] {
+        if object.get(keyword).is_some_and(|value| !value.is_number()) {
+            bail!("ai_tool_schema_invalid: {path}.{keyword} must be numeric");
+        }
+    }
+    for keyword in ["minItems", "maxItems"] {
+        if object
+            .get(keyword)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            bail!("ai_tool_schema_invalid: {path}.{keyword} must be non-negative");
+        }
+    }
+    if object
+        .get("minimum")
+        .and_then(Value::as_f64)
+        .zip(object.get("maximum").and_then(Value::as_f64))
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+        || object
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .zip(object.get("maxItems").and_then(Value::as_u64))
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        bail!("ai_tool_schema_invalid: {path} has inverted bounds");
+    }
+
+    if schema_type.as_deref() == Some("object") {
+        let empty_properties = serde_json::Map::new();
+        let properties = match object.get("properties") {
+            Some(Value::Object(properties)) => properties,
+            Some(_) => bail!("ai_tool_schema_invalid: {path}.properties must be an object"),
+            None => &empty_properties,
+        };
+        if object
+            .get("additionalProperties")
+            .is_some_and(|value| value != &Value::Bool(false))
+        {
+            bail!("ai_tool_schema_invalid: {path}.additionalProperties must be false");
+        }
+        if strict && object.get("additionalProperties") != Some(&Value::Bool(false)) {
+            bail!(
+                "ai_tool_schema_invalid: {path}.additionalProperties is required for strict schemas"
+            );
+        }
+        let empty_required = Vec::new();
+        let required = match object.get("required") {
+            Some(Value::Array(required)) => required,
+            Some(_) => bail!("ai_tool_schema_invalid: {path}.required must be an array"),
+            None => &empty_required,
+        };
+        let mut required_names = BTreeSet::new();
+        for (index, required) in required.iter().enumerate() {
+            let required = required.as_str().ok_or_else(|| {
+                anyhow!("ai_tool_schema_invalid: {path}.required[{index}] must be a string")
+            })?;
+            if !properties.contains_key(required) || !required_names.insert(required) {
+                bail!(
+                    "ai_tool_schema_invalid: {path}.required[{index}] must name one property once"
+                );
+            }
+        }
+        if strict && required_names.len() != properties.len() {
+            bail!("ai_tool_schema_invalid: {path}.required must include every strict property");
+        }
+        for (name, property) in properties {
+            if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                bail!("ai_tool_schema_invalid: {path}.properties has an invalid name");
+            }
+            validate_provider_json_schema(
+                property,
+                &format!("{path}.properties.{name}"),
+                depth + 1,
+                strict,
+                false,
+            )?;
+        }
+    } else if object.contains_key("properties")
+        || object.contains_key("required")
+        || object.contains_key("additionalProperties")
+    {
+        bail!("ai_tool_schema_invalid: {path} uses object keywords without object type");
+    }
+
+    if schema_type.as_deref() == Some("array") {
+        let items = object
+            .get("items")
+            .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path}.items is required"))?;
+        validate_provider_json_schema(items, &format!("{path}.items"), depth + 1, strict, false)?;
+    } else if object.contains_key("items")
+        || object.contains_key("minItems")
+        || object.contains_key("maxItems")
+    {
+        bail!("ai_tool_schema_invalid: {path} uses array keywords without array type");
+    }
+    Ok(())
+}
+
+fn provider_schema_type(value: Option<&Value>, path: &str) -> Result<Option<String>> {
+    let supported = |value: &str| {
+        matches!(
+            value,
+            "object" | "array" | "string" | "integer" | "number" | "boolean" | "null"
+        )
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Some(value) = value.as_str() {
+        if supported(value) {
+            return Ok(Some(value.to_owned()));
+        }
+        bail!("ai_tool_schema_invalid: {path}.type is unsupported");
+    }
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or_else(|| {
+            anyhow!("ai_tool_schema_invalid: {path}.type nullable union must contain two types")
+        })?;
+    let first = values[0]
+        .as_str()
+        .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path}.type must contain strings"))?;
+    let second = values[1]
+        .as_str()
+        .ok_or_else(|| anyhow!("ai_tool_schema_invalid: {path}.type must contain strings"))?;
+    if first == second
+        || !supported(first)
+        || !supported(second)
+        || !matches!((first, second), ("null", _) | (_, "null"))
+    {
+        bail!("ai_tool_schema_invalid: {path}.type nullable union is unsupported");
+    }
+    Ok(Some(
+        if first == "null" { second } else { first }.to_owned(),
+    ))
+}
+
+fn provider_schema_type_accepts(schema_type: Option<&Value>, value: &Value) -> bool {
+    let accepts = |schema_type: &str| match schema_type {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    };
+    match schema_type {
+        None => true,
+        Some(Value::String(schema_type)) => accepts(schema_type),
+        Some(Value::Array(schema_types)) => {
+            schema_types.iter().filter_map(Value::as_str).any(accepts)
+        }
+        Some(_) => false,
+    }
+}
+
 fn fit_request_to_input_ceiling(
     request: &mut Value,
     initial: &Value,
@@ -6528,6 +7609,85 @@ mod tests {
             exchange_response(execution_id),
         )
         .unwrap()
+    }
+
+    fn test_hosted_http_error(
+        status: StatusCode,
+        code: &str,
+        upstream_provider_status: Option<u16>,
+        provider_contacted: Option<bool>,
+    ) -> HostedHttpError {
+        HostedHttpError {
+            status,
+            path: "executions/id/ai/responses".into(),
+            code: code.into(),
+            request_id: Some("request-1".into()),
+            rustgrid_gateway_status: None,
+            upstream_provider_status,
+            failure_stage: None,
+            provider_contacted,
+            call_budget_consumed: None,
+            reservation_state: None,
+            reservation_reconciliation_state: None,
+            retryable: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
+        }
+    }
+
+    fn test_execution_failure(code: &str, message: &str) -> HostedAgentExecutionFailure {
+        HostedAgentExecutionFailure {
+            status: "failed",
+            category: "hosted_agent_execution_failed",
+            code: code.into(),
+            phase: ExecutionPhase::Discovery,
+            message: message.into(),
+            underlying_error: UnderlyingFailure {
+                r#type: "orchestration_guardrail".into(),
+                message: code.into(),
+                stack_reference: None,
+            },
+            model_calls_used: 0,
+            model_calls_limit: 40,
+            model_calls_remaining: 40,
+            phase_calls_used: 0,
+            phase_calls_limit: 8,
+            last_successful_action: json!({}),
+            usage: ToolUsage::default(),
+            recoverable: true,
+            resume_phase: "discovery".into(),
+            recommended_action: "Inspect the authoritative failure details.".into(),
+            artifact: None,
+            semantic_status: None,
+            persistence_status: None,
+            rustgrid_gateway_status: None,
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_state: None,
+            reservation_reconciliation_state: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
+        }
     }
 
     fn test_environment(execution_id: Uuid) -> GithubActionsEnvironment {
@@ -7519,7 +8679,9 @@ mod tests {
 
     #[test]
     fn hosted_tools_have_only_the_gateway_allowed_function_shape() {
-        for tool in hosted_tools() {
+        let tools = hosted_tools();
+        validate_provider_tool_definitions(&json!(&tools)).unwrap();
+        for tool in tools {
             let object = tool.as_object().unwrap();
             assert_eq!(object.get("type"), Some(&json!("function")));
             assert!(object.get("name").is_some_and(Value::is_string));
@@ -7542,6 +8704,91 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(properties, required);
             assert!(object.len() <= 5);
+        }
+    }
+
+    #[test]
+    fn provider_tool_preflight_rejects_duplicate_and_invalid_strict_schemas() {
+        let valid = json!({
+            "type": "function",
+            "name": "read_file",
+            "description": "Read one file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            "strict": true
+        });
+        let duplicate = json!([valid.clone(), valid]);
+        assert!(
+            validate_provider_tool_definitions(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate tool name")
+        );
+
+        let invalid = json!([{
+            "type": "function",
+            "name": "write_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            },
+            "strict": true
+        }]);
+        let error = validate_provider_tool_definitions(&invalid).unwrap_err();
+        assert!(error.to_string().contains("additionalProperties"));
+        assert!(error.to_string().contains("tools[0].parameters"));
+    }
+
+    #[test]
+    fn provider_schema_preflight_rejects_unsupported_keywords_and_excess_depth() {
+        let unsupported = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "pattern": "^src/"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        assert!(
+            validate_provider_json_schema(&unsupported, "schema", 0, true, true)
+                .unwrap_err()
+                .to_string()
+                .contains("schema.properties.path.pattern")
+        );
+
+        let mut nested = json!({"type": "string"});
+        for _ in 0..10 {
+            nested = json!({"type": "array", "items": nested});
+        }
+        assert!(
+            validate_provider_json_schema(&nested, "schema", 0, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("nesting depth")
+        );
+    }
+
+    #[test]
+    fn provider_schema_preflight_rejects_type_mismatches_and_missing_array_items() {
+        for (schema, expected_path) in [
+            (
+                json!({"type": "string", "enum": ["safe", 7]}),
+                "schema.enum",
+            ),
+            (json!({"type": "string", "minimum": 1}), "schema"),
+            (json!({"type": "array"}), "schema.items"),
+        ] {
+            let error =
+                validate_provider_json_schema(&schema, "schema", 0, false, false).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_path),
+                "unexpected schema error: {error}"
+            );
         }
     }
 
@@ -7604,59 +8851,57 @@ mod tests {
             path: "executions/id/ai/responses".into(),
             code: "ai_provider_unavailable".into(),
             request_id: Some("request-1".into()),
+            rustgrid_gateway_status: None,
             upstream_provider_status: None,
             failure_stage: None,
             provider_contacted: None,
             call_budget_consumed: None,
+            reservation_state: None,
             reservation_reconciliation_state: None,
             retryable: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
         });
         let (code, message) = safe_failure(&error, false);
         assert_eq!(code, "ai_provider_unavailable");
         assert_eq!(
             message,
-            "RustGrid rejected a hosted execution operation with ai_provider_unavailable."
+            "The upstream model provider failed while processing the request."
         );
         assert!(!message.contains("responses"));
     }
 
     #[test]
     fn structured_failures_preserve_phase_usage_and_actionable_cause() {
-        let error = anyhow::Error::new(HostedAgentExecutionFailure {
-            status: "failed",
-            category: "hosted_agent_execution_failed",
-            code: "search_loop_detected".into(),
-            phase: ExecutionPhase::Discovery,
-            message: "Repeated discovery search was rejected.".into(),
-            underlying_error: UnderlyingFailure {
-                r#type: "orchestration_guardrail".into(),
-                message: "duplicate_search_rejected".into(),
-                stack_reference: Some("request-2".into()),
-            },
-            model_calls_used: 7,
-            model_calls_limit: 40,
-            model_calls_remaining: 33,
-            phase_calls_used: 7,
-            phase_calls_limit: 8,
-            last_successful_action: json!({"tool": "read_files"}),
-            usage: ToolUsage {
-                reads: 6,
-                searches: 4,
-                ..ToolUsage::default()
-            },
-            recoverable: true,
-            resume_phase: "discovery".into(),
-            recommended_action: "Record the impact map.".into(),
-            artifact: None,
-            semantic_status: None,
-            persistence_status: None,
-            rustgrid_gateway_status: None,
-            upstream_provider_status: None,
-            failure_stage: None,
-            provider_contacted: None,
-            call_budget_consumed: None,
-            reservation_reconciliation_state: None,
-        });
+        let mut failure = test_execution_failure(
+            "search_loop_detected",
+            "Repeated discovery search was rejected.",
+        );
+        failure.underlying_error = UnderlyingFailure {
+            r#type: "orchestration_guardrail".into(),
+            message: "duplicate_search_rejected".into(),
+            stack_reference: Some("request-2".into()),
+        };
+        failure.model_calls_used = 7;
+        failure.model_calls_remaining = 33;
+        failure.phase_calls_used = 7;
+        failure.last_successful_action = json!({"tool": "read_files"});
+        failure.usage = ToolUsage {
+            reads: 6,
+            searches: 4,
+            ..ToolUsage::default()
+        };
+        failure.recommended_action = "Record the impact map.".into();
+        let error = anyhow::Error::new(failure);
         let (terminal_code, terminal_message) = safe_failure(&error, false);
         assert_eq!(terminal_code, "search_loop_detected");
         assert_eq!(terminal_message, "Repeated discovery search was rejected.");
@@ -7932,29 +9177,566 @@ mod tests {
     }
 
     #[test]
-    fn legacy_failed_replay_is_reported_as_an_idempotency_conflict() {
+    fn provider_http_400_is_authoritative_and_is_not_retried_as_a_gateway_failure() {
+        let execution_id = Uuid::from_u128(50);
+        let provider_request_id = "b4dd40ed-d63b-4df9-81c1-3e886f7949d5";
+        let rustgrid_request_id = "e24ad61e-ab87-485f-a2e1-6a6d9456ad0e";
+        let transport_request_id = "ed798a57-5611-4d47-b060-69c79b34ac3c";
+        let provider_message = "Invalid type for 'metadata.model_call_budget': expected a string, but got an integer instead.";
+        let Some((base, _request, server)) = one_request_server(
+            "502 Bad Gateway",
+            json!({
+                "code": "ai_provider_invalid_request",
+                "details": {
+                    "failure_stage": "provider_dispatch",
+                    "provider_contacted": true,
+                    "upstream_provider_status": 400,
+                    "rustgrid_gateway_status": null,
+                    "rustgrid_request_id": rustgrid_request_id,
+                    "transport_request_id": transport_request_id,
+                    "provider_request_id": provider_request_id,
+                    "reservation_state": "reconciled",
+                    "provider_error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_type",
+                        "message": provider_message,
+                        "parameter": "metadata.model_call_budget"
+                    },
+                    "provider_response_body": {
+                        "error": {
+                            "message": provider_message,
+                            "parameter": "metadata.model_call_budget"
+                        }
+                    },
+                    "model_alias": "gpt-5.6-sol",
+                    "resolved_provider_model": "gpt-5.6-sol",
+                    "adapter_version": "openai-responses-v1",
+                    "payload_schema_version": "rustgrid.execution_ai.responses.v1",
+                    "provider_attempts": 1,
+                    "model_calls_used": 0,
+                    "call_budget_consumed": false,
+                    "actual_cost_micros": 0,
+                    "recoverable": true
+                }
+            }),
+        ) else {
+            return;
+        };
+        let client = test_api_client(base, execution_id);
+        let registration = ai_call_registration(
+            execution_id,
+            1,
+            Uuid::from_u128(51),
+            0,
+            ExecutionPhase::Discovery,
+            0,
+        );
+        let error = client
+            .ai_response(
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "bounded",
+                    "metadata": {"model_call_budget": "40"},
+                    "store": false,
+                    "stream": false
+                }),
+                &registration,
+            )
+            .unwrap_err();
+        server.join().unwrap();
+
+        let failure = error.downcast_ref::<HostedHttpError>().unwrap();
+        assert_eq!(failure.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(failure.failure_class(), AiFailureClass::ProviderValidation);
+        assert_eq!(failure.effective_code(), "ai_provider_invalid_request");
+        assert_eq!(failure.failure_stage(), Some("provider_dispatch"));
+        assert_eq!(failure.rustgrid_gateway_status(), Some(None));
+        assert_eq!(failure.upstream_provider_status, Some(400));
+        assert_eq!(failure.provider_contacted(), Some(true));
+        assert_eq!(failure.call_budget_consumed(), Some(false));
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+        assert!(!failure.retryable_gateway_transport_failure());
+        assert!(!failure.retryable_registration_failure());
+        assert_eq!(
+            failure.terminal_message(),
+            "The upstream model provider rejected the request as invalid."
+        );
+        assert_eq!(
+            failure.provider_request_id.as_deref(),
+            Some(provider_request_id)
+        );
+        assert_eq!(
+            failure.rustgrid_request_id.as_deref(),
+            Some(rustgrid_request_id)
+        );
+        assert_eq!(
+            failure.transport_request_id.as_deref(),
+            Some(transport_request_id)
+        );
+        assert_eq!(failure.reservation_state(), Some("reconciled"));
+        let provider_error = failure.provider_error.as_ref().unwrap();
+        assert_eq!(
+            provider_error.error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(provider_error.code.as_deref(), Some("invalid_type"));
+        assert_eq!(provider_error.message.as_deref(), Some(provider_message));
+        assert_eq!(
+            provider_error.parameter.as_deref(),
+            Some("metadata.model_call_budget")
+        );
+        assert_eq!(
+            failure.provider_response_body.as_ref().unwrap()["error"]["message"],
+            provider_message
+        );
+        assert_eq!(failure.provider_attempts, Some(1));
+        assert_eq!(failure.actual_cost_micros, Some(0));
+
+        let event = provider_rejected_event(
+            failure,
+            &registration,
+            1,
+            1,
+            "gpt-5.6-sol",
+            0,
+            json!({"model_calls_used": 0}),
+            json!({"phase": "discovery"}),
+        );
+        assert_eq!(event["event_type"], "execution.ai.provider_rejected");
+        assert_eq!(event["failure_stage"], "provider_dispatch");
+        assert_eq!(event["rustgrid_gateway_status"], Value::Null);
+        assert_eq!(event["upstream_provider_status"], 400);
+        assert_eq!(event["provider_attempts"], 1);
+        assert_eq!(event["rustgrid_request_id"], rustgrid_request_id);
+        assert_eq!(event["transport_request_id"], transport_request_id);
+        assert_eq!(event["reservation_state"], "reconciled");
+        assert_eq!(event["model_calls_used"], 0);
+        assert_eq!(event["call_budget_consumed"], false);
+        assert_eq!(event["actual_cost_micros"], 0);
+        assert_eq!(
+            event["provider_error"]["message"].as_str(),
+            Some(provider_message)
+        );
+
+        let mut terminal = test_execution_failure(
+            "ai_provider_invalid_request",
+            "The upstream model provider rejected the request as invalid.",
+        );
+        terminal.rustgrid_gateway_status = failure.rustgrid_gateway_status();
+        terminal.upstream_provider_status = failure.upstream_provider_status;
+        terminal.failure_stage = failure.failure_stage().map(str::to_owned);
+        terminal.provider_contacted = failure.provider_contacted();
+        terminal.call_budget_consumed = failure.call_budget_consumed();
+        terminal.reservation_state = failure.reservation_state().map(str::to_owned);
+        terminal.rustgrid_request_id = failure.rustgrid_request_id.clone();
+        terminal.transport_request_id = failure.transport_request_id.clone();
+        terminal.provider_error = failure.provider_error.clone();
+        let terminal = serde_json::to_value(terminal).unwrap();
+        assert!(
+            terminal
+                .as_object()
+                .unwrap()
+                .contains_key("rustgrid_gateway_status")
+        );
+        assert!(terminal["rustgrid_gateway_status"].is_null());
+        assert_eq!(terminal["rustgrid_request_id"], rustgrid_request_id);
+        assert_eq!(terminal["transport_request_id"], transport_request_id);
+        assert_eq!(terminal["reservation_state"], "reconciled");
+
+        let (terminal_code, terminal_message) = safe_failure(&error, false);
+        assert_eq!(terminal_code, "ai_provider_invalid_request");
+        assert_eq!(
+            terminal_message,
+            "The upstream model provider rejected the request as invalid."
+        );
+        assert!(!terminal_message.contains("registration"));
+        assert!(!terminal_message.contains("uncertain"));
+    }
+
+    #[test]
+    fn provider_request_metadata_is_string_typed_and_preflight_rejects_integer_values() {
+        let metadata = provider_request_metadata(
+            Uuid::from_u128(52),
+            "AOPS-229",
+            "rustgrid-agent-hosted",
+            ExecutionPhase::Discovery,
+            40,
+        );
+        assert_eq!(metadata["model_call_budget"], "40");
+        assert!(metadata.as_object().unwrap().values().all(Value::is_string));
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"role": "user", "content": "bounded"}],
+            "max_output_tokens": 100,
+            "metadata": metadata,
+        });
+        validate_provider_request_envelope(&request).unwrap();
+
+        let invalid = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"role": "user", "content": "bounded"}],
+            "max_output_tokens": 100,
+            "metadata": {
+                "model_call_budget": 40
+            },
+        });
+        let error = validate_provider_request_envelope(&invalid).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ai_provider_request_invalid: metadata value `model_call_budget` must be a string"
+        );
+    }
+
+    #[test]
+    fn startup_provider_schema_failure_preserves_exact_code_path_and_zero_dispatch_evidence() {
+        let invalid = json!([{
+            "type": "function",
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "array"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }]);
+        let validation = validate_provider_tool_definitions(&invalid).unwrap_err();
+        let error = anyhow::Error::new(HostedProviderContractFailure::from_validation(validation));
+
+        let (code, message) = safe_failure(&error, false);
+        assert_eq!(code, "ai_tool_schema_invalid");
+        assert!(message.contains("tools[0].parameters.properties.path.items"));
+
+        let diagnostics = failure_diagnostics(&error, false);
+        assert_eq!(diagnostics["code"], "ai_tool_schema_invalid");
+        assert_eq!(diagnostics["failure_stage"], "request_validation");
+        assert_eq!(diagnostics["provider_contacted"], false);
+        assert_eq!(diagnostics["reservation_state"], "not_created");
+        assert_eq!(diagnostics["call_budget_consumed"], false);
+        assert_eq!(diagnostics["actual_cost_micros"], 0);
+        assert!(
+            diagnostics["message"]
+                .as_str()
+                .is_some_and(|value| value.contains("tools[0].parameters.properties.path.items"))
+        );
+    }
+
+    #[test]
+    fn large_safe_provider_400_retains_authoritative_fields_and_boundary_diagnostics() {
+        let message = "m".repeat(MAX_PROVIDER_ERROR_MESSAGE_BYTES);
+        let parameter = "p".repeat(MAX_PROVIDER_ERROR_PARAMETER_BYTES);
+        let provider_response_body = json!({
+            "error": {
+                "message": "b".repeat(32 * 1024)
+            }
+        });
+        let body = json!({
+            "code": "ai_provider_invalid_request",
+            "details": {
+                "failure_stage": "provider_dispatch",
+                "provider_contacted": true,
+                "upstream_provider_status": 400,
+                "rustgrid_gateway_status": null,
+                "call_budget_consumed": false,
+                "actual_cost_micros": 0,
+                "provider_error": {
+                    "type": "invalid_request_error",
+                    "code": "invalid_type",
+                    "message": message,
+                    "parameter": parameter
+                },
+                "provider_response_body": provider_response_body,
+                "provider_attempts": 1
+            }
+        });
+        let Some((url, receiver, handle)) = one_request_server("400 Bad Request", body) else {
+            return;
+        };
+        let response = hosted_http_client()
+            .unwrap()
+            .get(url)
+            .send()
+            .expect("provider error response");
+        let error = decode_response::<Value>(response, "executions/id/ai/responses").unwrap_err();
+        let failure = error
+            .downcast_ref::<HostedHttpError>()
+            .expect("typed hosted HTTP error");
+
+        assert_eq!(failure.effective_code(), "ai_provider_invalid_request");
+        assert_eq!(failure.failure_stage(), Some("provider_dispatch"));
+        assert_eq!(failure.provider_contacted(), Some(true));
+        assert_eq!(failure.upstream_provider_status, Some(400));
+        assert_eq!(failure.rustgrid_gateway_status(), Some(None));
+        assert_eq!(failure.call_budget_consumed(), Some(false));
+        assert_eq!(failure.actual_cost_micros, Some(0));
+        assert_eq!(failure.provider_attempts, Some(1));
+        assert_eq!(
+            failure
+                .provider_error
+                .as_ref()
+                .and_then(|diagnostic| diagnostic.message.as_deref()),
+            Some(message.as_str())
+        );
+        assert_eq!(
+            failure
+                .provider_error
+                .as_ref()
+                .and_then(|diagnostic| diagnostic.parameter.as_deref()),
+            Some(parameter.as_str())
+        );
+        assert_eq!(
+            failure.provider_response_body.as_ref(),
+            Some(&provider_response_body)
+        );
+
+        receiver.recv().unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn provider_failure_classes_have_distinct_authoritative_policies() {
+        let cases = [
+            (
+                "ai_provider_request_failed",
+                Some(400),
+                AiFailureClass::ProviderValidation,
+                "ai_provider_invalid_request",
+            ),
+            (
+                "ai_provider_rate_limited",
+                Some(429),
+                AiFailureClass::ProviderRateLimit,
+                "ai_provider_rate_limited",
+            ),
+            (
+                "ai_provider_authentication_failed",
+                Some(401),
+                AiFailureClass::ProviderAuthentication,
+                "ai_provider_authentication_failed",
+            ),
+            (
+                "ai_provider_unavailable",
+                Some(503),
+                AiFailureClass::ProviderServer,
+                "ai_provider_unavailable",
+            ),
+            (
+                "ai_provider_timeout",
+                Some(408),
+                AiFailureClass::ProviderTimeout,
+                "ai_provider_timeout",
+            ),
+        ];
+        for (code, upstream_status, class, effective_code) in cases {
+            let failure =
+                test_hosted_http_error(StatusCode::BAD_GATEWAY, code, upstream_status, Some(true));
+            assert_eq!(failure.failure_class(), class);
+            assert_eq!(failure.effective_code(), effective_code);
+            assert_eq!(failure.failure_stage(), Some("provider_dispatch"));
+            assert_eq!(failure.rustgrid_gateway_status(), None);
+            assert_eq!(failure.provider_contacted(), Some(true));
+            assert!(!failure.retryable_gateway_transport_failure());
+            assert!(!failure.terminal_message().contains("registration"));
+        }
+
+        let mut uncertain = test_hosted_http_error(
+            StatusCode::BAD_GATEWAY,
+            "ai_request_dispatch_uncertain",
+            None,
+            Some(true),
+        );
+        uncertain.failure_stage = Some("provider_dispatch".into());
+        assert_eq!(
+            uncertain.failure_class(),
+            AiFailureClass::ProviderDispatchUncertain
+        );
+        assert_eq!(uncertain.budget_disposition(), AiBudgetDisposition::Unknown);
+        assert!(uncertain.terminal_message().contains("could not determine"));
+    }
+
+    #[test]
+    fn explicit_provider_400_overrides_the_legacy_conflict_template() {
+        let mut failure = test_hosted_http_error(
+            StatusCode::CONFLICT,
+            "ai_provider_request_failed",
+            Some(400),
+            Some(true),
+        );
+        failure.failure_stage = Some("request_registration".into());
+        failure.call_budget_consumed = Some(false);
+        failure.actual_cost_micros = Some(0);
+
+        assert_eq!(failure.failure_class(), AiFailureClass::ProviderValidation);
+        assert_eq!(failure.effective_code(), "ai_provider_invalid_request");
+        assert_eq!(failure.failure_stage(), Some("provider_dispatch"));
+        assert_eq!(failure.rustgrid_gateway_status(), None);
+        assert_eq!(
+            failure.terminal_message(),
+            "The upstream model provider rejected the request as invalid."
+        );
+        assert!(!failure.retryable_registration_failure());
+    }
+
+    #[test]
+    fn definite_provider_400_overrides_stale_dispatch_uncertain_code() {
+        let mut failure = test_hosted_http_error(
+            StatusCode::BAD_GATEWAY,
+            "ai_request_dispatch_uncertain",
+            Some(400),
+            Some(true),
+        );
+        failure.call_budget_consumed = Some(false);
+        failure.actual_cost_micros = Some(0);
+
+        assert_eq!(failure.failure_class(), AiFailureClass::ProviderValidation);
+        assert_eq!(failure.effective_code(), "ai_provider_invalid_request");
+        assert_eq!(failure.failure_stage(), Some("provider_dispatch"));
+        assert_eq!(failure.upstream_provider_status, Some(400));
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+    }
+
+    #[test]
+    fn only_confirmed_non_billable_provider_validation_restores_semantic_budget() {
+        let mut failure = test_hosted_http_error(
+            StatusCode::BAD_GATEWAY,
+            "ai_provider_invalid_request",
+            Some(400),
+            Some(true),
+        );
+        failure.call_budget_consumed = Some(false);
+        failure.actual_cost_micros = Some(0);
+
+        let mut ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
+        ledger.begin_model_call().unwrap();
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+        ledger
+            .rollback_model_call(ExecutionPhase::Discovery)
+            .unwrap();
+        assert_eq!(ledger.budgeted_calls(), 0);
+
+        failure.actual_cost_micros = None;
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Unknown);
+        failure.actual_cost_micros = Some(0);
+        failure.call_budget_consumed = Some(true);
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Consumed);
+    }
+
+    #[test]
+    fn authoritative_non_billable_adapter_preflight_restores_semantic_budget() {
+        let mut failure = test_hosted_http_error(
+            StatusCode::BAD_REQUEST,
+            "ai_tool_schema_invalid",
+            None,
+            Some(false),
+        );
+        failure.failure_stage = Some("request_validation".into());
+        failure.call_budget_consumed = Some(false);
+        failure.actual_cost_micros = Some(0);
+        failure.reservation_state = Some("not_created".into());
+
+        assert_eq!(failure.failure_class(), AiFailureClass::RequestValidation);
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+        assert!(!failure.retryable_gateway_transport_failure());
+        assert!(!failure.retryable_registration_failure());
+
+        let mut ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
+        ledger.begin_model_call().unwrap();
+        ledger
+            .rollback_model_call(ExecutionPhase::Discovery)
+            .unwrap();
+        assert_eq!(ledger.budgeted_calls(), 0);
+
+        failure.reservation_state = None;
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Unknown);
+        failure.failure_stage = None;
+        failure.reservation_state = Some("not_created".into());
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+    }
+
+    #[test]
+    fn explicit_non_billable_pre_dispatch_release_restores_semantic_budget() {
+        let mut failure = test_hosted_http_error(
+            StatusCode::BAD_GATEWAY,
+            "ai_provider_connection_not_found",
+            None,
+            Some(false),
+        );
+        failure.failure_stage = Some("provider_credential_resolution".into());
+        failure.call_budget_consumed = Some(false);
+        failure.actual_cost_micros = Some(0);
+        failure.reservation_state = Some("released".into());
+
+        assert_eq!(failure.failure_class(), AiFailureClass::Gateway);
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Restore);
+
+        failure.actual_cost_micros = None;
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Unknown);
+        failure.actual_cost_micros = Some(0);
+        failure.upstream_provider_status = Some(400);
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Unknown);
+    }
+
+    #[test]
+    fn ambiguous_legacy_provider_failure_does_not_fabricate_registration_evidence() {
         let failure = HostedHttpError {
             status: StatusCode::CONFLICT,
             path: "executions/id/ai/responses".into(),
             code: "ai_provider_request_failed".into(),
             request_id: Some("24162c59-38d5-4705-80f9-717c8c26ee29".into()),
+            rustgrid_gateway_status: None,
             upstream_provider_status: None,
             failure_stage: None,
             provider_contacted: None,
             call_budget_consumed: None,
+            reservation_state: None,
             reservation_reconciliation_state: None,
             retryable: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
         };
 
-        assert_eq!(failure.effective_code(), "ai_request_idempotency_conflict");
-        assert_eq!(failure.failure_stage(), Some("request_registration"));
+        assert_eq!(failure.failure_class(), AiFailureClass::Gateway);
+        assert_eq!(failure.effective_code(), "ai_provider_request_failed");
+        assert_eq!(failure.failure_stage(), None);
         assert_eq!(failure.provider_contacted(), None);
         assert_eq!(failure.call_budget_consumed(), None);
+        assert_eq!(failure.reservation_reconciliation_state(), None);
+        assert_eq!(failure.rustgrid_gateway_status(), Some(Some(409)));
         assert_eq!(
-            failure.reservation_reconciliation_state(),
-            Some("previous_request_settled")
+            failure.terminal_message(),
+            "The RustGrid AI gateway rejected the model call."
         );
         assert!(!failure.retryable_registration_failure());
+    }
+
+    #[test]
+    fn provider_invalid_code_without_dispatch_evidence_remains_gateway_unknown() {
+        let failure = test_hosted_http_error(
+            StatusCode::BAD_GATEWAY,
+            "ai_provider_invalid_request",
+            None,
+            None,
+        );
+
+        assert_eq!(failure.failure_class(), AiFailureClass::Gateway);
+        assert_eq!(failure.effective_code(), "ai_provider_invalid_request");
+        assert_eq!(failure.failure_stage(), None);
+        assert_eq!(failure.provider_contacted(), None);
+        assert_eq!(failure.rustgrid_gateway_status(), Some(Some(502)));
+        assert_eq!(failure.budget_disposition(), AiBudgetDisposition::Unknown);
     }
 
     #[test]
@@ -7964,12 +9746,25 @@ mod tests {
             path: "executions/id/ai/responses".into(),
             code: "ai_request_idempotency_conflict".into(),
             request_id: Some("24162c59-38d5-4705-80f9-717c8c26ee29".into()),
+            rustgrid_gateway_status: None,
             upstream_provider_status: None,
             failure_stage: Some("request_registration".into()),
             provider_contacted: Some(false),
             call_budget_consumed: Some(false),
+            reservation_state: None,
             reservation_reconciliation_state: Some("previous_request_settled".into()),
             retryable: Some(false),
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
         };
 
         assert!(failure.retryable_registration_failure());
