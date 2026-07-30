@@ -5,6 +5,28 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.11 - 2026-07-30
+
+### Changed
+
+- Detect resumable hosted work from the signed base SHA, deterministic branch,
+  explicit incomplete draft pull request, and preserved diff before starting a
+  later GitHub Actions attempt.
+- Restore the draft pull request's remaining-work list and acceptance criteria
+  into the worker notebook, preserving an authoritative notebook when one is
+  available.
+- Resume partial work from planning or the notebook's later phase instead of
+  restarting repository discovery.
+- Emit `worker.partial_run_detected` with the pull request, changed paths,
+  remaining work, and actual resume phase.
+
+### Fixed
+
+- Prevent later hosted attempts from discarding or duplicating valid work when
+  notebook metadata is unavailable or stale.
+- Refuse to adopt arbitrary draft pull requests, first-attempt branches, or
+  branches without changes relative to the signed mission base.
+
 ## 1.4.10 - 2026-07-30
 
 ### Changed
