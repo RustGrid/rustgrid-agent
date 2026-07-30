@@ -64,7 +64,11 @@ const MAX_PROVIDER_ERROR_PARAMETER_BYTES: usize = 512;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 48 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
 const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
-const MAX_MODEL_CALLS_HARD_LIMIT: usize = 64;
+// The backend remains authoritative: the worker only accepts and enforces the
+// signed mission budget. This ceiling must accommodate repository-wide hosted
+// work instead of silently imposing the old 40/64-call product policy.
+const MAX_MODEL_CALLS_HARD_LIMIT: usize = 100;
+const MAX_HOSTED_TURN_WINDOWS: usize = 3;
 const MAX_REPAIR_ATTEMPTS: usize = 2;
 const MAX_AI_REGISTRATION_ATTEMPTS: usize = 3;
 const HOSTED_NAMESPACE: Uuid = Uuid::from_u128(0xc4e820c0_9ee5_4d13_87d0_05582a548e76);
@@ -3013,6 +3017,7 @@ struct GatewayAgent<'a> {
     impact_map_failure: Option<ImpactMapFailure>,
     last_successful_action: Value,
     partial_run: Option<PartialRunContext>,
+    budget_advisory_percent: u8,
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -3111,6 +3116,7 @@ impl<'a> GatewayAgent<'a> {
             impact_map_failure: None,
             last_successful_action: json!({}),
             partial_run,
+            budget_advisory_percent: 0,
         }
     }
 
@@ -3156,6 +3162,14 @@ impl<'a> GatewayAgent<'a> {
             object.insert("clamped".into(), json!(self.budget.clamped));
             object.insert("clamp_reason".into(), json!(self.budget.clamp_reason));
             object.insert("budget_contract".into(), json!(self.budget.contract));
+            object.insert(
+                "context_policy".into(),
+                json!({
+                    "authoritative_notebook": true,
+                    "raw_turn_windows_retained": MAX_HOSTED_TURN_WINDOWS,
+                    "older_tool_output_compacted": true,
+                }),
+            );
         }
         telemetry
     }
@@ -3476,6 +3490,13 @@ impl<'a> GatewayAgent<'a> {
         allow_budget_handoff: bool,
     ) -> Result<Option<ImplementationOutcome>> {
         loop {
+            if let Some((threshold, code, message)) =
+                hosted_budget_advisory(self.phases.budgeted_calls(), self.phases.total_limit())
+                    .filter(|(threshold, _, _)| *threshold > self.budget_advisory_percent)
+            {
+                self.budget_advisory_percent = threshold;
+                self.emit_guardrail(code, "continue_toward_completion", message)?;
+            }
             let phase = self.phases.active();
             if phase == ExecutionPhase::Planning
                 && self.blocked_plan_recorded_at.is_some_and(|recorded_at| {
@@ -3996,6 +4017,7 @@ impl<'a> GatewayAgent<'a> {
                         Some(&anyhow!("record_impact_map was not invoked")),
                     )?;
                     turns.push_back(turn);
+                    compact_hosted_turns(&mut turns);
                     continue;
                 }
                 let missing_artifact = match self.phases.active() {
@@ -4031,6 +4053,7 @@ impl<'a> GatewayAgent<'a> {
                         )
                     }));
                     turns.push_back(turn);
+                    compact_hosted_turns(&mut turns);
                     continue;
                 }
                 self.api.append_event(
@@ -4242,6 +4265,7 @@ impl<'a> GatewayAgent<'a> {
                 }));
             }
             turns.push_back(turn);
+            compact_hosted_turns(&mut turns);
         }
     }
 
@@ -7387,6 +7411,31 @@ fn fit_request_to_input_ceiling(
     Ok(())
 }
 
+fn hosted_budget_advisory(used: usize, limit: usize) -> Option<(u8, &'static str, &'static str)> {
+    let percent = used.saturating_mul(100) / limit.max(1);
+    if percent >= 90 {
+        Some((
+            90,
+            "execution_budget_finalization",
+            "The signed execution budget is at least 90% consumed. Stop broad exploration, continue the current implementation, and produce the smallest complete validated result.",
+        ))
+    } else if percent >= 70 {
+        Some((
+            70,
+            "execution_budget_constrained",
+            "The signed execution budget is at least 70% consumed. Continue from the notebook and existing diff, avoid repeated reads, and prioritize remaining acceptance criteria.",
+        ))
+    } else {
+        None
+    }
+}
+
+fn compact_hosted_turns(turns: &mut VecDeque<Vec<Value>>) {
+    while turns.len() > MAX_HOSTED_TURN_WINDOWS {
+        turns.pop_front();
+    }
+}
+
 fn should_continue_implementation(
     existing_pull_request: bool,
     resumed_branch: bool,
@@ -8450,13 +8499,13 @@ mod tests {
     }
 
     #[test]
-    fn forty_call_budget_is_split_into_hard_mission_phases() {
+    fn forty_call_budget_prioritizes_implementation_and_keeps_finalization_usable() {
         let normal = phase_budget_allocation(DEFAULT_HOSTED_MODEL_CALLS);
         assert_eq!(normal.discovery_maximum, 8);
         assert_eq!(normal.planning_maximum, 4);
-        assert_eq!(normal.implementation_repair_reserved, 20);
-        assert_eq!(normal.diff_review_reserved, 4);
-        assert_eq!(normal.completion_evaluation_reserved, 4);
+        assert_eq!(normal.implementation_repair_reserved, 25);
+        assert_eq!(normal.diff_review_reserved, 2);
+        assert_eq!(normal.completion_evaluation_reserved, 1);
         assert_eq!(normal.total(), 40);
     }
 
@@ -8482,6 +8531,32 @@ mod tests {
         let environment = test_environment(execution_id);
         let api = test_api_client(Url::parse("http://127.0.0.1:8080/").unwrap(), execution_id);
         manifest.validate(execution_id, &environment, &api).unwrap();
+    }
+
+    #[test]
+    fn repository_wide_signed_budget_can_reach_one_hundred_calls() {
+        let execution_id = Uuid::from_u128(0x22222222_2222_4222_8222_222222222222);
+        let mut manifest = test_manifest(execution_id);
+        manifest.manifest_version = 4;
+        manifest.model_call_budget = Some(100);
+        manifest.requested_model_call_budget = Some(100);
+        manifest.resolved_model_call_budget = Some(100);
+        manifest.budget_source = Some(BudgetSource::UserSelected);
+        manifest.clamped = Some(false);
+        manifest.clamp_reason = Some(None);
+        manifest.execution.maximum_model_calls = Some(100);
+        manifest.ai_gateway.maximum_model_calls = 100;
+
+        let environment = test_environment(execution_id);
+        let api = test_api_client(Url::parse("http://127.0.0.1:8080/").unwrap(), execution_id);
+        manifest.validate(execution_id, &environment, &api).unwrap();
+
+        manifest.model_call_budget = Some(101);
+        manifest.requested_model_call_budget = Some(101);
+        manifest.resolved_model_call_budget = Some(101);
+        manifest.execution.maximum_model_calls = Some(101);
+        manifest.ai_gateway.maximum_model_calls = 101;
+        assert!(manifest.validate(execution_id, &environment, &api).is_err());
     }
 
     #[test]
@@ -8544,16 +8619,20 @@ mod tests {
                 allocation.diff_review_reserved,
                 allocation.completion_evaluation_reserved,
             ),
-            (4, 2, 10, 2, 2)
+            (4, 2, 12, 1, 1)
         );
     }
 
     #[test]
-    fn context_history_is_retained_until_the_input_ceiling_requires_trimming() {
+    fn hosted_context_keeps_only_recent_turns_after_notebook_checkpointing() {
         let initial = json!({"role": "user", "content": "mission"});
         let mut turns = (0..12)
             .map(|index| vec![json!({"role": "assistant", "content": format!("turn-{index}")})])
             .collect::<VecDeque<_>>();
+        compact_hosted_turns(&mut turns);
+        assert_eq!(turns.len(), MAX_HOSTED_TURN_WINDOWS);
+        assert_eq!(turns[0][0]["content"], "turn-9");
+
         let mut input = vec![initial.clone()];
         input.extend(turns.iter().flatten().cloned());
         let mut request = json!({
@@ -8561,11 +8640,28 @@ mod tests {
             "input": input
         });
         fit_request_to_input_ceiling(&mut request, &initial, &mut turns, 100_000).unwrap();
-        assert_eq!(turns.len(), 12);
+        assert_eq!(turns.len(), MAX_HOSTED_TURN_WINDOWS);
 
-        fit_request_to_input_ceiling(&mut request, &initial, &mut turns, 300).unwrap();
-        assert!(turns.len() < 12);
+        let reduced_ceiling = serde_json::to_vec(&request).unwrap().len() - 1;
+        fit_request_to_input_ceiling(&mut request, &initial, &mut turns, reduced_ceiling).unwrap();
+        assert!(turns.len() < MAX_HOSTED_TURN_WINDOWS);
         assert_eq!(request["input"].as_array().unwrap().first(), Some(&initial));
+    }
+
+    #[test]
+    fn hosted_budget_thresholds_guide_completion_before_the_signed_limit() {
+        assert!(hosted_budget_advisory(27, 40).is_none());
+        assert_eq!(
+            hosted_budget_advisory(28, 40).map(|advisory| advisory.0),
+            Some(70)
+        );
+        let finalization = hosted_budget_advisory(36, 40).unwrap();
+        assert_eq!(finalization.0, 90);
+        assert!(
+            finalization
+                .2
+                .contains("smallest complete validated result")
+        );
     }
 
     #[test]
