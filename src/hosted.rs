@@ -7074,6 +7074,7 @@ fn validate_completion_evaluation(
     Ok(evaluation)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn completion_fallback(
     implementation: &ImplementationOutcome,
     impact_map: Option<&ImpactMap>,
@@ -7103,12 +7104,13 @@ fn completion_fallback(
                     .flat_map(|declaration| declaration.criteria_evidence.iter())
                     .filter(|item| item.criterion.trim() == criterion.trim())
                     .flat_map(|item| {
-                        item.paths.iter().filter_map(|path| {
-                            valid_paths.contains(path).then(|| CompletionEvidence {
+                        item.paths
+                            .iter()
+                            .filter(|path| valid_paths.contains(path))
+                            .map(|path| CompletionEvidence {
                                 path: path.clone(),
                                 description: item.evidence.clone(),
                             })
-                        })
                     })
                     .collect::<Vec<_>>();
                 if evidence.is_empty() {
@@ -7121,12 +7123,13 @@ fn completion_fallback(
                                 .any(|mapped| mapped.trim() == criterion.trim())
                         })
                         .flat_map(|area| {
-                            area.candidate_paths.iter().filter_map(|path| {
-                                valid_paths.contains(path).then(|| CompletionEvidence {
+                            area.candidate_paths
+                                .iter()
+                                .filter(|path| valid_paths.contains(path))
+                                .map(|path| CompletionEvidence {
                                     path: path.clone(),
                                     description: area.reason.clone(),
                                 })
-                            })
                         })
                         .collect();
                 }
@@ -7140,12 +7143,11 @@ fn completion_fallback(
                                 .iter()
                                 .any(|mapped| mapped.trim() == criterion.trim())
                         })
-                        .filter_map(|change| {
-                            valid_paths.contains(&change.path).then(|| CompletionEvidence {
+                        .filter(|change| valid_paths.contains(&change.path))
+                        .map(|change| CompletionEvidence {
                                 path: change.path.clone(),
                                 description: change.reason.clone(),
                             })
-                        })
                         .collect();
                 }
                 let mandatory_e2e_missing = browser_e2e_is_mandatory_and_missing(
@@ -7195,15 +7197,17 @@ fn completion_fallback(
                     verification_type,
                     status,
                     evidence,
-                    validation_evidence: (verification_type == VerificationType::AutomatedTest)
-                        .then(|| {
-                            validation
-                                .iter()
-                                .filter(|result| result.status == "passed")
-                                .map(|result| result.command.clone())
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    validation_evidence: if verification_type
+                        == VerificationType::AutomatedTest
+                    {
+                        validation
+                            .iter()
+                            .filter(|result| result.status == "passed")
+                            .map(|result| result.command.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     missing_evidence,
                     required_next_action,
                 }

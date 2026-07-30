@@ -5,6 +5,33 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.13 - 2026-07-30
+
+### Changed
+
+- Separate mission outcome, implementation completeness, verification
+  readiness, evaluator source, and worker process health in hosted completion
+  results.
+- Classify manual, accessibility, visual, product, and deployment checks as
+  pending external review instead of unfinished source implementation.
+- Apply project verification policy when deciding whether missing browser E2E
+  coverage blocks a theme implementation.
+- Reserve more final review and completion-evaluation capacity for 60-call
+  missions, retry invalid evaluator results, and reallocate unused
+  implementation capacity to finalization.
+- Emit cache-observability telemetry that distinguishes cold starts, stable
+  prefix changes, tool-order changes, and provider-reported zero cache reads.
+
+### Fixed
+
+- Prevent fully implemented work awaiting human review from being reported as
+  an incomplete implementation that must be continued.
+- Keep partial-result and resumable semantics limited to missions with actual
+  remaining implementation or automated-verification work.
+- Reconcile evaluator output with authoritative declarations, changed paths,
+  tool failures, acceptance criteria, and validation evidence before reporting
+  completion.
+
 ## 1.4.12 - 2026-07-30
 
 ### Changed
