@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.8 - 2026-07-30
+
 ### Changed
 
 - Scope hosted AI registration idempotency to execution ID, execution attempt,
