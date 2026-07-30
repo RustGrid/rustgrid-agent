@@ -35,7 +35,7 @@ use crate::{
     command,
     config::{DEFAULT_INSTANCE_URL, RepoConfig},
     git::{RemoteBranchMoved, Repo, read_repo_instructions},
-    github::GitHubClient,
+    github::{GitHubClient, PullRequest},
     shutdown,
     telemetry::{
         ExecutionSnapshot, ExecutionStatus, PhaseSnapshot, TELEMETRY_VERSION, TelemetryBatch,
@@ -1506,6 +1506,13 @@ struct ImplementationOutcome {
     explicit_declaration: Option<ImplementationDeclaration>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PartialRunContext {
+    pull_request_number: u64,
+    changed_paths: Vec<String>,
+    remaining_work: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct ToolUsage {
     reads: u32,
@@ -1633,6 +1640,162 @@ impl std::fmt::Display for HostedAgentExecutionFailure {
 }
 
 impl std::error::Error for HostedAgentExecutionFailure {}
+
+fn acceptance_criteria_from_ticket(ticket: &str) -> Vec<String> {
+    let mut criteria = Vec::new();
+    let mut in_acceptance_criteria = false;
+    for line in ticket.lines() {
+        let trimmed = line.trim();
+        let normalized = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+        if normalized == "acceptance criteria" {
+            in_acceptance_criteria = true;
+            continue;
+        }
+        if in_acceptance_criteria && trimmed.starts_with('#') {
+            break;
+        }
+        if !in_acceptance_criteria {
+            continue;
+        }
+        let item = trimmed
+            .strip_prefix("- [ ] ")
+            .or_else(|| trimmed.strip_prefix("- [x] "))
+            .or_else(|| trimmed.strip_prefix("- [X] "))
+            .or_else(|| trimmed.strip_prefix("- "))
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| {
+                let (number, item) = trimmed.split_once(". ")?;
+                number
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+                    .then_some(item)
+            })
+            .map(str::trim)
+            .filter(|item| !item.is_empty());
+        if let Some(item) = item {
+            push_unique(&mut criteria, item.to_owned());
+        }
+    }
+    if criteria.is_empty() && !ticket.trim().is_empty() {
+        criteria.push(ticket.trim().to_owned());
+    }
+    criteria
+}
+
+fn partial_pr_remaining_work(body: Option<&str>) -> Vec<String> {
+    let Some(body) = body else {
+        return Vec::new();
+    };
+    let Some((_, remainder)) = body.split_once("Remaining work:\n") else {
+        return Vec::new();
+    };
+    let section = remainder
+        .split_once("\n\nTechnical validation:")
+        .map(|(section, _)| section)
+        .unwrap_or(remainder);
+    section
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- "))
+        .map(str::trim)
+        .filter(|work| !work.is_empty() && *work != "None reported.")
+        .map(str::to_owned)
+        .collect()
+}
+
+fn detect_partial_run(
+    pull_request: Option<&PullRequest>,
+    resumed_branch: bool,
+    execution_attempt: i32,
+    changed_paths: Vec<String>,
+) -> Option<PartialRunContext> {
+    let pull_request = pull_request?;
+    let explicitly_incomplete = pull_request.body.as_deref().is_some_and(|body| {
+        body.contains("INCOMPLETE")
+            && body.contains("continue implementation before review or merge")
+            && body.contains("Remaining work:")
+    });
+    if execution_attempt <= 1
+        || !resumed_branch
+        || !pull_request.draft
+        || !explicitly_incomplete
+        || changed_paths.is_empty()
+    {
+        return None;
+    }
+    Some(PartialRunContext {
+        pull_request_number: pull_request.number,
+        changed_paths,
+        remaining_work: partial_pr_remaining_work(pull_request.body.as_deref()),
+    })
+}
+
+fn new_worker_notebook(
+    manifest: &HostedManifest,
+    repository_fingerprint: String,
+    partial_run: Option<&PartialRunContext>,
+) -> WorkerNotebook {
+    let acceptance_criteria = acceptance_criteria_from_ticket(&manifest.run.input_prompt);
+    let mut notebook = WorkerNotebook {
+        schema_version: 1,
+        revision: 0,
+        goal: manifest.ticket_title.clone(),
+        acceptance_criteria: acceptance_criteria.clone(),
+        phase: ExecutionPhase::Discovery,
+        repository_base_sha: manifest.github.base_sha.clone(),
+        branch: manifest.github.branch.clone(),
+        repository_fingerprint,
+        execution_attempt: manifest.execution.attempt_number,
+        architecture_findings: Vec::new(),
+        impact_map: Vec::new(),
+        impact_map_artifact: ArtifactCheckpoint::default(),
+        files_inspected: Vec::new(),
+        searches_completed: Vec::new(),
+        planned_changes: Vec::new(),
+        completed_changes: Vec::new(),
+        failed_changes: Vec::new(),
+        remaining_work: Vec::new(),
+        blocking_unknowns: Vec::new(),
+        validation_failures: Vec::new(),
+        phase_budget: Value::Null,
+        last_successful_action: json!({}),
+    };
+    if let Some(partial_run) = partial_run {
+        notebook.phase = ExecutionPhase::Planning;
+        notebook.architecture_findings.push(format!(
+            "Recovered draft pull request #{} with {} changed path(s); preserve valid prior work.",
+            partial_run.pull_request_number,
+            partial_run.changed_paths.len()
+        ));
+        notebook.impact_map.push(ImpactArea {
+            area: "existing_partial_implementation".into(),
+            candidate_paths: partial_run.changed_paths.clone(),
+            reason: "A later execution attempt resumed a draft pull request and must reconcile its existing diff before changing more code.".into(),
+            acceptance_criteria,
+        });
+        notebook.remaining_work = if partial_run.remaining_work.is_empty() {
+            vec!["Reconcile the preserved diff against every acceptance criterion.".into()]
+        } else {
+            partial_run.remaining_work.clone()
+        };
+        let restored_map = ImpactMap {
+            can_implement: true,
+            impact_map: notebook.impact_map.clone(),
+            files_inspected: Vec::new(),
+            searches_completed: Vec::new(),
+            blocking_unknowns: Vec::new(),
+        };
+        notebook.impact_map_artifact = ArtifactCheckpoint {
+            artifact: "impact_map".into(),
+            semantic_status: ArtifactSemanticStatus::Produced,
+            persistence_status: ArtifactPersistenceStatus::PendingRetry,
+            artifact_sha256: impact_map_sha256(&restored_map),
+            model_call_index: None,
+            phase: ExecutionPhase::Planning,
+            safe_error: None,
+        };
+    }
+    notebook
+}
 
 fn notebook_orchestration_state(
     notebook: &WorkerNotebook,
@@ -2447,7 +2610,37 @@ fn run_hosted_execution(
     drop(recovery_github);
     drop(recovery_token);
 
-    let mut agent = GatewayAgent::new(api.clone(), manifest, &repo, running, &containment);
+    let partial_run = detect_partial_run(
+        existing_pr.as_ref(),
+        resumed,
+        manifest.execution.attempt_number,
+        completion_changed_paths(&repo, &manifest.github.base_sha)?,
+    );
+    let mut agent = GatewayAgent::new(
+        api.clone(),
+        manifest,
+        &repo,
+        running,
+        &containment,
+        partial_run,
+    );
+    if let Some(partial_run) = &agent.partial_run {
+        api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.partial_run_detected",
+                "step": "implementation",
+                "status": "continuing",
+                "branch": manifest.github.branch,
+                "execution_attempt": manifest.execution.attempt_number,
+                "pull_request_number": partial_run.pull_request_number,
+                "changed_paths": partial_run.changed_paths,
+                "remaining_work": agent.notebook.remaining_work,
+                "resume_phase": agent.phases.active(),
+                "resumable": true
+            }),
+        )?;
+    }
     bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment)?;
     let mut implementation = if !should_continue_implementation(
         existing_pr.is_some(),
@@ -2819,6 +3012,7 @@ struct GatewayAgent<'a> {
     blocked_plan_recorded_at: Option<usize>,
     impact_map_failure: Option<ImpactMapFailure>,
     last_successful_action: Value,
+    partial_run: Option<PartialRunContext>,
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -2828,6 +3022,7 @@ impl<'a> GatewayAgent<'a> {
         repo: &'a Repo,
         running: &'a Arc<AtomicBool>,
         containment: &'a command::HostedProcessContainment,
+        partial_run: Option<PartialRunContext>,
     ) -> Self {
         let budget = manifest
             .budget_audit()
@@ -2850,30 +3045,22 @@ impl<'a> GatewayAgent<'a> {
                     && (notebook.repository_fingerprint.is_empty()
                         || notebook.repository_fingerprint == repository_fingerprint)
             });
-        let mut notebook = restored.unwrap_or_else(|| WorkerNotebook {
-            schema_version: 1,
-            revision: 0,
-            goal: manifest.ticket_title.clone(),
-            acceptance_criteria: vec![manifest.run.input_prompt.clone()],
-            phase: ExecutionPhase::Discovery,
-            repository_base_sha: manifest.github.base_sha.clone(),
-            branch: manifest.github.branch.clone(),
-            repository_fingerprint,
-            execution_attempt: manifest.execution.attempt_number,
-            architecture_findings: Vec::new(),
-            impact_map: Vec::new(),
-            impact_map_artifact: ArtifactCheckpoint::default(),
-            files_inspected: Vec::new(),
-            searches_completed: Vec::new(),
-            planned_changes: Vec::new(),
-            completed_changes: Vec::new(),
-            failed_changes: Vec::new(),
-            remaining_work: Vec::new(),
-            blocking_unknowns: Vec::new(),
-            validation_failures: Vec::new(),
-            phase_budget: Value::Null,
-            last_successful_action: json!({}),
+        let mut notebook = restored.unwrap_or_else(|| {
+            new_worker_notebook(manifest, repository_fingerprint, partial_run.as_ref())
         });
+        if let Some(partial_run) = &partial_run {
+            if notebook.impact_map.is_empty() {
+                notebook = new_worker_notebook(
+                    manifest,
+                    notebook.repository_fingerprint.clone(),
+                    Some(partial_run),
+                );
+            } else {
+                for work in &partial_run.remaining_work {
+                    push_unique(&mut notebook.remaining_work, work.clone());
+                }
+            }
+        }
         if !notebook.impact_map.is_empty()
             && notebook.impact_map_artifact.semantic_status == ArtifactSemanticStatus::Missing
         {
@@ -2923,11 +3110,12 @@ impl<'a> GatewayAgent<'a> {
             blocked_plan_recorded_at: None,
             impact_map_failure: None,
             last_successful_action: json!({}),
+            partial_run,
         }
     }
 
     fn implement(&mut self) -> Result<ImplementationOutcome> {
-        let prompt = build_hosted_prompt(self.manifest, self.repo)?;
+        let prompt = build_hosted_prompt(self.manifest, self.repo, self.partial_run.as_ref())?;
         self.checkpoint_notebook(false)?;
         self.append_event_recoverable(
             "progress",
@@ -5117,8 +5305,13 @@ acceptance criteria, or an unrecovered source-changing tool failure remains.",
     )
 }
 
-fn build_hosted_prompt(manifest: &HostedManifest, repo: &Repo) -> Result<String> {
+fn build_hosted_prompt(
+    manifest: &HostedManifest,
+    repo: &Repo,
+    partial_run: Option<&PartialRunContext>,
+) -> Result<String> {
     let files = collect_repo_files(&repo.root, &repo.root, 1_200)?;
+    let continuation_guidance = partial_implementation_guidance(partial_run);
     let instructions = read_repo_instructions(&repo.root)?
         .into_iter()
         .map(|(name, content)| {
@@ -5135,7 +5328,7 @@ fn build_hosted_prompt(manifest: &HostedManifest, repo: &Repo) -> Result<String>
     Ok(format!(
         "Implement RustGrid ticket {key}: {title}\n\nMission instructions:\n{prompt}\n\n\
 Execution attempt: {attempt}\nDeterministic branch: {branch}\nResolved model: {model}\n\
-Maximum model calls: {calls}\nMaximum cost USD: {cost}{visual_guidance}\n\nRepository files:\n{files}{instructions}",
+Maximum model calls: {calls}\nMaximum cost USD: {cost}{visual_guidance}{continuation_guidance}\n\nRepository files:\n{files}{instructions}",
         key = manifest.ticket_key,
         title = manifest.ticket_title,
         prompt = manifest.run.input_prompt,
@@ -5146,7 +5339,36 @@ Maximum model calls: {calls}\nMaximum cost USD: {cost}{visual_guidance}\n\nRepos
         cost = manifest.ai_gateway.maximum_cost_usd,
         visual_guidance = visual_guidance,
         files = files.join("\n"),
+        continuation_guidance = continuation_guidance,
     ))
+}
+
+fn partial_implementation_guidance(partial_run: Option<&PartialRunContext>) -> String {
+    let Some(partial_run) = partial_run else {
+        return String::new();
+    };
+    let remaining_work = if partial_run.remaining_work.is_empty() {
+        "- Reconcile the preserved diff against every acceptance criterion.".to_owned()
+    } else {
+        partial_run
+            .remaining_work
+            .iter()
+            .map(|work| format!("- {work}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "\n\nExisting partial implementation detected in draft pull request #{pull_request_number} \
+on the deterministic branch.\nChanged paths relative to the mission base:\n{changed_paths}\n\n\
+Previously reported remaining work:\n{remaining_work}\n\n\
+Before planning or editing, inspect these paths and compare the existing implementation \
+with every mission acceptance criterion. Preserve correct completed work, identify what is \
+partial or missing, and continue from the current branch state. Do not restart, duplicate, \
+or overwrite valid work merely because a worker notebook is unavailable or stale. Treat \
+changed paths as evidence of prior work, not proof that the mission is complete.",
+        pull_request_number = partial_run.pull_request_number,
+        changed_paths = partial_run.changed_paths.join("\n"),
+    )
 }
 
 fn visual_impact_guidance(ticket: &str) -> &'static str {
@@ -8352,6 +8574,124 @@ mod tests {
         assert!(should_continue_implementation(true, true, 2));
         assert!(should_continue_implementation(false, true, 1));
         assert!(should_continue_implementation(true, false, 1));
+    }
+
+    #[test]
+    fn partial_branch_changes_create_explicit_continuation_guidance() {
+        let partial_run = PartialRunContext {
+            pull_request_number: 138,
+            changed_paths: vec![
+                "src/components/theme/ThemeProvider.tsx".into(),
+                "tests/theme-provider.test.tsx".into(),
+            ],
+            remaining_work: vec!["Add the planned end-to-end test.".into()],
+        };
+        let guidance = partial_implementation_guidance(Some(&partial_run));
+
+        assert!(guidance.contains("Existing partial implementation detected"));
+        assert!(guidance.contains("draft pull request #138"));
+        assert!(guidance.contains("src/components/theme/ThemeProvider.tsx"));
+        assert!(guidance.contains("tests/theme-provider.test.tsx"));
+        assert!(guidance.contains("Add the planned end-to-end test."));
+        assert!(guidance.contains("compare the existing implementation"));
+        assert!(guidance.contains("Preserve correct completed work"));
+        assert!(guidance.contains("continue from the current branch state"));
+        assert!(guidance.contains("not proof that the mission is complete"));
+    }
+
+    #[test]
+    fn clean_branch_does_not_claim_that_partial_work_exists() {
+        assert!(partial_implementation_guidance(None).is_empty());
+    }
+
+    #[test]
+    fn partial_run_detection_requires_a_later_attempt_resumed_draft_and_existing_diff() {
+        let pull_request = PullRequest {
+            number: 138,
+            html_url: "https://github.com/RustGrid/example/pull/138".into(),
+            node_id: Some("PR_node".into()),
+            draft: true,
+            body: Some(
+                "⚠️ **INCOMPLETE — continue implementation before review or merge**\n\n\
+Remaining work:\n\
+- Add the planned end-to-end test.\n\
+- Reconcile the failed source edit.\n\n\
+Technical validation:\n- cargo test: passed"
+                    .into(),
+            ),
+        };
+        let changed_paths = vec!["src/theme.rs".into()];
+
+        let detected =
+            detect_partial_run(Some(&pull_request), true, 2, changed_paths.clone()).unwrap();
+        assert_eq!(detected.pull_request_number, 138);
+        assert_eq!(detected.changed_paths, changed_paths);
+        assert_eq!(
+            detected.remaining_work,
+            vec![
+                "Add the planned end-to-end test.",
+                "Reconcile the failed source edit."
+            ]
+        );
+        assert!(
+            detect_partial_run(Some(&pull_request), true, 1, vec!["src/theme.rs".into()]).is_none()
+        );
+        assert!(
+            detect_partial_run(Some(&pull_request), false, 2, vec!["src/theme.rs".into()])
+                .is_none()
+        );
+        assert!(detect_partial_run(Some(&pull_request), true, 2, Vec::new()).is_none());
+
+        let complete_pull_request = PullRequest {
+            draft: false,
+            ..pull_request
+        };
+        assert!(
+            detect_partial_run(
+                Some(&complete_pull_request),
+                true,
+                2,
+                vec!["src/theme.rs".into()]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recovered_partial_run_starts_from_planning_with_authoritative_remaining_work() {
+        let mut manifest = test_manifest(Uuid::from_u128(17));
+        manifest.execution.attempt_number = 2;
+        manifest.run.attempt = 2;
+        manifest.run.input_prompt = "\
+Implement theme support.\n\n\
+## Acceptance criteria\n\
+- Theme selection persists.\n\
+- Existing views use shared tokens.\n"
+            .into();
+        let partial_run = PartialRunContext {
+            pull_request_number: 138,
+            changed_paths: vec!["src/theme.rs".into(), "tests/theme.rs".into()],
+            remaining_work: vec!["Add browser coverage.".into()],
+        };
+
+        let notebook = new_worker_notebook(&manifest, "fingerprint".into(), Some(&partial_run));
+        let (impact_map, implementation_plan, phase) = notebook_orchestration_state(&notebook);
+
+        assert_eq!(phase, ExecutionPhase::Planning);
+        assert!(impact_map.is_some());
+        assert!(implementation_plan.is_none());
+        assert_eq!(notebook.remaining_work, vec!["Add browser coverage."]);
+        assert_eq!(
+            notebook.acceptance_criteria,
+            vec![
+                "Theme selection persists.",
+                "Existing views use shared tokens."
+            ]
+        );
+        assert_eq!(
+            notebook.impact_map[0].candidate_paths,
+            vec!["src/theme.rs", "tests/theme.rs"]
+        );
     }
 
     #[test]

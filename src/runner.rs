@@ -1038,6 +1038,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             html_url,
             node_id: None,
             draft: false,
+            body: None,
         }
     } else {
         let pr_token = tokens.token()?;

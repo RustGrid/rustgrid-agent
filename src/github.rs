@@ -25,6 +25,8 @@ pub struct PullRequest {
     pub node_id: Option<String>,
     #[serde(default)]
     pub draft: bool,
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
