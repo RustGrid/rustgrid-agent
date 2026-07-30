@@ -1255,6 +1255,22 @@ struct HostedExecutionPolicy {
     sandbox: HostedSandboxPolicy,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+struct ProjectVerificationPolicy {
+    browser_e2e_required_for_theme_changes: bool,
+    manual_browser_verification_required: bool,
+}
+
+impl Default for ProjectVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            browser_e2e_required_for_theme_changes: false,
+            manual_browser_verification_required: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct HostedCodexPolicy {
     command: Vec<String>,
@@ -1280,6 +1296,12 @@ struct HostedSandboxPolicy {
 #[derive(Clone, Debug, Serialize)]
 struct CompletionRequest {
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mission_outcome: Option<CompletionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_evaluation: Option<CompletionEvaluation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1322,11 +1344,34 @@ struct ValidationResult {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum CompletionStatus {
+    Complete,
+    CompletePendingExternalReview,
+    Partial,
+    Incomplete,
+    Blocked,
+    Uncertain,
+}
+
+impl CompletionStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::CompletePendingExternalReview => "complete_pending_external_review",
+            Self::Partial => "partial",
+            Self::Incomplete => "incomplete",
+            Self::Blocked => "blocked",
+            Self::Uncertain => "uncertain",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum ImplementationCompleteness {
     Complete,
     Partial,
     Incomplete,
-    Uncertain,
 }
 
 impl ImplementationCompleteness {
@@ -1335,7 +1380,105 @@ impl ImplementationCompleteness {
             Self::Complete => "complete",
             Self::Partial => "partial",
             Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VerificationReadiness {
+    Verified,
+    AutomatedVerified,
+    PendingManualReview,
+    Blocked,
+}
+
+impl VerificationReadiness {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::AutomatedVerified => "automated_verified",
+            Self::PendingManualReview => "pending_manual_review",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EvaluationSource {
+    Model,
+    OrchestratorFallback,
+    Hybrid,
+}
+
+impl EvaluationSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::OrchestratorFallback => "orchestrator_fallback",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VerificationType {
+    Code,
+    AutomatedTest,
+    ManualQa,
+    AccessibilityReview,
+    VisualReview,
+    ProductApproval,
+    DeploymentEnvironment,
+}
+
+impl VerificationType {
+    const fn requires_external_review(self) -> bool {
+        matches!(
+            self,
+            Self::ManualQa
+                | Self::AccessibilityReview
+                | Self::VisualReview
+                | Self::ProductApproval
+                | Self::DeploymentEnvironment
+        )
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::AutomatedTest => "automated_test",
+            Self::ManualQa => "manual_qa",
+            Self::AccessibilityReview => "accessibility_review",
+            Self::VisualReview => "visual_review",
+            Self::ProductApproval => "product_approval",
+            Self::DeploymentEnvironment => "deployment_environment",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CriterionStatus {
+    Satisfied,
+    PartiallySatisfied,
+    Unsatisfied,
+    Uncertain,
+    ExternalReviewRequired,
+    NotApplicable,
+}
+
+impl CriterionStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Satisfied => "satisfied",
+            Self::PartiallySatisfied => "partially_satisfied",
+            Self::Unsatisfied => "unsatisfied",
             Self::Uncertain => "uncertain",
+            Self::ExternalReviewRequired => "external_review_required",
+            Self::NotApplicable => "not_applicable",
         }
     }
 }
@@ -1348,20 +1491,46 @@ struct CompletionEvidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CriterionEvaluation {
+    criterion_id: String,
     criterion: String,
-    status: String,
+    verification_type: VerificationType,
+    status: CriterionStatus,
     #[serde(default)]
     evidence: Vec<CompletionEvidence>,
+    #[serde(default)]
+    validation_evidence: Vec<String>,
+    #[serde(default)]
+    missing_evidence: Vec<String>,
+    #[serde(default)]
+    required_next_action: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReviewChecklistItem {
+    r#type: VerificationType,
+    description: String,
+    status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CompletionEvaluation {
-    status: ImplementationCompleteness,
+    status: CompletionStatus,
+    implementation_completeness: ImplementationCompleteness,
+    verification_readiness: VerificationReadiness,
+    evaluation_source: EvaluationSource,
     confidence: f64,
     #[serde(default)]
     criteria: Vec<CriterionEvaluation>,
     #[serde(default)]
-    unresolved_work: Vec<String>,
+    remaining_implementation_work: Vec<String>,
+    #[serde(default)]
+    remaining_automated_verification: Vec<String>,
+    #[serde(default)]
+    pending_external_review: Vec<String>,
+    #[serde(default)]
+    optional_follow_up: Vec<String>,
+    #[serde(default)]
+    review_checklist: Vec<ReviewChecklistItem>,
     #[serde(default)]
     unrecovered_tool_failures: Vec<String>,
     summary: String,
@@ -1684,6 +1853,18 @@ fn acceptance_criteria_from_ticket(ticket: &str) -> Vec<String> {
         criteria.push(ticket.trim().to_owned());
     }
     criteria
+}
+
+fn project_verification_policy(manifest: &HostedManifest) -> ProjectVerificationPolicy {
+    manifest
+        .run
+        .metadata
+        .get("project_verification_policy")
+        .or_else(|| manifest.run.metadata.get("browser_test_policy"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| serde_json::from_value(manifest.run.metadata.clone()).ok())
+        .unwrap_or_default()
 }
 
 fn partial_pr_remaining_work(body: Option<&str>) -> Vec<String> {
@@ -2297,6 +2478,9 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             );
             let _ = api.complete(&CompletionRequest {
                 status: "failed".into(),
+                mission_outcome: None,
+                process_health: Some("failed".into()),
+                completion_evaluation: None,
                 output_summary: None,
                 failure_code: Some(code),
                 failure_message: Some(message),
@@ -2337,7 +2521,9 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             if let Err(error) = api.append_event(
                 "result",
                 json!({
-                    "status": "completed",
+                    "status": completion_request_status(result.completeness.status),
+                    "mission_outcome": result.completeness.status,
+                    "process_health": "healthy",
                     "branch": result.branch,
                     "head_sha": result.commit,
                     "pull_request_number": result.pull_request.number,
@@ -2351,7 +2537,10 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
                 );
             }
             api.complete(&CompletionRequest {
-                status: "completed".into(),
+                status: completion_request_status(result.completeness.status).into(),
+                mission_outcome: Some(result.completeness.status),
+                process_health: Some("healthy".into()),
+                completion_evaluation: Some(result.completeness.clone()),
                 output_summary: Some(truncate_text(&result.summary, 16_000)),
                 failure_code: None,
                 failure_message: None,
@@ -2382,18 +2571,25 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             api.append_event(
                 "result",
                 json!({
-                    "status": "partial_result",
+                    "status": completion_request_status(result.completeness.status),
+                    "mission_outcome": result.completeness.status,
+                    "process_health": "healthy",
                     "branch": result.branch,
                     "head_sha": result.commit,
                     "pull_request_number": result.pull_request.number,
                     "pull_request_url": result.pull_request.url,
                     "implementation_completeness": result.completeness,
                     "technical_validation": result.validation,
-                    "resumable": true
+                    "resumable": requires_implementation_continuation(
+                        result.completeness.status
+                    )
                 }),
             )?;
             api.complete(&CompletionRequest {
-                status: "partial_result".into(),
+                status: completion_request_status(result.completeness.status).into(),
+                mission_outcome: Some(result.completeness.status),
+                process_health: Some("healthy".into()),
+                completion_evaluation: Some(result.completeness.clone()),
                 output_summary: Some(truncate_text(
                     &format!("{}\n\n{}", result.summary, result.completeness.summary),
                     16_000,
@@ -2455,11 +2651,31 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
 }
 
 fn hosted_result_can_succeed(result: &HostedResult) -> bool {
-    result.completeness.status == ImplementationCompleteness::Complete
-        && result
-            .validation
-            .iter()
-            .all(|validation| validation.status == "passed")
+    matches!(
+        result.completeness.status,
+        CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview
+    ) && result
+        .validation
+        .iter()
+        .all(|validation| validation.status == "passed")
+}
+
+const fn completion_request_status(status: CompletionStatus) -> &'static str {
+    match status {
+        CompletionStatus::Complete => "completed",
+        CompletionStatus::CompletePendingExternalReview => "awaiting_external_review",
+        CompletionStatus::Partial | CompletionStatus::Incomplete | CompletionStatus::Uncertain => {
+            "partial_result"
+        }
+        CompletionStatus::Blocked => "blocked",
+    }
+}
+
+const fn requires_implementation_continuation(status: CompletionStatus) -> bool {
+    matches!(
+        status,
+        CompletionStatus::Partial | CompletionStatus::Incomplete | CompletionStatus::Uncertain
+    )
 }
 
 pub fn report_emergency_failure(execution_id: Uuid) -> Result<()> {
@@ -2480,6 +2696,9 @@ pub fn report_emergency_failure(execution_id: Uuid) -> Result<()> {
     );
     api.complete(&CompletionRequest {
         status: "failed".into(),
+        mission_outcome: None,
+        process_health: Some("failed".into()),
+        completion_evaluation: None,
         output_summary: None,
         failure_code: Some("github_actions_step_failed".into()),
         failure_message: Some(
@@ -2732,7 +2951,7 @@ fn run_hosted_execution(
             "budget": agent.budget_telemetry(),
             "tool_usage": agent.tool_usage,
             "changed_path_count": review_paths.len(),
-            "resumable": completeness.status != ImplementationCompleteness::Complete
+            "resumable": requires_implementation_continuation(completeness.status)
         }),
     )?;
 
@@ -2793,7 +3012,7 @@ fn run_hosted_execution(
     containment.drain()?;
     let publication_token = api.github_token(&manifest.github.repository)?;
     let github = GitHubClient::new(publication_token.expose(), &manifest.github.web_base_url)?;
-    let partial = completeness.status != ImplementationCompleteness::Complete;
+    let partial = requires_implementation_continuation(completeness.status);
     let pull = find_or_create_hosted_pull_request(
         &github,
         &repo_config,
@@ -3018,6 +3237,8 @@ struct GatewayAgent<'a> {
     last_successful_action: Value,
     partial_run: Option<PartialRunContext>,
     budget_advisory_percent: u8,
+    last_cache_prefix_sha256: Option<String>,
+    last_tool_order_sha256: Option<String>,
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -3088,6 +3309,8 @@ impl<'a> GatewayAgent<'a> {
         }
         let (impact_map, implementation_plan, initial_phase) =
             notebook_orchestration_state(&notebook);
+        let mut phases = PhaseLedger::new(total_calls, initial_phase);
+        phases.ensure_finalization_minimum(notebook.acceptance_criteria.len());
         Self {
             api,
             manifest,
@@ -3095,7 +3318,7 @@ impl<'a> GatewayAgent<'a> {
             running,
             containment,
             budget,
-            phases: PhaseLedger::new(total_calls, initial_phase),
+            phases,
             impact_map,
             implementation_plan,
             declaration: None,
@@ -3117,6 +3340,8 @@ impl<'a> GatewayAgent<'a> {
             last_successful_action: json!({}),
             partial_run,
             budget_advisory_percent: 0,
+            last_cache_prefix_sha256: None,
+            last_tool_order_sha256: None,
         }
     }
 
@@ -3182,6 +3407,18 @@ impl<'a> GatewayAgent<'a> {
                 false
             }
         }
+    }
+
+    fn record_cache_observability(&mut self, request: &Value, response: &Value) {
+        let (payload, prefix_sha256, tool_order_sha256) = cache_observability_payload(
+            request,
+            response,
+            self.last_cache_prefix_sha256.as_deref(),
+            self.last_tool_order_sha256.as_deref(),
+        );
+        self.append_event_recoverable("progress", payload, "AI cache observability");
+        self.last_cache_prefix_sha256 = Some(prefix_sha256);
+        self.last_tool_order_sha256 = Some(tool_order_sha256);
     }
 
     fn notebook_checkpoint_metadata(&self, artifact_sha256: Option<&str>) -> Value {
@@ -3807,7 +4044,7 @@ impl<'a> GatewayAgent<'a> {
                     "budget": self.budget_telemetry(),
                 }),
             )?;
-            let response = match self.api.ai_response(request, &registration) {
+            let response = match self.api.ai_response(request.clone(), &registration) {
                 Ok(response) => {
                     registration_attempt = 0;
                     response
@@ -3942,6 +4179,7 @@ impl<'a> GatewayAgent<'a> {
                     ));
                 }
             };
+            self.record_cache_observability(&request, &response);
             let output = response
                 .get("output")
                 .and_then(Value::as_array)
@@ -4284,8 +4522,12 @@ impl<'a> GatewayAgent<'a> {
         let fallback = completion_fallback(
             implementation,
             self.impact_map.as_ref(),
+            self.implementation_plan.as_ref(),
             &unrecovered,
             changed_paths,
+            &self.notebook.acceptance_criteria,
+            validation,
+            project_verification_policy(self.manifest),
         );
         if changed_paths.is_empty() {
             return Ok(fallback);
@@ -4317,10 +4559,14 @@ impl<'a> GatewayAgent<'a> {
 Regression gates are only technical validation and cannot by themselves satisfy functional \
 criteria. Every satisfied criterion must cite concrete diff evidence. Missing evidence is \
 uncertain or incomplete. An unrecovered edit failure blocks complete. A broad task with a narrow \
-diff needs explicit architectural evidence. Return only one JSON object matching the requested \
-schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nImpact map:\n{}\n\nImplementation plan:\n{}\n\nWorker notebook:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nUnrecovered tool failures:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
+diff needs explicit architectural evidence. Classify human, design, accessibility, visual, \
+product-approval, and deployment-environment checks as external review rather than missing source \
+implementation. Apply the supplied browser-test policy exactly. Return only one JSON object matching the requested \
+schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nProject verification policy:\n{}\n\nImpact map:\n{}\n\nImplementation plan:\n{}\n\nWorker notebook:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nUnrecovered tool failures:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
             self.manifest.ticket_title,
             self.manifest.run.input_prompt,
+            serde_json::to_string(&project_verification_policy(self.manifest))
+                .unwrap_or_else(|_| "{}".into()),
             serde_json::to_string(&self.impact_map).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&self.implementation_plan).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&self.notebook).unwrap_or_else(|_| "null".into()),
@@ -4349,70 +4595,94 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             )
         });
         validate_provider_request_envelope(&request)?;
-        let model_call = self.phases.begin_model_call()?;
-        self.api.append_event(
-            "progress",
-            json!({
-                "step": "completion_evaluation",
-                "status": "running",
-                "phase": ExecutionPhase::CompletionEvaluation,
-                "model_call": model_call,
-                "budget": self.budget_telemetry(),
-            }),
-        )?;
-        let registration = ai_call_registration(
-            self.manifest.execution.execution_id,
-            self.api.execution_attempt,
-            self.api.session_id()?,
-            model_call.saturating_sub(1),
-            ExecutionPhase::CompletionEvaluation,
-            0,
-        );
-        let evaluated_response = match self.api.ai_response(request, &registration) {
-            Ok(response) => Some(response),
-            Err(error) => {
-                let http = error.downcast_ref::<HostedHttpError>();
-                if http.map(HostedHttpError::budget_disposition)
-                    == Some(AiBudgetDisposition::Restore)
-                {
-                    self.phases
-                        .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
-                    if let Some(failure) = http.filter(|failure| {
-                        failure.failure_class() == AiFailureClass::ProviderValidation
-                    }) {
-                        self.append_event_recoverable(
-                            "progress",
-                            provider_rejected_event(
-                                failure,
-                                &registration,
-                                self.api.execution_attempt,
-                                model_call,
-                                self.manifest.ai_gateway.model.as_str(),
-                                self.phases.budgeted_calls(),
-                                self.budget_telemetry(),
-                                json!(&self.notebook),
-                            ),
-                            "completion evaluator provider rejection telemetry",
-                        );
-                    }
+        let attempts_available = self
+            .phases
+            .phase_limit(ExecutionPhase::CompletionEvaluation)
+            .saturating_sub(
+                self.phases
+                    .phase_calls(ExecutionPhase::CompletionEvaluation),
+            );
+        for evaluator_attempt in 0..attempts_available {
+            let model_call = self.phases.begin_model_call()?;
+            self.api.append_event(
+                "progress",
+                json!({
+                    "step": "completion_evaluation",
+                    "status": if evaluator_attempt == 0 { "running" } else { "retrying" },
+                    "evaluation_attempt": evaluator_attempt + 1,
+                    "phase": ExecutionPhase::CompletionEvaluation,
+                    "model_call": model_call,
+                    "budget": self.budget_telemetry(),
+                }),
+            )?;
+            let registration = ai_call_registration(
+                self.manifest.execution.execution_id,
+                self.api.execution_attempt,
+                self.api.session_id()?,
+                model_call.saturating_sub(1),
+                ExecutionPhase::CompletionEvaluation,
+                0,
+            );
+            let evaluated_response = match self.api.ai_response(request.clone(), &registration) {
+                Ok(response) => {
+                    self.record_cache_observability(&request, &response);
+                    Some(response)
                 }
-                None
+                Err(error) => {
+                    let http = error.downcast_ref::<HostedHttpError>();
+                    if http.map(HostedHttpError::budget_disposition)
+                        == Some(AiBudgetDisposition::Restore)
+                    {
+                        self.phases
+                            .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
+                        if let Some(failure) = http.filter(|failure| {
+                            failure.failure_class() == AiFailureClass::ProviderValidation
+                        }) {
+                            self.append_event_recoverable(
+                                "progress",
+                                provider_rejected_event(
+                                    failure,
+                                    &registration,
+                                    self.api.execution_attempt,
+                                    model_call,
+                                    self.manifest.ai_gateway.model.as_str(),
+                                    self.phases.budgeted_calls(),
+                                    self.budget_telemetry(),
+                                    json!(&self.notebook),
+                                ),
+                                "completion evaluator provider rejection telemetry",
+                            );
+                        }
+                    }
+                    None
+                }
+            };
+            let evaluated = evaluated_response
+                .and_then(|response| response_message_text(&response))
+                .and_then(|text| parse_completion_evaluation(&text).ok())
+                .map(|evaluation| {
+                    reconcile_model_completion_evaluation(
+                        evaluation,
+                        fallback.clone(),
+                        implementation,
+                        &unrecovered,
+                    )
+                })
+                .and_then(|evaluation| {
+                    validate_completion_evaluation(
+                        evaluation,
+                        implementation,
+                        &unrecovered,
+                        changed_paths,
+                        &self.notebook.acceptance_criteria,
+                    )
+                    .ok()
+                });
+            if let Some(evaluated) = evaluated {
+                return Ok(evaluated);
             }
-        };
-        let evaluated = evaluated_response
-            .and_then(|response| response_message_text(&response))
-            .and_then(|text| parse_completion_evaluation(&text).ok())
-            .and_then(|evaluation| {
-                validate_completion_evaluation(
-                    evaluation,
-                    implementation,
-                    self.impact_map.as_ref(),
-                    &unrecovered,
-                    changed_paths,
-                )
-                .ok()
-            });
-        Ok(evaluated.unwrap_or(fallback))
+        }
+        Ok(fallback)
     }
 
     fn execute_tool(&mut self, name: &str, raw_arguments: &str) -> Result<String> {
@@ -4648,6 +4918,34 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 ))
             }
             "repository_snapshot" => {
+                if matches!(
+                    self.phases.active(),
+                    ExecutionPhase::Implementation | ExecutionPhase::Repair
+                ) {
+                    let reallocated = self.phases.release_unused_implementation_capacity();
+                    for (target, calls) in [
+                        ("diff_review", reallocated.diff_review_calls),
+                        (
+                            "completion_evaluation",
+                            reallocated.completion_evaluation_calls,
+                        ),
+                    ] {
+                        if calls > 0 {
+                            self.append_event_recoverable(
+                                "progress",
+                                json!({
+                                    "event_type": "worker.phase_budget_reallocated",
+                                    "from": "implementation_repair",
+                                    "to": target,
+                                    "calls": calls,
+                                    "reason": "implementation_finished_early",
+                                    "budget": self.budget_telemetry(),
+                                }),
+                                "phase budget reallocation telemetry",
+                            );
+                        }
+                    }
+                }
                 self.transition_phase(
                     ExecutionPhase::DiffReview,
                     "implementation requested complete repository diff review",
@@ -6425,6 +6723,13 @@ fn unsuccessful_completion(
         } else {
             "failed".into()
         },
+        mission_outcome: None,
+        process_health: Some(if cancelled {
+            "cancelled".into()
+        } else {
+            "failed".into()
+        }),
+        completion_evaluation: None,
         output_summary: None,
         failure_code: (!cancelled).then_some(failure_code),
         failure_message: (!cancelled).then_some(failure_message),
@@ -6455,26 +6760,71 @@ fn hosted_pull_request_body(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let completeness_heading = if completeness.status == ImplementationCompleteness::Complete {
-        "Implementation completeness: **complete**"
-    } else {
-        "⚠️ **INCOMPLETE — continue implementation before review or merge**"
+    let completeness_heading = match completeness.status {
+        CompletionStatus::Complete => "Implementation completeness: **complete**",
+        CompletionStatus::CompletePendingExternalReview => {
+            "✅ **IMPLEMENTATION COMPLETE — external review remains**"
+        }
+        CompletionStatus::Blocked => "⛔ **BLOCKED — external technical input is required**",
+        CompletionStatus::Partial | CompletionStatus::Incomplete | CompletionStatus::Uncertain => {
+            "⚠️ **INCOMPLETE — continue implementation before review or merge**"
+        }
     };
-    let unresolved = if completeness.unresolved_work.is_empty() {
-        "- None reported.".into()
+    let render_items = |items: &[String]| {
+        if items.is_empty() {
+            "- None.".into()
+        } else {
+            items
+                .iter()
+                .map(|work| format!("- {work}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    let criteria = completeness
+        .criteria
+        .iter()
+        .map(|criterion| {
+            let evidence = if criterion.evidence.is_empty() {
+                "no repository evidence".into()
+            } else {
+                criterion
+                    .evidence
+                    .iter()
+                    .map(|evidence| format!("`{}` — {}", evidence.path, evidence.description))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            format!(
+                "- **{}** · `{}` · `{}` — {}",
+                criterion.criterion_id,
+                criterion.verification_type.as_str(),
+                criterion.status.as_str(),
+                evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let review_checklist = if completeness.review_checklist.is_empty() {
+        "- None.".into()
     } else {
         completeness
-            .unresolved_work
+            .review_checklist
             .iter()
-            .map(|work| format!("- {work}"))
+            .map(|item| format!("- [ ] {}", item.description))
             .collect::<Vec<_>>()
             .join("\n")
     };
     format!(
         "{}\n\nRustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
 Execution: `{}` (attempt {})\nModel: `{}`\nMaximum cost: `${}`\n\n\
-Completion evaluator: `{}` at {:.0}% confidence\n\n{}\n\n\
-Remaining work:\n{}\n\nTechnical validation:\n{}\n\n\
+Completion evaluator: `{}` at {:.0}% confidence\n\
+Implementation: `{}` · verification: `{}` · source: `{}`\n\n{}\n\n\
+Criterion evidence:\n{}\n\n\
+Remaining implementation work:\n{}\n\n\
+Remaining automated verification:\n{}\n\n\
+External review checklist:\n{}\n\n\
+Optional follow-up:\n{}\n\nTechnical validation:\n{}\n\n\
 _The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
         completeness_heading,
         manifest.ticket_key,
@@ -6484,8 +6834,19 @@ _The OpenAI credential remained encrypted in RustGrid and was never sent to this
         manifest.ai_gateway.maximum_cost_usd,
         completeness.status.as_str(),
         completeness.confidence * 100.0,
+        completeness.implementation_completeness.as_str(),
+        completeness.verification_readiness.as_str(),
+        completeness.evaluation_source.as_str(),
         completeness.summary,
-        unresolved,
+        if criteria.is_empty() {
+            "- No acceptance criteria were supplied.".into()
+        } else {
+            criteria
+        },
+        render_items(&completeness.remaining_implementation_work),
+        render_items(&completeness.remaining_automated_verification),
+        review_checklist,
+        render_items(&completeness.optional_follow_up),
         if checks.is_empty() {
             "- No required validation commands configured.".into()
         } else {
@@ -6513,14 +6874,75 @@ fn sanitized_message_content(item: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn cache_observability_payload(
+    request: &Value,
+    response: &Value,
+    previous_prefix_sha256: Option<&str>,
+    previous_tool_order_sha256: Option<&str>,
+) -> (Value, String, String) {
+    let tools = request.get("tools").cloned().unwrap_or_else(|| json!([]));
+    let stable_prefix = json!({
+        "model": request.get("model"),
+        "instructions": request.get("instructions"),
+        "tools": tools,
+    });
+    let encoded_prefix = serde_json::to_vec(&stable_prefix).unwrap_or_default();
+    let prefix_sha256 = hex::encode(Sha256::digest(&encoded_prefix));
+    let encoded_tools = serde_json::to_vec(&tools).unwrap_or_default();
+    let tool_order_sha256 = hex::encode(Sha256::digest(&encoded_tools));
+    let cached_tokens = response
+        .pointer("/usage/input_tokens_details/cached_tokens")
+        .or_else(|| response.pointer("/usage/cached_input_tokens"))
+        .and_then(Value::as_u64);
+    let invalidation_reason = if previous_prefix_sha256.is_none() {
+        "cold_start"
+    } else if previous_tool_order_sha256 != Some(tool_order_sha256.as_str()) {
+        "tool_order_changed"
+    } else if previous_prefix_sha256 != Some(prefix_sha256.as_str()) {
+        "stable_prefix_changed"
+    } else if cached_tokens == Some(0) {
+        "provider_reported_zero_cache_read"
+    } else {
+        "none"
+    };
+    (
+        json!({
+            "event_type": "execution.ai.cache_observability",
+            "stable_prefix_sha256": prefix_sha256,
+            "cache_eligible_prefix_bytes": encoded_prefix.len(),
+            "cache_read_tokens": cached_tokens,
+            "cache_read": cached_tokens.is_some_and(|value| value > 0),
+            "cache_invalidation_reason": invalidation_reason,
+            "model_cache_support_reported": cached_tokens.is_some(),
+            "gateway_forwarded_cache_fields":
+                request.get("prompt_cache_key").is_some()
+                    || request.get("cache_control").is_some(),
+            "metadata_excluded_from_stable_prefix": true,
+            "tool_order_sha256": tool_order_sha256,
+        }),
+        prefix_sha256,
+        tool_order_sha256,
+    )
+}
+
 fn completion_evaluator_instructions() -> &'static str {
     "You are an independent implementation-completeness evaluator. Return only JSON with keys \
-status, confidence, criteria, unresolved_work, unrecovered_tool_failures, and summary. Status is \
-complete, partial, incomplete, or uncertain. Each criterion contains criterion, status, and \
-evidence; criterion status is satisfied, unsatisfied, uncertain, or not_applicable. Evidence \
-contains repository-relative path and description. Never use passing tests or builds alone as \
-functional evidence and never infer missing implementation optimistically. Include exactly one \
-criterion result for every criterion in the impact map, preserving the criterion text verbatim."
+status, implementation_completeness, verification_readiness, evaluation_source, confidence, \
+criteria, remaining_implementation_work, remaining_automated_verification, \
+pending_external_review, optional_follow_up, review_checklist, unrecovered_tool_failures, and \
+summary. Status is complete, complete_pending_external_review, partial, incomplete, blocked, or \
+uncertain. implementation_completeness is complete, partial, or incomplete. \
+verification_readiness is verified, automated_verified, pending_manual_review, or blocked. \
+evaluation_source is model. Each criterion contains criterion_id, criterion, verification_type, \
+status, evidence, validation_evidence, missing_evidence, and required_next_action. Verification \
+type is code, automated_test, manual_qa, accessibility_review, visual_review, product_approval, \
+or deployment_environment. Criterion status is satisfied, partially_satisfied, unsatisfied, \
+uncertain, external_review_required, or not_applicable. Evidence contains repository-relative \
+path and description. Never use passing tests or builds alone as functional evidence and never \
+infer missing implementation optimistically. Human, design, product, visual, manual \
+accessibility, and deployment-environment verification is external_review_required, not missing \
+source code. Include exactly one criterion result for every acceptance criterion in the worker \
+notebook, preserving its ac-N identifier, order, and text verbatim."
 }
 
 fn response_message_text(response: &Value) -> Option<String> {
@@ -6555,9 +6977,9 @@ fn parse_completion_evaluation(text: &str) -> Result<CompletionEvaluation> {
 fn validate_completion_evaluation(
     mut evaluation: CompletionEvaluation,
     implementation: &ImplementationOutcome,
-    impact_map: Option<&ImpactMap>,
     unrecovered: &[ToolFailureRecord],
     changed_paths: &[String],
+    ticket_criteria: &[String],
 ) -> Result<CompletionEvaluation> {
     let authoritative_failures = unrecovered
         .iter()
@@ -6575,33 +6997,26 @@ fn validate_completion_evaluation(
         })
         .collect::<Vec<_>>();
     evaluation.unrecovered_tool_failures = authoritative_failures;
-    if let Some(declaration) = &implementation.explicit_declaration {
-        for work in &declaration.remaining_work {
-            if !evaluation.unresolved_work.contains(work) {
-                evaluation.unresolved_work.push(work.clone());
-            }
-        }
-    }
     if !evaluation.confidence.is_finite()
         || !(0.0..=1.0).contains(&evaluation.confidence)
         || evaluation.summary.trim().is_empty()
         || evaluation.criteria.is_empty()
+        || evaluation.criteria.len() != ticket_criteria.len()
     {
         bail!("completion evaluation is incomplete");
     }
     let valid_paths = changed_paths.iter().collect::<BTreeSet<_>>();
-    let mut evaluated_criteria = BTreeSet::new();
-    for criterion in &evaluation.criteria {
+    let mut evaluated_ids = BTreeSet::new();
+    for (index, criterion) in evaluation.criteria.iter().enumerate() {
+        let expected_id = format!("ac-{}", index + 1);
         if criterion.criterion.trim().is_empty()
-            || !evaluated_criteria.insert(criterion.criterion.trim())
-            || !matches!(
-                criterion.status.as_str(),
-                "satisfied" | "unsatisfied" | "uncertain" | "not_applicable"
-            )
+            || criterion.criterion_id != expected_id
+            || criterion.criterion != ticket_criteria[index]
+            || !evaluated_ids.insert(criterion.criterion_id.as_str())
         {
             bail!("completion evaluation contains an invalid criterion");
         }
-        if criterion.status == "satisfied"
+        if criterion.status == CriterionStatus::Satisfied
             && (criterion.evidence.is_empty()
                 || criterion.evidence.iter().any(|evidence| {
                     evidence.description.trim().is_empty() || !valid_paths.contains(&evidence.path)
@@ -6609,29 +7024,52 @@ fn validate_completion_evaluation(
         {
             bail!("satisfied completion criterion lacks concrete diff evidence");
         }
+        if criterion.status == CriterionStatus::ExternalReviewRequired
+            && !criterion.verification_type.requires_external_review()
+        {
+            bail!("implementation-owned criterion cannot require external review");
+        }
+        if criterion.verification_type.requires_external_review()
+            && !matches!(
+                criterion.status,
+                CriterionStatus::ExternalReviewRequired
+                    | CriterionStatus::Satisfied
+                    | CriterionStatus::NotApplicable
+            )
+        {
+            bail!("external verification criterion has an invalid ownership status");
+        }
+        if criterion.status == CriterionStatus::ExternalReviewRequired
+            && criterion.required_next_action.is_none()
+        {
+            bail!("external verification criterion requires an actionable review step");
+        }
     }
-    if impact_map.is_some_and(|map| {
-        map.impact_map.iter().any(|area| {
-            area.acceptance_criteria.iter().any(|criterion| {
-                criterion.trim().is_empty() || !evaluated_criteria.contains(criterion.trim())
-            })
-        })
-    }) {
-        bail!("completion evaluation does not cover every mapped acceptance criterion");
-    }
-    if evaluation.status == ImplementationCompleteness::Complete
-        && (impact_map.is_none()
-            || !unrecovered.is_empty()
+    if evaluation.implementation_completeness == ImplementationCompleteness::Complete
+        && (!unrecovered.is_empty()
             || implementation
                 .explicit_declaration
                 .as_ref()
                 .is_none_or(|declaration| declaration.implementation_status != "complete")
-            || !evaluation.unresolved_work.is_empty()
+            || !evaluation.remaining_implementation_work.is_empty()
+            || !evaluation.remaining_automated_verification.is_empty()
             || evaluation.criteria.iter().any(|criterion| {
-                !matches!(criterion.status.as_str(), "satisfied" | "not_applicable")
+                !criterion.verification_type.requires_external_review()
+                    && !matches!(
+                        criterion.status,
+                        CriterionStatus::Satisfied | CriterionStatus::NotApplicable
+                    )
             }))
     {
         bail!("completion evaluator cannot prove implementation completeness");
+    }
+    if evaluation.status == CompletionStatus::CompletePendingExternalReview
+        && (evaluation.implementation_completeness != ImplementationCompleteness::Complete
+            || evaluation.verification_readiness != VerificationReadiness::PendingManualReview
+            || evaluation.pending_external_review.is_empty()
+            || evaluation.review_checklist.is_empty())
+    {
+        bail!("review-pending completion lacks its external review contract");
     }
     Ok(evaluation)
 }
@@ -6639,49 +7077,143 @@ fn validate_completion_evaluation(
 fn completion_fallback(
     implementation: &ImplementationOutcome,
     impact_map: Option<&ImpactMap>,
+    implementation_plan: Option<&ImplementationPlan>,
     unrecovered: &[ToolFailureRecord],
     changed_paths: &[String],
+    ticket_criteria: &[String],
+    validation: &[ValidationResult],
+    policy: ProjectVerificationPolicy,
 ) -> CompletionEvaluation {
-    let (status, summary) = if changed_paths.is_empty() {
-        (
-            ImplementationCompleteness::Incomplete,
-            "The implementation produced no reviewable repository changes.",
-        )
-    } else if !unrecovered.is_empty() {
-        (
-            ImplementationCompleteness::Incomplete,
-            "One or more source-changing tool failures remain unrecovered.",
-        )
-    } else if impact_map.is_none() || implementation.explicit_declaration.is_none() {
-        (
-            ImplementationCompleteness::Uncertain,
-            "The implementation lacks the required impact map or explicit diff-review declaration.",
-        )
-    } else if implementation.budget_exhausted
-        || implementation
-            .explicit_declaration
-            .as_ref()
-            .is_some_and(|declaration| declaration.implementation_status != "complete")
-    {
-        (
-            ImplementationCompleteness::Partial,
-            "The implementation is valid resumable work but was not declared complete.",
-        )
-    } else {
-        (
-            ImplementationCompleteness::Uncertain,
-            "Independent requirement-to-diff evaluation was unavailable.",
-        )
-    };
-    CompletionEvaluation {
-        status,
+    let declaration = implementation.explicit_declaration.as_ref();
+    let valid_paths = changed_paths.iter().collect::<BTreeSet<_>>();
+    let all_validation_passed = validation.iter().all(|result| result.status == "passed");
+    let mut evaluation = CompletionEvaluation {
+        status: CompletionStatus::Uncertain,
+        implementation_completeness: ImplementationCompleteness::Incomplete,
+        verification_readiness: VerificationReadiness::Blocked,
+        evaluation_source: EvaluationSource::OrchestratorFallback,
         confidence: 1.0,
-        criteria: Vec::new(),
-        unresolved_work: implementation
-            .explicit_declaration
-            .as_ref()
-            .map(|declaration| declaration.remaining_work.clone())
-            .unwrap_or_default(),
+        criteria: ticket_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, criterion)| {
+                let mut verification_type = verification_type_for_criterion(criterion);
+                let mut evidence = declaration
+                    .into_iter()
+                    .flat_map(|declaration| declaration.criteria_evidence.iter())
+                    .filter(|item| item.criterion.trim() == criterion.trim())
+                    .flat_map(|item| {
+                        item.paths.iter().filter_map(|path| {
+                            valid_paths.contains(path).then(|| CompletionEvidence {
+                                path: path.clone(),
+                                description: item.evidence.clone(),
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if evidence.is_empty() {
+                    evidence = impact_map
+                        .into_iter()
+                        .flat_map(|map| map.impact_map.iter())
+                        .filter(|area| {
+                            area.acceptance_criteria
+                                .iter()
+                                .any(|mapped| mapped.trim() == criterion.trim())
+                        })
+                        .flat_map(|area| {
+                            area.candidate_paths.iter().filter_map(|path| {
+                                valid_paths.contains(path).then(|| CompletionEvidence {
+                                    path: path.clone(),
+                                    description: area.reason.clone(),
+                                })
+                            })
+                        })
+                        .collect();
+                }
+                if evidence.is_empty() {
+                    evidence = implementation_plan
+                        .into_iter()
+                        .flat_map(|plan| plan.planned_changes.iter())
+                        .filter(|change| {
+                            change
+                                .acceptance_criteria
+                                .iter()
+                                .any(|mapped| mapped.trim() == criterion.trim())
+                        })
+                        .filter_map(|change| {
+                            valid_paths.contains(&change.path).then(|| CompletionEvidence {
+                                path: change.path.clone(),
+                                description: change.reason.clone(),
+                            })
+                        })
+                        .collect();
+                }
+                let mandatory_e2e_missing = browser_e2e_is_mandatory_and_missing(
+                    criterion,
+                    policy,
+                    changed_paths,
+                );
+                if mandatory_e2e_missing {
+                    verification_type = VerificationType::AutomatedTest;
+                }
+                let (status, missing_evidence, required_next_action) =
+                    if verification_type.requires_external_review() {
+                        (
+                            CriterionStatus::ExternalReviewRequired,
+                            vec!["External review evidence has not been recorded.".into()],
+                            Some(criterion.clone()),
+                        )
+                    } else if mandatory_e2e_missing {
+                        (
+                            CriterionStatus::Unsatisfied,
+                            vec!["Project policy requires browser E2E coverage for this theme change.".into()],
+                            Some("Add and pass the required authenticated browser E2E coverage.".into()),
+                        )
+                    } else if !unrecovered.is_empty() {
+                        (
+                            CriterionStatus::Unsatisfied,
+                            vec!["A source-changing tool failure remains unrecovered.".into()],
+                            Some("Recover the failed implementation change and rerun validation.".into()),
+                        )
+                    } else if declaration.is_some_and(|value| {
+                        value.implementation_status == "complete"
+                    }) && !evidence.is_empty()
+                        && (verification_type != VerificationType::AutomatedTest
+                            || all_validation_passed)
+                    {
+                        (CriterionStatus::Satisfied, Vec::new(), None)
+                    } else {
+                        (
+                            CriterionStatus::Uncertain,
+                            vec!["No complete criterion-to-diff evidence was available.".into()],
+                            Some("Provide concrete implementation evidence for this criterion.".into()),
+                        )
+                    };
+                CriterionEvaluation {
+                    criterion_id: format!("ac-{}", index + 1),
+                    criterion: criterion.clone(),
+                    verification_type,
+                    status,
+                    evidence,
+                    validation_evidence: (verification_type == VerificationType::AutomatedTest)
+                        .then(|| {
+                            validation
+                                .iter()
+                                .filter(|result| result.status == "passed")
+                                .map(|result| result.command.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    missing_evidence,
+                    required_next_action,
+                }
+            })
+            .collect(),
+        remaining_implementation_work: Vec::new(),
+        remaining_automated_verification: Vec::new(),
+        pending_external_review: Vec::new(),
+        optional_follow_up: Vec::new(),
+        review_checklist: Vec::new(),
         unrecovered_tool_failures: unrecovered
             .iter()
             .map(|failure| {
@@ -6697,7 +7229,225 @@ fn completion_fallback(
                 )
             })
             .collect(),
-        summary: summary.into(),
+        summary: "Completion was classified from the authoritative notebook, diff, declaration, and validation evidence.".into(),
+    };
+    if let Some(declaration) = declaration {
+        for work in &declaration.remaining_work {
+            classify_remaining_work(work, &mut evaluation);
+        }
+    }
+    finalize_completion_dimensions(&mut evaluation, implementation, unrecovered);
+    evaluation
+}
+
+fn reconcile_model_completion_evaluation(
+    model: CompletionEvaluation,
+    mut fallback: CompletionEvaluation,
+    implementation: &ImplementationOutcome,
+    unrecovered: &[ToolFailureRecord],
+) -> CompletionEvaluation {
+    if model.criteria.is_empty() {
+        return fallback;
+    }
+    let mut matched = 0_usize;
+    for expected in &mut fallback.criteria {
+        if let Some(candidate) = model.criteria.iter().find(|candidate| {
+            candidate.criterion_id == expected.criterion_id
+                && candidate.criterion == expected.criterion
+        }) {
+            *expected = candidate.clone();
+            matched = matched.saturating_add(1);
+        }
+    }
+    fallback.confidence = model.confidence;
+    if !model.summary.trim().is_empty() {
+        fallback.summary = model.summary;
+    }
+    fallback.optional_follow_up = model.optional_follow_up;
+    fallback.evaluation_source =
+        if matched == fallback.criteria.len() && model.criteria.len() == fallback.criteria.len() {
+            EvaluationSource::Model
+        } else {
+            EvaluationSource::Hybrid
+        };
+    finalize_completion_dimensions(&mut fallback, implementation, unrecovered);
+    fallback
+}
+
+fn finalize_completion_dimensions(
+    evaluation: &mut CompletionEvaluation,
+    implementation: &ImplementationOutcome,
+    unrecovered: &[ToolFailureRecord],
+) {
+    evaluation.review_checklist.clear();
+    for criterion in &evaluation.criteria {
+        match criterion.status {
+            CriterionStatus::ExternalReviewRequired => {
+                push_unique(
+                    &mut evaluation.pending_external_review,
+                    criterion
+                        .required_next_action
+                        .clone()
+                        .unwrap_or_else(|| criterion.criterion.clone()),
+                );
+                evaluation.review_checklist.push(ReviewChecklistItem {
+                    r#type: criterion.verification_type,
+                    description: criterion
+                        .required_next_action
+                        .clone()
+                        .unwrap_or_else(|| criterion.criterion.clone()),
+                    status: "pending".into(),
+                });
+            }
+            CriterionStatus::Unsatisfied | CriterionStatus::PartiallySatisfied => {
+                let work = criterion
+                    .required_next_action
+                    .clone()
+                    .unwrap_or_else(|| criterion.criterion.clone());
+                if criterion.verification_type == VerificationType::AutomatedTest {
+                    push_unique(&mut evaluation.remaining_automated_verification, work);
+                } else if !criterion.verification_type.requires_external_review() {
+                    push_unique(&mut evaluation.remaining_implementation_work, work);
+                }
+            }
+            CriterionStatus::Satisfied
+            | CriterionStatus::Uncertain
+            | CriterionStatus::NotApplicable => {}
+        }
+    }
+    let declaration_status = implementation
+        .explicit_declaration
+        .as_ref()
+        .map(|declaration| declaration.implementation_status.as_str());
+    let internal_criteria_complete = evaluation.criteria.iter().all(|criterion| {
+        criterion.verification_type.requires_external_review()
+            || matches!(
+                criterion.status,
+                CriterionStatus::Satisfied | CriterionStatus::NotApplicable
+            )
+    });
+    evaluation.implementation_completeness =
+        if implementation.explicit_declaration.as_ref().is_none()
+            || declaration_status == Some("blocked")
+            || implementation.budget_exhausted
+            || !unrecovered.is_empty()
+            || !evaluation.remaining_implementation_work.is_empty()
+            || !evaluation.remaining_automated_verification.is_empty()
+            || !internal_criteria_complete
+        {
+            if declaration_status == Some("blocked")
+                || implementation.explicit_declaration.is_none()
+                || !unrecovered.is_empty()
+            {
+                ImplementationCompleteness::Incomplete
+            } else {
+                ImplementationCompleteness::Partial
+            }
+        } else {
+            ImplementationCompleteness::Complete
+        };
+    evaluation.verification_readiness = if declaration_status == Some("blocked") {
+        VerificationReadiness::Blocked
+    } else if !evaluation.pending_external_review.is_empty() {
+        VerificationReadiness::PendingManualReview
+    } else if evaluation.implementation_completeness == ImplementationCompleteness::Complete {
+        VerificationReadiness::AutomatedVerified
+    } else {
+        VerificationReadiness::Blocked
+    };
+    evaluation.status = if declaration_status == Some("blocked") {
+        CompletionStatus::Blocked
+    } else if evaluation.implementation_completeness == ImplementationCompleteness::Complete
+        && evaluation.verification_readiness == VerificationReadiness::PendingManualReview
+    {
+        CompletionStatus::CompletePendingExternalReview
+    } else if evaluation.implementation_completeness == ImplementationCompleteness::Complete {
+        CompletionStatus::Complete
+    } else if implementation.explicit_declaration.is_none() {
+        CompletionStatus::Uncertain
+    } else if evaluation.implementation_completeness == ImplementationCompleteness::Partial {
+        CompletionStatus::Partial
+    } else {
+        CompletionStatus::Incomplete
+    };
+}
+
+fn verification_type_for_criterion(criterion: &str) -> VerificationType {
+    let normalized = criterion.to_ascii_lowercase();
+    if normalized.contains("product")
+        || normalized.contains("design owner")
+        || normalized.contains("palette approval")
+        || normalized.contains("approved by")
+    {
+        VerificationType::ProductApproval
+    } else if normalized.contains("accessibility")
+        || normalized.contains("contrast")
+        || normalized.contains("keyboard focus")
+    {
+        VerificationType::AccessibilityReview
+    } else if normalized.contains("screenshot") || normalized.contains("visual review") {
+        VerificationType::VisualReview
+    } else if normalized.contains("deployment")
+        || normalized.contains("staging")
+        || normalized.contains("production environment")
+    {
+        VerificationType::DeploymentEnvironment
+    } else if normalized.contains("manual")
+        || normalized.contains("navigation")
+        || normalized.contains("page reload")
+        || normalized.contains("browser verification")
+    {
+        VerificationType::ManualQa
+    } else if normalized.contains("test")
+        || normalized.contains("coverage")
+        || normalized.contains("build")
+        || normalized.contains("lint")
+    {
+        VerificationType::AutomatedTest
+    } else {
+        VerificationType::Code
+    }
+}
+
+fn browser_e2e_is_mandatory_and_missing(
+    criterion: &str,
+    policy: ProjectVerificationPolicy,
+    changed_paths: &[String],
+) -> bool {
+    if !policy.browser_e2e_required_for_theme_changes {
+        return false;
+    }
+    let normalized = criterion.to_ascii_lowercase();
+    let is_theme_browser_criterion = (normalized.contains("theme")
+        || normalized.contains("palette"))
+        && (normalized.contains("browser")
+            || normalized.contains("navigation")
+            || normalized.contains("reload")
+            || normalized.contains("e2e"));
+    is_theme_browser_criterion
+        && !changed_paths.iter().any(|path| {
+            let path = path.to_ascii_lowercase();
+            path.contains("e2e")
+                || path.contains("playwright")
+                || path.ends_with(".spec.ts")
+                || path.ends_with(".spec.tsx")
+        })
+}
+
+fn classify_remaining_work(work: &str, evaluation: &mut CompletionEvaluation) {
+    let verification_type = verification_type_for_criterion(work);
+    if verification_type.requires_external_review() {
+        push_unique(&mut evaluation.pending_external_review, work.to_owned());
+    } else if verification_type == VerificationType::AutomatedTest {
+        push_unique(
+            &mut evaluation.remaining_automated_verification,
+            work.to_owned(),
+        );
+    } else {
+        push_unique(
+            &mut evaluation.remaining_implementation_work,
+            work.to_owned(),
+        );
     }
 }
 
@@ -8477,8 +9227,17 @@ mod tests {
             budget_exhausted: true,
             explicit_declaration: None,
         };
-        let result = completion_fallback(&implementation, None, &[], &changed);
-        assert_ne!(result.status, ImplementationCompleteness::Complete);
+        let result = completion_fallback(
+            &implementation,
+            None,
+            None,
+            &[],
+            &changed,
+            &["Theme can be selected".into()],
+            &[],
+            ProjectVerificationPolicy::default(),
+        );
+        assert_ne!(result.status, CompletionStatus::Complete);
         let hosted_result = HostedResult {
             summary: "partial edit".into(),
             branch: "rustgrid/partial".into(),
@@ -8861,10 +9620,14 @@ Implement theme support.\n\n\
         let result = completion_fallback(
             &implementation,
             Some(&test_impact_map()),
+            None,
             &failures,
             &["src/theme.css".into()],
+            &["Theme can be selected".into()],
+            &[],
+            ProjectVerificationPolicy::default(),
         );
-        assert_eq!(result.status, ImplementationCompleteness::Incomplete);
+        assert_eq!(result.status, CompletionStatus::Incomplete);
         assert_eq!(result.unrecovered_tool_failures.len(), 1);
     }
 
@@ -8887,27 +9650,40 @@ Implement theme support.\n\n\
             }),
         };
         let evaluation = CompletionEvaluation {
-            status: ImplementationCompleteness::Complete,
+            status: CompletionStatus::Complete,
+            implementation_completeness: ImplementationCompleteness::Complete,
+            verification_readiness: VerificationReadiness::AutomatedVerified,
+            evaluation_source: EvaluationSource::Model,
             confidence: 0.95,
             criteria: vec![CriterionEvaluation {
+                criterion_id: "ac-1".into(),
                 criterion: "Theme can be selected".into(),
-                status: "satisfied".into(),
+                verification_type: VerificationType::Code,
+                status: CriterionStatus::Satisfied,
                 evidence: vec![CompletionEvidence {
                     path: "src/theme.css".into(),
                     description: "Adds the complete theme token set.".into(),
                 }],
+                validation_evidence: vec!["cargo test".into()],
+                missing_evidence: vec![],
+                required_next_action: None,
             }],
-            unresolved_work: vec![],
+            remaining_implementation_work: vec![],
+            remaining_automated_verification: vec![],
+            pending_external_review: vec![],
+            optional_follow_up: vec![],
+            review_checklist: vec![],
             unrecovered_tool_failures: vec![],
             summary: "All criteria have diff evidence.".into(),
         };
+        let criteria = vec!["Theme can be selected".into()];
         assert!(
             validate_completion_evaluation(
                 evaluation.clone(),
                 &implementation,
-                Some(&test_impact_map()),
                 &[],
                 &["src/theme.css".into()],
+                &criteria,
             )
             .is_ok()
         );
@@ -8934,25 +9710,37 @@ Implement theme support.\n\n\
             validate_completion_evaluation(
                 missing_evidence,
                 &implementation,
-                Some(&test_impact_map()),
                 &[],
                 &["src/theme.css".into()],
+                &criteria,
             )
             .is_err()
         );
 
         let missing_criterion = CompletionEvaluation {
-            status: ImplementationCompleteness::Complete,
+            status: CompletionStatus::Complete,
+            implementation_completeness: ImplementationCompleteness::Complete,
+            verification_readiness: VerificationReadiness::AutomatedVerified,
+            evaluation_source: EvaluationSource::Model,
             confidence: 0.9,
             criteria: vec![CriterionEvaluation {
+                criterion_id: "ac-1".into(),
                 criterion: "A different criterion".into(),
-                status: "satisfied".into(),
+                verification_type: VerificationType::Code,
+                status: CriterionStatus::Satisfied,
                 evidence: vec![CompletionEvidence {
                     path: "src/theme.css".into(),
                     description: "Changed theme code.".into(),
                 }],
+                validation_evidence: vec![],
+                missing_evidence: vec![],
+                required_next_action: None,
             }],
-            unresolved_work: vec![],
+            remaining_implementation_work: vec![],
+            remaining_automated_verification: vec![],
+            pending_external_review: vec![],
+            optional_follow_up: vec![],
+            review_checklist: vec![],
             unrecovered_tool_failures: vec![],
             summary: "Incomplete mapping.".into(),
         };
@@ -8960,9 +9748,9 @@ Implement theme support.\n\n\
             validate_completion_evaluation(
                 missing_criterion,
                 &implementation,
-                Some(&test_impact_map()),
                 &[],
                 &["src/theme.css".into()],
+                &criteria,
             )
             .is_err()
         );
@@ -8972,10 +9760,17 @@ Implement theme support.\n\n\
     fn partial_pull_request_is_prominently_marked_incomplete_and_resumable() {
         let manifest = test_manifest(Uuid::from_u128(0x11111111_1111_4111_8111_111111111111));
         let completeness = CompletionEvaluation {
-            status: ImplementationCompleteness::Partial,
+            status: CompletionStatus::Partial,
+            implementation_completeness: ImplementationCompleteness::Partial,
+            verification_readiness: VerificationReadiness::Blocked,
+            evaluation_source: EvaluationSource::OrchestratorFallback,
             confidence: 1.0,
             criteria: vec![],
-            unresolved_work: vec!["Add settings integration".into()],
+            remaining_implementation_work: vec!["Add settings integration".into()],
+            remaining_automated_verification: vec![],
+            pending_external_review: vec![],
+            optional_follow_up: vec![],
+            review_checklist: vec![],
             unrecovered_tool_failures: vec![],
             summary: "Budget exhausted after one theme-provider edit.".into(),
         };
@@ -8983,6 +9778,209 @@ Implement theme support.\n\n\
         assert!(body.contains("INCOMPLETE"));
         assert!(body.contains("Add settings integration"));
         assert!(body.contains("partial"));
+    }
+
+    #[test]
+    fn deterministic_fallback_classifies_external_review_without_missing_code() {
+        let criteria = vec![
+            "The designated product owner approves the light-blue palette.".into(),
+            "Complete manual accessibility contrast and keyboard focus review.".into(),
+        ];
+        let implementation = ImplementationOutcome {
+            summary: "implementation complete".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["theme implementation".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+                changed_paths: vec!["src/theme.css".into()],
+                criteria_evidence: vec![],
+            }),
+        };
+        let result = completion_fallback(
+            &implementation,
+            None,
+            None,
+            &[],
+            &["src/theme.css".into()],
+            &criteria,
+            &[ValidationResult {
+                id: "test".into(),
+                command: "npm test".into(),
+                status: "passed".into(),
+                output: String::new(),
+            }],
+            ProjectVerificationPolicy::default(),
+        );
+
+        assert_eq!(result.criteria.len(), criteria.len());
+        assert_eq!(
+            result.criteria[0].verification_type,
+            VerificationType::ProductApproval
+        );
+        assert_eq!(
+            result.criteria[1].verification_type,
+            VerificationType::AccessibilityReview
+        );
+        assert!(
+            result
+                .criteria
+                .iter()
+                .all(|criterion| criterion.status == CriterionStatus::ExternalReviewRequired)
+        );
+        assert_eq!(
+            result.implementation_completeness,
+            ImplementationCompleteness::Complete
+        );
+        assert_eq!(
+            result.verification_readiness,
+            VerificationReadiness::PendingManualReview
+        );
+        assert_eq!(
+            result.status,
+            CompletionStatus::CompletePendingExternalReview
+        );
+        assert!(result.remaining_implementation_work.is_empty());
+        assert_eq!(result.review_checklist.len(), 2);
+    }
+
+    #[test]
+    fn browser_e2e_policy_controls_implementation_completeness() {
+        let criterion = "Theme persists through browser navigation and page reload.".to_string();
+        let implementation = ImplementationOutcome {
+            summary: "theme implementation complete".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["theme persistence".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+                changed_paths: vec!["src/theme.tsx".into()],
+                criteria_evidence: vec![ImplementationCriterionEvidence {
+                    criterion: criterion.clone(),
+                    paths: vec!["src/theme.tsx".into()],
+                    evidence: "The provider persists and restores the selected theme.".into(),
+                }],
+            }),
+        };
+        let changed_paths = vec!["src/theme.tsx".into()];
+        let criteria = vec![criterion];
+        let validation = vec![ValidationResult {
+            id: "test".into(),
+            command: "npm test".into(),
+            status: "passed".into(),
+            output: String::new(),
+        }];
+
+        let optional = completion_fallback(
+            &implementation,
+            None,
+            None,
+            &[],
+            &changed_paths,
+            &criteria,
+            &validation,
+            ProjectVerificationPolicy {
+                browser_e2e_required_for_theme_changes: false,
+                manual_browser_verification_required: true,
+            },
+        );
+        assert_eq!(
+            optional.implementation_completeness,
+            ImplementationCompleteness::Complete
+        );
+        assert_eq!(
+            optional.status,
+            CompletionStatus::CompletePendingExternalReview
+        );
+
+        let mandatory = completion_fallback(
+            &implementation,
+            None,
+            None,
+            &[],
+            &changed_paths,
+            &criteria,
+            &validation,
+            ProjectVerificationPolicy {
+                browser_e2e_required_for_theme_changes: true,
+                manual_browser_verification_required: false,
+            },
+        );
+        assert_eq!(
+            mandatory.criteria[0].verification_type,
+            VerificationType::AutomatedTest
+        );
+        assert_eq!(mandatory.status, CompletionStatus::Partial);
+        assert!(!mandatory.remaining_automated_verification.is_empty());
+    }
+
+    #[test]
+    fn review_pending_pull_request_is_not_marked_implementation_incomplete() {
+        let manifest = test_manifest(Uuid::from_u128(0x11111111_1111_4111_8111_111111111111));
+        let implementation = ImplementationOutcome {
+            summary: "complete".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["palette".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+                changed_paths: vec!["src/theme.css".into()],
+                criteria_evidence: vec![],
+            }),
+        };
+        let completeness = completion_fallback(
+            &implementation,
+            None,
+            None,
+            &[],
+            &["src/theme.css".into()],
+            &["Product owner approves the palette.".into()],
+            &[],
+            ProjectVerificationPolicy::default(),
+        );
+        let body = hosted_pull_request_body(&manifest, &[], &completeness);
+        assert!(body.contains("IMPLEMENTATION COMPLETE"));
+        assert!(body.contains("External review checklist"));
+        assert!(!body.contains("INCOMPLETE — continue implementation"));
+        assert!(!requires_implementation_continuation(completeness.status));
+    }
+
+    #[test]
+    fn cache_observability_explains_zero_reads_without_metadata_churn() {
+        let first_request = json!({
+            "model": "gpt-5.6",
+            "instructions": "stable",
+            "tools": [{"type": "function", "name": "read_files"}],
+            "metadata": {"phase": "discovery"}
+        });
+        let second_request = json!({
+            "model": "gpt-5.6",
+            "instructions": "stable",
+            "tools": [{"type": "function", "name": "read_files"}],
+            "metadata": {"phase": "implementation"}
+        });
+        let response = json!({
+            "usage": {"input_tokens_details": {"cached_tokens": 0}}
+        });
+        let (cold, prefix, tools) =
+            cache_observability_payload(&first_request, &response, None, None);
+        assert_eq!(cold["cache_invalidation_reason"], "cold_start");
+        assert_eq!(cold["cache_read"], false);
+        assert_eq!(cold["model_cache_support_reported"], true);
+        assert_eq!(cold["gateway_forwarded_cache_fields"], false);
+
+        let (stable, second_prefix, second_tools) =
+            cache_observability_payload(&second_request, &response, Some(&prefix), Some(&tools));
+        assert_eq!(prefix, second_prefix);
+        assert_eq!(tools, second_tools);
+        assert_eq!(
+            stable["cache_invalidation_reason"],
+            "provider_reported_zero_cache_read"
+        );
+        assert_eq!(stable["metadata_excluded_from_stable_prefix"], true);
     }
 
     #[test]
@@ -10268,6 +11266,9 @@ Implement theme support.\n\n\
         completion_client
             .complete(&CompletionRequest {
                 status: "failed".into(),
+                mission_outcome: None,
+                process_health: Some("failed".into()),
+                completion_evaluation: None,
                 output_summary: None,
                 failure_code: Some("validation_failed".into()),
                 failure_message: Some("Required validation failed.".into()),
@@ -10318,6 +11319,9 @@ Implement theme support.\n\n\
         let execution_id = Uuid::from_u128(0x50505050_5050_4050_8050_505050505050);
         let completion = CompletionRequest {
             status: "partial_result".into(),
+            mission_outcome: Some(CompletionStatus::Partial),
+            process_health: Some("healthy".into()),
+            completion_evaluation: None,
             output_summary: Some("Continue implementation.".into()),
             failure_code: None,
             failure_message: None,

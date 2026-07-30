@@ -70,6 +70,15 @@ impl PhaseBudgetAllocation {
 }
 
 pub(super) fn phase_budget_allocation(total: usize) -> PhaseBudgetAllocation {
+    if total >= 60 {
+        return PhaseBudgetAllocation {
+            discovery_maximum: 8,
+            planning_maximum: 4,
+            implementation_repair_reserved: total.saturating_sub(22),
+            diff_review_reserved: 4,
+            completion_evaluation_reserved: 6,
+        };
+    }
     if total == DEFAULT_HOSTED_MODEL_CALLS {
         return PhaseBudgetAllocation {
             discovery_maximum: 8,
@@ -125,6 +134,14 @@ pub(super) struct PhaseLedger {
     repair_calls: usize,
     diff_review_calls: usize,
     completion_evaluation_calls: usize,
+    reallocated_diff_review_calls: usize,
+    reallocated_completion_evaluation_calls: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct PhaseBudgetReallocation {
+    pub(super) diff_review_calls: usize,
+    pub(super) completion_evaluation_calls: usize,
 }
 
 impl PhaseLedger {
@@ -140,6 +157,8 @@ impl PhaseLedger {
             repair_calls: 0,
             diff_review_calls: 0,
             completion_evaluation_calls: 0,
+            reallocated_diff_review_calls: 0,
+            reallocated_completion_evaluation_calls: 0,
         }
     }
 
@@ -193,6 +212,40 @@ impl PhaseLedger {
             .saturating_sub(self.planning_calls)
             .saturating_sub(self.allocation.diff_review_reserved)
             .saturating_sub(self.allocation.completion_evaluation_reserved)
+            .saturating_sub(self.reallocated_diff_review_calls)
+            .saturating_sub(self.reallocated_completion_evaluation_calls)
+    }
+
+    pub(super) fn ensure_finalization_minimum(&mut self, criterion_count: usize) {
+        self.reallocated_diff_review_calls = 4_usize
+            .saturating_sub(self.allocation.diff_review_reserved)
+            .min(self.allocation.implementation_repair_reserved);
+        let evaluation_minimum: usize = if criterion_count > 5 { 3 } else { 1 };
+        self.reallocated_completion_evaluation_calls = evaluation_minimum
+            .saturating_sub(self.allocation.completion_evaluation_reserved)
+            .min(
+                self.allocation
+                    .implementation_repair_reserved
+                    .saturating_sub(self.reallocated_diff_review_calls),
+            );
+    }
+
+    pub(super) fn release_unused_implementation_capacity(&mut self) -> PhaseBudgetReallocation {
+        let unused = self
+            .implementation_repair_capacity()
+            .saturating_sub(self.implementation_repair_calls());
+        let diff_review_calls = unused.min(4);
+        let completion_evaluation_calls = unused.saturating_sub(diff_review_calls);
+        self.reallocated_diff_review_calls = self
+            .reallocated_diff_review_calls
+            .saturating_add(diff_review_calls);
+        self.reallocated_completion_evaluation_calls = self
+            .reallocated_completion_evaluation_calls
+            .saturating_add(completion_evaluation_calls);
+        PhaseBudgetReallocation {
+            diff_review_calls,
+            completion_evaluation_calls,
+        }
     }
 
     pub(super) const fn first_write_attempt_deadline(&self) -> usize {
@@ -235,8 +288,14 @@ impl PhaseLedger {
             ExecutionPhase::Implementation | ExecutionPhase::Repair => {
                 self.implementation_repair_capacity()
             }
-            ExecutionPhase::DiffReview => self.allocation.diff_review_reserved,
-            ExecutionPhase::CompletionEvaluation => self.allocation.completion_evaluation_reserved,
+            ExecutionPhase::DiffReview => self
+                .allocation
+                .diff_review_reserved
+                .saturating_add(self.reallocated_diff_review_calls),
+            ExecutionPhase::CompletionEvaluation => self
+                .allocation
+                .completion_evaluation_reserved
+                .saturating_add(self.reallocated_completion_evaluation_calls),
             ExecutionPhase::Validation | ExecutionPhase::Publication => 0,
         }
     }
@@ -350,10 +409,14 @@ impl PhaseLedger {
                 "diff_review": {
                     "consumed": self.diff_review_calls,
                     "reserved": self.allocation.diff_review_reserved,
+                    "reallocated": self.reallocated_diff_review_calls,
+                    "limit": self.phase_limit(ExecutionPhase::DiffReview),
                 },
                 "completion_evaluation": {
                     "consumed": self.completion_evaluation_calls,
                     "reserved": self.allocation.completion_evaluation_reserved,
+                    "reallocated": self.reallocated_completion_evaluation_calls,
+                    "limit": self.phase_limit(ExecutionPhase::CompletionEvaluation),
                 }
             }
         })
@@ -452,19 +515,47 @@ mod tests {
     }
 
     #[test]
-    fn sixty_call_budget_puts_incremental_capacity_into_implementation() {
+    fn sixty_call_budget_reserves_review_and_completion_capacity() {
         let allocation = phase_budget_allocation(60);
         assert_eq!(allocation.discovery_maximum, 8);
         assert_eq!(allocation.planning_maximum, 4);
-        assert_eq!(allocation.implementation_repair_reserved, 45);
-        assert_eq!(allocation.diff_review_reserved, 2);
-        assert_eq!(allocation.completion_evaluation_reserved, 1);
+        assert_eq!(allocation.implementation_repair_reserved, 38);
+        assert_eq!(allocation.diff_review_reserved, 4);
+        assert_eq!(allocation.completion_evaluation_reserved, 6);
         assert_eq!(allocation.total(), 60);
 
         let ledger = PhaseLedger::new(60, ExecutionPhase::Discovery);
         assert_eq!(ledger.first_write_attempt_deadline(), 17);
         assert_eq!(ledger.successful_write_deadline(), 22);
-        assert_eq!(ledger.diff_review_start_call(), 58);
+        assert_eq!(ledger.diff_review_start_call(), 51);
+    }
+
+    #[test]
+    fn unused_implementation_capacity_is_reassigned_to_finalization() {
+        let mut ledger = PhaseLedger::new(60, ExecutionPhase::Implementation);
+        ledger.discovery_calls = 8;
+        ledger.planning_calls = 4;
+        ledger.implementation_calls = 20;
+        let reallocated = ledger.release_unused_implementation_capacity();
+
+        assert_eq!(reallocated.diff_review_calls, 4);
+        assert_eq!(reallocated.completion_evaluation_calls, 14);
+        assert_eq!(ledger.implementation_repair_capacity(), 20);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::DiffReview), 8);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::CompletionEvaluation), 20);
+        assert_eq!(ledger.total_limit, 60);
+    }
+
+    #[test]
+    fn larger_acceptance_sets_keep_three_evaluation_calls_and_four_review_calls() {
+        let mut ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
+        ledger.discovery_calls = 8;
+        ledger.planning_calls = 4;
+        ledger.ensure_finalization_minimum(8);
+
+        assert_eq!(ledger.phase_limit(ExecutionPhase::DiffReview), 4);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::CompletionEvaluation), 3);
+        assert_eq!(ledger.implementation_repair_capacity(), 21);
     }
 
     #[test]
