@@ -5,6 +5,18 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Separate the stable semantic AI-call identity from worker-session transport
+  attempts, and retry proven pre-dispatch registration failures up to three
+  times with bounded jitter without reinitializing the notebook or phase.
+
+### Fixed
+
+- Keep pre-dispatch registration retries outside model-call accounting and
+  report precise retry/exhaustion telemetry without inferring safety from
+  ambiguous legacy gateway failures.
+
 ## 1.4.8 - 2026-07-30
 
 ### Changed

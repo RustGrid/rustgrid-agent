@@ -62,7 +62,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
 const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_CALLS_HARD_LIMIT: usize = 64;
 const MAX_REPAIR_ATTEMPTS: usize = 2;
-const MAX_AI_REGISTRATION_RETRIES: usize = 2;
+const MAX_AI_REGISTRATION_ATTEMPTS: usize = 3;
 const HOSTED_NAMESPACE: Uuid = Uuid::from_u128(0xc4e820c0_9ee5_4d13_87d0_05582a548e76);
 const EXECUTION_PERMISSIONS: [&str; 7] = [
     "ai:invoke",
@@ -318,12 +318,10 @@ impl HostedHttpError {
 
     fn provider_contacted(&self) -> Option<bool> {
         self.provider_contacted
-            .or_else(|| self.is_legacy_failed_request_replay().then_some(false))
     }
 
     fn call_budget_consumed(&self) -> Option<bool> {
         self.call_budget_consumed
-            .or_else(|| self.is_legacy_failed_request_replay().then_some(false))
     }
 
     fn reservation_reconciliation_state(&self) -> Option<&str> {
@@ -336,10 +334,25 @@ impl HostedHttpError {
     }
 
     fn retryable_registration_failure(&self) -> bool {
-        self.retryable == Some(true)
-            && self.failure_stage() == Some("request_registration")
+        let safe_pre_dispatch_failure = self.failure_stage() == Some("request_registration")
             && self.provider_contacted() == Some(false)
-            && self.call_budget_consumed() == Some(false)
+            && self.call_budget_consumed() == Some(false);
+        let retryable_reconciliation = matches!(
+            self.reservation_reconciliation_state(),
+            Some("failed_before_dispatch" | "previous_request_settled" | "released" | "reconciled")
+        );
+        let permanent_conflict = matches!(
+            self.effective_code(),
+            "ai_request_payload_conflict"
+                | "execution_ai_access_revoked"
+                | "execution_ai_request_not_allowed"
+                | "execution_token_invalid"
+                | "execution_token_scope_invalid"
+        );
+        safe_pre_dispatch_failure
+            && !permanent_conflict
+            && (self.retryable == Some(true)
+                || (self.retryable == Some(false) && retryable_reconciliation))
     }
 }
 
@@ -522,14 +535,43 @@ impl HostedApiClient {
         SecretString::new(issued.token, "GitHub repository token")
     }
 
-    fn ai_response(&self, body: Value, idempotency_key: Uuid) -> Result<Value> {
-        self.send_json(
-            Method::POST,
-            &format!("executions/{}/ai/responses", self.execution_id),
-            Some(body),
-            Some(idempotency_key),
-            3,
-        )
+    fn ai_response(&self, body: Value, registration: &AiCallRegistration) -> Result<Value> {
+        self.ensure_fresh()?;
+        let token = self.current_token()?;
+        let path = format!("executions/{}/ai/responses", self.execution_id);
+        let url = self
+            .api_root
+            .join(&path)
+            .with_context(|| format!("invalid RustGrid API path {path}"))?;
+        for attempt in 0..3 {
+            let response = self
+                .http
+                .post(url.clone())
+                .bearer_auth(token.expose())
+                .header(header::ACCEPT, "application/json")
+                .header("Idempotency-Key", registration.request_id.to_string())
+                .header(
+                    "X-RustGrid-Semantic-Call-Id",
+                    registration.semantic_call_id.to_string(),
+                )
+                .header("X-RustGrid-Call-Index", registration.call_index.to_string())
+                .header("X-RustGrid-Call-Phase", registration.phase.as_str())
+                .header(
+                    "X-RustGrid-Registration-Attempt",
+                    registration.registration_attempt.to_string(),
+                )
+                .json(&body)
+                .send();
+            match response {
+                Ok(response) if retryable_status(response.status()) && attempt < 2 => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Ok(response) => return decode_response(response, &path),
+                Err(_) if attempt < 2 => thread::sleep(retry_delay(attempt)),
+                Err(_) => bail!("RustGrid {path} transport failed"),
+            }
+        }
+        unreachable!("bounded AI gateway transport loop always returns")
     }
 
     fn telemetry(&self, batch: &TelemetryBatch) -> Result<()> {
@@ -724,23 +766,48 @@ fn completion_idempotency_key(execution_id: Uuid, completion: &CompletionRequest
     Ok(Uuid::new_v5(&HOSTED_NAMESPACE, &key_material))
 }
 
-fn ai_response_idempotency_key(
+#[derive(Clone, Copy, Debug)]
+struct AiCallRegistration {
+    semantic_call_id: Uuid,
+    request_id: Uuid,
+    call_index: usize,
+    phase: ExecutionPhase,
+    registration_attempt: usize,
+}
+
+fn ai_call_registration(
     execution_id: Uuid,
     execution_attempt: i32,
     worker_session_id: Uuid,
     call_index: usize,
-) -> Uuid {
+    phase: ExecutionPhase,
+    registration_attempt: usize,
+) -> AiCallRegistration {
     let attempt = execution_attempt.to_be_bytes();
-    let call_index = call_index.to_be_bytes();
-    let key_material = [
-        b"ai-registration:".as_slice(),
+    let call_index_bytes = call_index.to_be_bytes();
+    let semantic_material = [
+        b"ai-semantic-call:".as_slice(),
         execution_id.as_bytes().as_slice(),
         attempt.as_slice(),
-        worker_session_id.as_bytes().as_slice(),
-        call_index.as_slice(),
+        call_index_bytes.as_slice(),
     ]
     .concat();
-    Uuid::new_v5(&HOSTED_NAMESPACE, &key_material)
+    let semantic_call_id = Uuid::new_v5(&HOSTED_NAMESPACE, &semantic_material);
+    let registration_attempt_bytes = registration_attempt.to_be_bytes();
+    let transport_material = [
+        b"ai-registration-attempt:".as_slice(),
+        semantic_call_id.as_bytes().as_slice(),
+        worker_session_id.as_bytes().as_slice(),
+        registration_attempt_bytes.as_slice(),
+    ]
+    .concat();
+    AiCallRegistration {
+        semantic_call_id,
+        request_id: Uuid::new_v5(&HOSTED_NAMESPACE, &transport_material),
+        call_index,
+        phase,
+        registration_attempt,
+    }
 }
 
 #[derive(Deserialize)]
@@ -3132,7 +3199,7 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<ImplementationOutcome> {
         let mut initial = json!({"role": "user", "content": prompt});
         let mut turns = VecDeque::<Vec<Value>>::new();
-        let mut registration_retries = 0;
+        let mut registration_attempt = 0;
         loop {
             ensure_running(self.running)?;
             if let Some(outcome) = self.prepare_next_model_call(allow_budget_handoff)? {
@@ -3176,11 +3243,13 @@ impl<'a> GatewayAgent<'a> {
 
             let call_phase = self.phases.active();
             let model_call = self.phases.begin_model_call()?;
-            let idempotency_key = ai_response_idempotency_key(
+            let registration = ai_call_registration(
                 self.manifest.execution.execution_id,
                 self.api.execution_attempt,
                 self.api.session_id()?,
                 model_call.saturating_sub(1),
+                call_phase,
+                registration_attempt,
             );
             self.api.append_event(
                 "progress",
@@ -3194,9 +3263,9 @@ impl<'a> GatewayAgent<'a> {
                     "budget": self.budget_telemetry(),
                 }),
             )?;
-            let response = match self.api.ai_response(request, idempotency_key) {
+            let response = match self.api.ai_response(request, &registration) {
                 Ok(response) => {
-                    registration_retries = 0;
+                    registration_attempt = 0;
                     response
                 }
                 Err(error) => {
@@ -3205,17 +3274,20 @@ impl<'a> GatewayAgent<'a> {
                         http.and_then(HostedHttpError::call_budget_consumed) == Some(false);
                     if call_was_not_consumed {
                         self.phases.rollback_model_call(call_phase)?;
-                        let retryable = http
-                            .is_some_and(HostedHttpError::retryable_registration_failure)
-                            && registration_retries < MAX_AI_REGISTRATION_RETRIES;
+                        let registration_can_retry =
+                            http.is_some_and(HostedHttpError::retryable_registration_failure);
+                        let retryable = registration_can_retry
+                            && registration_attempt + 1 < MAX_AI_REGISTRATION_ATTEMPTS;
+                        let retries_exhausted = registration_can_retry && !retryable;
                         self.append_event_recoverable(
                             "progress",
                             json!({
                                 "event_type": if retryable {
-                                    "execution.ai.retryable_failure"
+                                    "execution.ai.registration_retry"
                                 } else {
                                     "execution.ai.registration_failure"
                                 },
+                                "semantic_call_id": registration.semantic_call_id,
                                 "call_index": model_call.saturating_sub(1),
                                 "execution_attempt": self.api.execution_attempt,
                                 "worker_session_id": self.api.session_id()?,
@@ -3234,16 +3306,32 @@ impl<'a> GatewayAgent<'a> {
                                     .and_then(
                                         HostedHttpError::reservation_reconciliation_state
                                     ),
+                                "reason": http
+                                    .and_then(
+                                        HostedHttpError::reservation_reconciliation_state
+                                    )
+                                    .unwrap_or("failed_before_dispatch"),
                                 "retryable": retryable,
-                                "registration_retry": registration_retries,
+                                "registration_attempt": if retryable {
+                                    registration_attempt.saturating_add(1)
+                                } else {
+                                    registration_attempt
+                                },
+                                "registration_attempts_exhausted": retries_exhausted,
+                                "message": retries_exhausted.then_some(
+                                    "The AI request could not be registered after 3 attempts. No provider call, model budget, or actual cost was consumed."
+                                ),
                                 "budget": self.budget_telemetry(),
                                 "notebook": self.notebook,
                             }),
                             "AI request registration failure telemetry",
                         );
                         if retryable {
-                            thread::sleep(retry_delay(registration_retries));
-                            registration_retries = registration_retries.saturating_add(1);
+                            thread::sleep(registration_retry_delay(
+                                registration_attempt,
+                                registration.semantic_call_id,
+                            ));
+                            registration_attempt = registration_attempt.saturating_add(1);
                             continue;
                         }
                     }
@@ -3718,19 +3806,17 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 "budget": self.budget_telemetry(),
             }),
         )?;
-        let request_sha = Sha256::digest(serde_json::to_vec(&request).unwrap_or_default());
-        let idempotency_key = Uuid::new_v5(
-            &HOSTED_NAMESPACE,
-            &[
-                b"completion-evaluator:".as_slice(),
-                self.manifest.execution.execution_id.as_bytes().as_slice(),
-                request_sha.as_slice(),
-            ]
-            .concat(),
+        let registration = ai_call_registration(
+            self.manifest.execution.execution_id,
+            self.api.execution_attempt,
+            self.api.session_id()?,
+            model_call.saturating_sub(1),
+            ExecutionPhase::CompletionEvaluation,
+            0,
         );
         let evaluated = self
             .api
-            .ai_response(request, idempotency_key)
+            .ai_response(request, &registration)
             .ok()
             .and_then(|response| response_message_text(&response))
             .and_then(|text| parse_completion_evaluation(&text).ok())
@@ -5235,6 +5321,17 @@ fn retryable_status(status: StatusCode) -> bool {
 
 fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(250_u64.saturating_mul(1_u64 << attempt.min(5)))
+}
+
+fn registration_retry_delay(attempt: usize, semantic_call_id: Uuid) -> Duration {
+    let base_millis = [250_u64, 1_000, 3_000]
+        .get(attempt)
+        .copied()
+        .unwrap_or(3_000);
+    let bytes = semantic_call_id.as_bytes();
+    let sample = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let jitter_percent = 80_u64 + u64::from(sample % 41);
+    Duration::from_millis(base_millis.saturating_mul(jitter_percent) / 100)
 }
 
 fn token_refresh_after(expires_at: SystemTime) -> SystemTime {
@@ -7729,26 +7826,57 @@ mod tests {
     }
 
     #[test]
-    fn ai_registration_idempotency_is_scoped_to_attempt_session_and_call() {
+    fn ai_registration_separates_semantic_calls_from_transport_attempts() {
         let execution_id = Uuid::from_u128(44);
         let session_id = Uuid::from_u128(45);
-        let key = ai_response_idempotency_key(execution_id, 9, session_id, 0);
+        let registration =
+            ai_call_registration(execution_id, 9, session_id, 0, ExecutionPhase::Discovery, 0);
 
         assert_eq!(
-            key,
-            ai_response_idempotency_key(execution_id, 9, session_id, 0)
+            registration.semantic_call_id,
+            ai_call_registration(
+                execution_id,
+                9,
+                Uuid::from_u128(46),
+                0,
+                ExecutionPhase::Discovery,
+                1
+            )
+            .semantic_call_id
         );
         assert_ne!(
-            key,
-            ai_response_idempotency_key(execution_id, 10, session_id, 0)
+            registration.semantic_call_id,
+            ai_call_registration(
+                execution_id,
+                10,
+                session_id,
+                0,
+                ExecutionPhase::Discovery,
+                0
+            )
+            .semantic_call_id
         );
         assert_ne!(
-            key,
-            ai_response_idempotency_key(execution_id, 9, Uuid::from_u128(46), 0)
+            registration.semantic_call_id,
+            ai_call_registration(execution_id, 9, session_id, 1, ExecutionPhase::Discovery, 0)
+                .semantic_call_id
         );
         assert_ne!(
-            key,
-            ai_response_idempotency_key(execution_id, 9, session_id, 1)
+            registration.request_id,
+            ai_call_registration(
+                execution_id,
+                9,
+                Uuid::from_u128(46),
+                0,
+                ExecutionPhase::Discovery,
+                0
+            )
+            .request_id
+        );
+        assert_ne!(
+            registration.request_id,
+            ai_call_registration(execution_id, 9, session_id, 0, ExecutionPhase::Discovery, 1)
+                .request_id
         );
     }
 
@@ -7780,7 +7908,14 @@ mod tests {
                     "store": false,
                     "stream": false
                 }),
-                Uuid::from_u128(48),
+                &ai_call_registration(
+                    execution_id,
+                    1,
+                    Uuid::from_u128(49),
+                    0,
+                    ExecutionPhase::Discovery,
+                    0,
+                ),
             )
             .unwrap_err();
         server.join().unwrap();
@@ -7813,13 +7948,43 @@ mod tests {
 
         assert_eq!(failure.effective_code(), "ai_request_idempotency_conflict");
         assert_eq!(failure.failure_stage(), Some("request_registration"));
-        assert_eq!(failure.provider_contacted(), Some(false));
-        assert_eq!(failure.call_budget_consumed(), Some(false));
+        assert_eq!(failure.provider_contacted(), None);
+        assert_eq!(failure.call_budget_consumed(), None);
         assert_eq!(
             failure.reservation_reconciliation_state(),
             Some("previous_request_settled")
         );
         assert!(!failure.retryable_registration_failure());
+    }
+
+    #[test]
+    fn settled_pre_dispatch_registration_is_retryable_even_if_legacy_flag_is_false() {
+        let failure = HostedHttpError {
+            status: StatusCode::CONFLICT,
+            path: "executions/id/ai/responses".into(),
+            code: "ai_request_idempotency_conflict".into(),
+            request_id: Some("24162c59-38d5-4705-80f9-717c8c26ee29".into()),
+            upstream_provider_status: None,
+            failure_stage: Some("request_registration".into()),
+            provider_contacted: Some(false),
+            call_budget_consumed: Some(false),
+            reservation_reconciliation_state: Some("previous_request_settled".into()),
+            retryable: Some(false),
+        };
+
+        assert!(failure.retryable_registration_failure());
+    }
+
+    #[test]
+    fn registration_retry_delays_are_bounded_and_jittered() {
+        let semantic_call_id = Uuid::from_u128(0x1234);
+        let first = registration_retry_delay(0, semantic_call_id);
+        let second = registration_retry_delay(1, semantic_call_id);
+        let third = registration_retry_delay(2, semantic_call_id);
+
+        assert!((Duration::from_millis(200)..=Duration::from_millis(300)).contains(&first));
+        assert!((Duration::from_millis(800)..=Duration::from_millis(1_200)).contains(&second));
+        assert!((Duration::from_millis(2_400)..=Duration::from_millis(3_600)).contains(&third));
     }
 
     #[test]
@@ -7840,7 +8005,14 @@ mod tests {
                     "store": false,
                     "stream": false
                 }),
-                Uuid::from_u128(45),
+                &ai_call_registration(
+                    execution_id,
+                    1,
+                    Uuid::from_u128(45),
+                    0,
+                    ExecutionPhase::Discovery,
+                    0,
+                ),
             )
             .unwrap();
         ai_server.join().unwrap();
@@ -7848,7 +8020,11 @@ mod tests {
         assert!(ai_request.starts_with(&format!(
             "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
         )));
-        assert!(ai_request.contains("idempotency-key: 00000000-0000-0000-0000-00000000002d"));
+        assert!(ai_request.contains("idempotency-key:"));
+        assert!(ai_request.contains("x-rustgrid-semantic-call-id:"));
+        assert!(ai_request.contains("x-rustgrid-call-index: 0"));
+        assert!(ai_request.contains("x-rustgrid-call-phase: discovery"));
+        assert!(ai_request.contains("x-rustgrid-registration-attempt: 0"));
         assert!(ai_request.contains("authorization: Bearer rge_"));
         assert!(!ai_request.contains("OPENAI_API_KEY"));
 
