@@ -5,6 +5,32 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.12 - 2026-07-30
+
+### Changed
+
+- Allocate a signed 60-call hosted mission as 8 discovery calls, 4 planning
+  calls, 45 implementation and repair calls, 2 diff-review calls, and 1
+  completion-evaluation call.
+- Cap discovery and planning as the hosted budget grows so additional capacity
+  funds implementation and repair instead of repeated exploration.
+- Keep first-write guardrails anchored to calls 17 and 22 for larger missions,
+  matching the local worker's bias toward producing and validating a concrete
+  change early.
+- Compact raw hosted conversation history to the latest three turn windows
+  after notebook checkpointing, while preserving the durable notebook and
+  existing diff as the authoritative continuation state.
+- Accept internally consistent backend-signed hosted budgets up to 100 calls
+  while continuing to enforce the exact signed mission limit.
+
+### Fixed
+
+- Prevent the old phase proportions and raw-history growth from exhausting a
+  larger hosted budget before the implementation is complete.
+- Add 70% and 90% budget guidance that prioritizes remaining acceptance
+  criteria and the smallest complete validated result instead of starting new
+  broad exploration.
+
 ## 1.4.11 - 2026-07-30
 
 ### Changed
