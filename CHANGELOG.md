@@ -5,6 +5,35 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.10 - 2026-07-30
+
+### Changed
+
+- Validate the hosted startup request, function-tool schemas, metadata, and
+  model-facing options before repository work, then revalidate each exact agent
+  and completion-evaluator request immediately before dispatch.
+- Validate strict structured-output schemas whenever a request supplies a
+  `text.format` configuration.
+- Preserve bounded provider diagnostics, request identifiers, adapter and
+  payload-schema versions, provider attempts, explicit gateway status, and
+  reservation accounting through worker telemetry and terminal results.
+
+### Fixed
+
+- Encode `metadata.model_call_budget` as a string, as required by the provider,
+  instead of sending the integer value that caused upstream HTTP 400
+  `invalid_type` rejections.
+- Derive provider-dispatch failures from authoritative provider evidence
+  instead of reusing stale registration-conflict or dispatch-uncertain
+  diagnostics.
+- Restore phase capacity only when RustGrid explicitly proves that an invalid
+  provider request consumed no semantic model call and incurred zero actual
+  cost.
+- Preserve actionable validation codes and exact paths, including
+  `ai_tool_schema_invalid`, `ai_response_schema_invalid`, and request-envelope
+  failures when their corresponding request shapes are validated, and retain
+  safe provider errors up to the backend contract bounds.
+
 ## 1.4.9 - 2026-07-30
 
 ### Changed
