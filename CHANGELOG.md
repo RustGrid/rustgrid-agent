@@ -5,6 +5,8 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.9 - 2026-07-30
+
 ### Changed
 
 - Separate the stable semantic AI-call identity from worker-session transport
