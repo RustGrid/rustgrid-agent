@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rustgrid.com/contracts/impact-map-v2.schema.json",
+  "title": "RustGrid impact map",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "areas", "inspected_files", "searches", "unresolved_questions"],
+  "properties": {
+    "schema_version": { "const": "rustgrid.impact_map.v2" },
+    "areas": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["area_id", "name", "candidate_paths", "evidence", "acceptance_criteria_ids", "reason"],
+        "properties": {
+          "area_id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "candidate_paths": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "path", "query", "description"],
+              "properties": {
+                "type": { "enum": ["file_read", "search_match", "repository_structure", "test_reference", "inference"] },
+                "path": { "type": ["string", "null"] },
+                "query": { "type": ["string", "null"] },
+                "description": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "acceptance_criteria_ids": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^ac-[1-9][0-9]*$" } },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "inspected_files": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "searches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query", "scope"],
+        "properties": {
+          "query": { "type": "string", "minLength": 1 },
+          "scope": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "unresolved_questions": { "type": "array", "items": { "type": "string" } }
+  }
+}

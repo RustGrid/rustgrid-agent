@@ -90,6 +90,9 @@ jobs:
       - name: Use Rust toolchain
         run: rustup default 1.94
 
+      - name: Verify impact-map generated contract
+        run: node scripts/check-impact-map-contract.mjs --check
+
       - name: Check formatting
         run: cargo fmt --check
 

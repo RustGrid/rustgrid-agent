@@ -44,7 +44,13 @@ use crate::{
     token::parse_rfc3339_utc,
 };
 
+mod impact_map;
 mod orchestration;
+
+use impact_map::{
+    ArtifactSource, IMPACT_MAP_SCHEMA_VERSION, ImpactArea, ImpactMap, InvalidPayloadShape,
+    ValidationError,
+};
 
 #[cfg(test)]
 use orchestration::phase_budget_allocation;
@@ -1539,31 +1545,6 @@ struct CompletionEvaluation {
     summary: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ImpactMap {
-    can_implement: bool,
-    #[serde(default)]
-    impact_map: Vec<ImpactArea>,
-    #[serde(default)]
-    files_inspected: Vec<String>,
-    #[serde(default)]
-    searches_completed: Vec<String>,
-    #[serde(default)]
-    blocking_unknowns: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ImpactArea {
-    area: String,
-    #[serde(default)]
-    candidate_paths: Vec<String>,
-    reason: String,
-    #[serde(default)]
-    acceptance_criteria: Vec<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ImplementationPlan {
     implementation_status: String,
@@ -1708,10 +1689,30 @@ struct IntendedChangeRecord {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ArtifactSemanticStatus {
-    Produced,
+    Partial,
+    Sufficient,
     Invalid,
     #[default]
     Missing,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactSerializationStatus {
+    Valid,
+    Normalizable,
+    #[default]
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactFailureLayer {
+    ProviderToolArgumentGeneration,
+    GatewayToolArgumentParsing,
+    WorkerToolSchemaValidation,
+    ArtifactSemanticValidation,
+    ArtifactPersistence,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1727,6 +1728,7 @@ enum ArtifactPersistenceStatus {
 struct ArtifactCheckpoint {
     artifact: String,
     semantic_status: ArtifactSemanticStatus,
+    serialization_status: ArtifactSerializationStatus,
     persistence_status: ArtifactPersistenceStatus,
     #[serde(default)]
     artifact_sha256: Option<String>,
@@ -1735,6 +1737,16 @@ struct ArtifactCheckpoint {
     phase: ExecutionPhase,
     #[serde(default)]
     safe_error: Option<String>,
+    #[serde(default)]
+    artifact_source: Option<ArtifactSource>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    failure_layer: Option<ArtifactFailureLayer>,
+    #[serde(default)]
+    validation_errors: Vec<ValidationError>,
+    #[serde(default)]
+    invalid_payload_shape: Option<InvalidPayloadShape>,
 }
 
 impl Default for ArtifactCheckpoint {
@@ -1742,11 +1754,17 @@ impl Default for ArtifactCheckpoint {
         Self {
             artifact: "impact_map".into(),
             semantic_status: ArtifactSemanticStatus::Missing,
+            serialization_status: ArtifactSerializationStatus::Invalid,
             persistence_status: ArtifactPersistenceStatus::PendingRetry,
             artifact_sha256: None,
             model_call_index: None,
             phase: ExecutionPhase::Discovery,
             safe_error: None,
+            artifact_source: None,
+            confidence: None,
+            failure_layer: None,
+            validation_errors: Vec::new(),
+            invalid_payload_shape: None,
         }
     }
 }
@@ -1755,6 +1773,10 @@ impl Default for ArtifactCheckpoint {
 struct ImpactMapFailure {
     code: &'static str,
     safe_error: String,
+    errors: Vec<ValidationError>,
+    invalid_payload: Value,
+    invalid_payload_shape: InvalidPayloadShape,
+    failure_layer: ArtifactFailureLayer,
 }
 
 #[derive(Clone, Debug)]
@@ -1788,6 +1810,8 @@ struct WorkerNotebook {
     goal: String,
     #[serde(default)]
     acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    acceptance_criteria_v2: Vec<impact_map::AcceptanceCriterion>,
     phase: ExecutionPhase,
     repository_base_sha: String,
     branch: String,
@@ -1798,7 +1822,13 @@ struct WorkerNotebook {
     #[serde(default)]
     impact_map: Vec<ImpactArea>,
     #[serde(default)]
+    impact_map_v2: Option<ImpactMap>,
+    #[serde(default)]
     impact_map_artifact: ArtifactCheckpoint,
+    #[serde(default)]
+    impact_map_invalid_payload: Option<Value>,
+    #[serde(default)]
+    impact_evidence: Vec<impact_map::EvidenceReference>,
     #[serde(default)]
     files_inspected: Vec<String>,
     #[serde(default)]
@@ -1837,6 +1867,11 @@ struct UnderlyingFailure {
 struct HostedAgentExecutionFailure {
     status: &'static str,
     category: &'static str,
+    process_health: &'static str,
+    mission_outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<String>,
+    resumable: bool,
     code: String,
     phase: ExecutionPhase,
     message: String,
@@ -1956,6 +1991,16 @@ fn project_verification_policy(manifest: &HostedManifest) -> ProjectVerification
         .unwrap_or_default()
 }
 
+fn impact_map_fallback_threshold(manifest: &HostedManifest) -> f64 {
+    manifest
+        .run
+        .metadata
+        .get("impact_map_fallback_confidence_threshold")
+        .and_then(Value::as_f64)
+        .filter(|value| (0.0..=1.0).contains(value))
+        .unwrap_or(0.8)
+}
+
 fn partial_pr_remaining_work(body: Option<&str>) -> Vec<String> {
     let Some(body) = body else {
         return Vec::new();
@@ -2014,6 +2059,7 @@ fn new_worker_notebook(
         revision: 0,
         goal: manifest.ticket_title.clone(),
         acceptance_criteria: acceptance_criteria.clone(),
+        acceptance_criteria_v2: impact_map::acceptance_criteria(&acceptance_criteria),
         phase: ExecutionPhase::Discovery,
         repository_base_sha: manifest.github.base_sha.clone(),
         branch: manifest.github.branch.clone(),
@@ -2021,7 +2067,10 @@ fn new_worker_notebook(
         execution_attempt: manifest.execution.attempt_number,
         architecture_findings: Vec::new(),
         impact_map: Vec::new(),
+        impact_map_v2: None,
         impact_map_artifact: ArtifactCheckpoint::default(),
+        impact_map_invalid_payload: None,
+        impact_evidence: Vec::new(),
         files_inspected: Vec::new(),
         searches_completed: Vec::new(),
         planned_changes: Vec::new(),
@@ -2042,11 +2091,20 @@ fn new_worker_notebook(
             partial_run.pull_request_number,
             partial_run.changed_paths.len()
         ));
+        let criteria_ids = (0..acceptance_criteria.len())
+            .map(impact_map::criterion_id)
+            .collect();
         notebook.impact_map.push(ImpactArea {
-            area: "existing_partial_implementation".into(),
+            area_id: "area-existing-partial-implementation".into(),
+            name: "Existing partial implementation".into(),
             candidate_paths: partial_run.changed_paths.clone(),
+            evidence: partial_run.changed_paths.iter().map(|path| impact_map::ImpactEvidence {
+                evidence_type: impact_map::EvidenceType::Inference,
+                path: Some(path.clone()), query: None,
+                description: "Path was preserved from the resumed draft pull request.".into(),
+            }).collect(),
             reason: "A later execution attempt resumed a draft pull request and must reconcile its existing diff before changing more code.".into(),
-            acceptance_criteria,
+            acceptance_criteria_ids: criteria_ids,
         });
         notebook.remaining_work = if partial_run.remaining_work.is_empty() {
             vec!["Reconcile the preserved diff against every acceptance criterion.".into()]
@@ -2054,20 +2112,27 @@ fn new_worker_notebook(
             partial_run.remaining_work.clone()
         };
         let restored_map = ImpactMap {
-            can_implement: true,
-            impact_map: notebook.impact_map.clone(),
-            files_inspected: Vec::new(),
-            searches_completed: Vec::new(),
-            blocking_unknowns: Vec::new(),
+            schema_version: IMPACT_MAP_SCHEMA_VERSION.into(),
+            areas: notebook.impact_map.clone(),
+            inspected_files: partial_run.changed_paths.clone(),
+            searches: Vec::new(),
+            unresolved_questions: Vec::new(),
         };
+        notebook.impact_map_v2 = Some(restored_map.clone());
         notebook.impact_map_artifact = ArtifactCheckpoint {
             artifact: "impact_map".into(),
-            semantic_status: ArtifactSemanticStatus::Produced,
+            semantic_status: ArtifactSemanticStatus::Sufficient,
+            serialization_status: ArtifactSerializationStatus::Valid,
             persistence_status: ArtifactPersistenceStatus::PendingRetry,
             artifact_sha256: impact_map_sha256(&restored_map),
             model_call_index: None,
             phase: ExecutionPhase::Planning,
             safe_error: None,
+            artifact_source: Some(ArtifactSource::OrchestratorFallback),
+            confidence: Some(1.0),
+            failure_layer: None,
+            validation_errors: Vec::new(),
+            invalid_payload_shape: None,
         };
     }
     notebook
@@ -2080,12 +2145,21 @@ fn notebook_orchestration_state(
     Option<ImplementationPlan>,
     ExecutionPhase,
 ) {
-    let impact_map = (!notebook.impact_map.is_empty()).then(|| ImpactMap {
-        can_implement: notebook.blocking_unknowns.is_empty(),
-        impact_map: notebook.impact_map.clone(),
-        files_inspected: notebook.files_inspected.clone(),
-        searches_completed: notebook.searches_completed.clone(),
-        blocking_unknowns: notebook.blocking_unknowns.clone(),
+    let impact_map = notebook.impact_map_v2.clone().or_else(|| {
+        (!notebook.impact_map.is_empty()).then(|| ImpactMap {
+            schema_version: IMPACT_MAP_SCHEMA_VERSION.into(),
+            areas: notebook.impact_map.clone(),
+            inspected_files: notebook.files_inspected.clone(),
+            searches: notebook
+                .searches_completed
+                .iter()
+                .map(|query| impact_map::ImpactSearch {
+                    query: query.clone(),
+                    scope: None,
+                })
+                .collect(),
+            unresolved_questions: notebook.blocking_unknowns.clone(),
+        })
     });
     let implementation_plan = (!notebook.planned_changes.is_empty()).then(|| ImplementationPlan {
         implementation_status: "ready".into(),
@@ -2327,45 +2401,38 @@ fn validate_write_repair_strategy(
     Ok(())
 }
 
-fn validate_impact_map(map: &ImpactMap) -> Result<()> {
-    if map.impact_map.is_empty()
-        || map.files_inspected.is_empty()
-        || (map.can_implement && !map.blocking_unknowns.is_empty())
-        || (!map.can_implement && map.blocking_unknowns.is_empty())
-        || map.impact_map.iter().any(|area| {
-            area.area.trim().is_empty()
-                || area.reason.trim().is_empty()
-                || area.candidate_paths.is_empty()
-                || area
-                    .candidate_paths
-                    .iter()
-                    .any(|path| path.trim().is_empty())
-                || area.acceptance_criteria.is_empty()
-        })
-    {
+fn validate_impact_map(map: &ImpactMap, notebook: &WorkerNotebook) -> Result<()> {
+    let errors = impact_map::validate(map, notebook.acceptance_criteria.len());
+    if !errors.is_empty() {
         bail!(
-            "impact map must identify areas, candidate paths, evidence, inspected files, and acceptance criteria"
+            "{}",
+            serde_json::to_string(&json!({
+                "code": "impact_map_schema_mismatch",
+                "errors": errors,
+            }))?
         );
     }
     Ok(())
 }
 
-fn merge_impact_map_discovery(mut map: ImpactMap, notebook: &WorkerNotebook) -> ImpactMap {
-    if map.files_inspected.is_empty() {
-        map.files_inspected = notebook.files_inspected.clone();
-    }
-    if map.searches_completed.is_empty() {
-        map.searches_completed = notebook.searches_completed.clone();
-    }
-    map
-}
-
-fn impact_map_from_value(value: Value, notebook: &WorkerNotebook) -> Result<ImpactMap> {
-    let map = serde_json::from_value::<ImpactMap>(value)
-        .context("impact map does not match the strict artifact schema")?;
-    let map = merge_impact_map_discovery(map, notebook);
-    validate_impact_map(&map)?;
-    Ok(map)
+fn impact_map_from_value(
+    value: Value,
+    notebook: &WorkerNotebook,
+) -> Result<(ImpactMap, ArtifactSource)> {
+    impact_map::normalize(
+        &value,
+        &notebook.files_inspected,
+        &notebook.searches_completed,
+        &notebook.acceptance_criteria,
+    )
+    .map_err(|errors| {
+        anyhow!(
+            serde_json::to_string(&json!({
+                "code":"impact_map_schema_mismatch", "errors":errors
+            }))
+            .unwrap_or_else(|_| "impact_map_schema_mismatch".into())
+        )
+    })
 }
 
 fn json_object_from_text(text: &str) -> Option<Value> {
@@ -2398,7 +2465,7 @@ fn recover_impact_map(
     raw_arguments: Option<&str>,
     assistant_text: Option<&str>,
     notebook: &WorkerNotebook,
-) -> Result<ImpactMap> {
+) -> Result<(ImpactMap, ArtifactSource)> {
     let mut errors = Vec::new();
     for candidate in [
         raw_arguments.and_then(json_object_from_text),
@@ -2446,7 +2513,43 @@ fn classify_impact_map_failure(error: &anyhow::Error) -> ImpactMapFailure {
     } else {
         "impact_map_tool_failure"
     };
-    ImpactMapFailure { code, safe_error }
+    ImpactMapFailure {
+        code,
+        safe_error,
+        errors: Vec::new(),
+        invalid_payload: Value::Null,
+        invalid_payload_shape: impact_map::safe_shape(&Value::Null),
+        failure_layer: ArtifactFailureLayer::WorkerToolSchemaValidation,
+    }
+}
+
+fn invalid_impact_map_semantic_status(value: &Value) -> ArtifactSemanticStatus {
+    let areas = value
+        .as_array()
+        .or_else(|| value.get("areas").and_then(Value::as_array))
+        .or_else(|| value.get("impact_map").and_then(Value::as_array));
+    if areas.is_some_and(|areas| {
+        areas.iter().any(|area| {
+            area.get("name")
+                .or_else(|| area.get("area"))
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+                && area
+                    .get("candidate_paths")
+                    .and_then(Value::as_array)
+                    .is_some_and(|v| !v.is_empty())
+                && area
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.trim().is_empty())
+        })
+    }) {
+        ArtifactSemanticStatus::Partial
+    } else if value.is_null() {
+        ArtifactSemanticStatus::Missing
+    } else {
+        ArtifactSemanticStatus::Invalid
+    }
 }
 
 impl HostedManifest {
@@ -3590,6 +3693,16 @@ impl<'a> GatewayAgent<'a> {
         let mut notebook = restored.unwrap_or_else(|| {
             new_worker_notebook(manifest, repository_fingerprint, partial_run.as_ref())
         });
+        if notebook.acceptance_criteria_v2.is_empty() {
+            notebook.acceptance_criteria_v2 =
+                impact_map::acceptance_criteria(&notebook.acceptance_criteria);
+        }
+        if notebook.impact_evidence.is_empty() {
+            notebook.impact_evidence = impact_map::evidence_catalog(
+                &notebook.files_inspected,
+                &notebook.searches_completed,
+            );
+        }
         normalize_notebook_intended_changes(&mut notebook)?;
         if let Some(partial_run) = &partial_run {
             if notebook.impact_map.is_empty() {
@@ -3604,28 +3717,120 @@ impl<'a> GatewayAgent<'a> {
                 }
             }
         }
+        if notebook.phase == ExecutionPhase::ArtifactRepair && notebook.impact_map.is_empty() {
+            let recovered = notebook
+                .impact_map_invalid_payload
+                .as_ref()
+                .and_then(|payload| {
+                    impact_map::normalize(
+                        payload,
+                        &notebook.files_inspected,
+                        &notebook.searches_completed,
+                        &notebook.acceptance_criteria,
+                    )
+                    .ok()
+                    .map(|(map, source)| (map, source, 1.0))
+                })
+                .or_else(|| {
+                    impact_map::fallback(
+                        &notebook.files_inspected,
+                        &notebook.searches_completed,
+                        &notebook.acceptance_criteria,
+                        &notebook.blocking_unknowns,
+                    )
+                    .map(|(map, confidence)| {
+                        (map, ArtifactSource::OrchestratorFallback, confidence)
+                    })
+                });
+            if let Some((map, source, confidence)) = recovered
+                .filter(|(_, _, confidence)| *confidence >= impact_map_fallback_threshold(manifest))
+            {
+                notebook.impact_map = map.areas.clone();
+                notebook.impact_map_v2 = Some(map.clone());
+                notebook.files_inspected = map.inspected_files.clone();
+                notebook.searches_completed = map
+                    .searches
+                    .iter()
+                    .map(|search| search.query.clone())
+                    .collect();
+                notebook.blocking_unknowns = map.unresolved_questions.clone();
+                notebook.impact_map_invalid_payload = None;
+                notebook.impact_map_artifact = ArtifactCheckpoint {
+                    artifact: "impact_map".into(),
+                    semantic_status: ArtifactSemanticStatus::Sufficient,
+                    serialization_status: ArtifactSerializationStatus::Valid,
+                    persistence_status: ArtifactPersistenceStatus::PendingRetry,
+                    artifact_sha256: impact_map_sha256(&map),
+                    model_call_index: None,
+                    phase: ExecutionPhase::ArtifactRepair,
+                    safe_error: None,
+                    artifact_source: Some(source),
+                    confidence: Some(confidence),
+                    failure_layer: None,
+                    validation_errors: Vec::new(),
+                    invalid_payload_shape: None,
+                };
+            }
+        }
         if !notebook.impact_map.is_empty()
             && notebook.impact_map_artifact.semantic_status == ArtifactSemanticStatus::Missing
         {
             let restored_map = ImpactMap {
-                can_implement: notebook.blocking_unknowns.is_empty(),
-                impact_map: notebook.impact_map.clone(),
-                files_inspected: notebook.files_inspected.clone(),
-                searches_completed: notebook.searches_completed.clone(),
-                blocking_unknowns: notebook.blocking_unknowns.clone(),
+                schema_version: IMPACT_MAP_SCHEMA_VERSION.into(),
+                areas: notebook.impact_map.clone(),
+                inspected_files: notebook.files_inspected.clone(),
+                searches: notebook
+                    .searches_completed
+                    .iter()
+                    .map(|query| impact_map::ImpactSearch {
+                        query: query.clone(),
+                        scope: None,
+                    })
+                    .collect(),
+                unresolved_questions: notebook.blocking_unknowns.clone(),
             };
+            notebook.impact_map_v2 = Some(restored_map.clone());
             notebook.impact_map_artifact = ArtifactCheckpoint {
                 artifact: "impact_map".into(),
-                semantic_status: ArtifactSemanticStatus::Produced,
+                semantic_status: ArtifactSemanticStatus::Sufficient,
+                serialization_status: ArtifactSerializationStatus::Valid,
                 persistence_status: ArtifactPersistenceStatus::Persisted,
                 artifact_sha256: impact_map_sha256(&restored_map),
                 model_call_index: None,
                 phase: ExecutionPhase::Discovery,
                 safe_error: None,
+                artifact_source: Some(ArtifactSource::NormalizedModel),
+                confidence: Some(1.0),
+                failure_layer: None,
+                validation_errors: Vec::new(),
+                invalid_payload_shape: None,
             };
         }
         let (impact_map, implementation_plan, initial_phase) =
             notebook_orchestration_state(&notebook);
+        let impact_map_failure =
+            notebook
+                .impact_map_invalid_payload
+                .as_ref()
+                .map(|payload| ImpactMapFailure {
+                    code: "impact_map_schema_mismatch",
+                    safe_error: notebook
+                        .impact_map_artifact
+                        .safe_error
+                        .clone()
+                        .unwrap_or_else(|| "impact_map_schema_mismatch".into()),
+                    errors: notebook.impact_map_artifact.validation_errors.clone(),
+                    invalid_payload: payload.clone(),
+                    invalid_payload_shape: notebook
+                        .impact_map_artifact
+                        .invalid_payload_shape
+                        .clone()
+                        .unwrap_or_else(|| impact_map::safe_shape(payload)),
+                    failure_layer: notebook
+                        .impact_map_artifact
+                        .failure_layer
+                        .unwrap_or(ArtifactFailureLayer::WorkerToolSchemaValidation),
+                });
         let mut phases = PhaseLedger::new(total_calls, initial_phase);
         phases.ensure_finalization_minimum(notebook.acceptance_criteria.len());
         Ok(Self {
@@ -3654,7 +3859,7 @@ impl<'a> GatewayAgent<'a> {
             write_progress_reported: false,
             write_blocker: None,
             blocked_plan_recorded_at: None,
-            impact_map_failure: None,
+            impact_map_failure,
             last_successful_action: json!({}),
             partial_run,
             budget_advisory_percent: 0,
@@ -3747,6 +3952,10 @@ impl<'a> GatewayAgent<'a> {
             "artifact_hash": artifact_sha256,
             "model_call_index": self.phases.total_calls(),
             "phase": self.phases.active(),
+            "tool_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+            "tool_schema_sha256": impact_map::schema_sha256(),
+            "validator_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+            "validator_schema_sha256": impact_map::schema_sha256(),
         })
     }
 
@@ -3800,6 +4009,12 @@ impl<'a> GatewayAgent<'a> {
         self.notebook.phase = self.phases.active();
         self.notebook.phase_budget = self.budget_telemetry();
         self.notebook.last_successful_action = self.last_successful_action.clone();
+        self.notebook.acceptance_criteria_v2 =
+            impact_map::acceptance_criteria(&self.notebook.acceptance_criteria);
+        self.notebook.impact_evidence = impact_map::evidence_catalog(
+            &self.notebook.files_inspected,
+            &self.notebook.searches_completed,
+        );
         if repository_changed {
             self.notebook.repository_fingerprint =
                 repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
@@ -3810,24 +4025,41 @@ impl<'a> GatewayAgent<'a> {
     fn accept_impact_map(
         &mut self,
         map: ImpactMap,
-        recovery_source: &str,
+        artifact_source: ArtifactSource,
+        confidence: f64,
         triggering_error: Option<&anyhow::Error>,
     ) -> Result<String> {
-        validate_impact_map(&map)?;
+        validate_impact_map(&map, &self.notebook)?;
         let artifact_sha256 = impact_map_sha256(&map);
-        self.notebook.impact_map = map.impact_map.clone();
-        self.notebook.files_inspected = map.files_inspected.clone();
-        self.notebook.searches_completed = map.searches_completed.clone();
-        self.notebook.blocking_unknowns = map.blocking_unknowns.clone();
+        self.notebook.impact_map = map.areas.clone();
+        self.notebook.impact_map_v2 = Some(map.clone());
+        self.notebook.files_inspected = map.inspected_files.clone();
+        self.notebook.searches_completed = map
+            .searches
+            .iter()
+            .map(|search| search.query.clone())
+            .collect();
+        self.notebook.blocking_unknowns = map.unresolved_questions.clone();
         self.notebook.impact_map_artifact = ArtifactCheckpoint {
             artifact: "impact_map".into(),
-            semantic_status: ArtifactSemanticStatus::Produced,
+            semantic_status: ArtifactSemanticStatus::Sufficient,
+            serialization_status: if artifact_source == ArtifactSource::NormalizedModel {
+                ArtifactSerializationStatus::Normalizable
+            } else {
+                ArtifactSerializationStatus::Valid
+            },
             persistence_status: ArtifactPersistenceStatus::PendingRetry,
             artifact_sha256: artifact_sha256.clone(),
             model_call_index: Some(self.phases.total_calls()),
             phase: self.phases.active(),
             safe_error: triggering_error.map(|error| truncate_text(&format!("{error:#}"), 2_000)),
+            artifact_source: Some(artifact_source),
+            confidence: Some(confidence),
+            failure_layer: None,
+            validation_errors: Vec::new(),
+            invalid_payload_shape: None,
         };
+        self.notebook.impact_map_invalid_payload = None;
         self.impact_map = Some(map);
         self.impact_map_failure = None;
         let persistence_error = self.transition_phase(
@@ -3843,6 +4075,8 @@ impl<'a> GatewayAgent<'a> {
         self.notebook.impact_map_artifact.phase = ExecutionPhase::Discovery;
         if let Some(error) = persistence_error.as_ref() {
             self.notebook.impact_map_artifact.safe_error = Some(error.clone());
+            self.notebook.impact_map_artifact.failure_layer =
+                Some(ArtifactFailureLayer::ArtifactPersistence);
         }
         if !persisted {
             self.append_event_recoverable(
@@ -3850,12 +4084,18 @@ impl<'a> GatewayAgent<'a> {
                 json!({
                     "event_type": "worker.artifact_persistence_failed",
                     "artifact": "impact_map",
-                    "semantic_status": ArtifactSemanticStatus::Produced,
+                    "semantic_status": ArtifactSemanticStatus::Sufficient,
+                    "serialization_status": self.notebook.impact_map_artifact.serialization_status,
                     "persistence_status": ArtifactPersistenceStatus::Failed,
                     "recoverable": true,
                     "action": "retry_or_continue",
                     "safe_error": persistence_error,
-                    "recovery_source": recovery_source,
+                    "artifact_source": artifact_source,
+                    "confidence": confidence,
+                    "tool_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+                    "tool_schema_sha256": impact_map::schema_sha256(),
+                    "validator_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+                    "validator_schema_sha256": impact_map::schema_sha256(),
                     "notebook": self.notebook,
                     "checkpoint": self.notebook_checkpoint_metadata(
                         artifact_sha256.as_deref()
@@ -3865,10 +4105,10 @@ impl<'a> GatewayAgent<'a> {
             );
         }
         Ok(if persisted {
-            format!("recorded implementation impact map from {recovery_source}")
+            format!("recorded implementation impact map from {artifact_source:?}")
         } else {
             format!(
-                "impact map was semantically accepted from {recovery_source}; persistence is degraded and will be retried without another discovery model call"
+                "impact map was semantically accepted from {artifact_source:?}; persistence is degraded and will be retried without another discovery model call"
             )
         })
     }
@@ -3931,6 +4171,10 @@ impl<'a> GatewayAgent<'a> {
         anyhow!(HostedAgentExecutionFailure {
             status: "failed",
             category: "hosted_agent_execution_failed",
+            process_health: "failed",
+            mission_outcome: "failed",
+            blocker: None,
+            resumable: recoverable,
             code: code.to_owned(),
             phase,
             message: message.into(),
@@ -3993,8 +4237,12 @@ impl<'a> GatewayAgent<'a> {
     ) -> anyhow::Error {
         let phase = self.phases.active();
         anyhow!(HostedAgentExecutionFailure {
-            status: "failed",
+            status: "blocked",
             category: "hosted_agent_execution_failed",
+            process_health: "healthy",
+            mission_outcome: "blocked",
+            blocker: Some("impact_map_artifact_invalid".into()),
+            resumable: true,
             code: code.to_owned(),
             phase,
             message: message.into(),
@@ -4135,7 +4383,7 @@ impl<'a> GatewayAgent<'a> {
                     return Err(self.impact_map_execution_failure(
                         code,
                         format!("Impact-map repair failed: {detail}"),
-                        ArtifactSemanticStatus::Invalid,
+                        self.notebook.impact_map_artifact.semantic_status,
                         ArtifactPersistenceStatus::PendingRetry,
                         "Resume from artifact repair with the preserved discovery notebook.",
                     ));
@@ -4303,13 +4551,20 @@ impl<'a> GatewayAgent<'a> {
             if let Some(outcome) = self.prepare_next_model_call(allow_budget_handoff)? {
                 return Ok(outcome);
             }
-            initial["content"] = Value::String(format!(
-                "{prompt}\n\nRustGrid worker notebook (authoritative compact continuation state):\n{}",
-                serde_json::to_string(&self.notebook).unwrap_or_else(|_| "{}".into())
-            ));
+            let artifact_repair = self.phases.active() == ExecutionPhase::ArtifactRepair;
+            initial["content"] = Value::String(if artifact_repair {
+                compact_impact_map_repair_context(self.impact_map_failure.as_ref(), &self.notebook)
+            } else {
+                format!(
+                    "{prompt}\n\nRustGrid worker notebook (authoritative compact continuation state):\n{}",
+                    serde_json::to_string(&self.notebook).unwrap_or_else(|_| "{}".into())
+                )
+            });
             let mut input = vec![initial.clone()];
-            for turn in &turns {
-                input.extend(turn.iter().cloned());
+            if !artifact_repair {
+                for turn in &turns {
+                    input.extend(turn.iter().cloned());
+                }
             }
             let max_output_tokens = self.manifest.ai_gateway.maximum_output_tokens.min(16_384);
             let active_phase = self.phases.active();
@@ -4565,11 +4820,13 @@ impl<'a> GatewayAgent<'a> {
                     self.phases.active(),
                     ExecutionPhase::Discovery | ExecutionPhase::ArtifactRepair
                 ) && self.impact_map.is_none()
-                    && let Ok(map) = recover_impact_map(None, Some(&summary), &self.notebook)
+                    && let Ok((map, source)) =
+                        recover_impact_map(None, Some(&summary), &self.notebook)
                 {
                     self.accept_impact_map(
                         map,
-                        "assistant response",
+                        source,
+                        1.0,
                         Some(&anyhow!("record_impact_map was not invoked")),
                     )?;
                     turns.push_back(turn);
@@ -4630,6 +4887,24 @@ impl<'a> GatewayAgent<'a> {
             }
             for (call_id, name, arguments) in function_calls {
                 ensure_running(self.running)?;
+                if name == "record_impact_map" {
+                    let supplemental = self.phases.active() == ExecutionPhase::ArtifactRepair;
+                    self.api.append_event(
+                        "progress",
+                        json!({
+                            "event_type":"worker.impact_map_artifact_attempt",
+                            "failure_layer":ArtifactFailureLayer::ProviderToolArgumentGeneration,
+                            "tool_schema_version":IMPACT_MAP_SCHEMA_VERSION,
+                            "tool_schema_sha256":impact_map::schema_sha256(),
+                            "validator_schema_version":IMPACT_MAP_SCHEMA_VERSION,
+                            "validator_schema_sha256":impact_map::schema_sha256(),
+                            "provider_call_occurred":true,
+                            "configured_mission_budget_consumed":!supplemental,
+                            "supplemental_repair_budget_consumed":supplemental,
+                            "accounting": artifact_call_accounting(self.phases.active()),
+                        }),
+                    )?;
+                }
                 let target = tool_target(&arguments);
                 let change_id = tool_change_id(&arguments);
                 let before_sha256 = target
@@ -4727,36 +5002,107 @@ impl<'a> GatewayAgent<'a> {
                                 Some(&summary),
                                 &self.notebook,
                             ) {
-                                Ok(map) => {
-                                    let output = self.accept_impact_map(
-                                        map,
-                                        "stored tool arguments or assistant response",
-                                        Some(&error),
-                                    )?;
+                                Ok((map, source)) => {
+                                    let output =
+                                        self.accept_impact_map(map, source, 1.0, Some(&error))?;
                                     json!({
                                         "ok": true,
                                         "output": output,
                                         "recovered": true,
-                                        "semantic_status": ArtifactSemanticStatus::Produced,
+                                        "semantic_status": ArtifactSemanticStatus::Sufficient,
+                                        "serialization_status": self.notebook.impact_map_artifact.serialization_status,
                                         "persistence_status": self.notebook
                                             .impact_map_artifact
                                             .persistence_status,
                                     })
                                 }
                                 Err(recovery_error) => {
-                                    let failure = classify_impact_map_failure(&error);
-                                    let safe_error = failure.safe_error.clone();
-                                    self.impact_map_failure = Some(failure);
-                                    self.notebook.impact_map_artifact = ArtifactCheckpoint {
-                                        artifact: "impact_map".into(),
-                                        semantic_status: ArtifactSemanticStatus::Invalid,
-                                        persistence_status: ArtifactPersistenceStatus::PendingRetry,
-                                        artifact_sha256: None,
-                                        model_call_index: Some(self.phases.total_calls()),
-                                        phase: self.phases.active(),
-                                        safe_error: Some(safe_error.clone()),
-                                    };
-                                    self.append_event_recoverable(
+                                    if let Some((fallback, confidence)) = impact_map::fallback(
+                                        &self.notebook.files_inspected,
+                                        &self.notebook.searches_completed,
+                                        &self.notebook.acceptance_criteria,
+                                        &self.notebook.blocking_unknowns,
+                                    )
+                                    .filter(|(_, confidence)| {
+                                        *confidence >= impact_map_fallback_threshold(self.manifest)
+                                    }) {
+                                        let output = self.accept_impact_map(
+                                            fallback,
+                                            ArtifactSource::OrchestratorFallback,
+                                            confidence,
+                                            Some(&error),
+                                        )?;
+                                        self.append_event_recoverable("progress", json!({
+                                            "event_type":"worker.impact_map_fallback_accepted",
+                                            "artifact_source":"orchestrator_fallback",
+                                            "confidence":confidence,
+                                            "process_health":"healthy",
+                                            "mission_outcome":"continuing",
+                                            "tool_schema_version":IMPACT_MAP_SCHEMA_VERSION,
+                                            "tool_schema_sha256":impact_map::schema_sha256(),
+                                            "validator_schema_version":IMPACT_MAP_SCHEMA_VERSION,
+                                            "validator_schema_sha256":impact_map::schema_sha256(),
+                                        }), "impact-map deterministic fallback");
+                                        json!({"ok":true,"output":output,"recovered":true,"artifact_source":"orchestrator_fallback","confidence":confidence})
+                                    } else {
+                                        let invalid_payload = json_object_from_text(&arguments)
+                                            .unwrap_or(Value::Null);
+                                        let validation_errors = impact_map::normalize(
+                                            &invalid_payload,
+                                            &self.notebook.files_inspected,
+                                            &self.notebook.searches_completed,
+                                            &self.notebook.acceptance_criteria,
+                                        )
+                                        .err()
+                                        .unwrap_or_default();
+                                        let invalid_payload_shape =
+                                            impact_map::safe_shape(&invalid_payload);
+                                        let semantic_status =
+                                            invalid_impact_map_semantic_status(&invalid_payload);
+                                        let failure_layer = if invalid_payload.is_null() {
+                                            ArtifactFailureLayer::GatewayToolArgumentParsing
+                                        } else if semantic_status == ArtifactSemanticStatus::Partial
+                                        {
+                                            ArtifactFailureLayer::ArtifactSemanticValidation
+                                        } else {
+                                            ArtifactFailureLayer::WorkerToolSchemaValidation
+                                        };
+                                        let mut failure = classify_impact_map_failure(&error);
+                                        failure.code = "impact_map_schema_mismatch";
+                                        failure.safe_error = serde_json::to_string(&json!({
+                                            "code":"impact_map_schema_mismatch",
+                                            "errors":validation_errors,
+                                        }))
+                                        .unwrap_or_else(|_| "impact_map_schema_mismatch".into());
+                                        failure.errors = validation_errors.clone();
+                                        failure.invalid_payload = invalid_payload.clone();
+                                        failure.invalid_payload_shape =
+                                            invalid_payload_shape.clone();
+                                        failure.failure_layer = failure_layer;
+                                        let safe_error = failure.safe_error.clone();
+                                        self.impact_map_failure = Some(failure);
+                                        self.notebook.impact_map_invalid_payload =
+                                            Some(invalid_payload.clone());
+                                        self.notebook.impact_map_artifact = ArtifactCheckpoint {
+                                            artifact: "impact_map".into(),
+                                            semantic_status,
+                                            serialization_status:
+                                                ArtifactSerializationStatus::Invalid,
+                                            persistence_status:
+                                                ArtifactPersistenceStatus::PendingRetry,
+                                            artifact_sha256: None,
+                                            model_call_index: Some(self.phases.total_calls()),
+                                            phase: self.phases.active(),
+                                            safe_error: Some(safe_error.clone()),
+                                            artifact_source: None,
+                                            confidence: None,
+                                            failure_layer: Some(failure_layer),
+                                            validation_errors: validation_errors.clone(),
+                                            invalid_payload_shape: Some(
+                                                invalid_payload_shape.clone(),
+                                            ),
+                                        };
+                                        self.append_event_recoverable(
                                         "progress",
                                         json!({
                                             "event_type": "worker.artifact_repair_required",
@@ -4764,7 +5110,17 @@ impl<'a> GatewayAgent<'a> {
                                             "code": self.impact_map_failure.as_ref().map(
                                                 |failure| failure.code
                                             ),
-                                            "semantic_status": ArtifactSemanticStatus::Invalid,
+                                            "semantic_status": semantic_status,
+                                            "serialization_status": ArtifactSerializationStatus::Invalid,
+                                            "failure_layer": failure_layer,
+                                            "validation_errors": validation_errors,
+                                            "invalid_payload_shape": invalid_payload_shape,
+                                            "tool_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+                                            "tool_schema_sha256": impact_map::schema_sha256(),
+                                            "validator_schema_version": IMPACT_MAP_SCHEMA_VERSION,
+                                            "validator_schema_sha256": impact_map::schema_sha256(),
+                                            "process_health":"healthy",
+                                            "mission_outcome":"blocked",
                                             "persistence_status":
                                                 ArtifactPersistenceStatus::PendingRetry,
                                             "recoverable": true,
@@ -4780,18 +5136,19 @@ impl<'a> GatewayAgent<'a> {
                                         }),
                                         "impact-map repair checkpoint",
                                     );
-                                    if self.phases.active() == ExecutionPhase::Discovery {
-                                        self.transition_phase(
+                                        if self.phases.active() == ExecutionPhase::Discovery {
+                                            self.transition_phase(
                                             ExecutionPhase::ArtifactRepair,
                                             "impact map tool failed; repository discovery is preserved",
                                         )?;
+                                        }
+                                        json!({
+                                            "ok": false,
+                                            "error": safe_error,
+                                            "recoverable": true,
+                                            "resume_phase": "artifact_repair",
+                                        })
                                     }
-                                    json!({
-                                        "ok": false,
-                                        "error": safe_error,
-                                        "recoverable": true,
-                                        "resume_phase": "artifact_repair",
-                                    })
                                 }
                             }
                         } else {
@@ -4865,7 +5222,7 @@ impl<'a> GatewayAgent<'a> {
                 }
                 let retrying_impact_map_persistence = name == "record_impact_map"
                     && self.notebook.impact_map_artifact.semantic_status
-                        == ArtifactSemanticStatus::Produced
+                        == ArtifactSemanticStatus::Sufficient
                     && self.notebook.impact_map_artifact.persistence_status
                         != ArtifactPersistenceStatus::Persisted;
                 let mut event_notebook = self.notebook.clone();
@@ -5549,9 +5906,10 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 ))
             }
             "record_impact_map" => {
-                let map = impact_map_from_value(Value::Object(object.clone()), &self.notebook)
-                    .context("impact map is malformed")?;
-                self.accept_impact_map(map, "record_impact_map arguments", None)
+                let (map, source) =
+                    impact_map_from_value(Value::Object(object.clone()), &self.notebook)
+                        .context("impact map is malformed")?;
+                self.accept_impact_map(map, source, 1.0, None)
             }
             "record_implementation_plan" => {
                 let mut plan: ImplementationPlan =
@@ -5577,9 +5935,16 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                             .flat_map(|change| &change.acceptance_criteria)
                             .map(|criterion| criterion.trim())
                             .collect::<BTreeSet<_>>();
-                        map.impact_map
+                        map.areas
                             .iter()
-                            .flat_map(|area| &area.acceptance_criteria)
+                            .flat_map(|area| &area.acceptance_criteria_ids)
+                            .filter_map(|id| {
+                                id.strip_prefix("ac-")
+                                    .and_then(|n| n.parse::<usize>().ok())
+                                    .and_then(|n| {
+                                        self.notebook.acceptance_criteria.get(n.saturating_sub(1))
+                                    })
+                            })
                             .any(|criterion| !planned_criteria.contains(criterion.trim()))
                     })
                 {
@@ -5771,7 +6136,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 || plan.planned_new_files.iter().any(|file| related(file))
                 || plan.planned_test_changes.iter().any(|file| related(file))
         }) || self.impact_map.as_ref().is_some_and(|map| {
-            map.impact_map
+            map.areas
                 .iter()
                 .flat_map(|area| &area.candidate_paths)
                 .any(|candidate| related(candidate))
@@ -5850,40 +6215,8 @@ fn hosted_tools() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "record_impact_map",
-            "description": "Record the repository-level implementation impact map before making source changes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "can_implement": {"type": "boolean"},
-                    "impact_map": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "area": {"type": "string"},
-                                "candidate_paths": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "minItems": 1
-                                },
-                                "reason": {"type": "string"},
-                                "acceptance_criteria": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "minItems": 1
-                                },
-                            },
-                            "required": ["area", "candidate_paths", "reason", "acceptance_criteria"],
-                            "additionalProperties": false
-                        }
-                    },
-                    "files_inspected": {"type": "array", "items": {"type": "string"}},
-                    "searches_completed": {"type": "array", "items": {"type": "string"}},
-                    "blocking_unknowns": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["can_implement", "impact_map", "files_inspected", "searches_completed", "blocking_unknowns"],
-                "additionalProperties": false
-            },
+            "description": "Record semantic area mappings. The orchestrator expands evidence references and attaches canonical v2 wrapper fields.",
+            "parameters": impact_map::provider_tool_schema(),
             "strict": true
         }),
         json!({
@@ -6233,6 +6566,40 @@ fn hosted_tools_for_phase(phase: ExecutionPhase) -> Vec<Value> {
                 .is_some_and(|name| phase_permits_tool(phase, name))
         })
         .collect()
+}
+
+fn compact_impact_map_repair_context(
+    failure: Option<&ImpactMapFailure>,
+    notebook: &WorkerNotebook,
+) -> String {
+    let criteria = notebook
+        .acceptance_criteria_v2
+        .iter()
+        .map(|criterion| json!({"id":criterion.id,"text":truncate_text(&criterion.text, 500)}))
+        .collect::<Vec<_>>();
+    let evidence = &notebook.impact_evidence;
+    let context = json!({
+        "instruction":"The previous impact map was semantically useful but failed validation. Correct only the invalid structural portions. Do not perform repository discovery. Call record_impact_map exactly once.",
+        "invalid_artifact":failure.map(|failure| &failure.invalid_payload),
+        "validation_errors":failure.map(|failure| &failure.errors).unwrap_or(&Vec::new()),
+        "canonical_schema":impact_map::schema(),
+        "allowed_model_fields":["areas","name","candidate_paths","evidence_refs","acceptance_criteria_ids","reason"],
+        "evidence":evidence,
+        "acceptance_criteria":criteria,
+        "minimal_valid_model_input":{"areas":[{"name":"Affected surface","candidate_paths":["src/example.rs"],"evidence_refs":["read-1"],"acceptance_criteria_ids":["ac-1"],"reason":"Implements the criterion."}]},
+        "tool_schema_version":IMPACT_MAP_SCHEMA_VERSION,
+        "tool_schema_sha256":impact_map::schema_sha256(),
+    });
+    truncate_text(&serde_json::to_string(&context).unwrap_or_default(), 19_000)
+}
+
+fn artifact_call_accounting(phase: ExecutionPhase) -> Value {
+    let supplemental = phase == ExecutionPhase::ArtifactRepair;
+    json!({
+        "provider_call_occurred": true,
+        "configured_mission_budget_consumed": !supplemental,
+        "supplemental_repair_budget_consumed": supplemental,
+    })
 }
 
 fn hosted_agent_instructions(phase: ExecutionPhase) -> String {
@@ -7765,11 +8132,11 @@ fn completion_fallback(
                 if evidence.is_empty() {
                     evidence = impact_map
                         .into_iter()
-                        .flat_map(|map| map.impact_map.iter())
+                        .flat_map(|map| map.areas.iter())
                         .filter(|area| {
-                            area.acceptance_criteria
+                            area.acceptance_criteria_ids
                                 .iter()
-                                .any(|mapped| mapped.trim() == criterion.trim())
+                                .any(|mapped| mapped == &impact_map::criterion_id(index))
                         })
                         .flat_map(|area| {
                             area.candidate_paths
@@ -9653,6 +10020,10 @@ mod tests {
         HostedAgentExecutionFailure {
             status: "failed",
             category: "hosted_agent_execution_failed",
+            process_health: "failed",
+            mission_outcome: "failed",
+            blocker: None,
+            resumable: true,
             code: code.into(),
             phase: ExecutionPhase::Discovery,
             message: message.into(),
@@ -10977,6 +11348,10 @@ Implement theme support.\n\n\
             revision: 12,
             goal: "Apply a complete theme".into(),
             acceptance_criteria: vec!["All surfaces use the theme".into()],
+            acceptance_criteria_v2: vec![impact_map::AcceptanceCriterion {
+                id: "ac-1".into(),
+                text: "All surfaces use the theme".into(),
+            }],
             phase: ExecutionPhase::DiffReview,
             repository_base_sha: "a".repeat(40),
             branch: "rustgrid/aops-226-deadbeef".into(),
@@ -10984,16 +11359,26 @@ Implement theme support.\n\n\
             execution_attempt: 2,
             architecture_findings: vec!["Tokens are centralized.".into()],
             impact_map: vec![ImpactArea {
-                area: "tokens".into(),
+                area_id: "area-tokens".into(),
+                name: "tokens".into(),
                 candidate_paths: vec!["src/theme.css".into()],
+                evidence: vec![impact_map::ImpactEvidence {
+                    evidence_type: impact_map::EvidenceType::FileRead,
+                    path: Some("src/theme.css".into()),
+                    query: None,
+                    description: "inspected".into(),
+                }],
                 reason: "Shared token source".into(),
-                acceptance_criteria: vec!["All surfaces use the theme".into()],
+                acceptance_criteria_ids: vec!["ac-1".into()],
             }],
+            impact_map_v2: None,
             impact_map_artifact: ArtifactCheckpoint {
-                semantic_status: ArtifactSemanticStatus::Produced,
+                semantic_status: ArtifactSemanticStatus::Sufficient,
                 persistence_status: ArtifactPersistenceStatus::Persisted,
                 ..ArtifactCheckpoint::default()
             },
+            impact_map_invalid_payload: None,
+            impact_evidence: vec![],
             files_inspected: vec!["src/theme.css".into()],
             searches_completed: vec!["literal:src:theme".into()],
             planned_changes: vec![PlannedChange {
@@ -11421,14 +11806,21 @@ Implement theme support.\n\n\
     fn valid_impact_map_is_recovered_from_tool_arguments_and_notebook_progress() {
         let notebook = test_discovery_notebook(ExecutionPhase::Discovery);
         let mut map = test_impact_map();
-        map.files_inspected.clear();
-        map.searches_completed.clear();
+        map.inspected_files.clear();
+        map.searches.clear();
         let arguments = serde_json::to_string(&map).unwrap();
 
-        let recovered = recover_impact_map(Some(&arguments), None, &notebook).unwrap();
-        assert_eq!(recovered.files_inspected, notebook.files_inspected);
-        assert_eq!(recovered.searches_completed, notebook.searches_completed);
-        assert_eq!(recovered.impact_map, map.impact_map);
+        let (recovered, _) = recover_impact_map(Some(&arguments), None, &notebook).unwrap();
+        assert_eq!(recovered.inspected_files, notebook.files_inspected);
+        assert_eq!(
+            recovered
+                .searches
+                .iter()
+                .map(|s| &s.query)
+                .collect::<Vec<_>>(),
+            notebook.searches_completed.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(recovered.areas, map.areas);
     }
 
     #[test]
@@ -11439,8 +11831,8 @@ Implement theme support.\n\n\
             serde_json::to_string(&test_impact_map()).unwrap()
         );
 
-        let recovered = recover_impact_map(None, Some(&response), &notebook).unwrap();
-        assert_eq!(recovered.impact_map, test_impact_map().impact_map);
+        let (recovered, _) = recover_impact_map(None, Some(&response), &notebook).unwrap();
+        assert_eq!(recovered.areas, test_impact_map().areas);
     }
 
     #[test]
@@ -11456,15 +11848,21 @@ Implement theme support.\n\n\
     fn semantic_impact_map_survives_failed_persistence_and_resumes_planning() {
         let mut notebook = test_discovery_notebook(ExecutionPhase::Planning);
         let map = test_impact_map();
-        notebook.impact_map = map.impact_map.clone();
+        notebook.impact_map = map.areas.clone();
         notebook.impact_map_artifact = ArtifactCheckpoint {
             artifact: "impact_map".into(),
-            semantic_status: ArtifactSemanticStatus::Produced,
+            semantic_status: ArtifactSemanticStatus::Sufficient,
+            serialization_status: ArtifactSerializationStatus::Valid,
             persistence_status: ArtifactPersistenceStatus::Failed,
             artifact_sha256: impact_map_sha256(&map),
             model_call_index: Some(8),
             phase: ExecutionPhase::Discovery,
             safe_error: Some("worker event transport failed".into()),
+            artifact_source: Some(ArtifactSource::Model),
+            confidence: Some(1.0),
+            failure_layer: Some(ArtifactFailureLayer::ArtifactPersistence),
+            validation_errors: Vec::new(),
+            invalid_payload_shape: None,
         };
 
         let (restored, plan, phase) = notebook_orchestration_state(&notebook);
@@ -11473,7 +11871,7 @@ Implement theme support.\n\n\
         assert_eq!(phase, ExecutionPhase::Planning);
         assert_eq!(
             notebook.impact_map_artifact.semantic_status,
-            ArtifactSemanticStatus::Produced
+            ArtifactSemanticStatus::Sufficient
         );
         assert_eq!(
             notebook.impact_map_artifact.persistence_status,
@@ -11499,12 +11897,126 @@ Implement theme support.\n\n\
         );
     }
 
+    #[test]
+    fn artifact_repair_context_contains_exact_corrections_without_discovery_transcript() {
+        let notebook = test_discovery_notebook(ExecutionPhase::ArtifactRepair);
+        let invalid = json!({"areas":[{"name":"Theme","candidate_paths":[]}]});
+        let failure = ImpactMapFailure {
+            code: "impact_map_schema_mismatch",
+            safe_error: "invalid".into(),
+            errors: vec![ValidationError {
+                path: "$.areas[0].candidate_paths".into(),
+                keyword: "minItems".into(),
+                message: "At least one candidate path is required.".into(),
+            }],
+            invalid_payload: invalid.clone(),
+            invalid_payload_shape: impact_map::safe_shape(&invalid),
+            failure_layer: ArtifactFailureLayer::WorkerToolSchemaValidation,
+        };
+        let context = compact_impact_map_repair_context(Some(&failure), &notebook);
+        assert!(context.contains("$.areas[0].candidate_paths"));
+        assert!(context.contains("evidence_id"));
+        assert!(context.contains("ac-1"));
+        assert!(!context.contains("Theme tokens are centralized"));
+    }
+
+    #[test]
+    fn artifact_repair_context_remains_below_five_thousand_tokens() {
+        let context = compact_impact_map_repair_context(
+            None,
+            &test_discovery_notebook(ExecutionPhase::ArtifactRepair),
+        );
+        assert!(context.len().div_ceil(4) < 5_000);
+    }
+
+    #[test]
+    fn supplemental_repair_accounting_is_separate_from_mission_budget() {
+        let accounting = artifact_call_accounting(ExecutionPhase::ArtifactRepair);
+        assert_eq!(accounting["provider_call_occurred"], true);
+        assert_eq!(accounting["configured_mission_budget_consumed"], false);
+        assert_eq!(accounting["supplemental_repair_budget_consumed"], true);
+    }
+
+    #[test]
+    fn formatting_failure_is_healthy_blocked_and_resumable() {
+        let failure = HostedAgentExecutionFailure {
+            status: "blocked",
+            category: "hosted_agent_execution_failed",
+            process_health: "healthy",
+            mission_outcome: "blocked",
+            blocker: Some("impact_map_artifact_invalid".into()),
+            resumable: true,
+            code: "impact_map_schema_mismatch".into(),
+            phase: ExecutionPhase::ArtifactRepair,
+            message: "repair".into(),
+            underlying_error: UnderlyingFailure {
+                r#type: "orchestration_guardrail".into(),
+                message: "schema".into(),
+                stack_reference: None,
+            },
+            model_calls_used: 6,
+            model_calls_limit: 10,
+            model_calls_remaining: 4,
+            phase_calls_used: 1,
+            phase_calls_limit: 1,
+            last_successful_action: json!({}),
+            usage: ToolUsage::default(),
+            recoverable: true,
+            resume_phase: "artifact_repair".into(),
+            recommended_action: "resume".into(),
+            artifact: Some("impact_map".into()),
+            semantic_status: Some(ArtifactSemanticStatus::Invalid),
+            persistence_status: Some(ArtifactPersistenceStatus::PendingRetry),
+            rustgrid_gateway_status: None,
+            upstream_provider_status: None,
+            failure_stage: None,
+            provider_contacted: None,
+            call_budget_consumed: None,
+            reservation_state: None,
+            reservation_reconciliation_state: None,
+            rustgrid_request_id: None,
+            transport_request_id: None,
+            provider_request_id: None,
+            provider_error: None,
+            provider_response_body: None,
+            model_alias: None,
+            resolved_provider_model: None,
+            adapter_version: None,
+            payload_schema_version: None,
+            provider_attempts: None,
+            actual_cost_micros: None,
+        };
+        let value = serde_json::to_value(failure).unwrap();
+        assert_eq!(value["process_health"], "healthy");
+        assert_eq!(value["mission_outcome"], "blocked");
+        assert_eq!(value["resumable"], true);
+    }
+
+    #[test]
+    fn resume_revision_eight_reuses_discovery_without_discovery_tools() {
+        let mut notebook = test_discovery_notebook(ExecutionPhase::ArtifactRepair);
+        notebook.revision = 8;
+        let (_, _, phase) = notebook_orchestration_state(&notebook);
+        assert_eq!(notebook.revision, 8);
+        assert_eq!(phase, ExecutionPhase::ArtifactRepair);
+        let names = hosted_tools_for_phase(phase)
+            .into_iter()
+            .filter_map(|v| v["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["record_impact_map"]);
+        assert!(!names.contains(&"read_file".into()));
+    }
+
     fn test_discovery_notebook(phase: ExecutionPhase) -> WorkerNotebook {
         WorkerNotebook {
             schema_version: 1,
             revision: 4,
             goal: "Apply a complete theme".into(),
             acceptance_criteria: vec!["All surfaces use the theme".into()],
+            acceptance_criteria_v2: vec![impact_map::AcceptanceCriterion {
+                id: "ac-1".into(),
+                text: "All surfaces use the theme".into(),
+            }],
             phase,
             repository_base_sha: "a".repeat(40),
             branch: "rustgrid/aops-226-deadbeef".into(),
@@ -11512,11 +12024,17 @@ Implement theme support.\n\n\
             execution_attempt: 1,
             architecture_findings: vec!["Theme tokens are centralized.".into()],
             impact_map: vec![],
+            impact_map_v2: None,
             impact_map_artifact: ArtifactCheckpoint {
                 semantic_status: ArtifactSemanticStatus::Invalid,
                 persistence_status: ArtifactPersistenceStatus::PendingRetry,
                 ..ArtifactCheckpoint::default()
             },
+            impact_map_invalid_payload: None,
+            impact_evidence: impact_map::evidence_catalog(
+                &["src/components/theme/ThemeProvider.tsx".into()],
+                &["literal:src:ThemeProvider".into()],
+            ),
             files_inspected: vec!["src/components/theme/ThemeProvider.tsx".into()],
             searches_completed: vec!["literal:src:ThemeProvider".into()],
             planned_changes: vec![],
@@ -11619,16 +12137,26 @@ Implement theme support.\n\n\
 
     fn test_impact_map() -> ImpactMap {
         ImpactMap {
-            can_implement: true,
-            impact_map: vec![ImpactArea {
-                area: "theme".into(),
+            schema_version: IMPACT_MAP_SCHEMA_VERSION.into(),
+            areas: vec![ImpactArea {
+                area_id: "area-theme".into(),
+                name: "theme".into(),
                 candidate_paths: vec!["src/theme.css".into()],
+                evidence: vec![impact_map::ImpactEvidence {
+                    evidence_type: impact_map::EvidenceType::FileRead,
+                    path: Some("src/theme.css".into()),
+                    query: None,
+                    description: "inspected".into(),
+                }],
                 reason: "The token source propagates to every themed surface.".into(),
-                acceptance_criteria: vec!["Theme can be selected".into()],
+                acceptance_criteria_ids: vec!["ac-1".into()],
             }],
-            files_inspected: vec!["src/theme.css".into()],
-            searches_completed: vec!["theme".into()],
-            blocking_unknowns: vec![],
+            inspected_files: vec!["src/theme.css".into()],
+            searches: vec![impact_map::ImpactSearch {
+                query: "theme".into(),
+                scope: None,
+            }],
+            unresolved_questions: vec![],
         }
     }
 
