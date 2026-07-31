@@ -5,6 +5,33 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.14 - 2026-07-31
+
+### Changed
+
+- Track planned source changes with stable change IDs and keep ordered write
+  attempts as diagnostic history separate from intended-change state.
+- Reconcile failed edits against later target writes, the final repository
+  diff, implementation declarations, and authoritative validation before
+  completion evaluation.
+- Add bounded range, unique-symbol, unified-diff, and small-file rewrite tools
+  that report before/after hashes, changed ranges, and concise diff summaries.
+- Include passed test and build commands in satisfied code-criterion evidence.
+
+### Fixed
+
+- Prevent ambiguous or absent intermediate replacements from making completed,
+  changed, and validated work appear incomplete.
+- Prevent earlier successful writes and successful no-op writes from
+  incorrectly superseding later failures.
+- Stop repeated ambiguous replacement loops after one bounded retry and direct
+  repair toward deterministic editing strategies.
+- Treat published complete, external-review-pending, partial, and blocked
+  mission outcomes as healthy GitHub Actions process results while preserving
+  nonzero exits for invalid terminal results and publication failures.
+- Keep review-pending pull requests normally titled and reserve draft
+  `[INCOMPLETE]` presentation for work that needs implementation continuation.
+
 ## 1.4.13 - 2026-07-30
 
 ### Changed
