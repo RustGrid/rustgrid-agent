@@ -1564,13 +1564,60 @@ struct ImplementationPlan {
 struct PlannedChange {
     #[serde(default)]
     change_id: String,
+    #[serde(default)]
+    parent_change_id: Option<String>,
+    #[serde(default, skip_serializing)]
     path: String,
+    #[serde(default, deserialize_with = "deserialize_planned_targets")]
+    targets: Vec<PlannedTarget>,
+    #[serde(rename = "intent", alias = "change")]
     change: String,
     reason: String,
+    #[serde(default)]
+    status: IntendedChangeStatus,
     #[serde(default)]
     acceptance_criteria: Vec<String>,
     #[serde(default)]
     test_coverage: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PlannedTarget {
+    path: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    new_file: bool,
+    #[serde(default)]
+    status: IntendedChangeStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PlannedTargetInput {
+    Path(String),
+    Target(PlannedTarget),
+}
+
+fn deserialize_planned_targets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<PlannedTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<PlannedTargetInput>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|value| match value {
+            PlannedTargetInput::Path(path) => PlannedTarget {
+                path,
+                role: String::new(),
+                new_file: false,
+                status: IntendedChangeStatus::Planned,
+            },
+            PlannedTargetInput::Target(target) => target,
+        })
+        .collect())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1644,6 +1691,7 @@ enum IntendedChangeStatus {
     InProgress,
     Applied,
     Verified,
+    Partial,
     Unresolved,
 }
 
@@ -1675,11 +1723,68 @@ struct WriteAttemptRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct IntendedChangeRecord {
+struct MutationPreflightRecord {
     change_id: String,
     target: String,
+    failure_code: String,
+    plan_revision: u64,
+    retryable_with_same_plan: bool,
+    repair_strategy: String,
+    mutation_attempted: bool,
+    mutation_preflight_failed: bool,
+    #[serde(default)]
+    deterministic_repair_attempted: bool,
+    #[serde(default = "one_u32")]
+    occurrences: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ImplementationPlanRepair {
+    change_id: String,
+    targets_before: Vec<String>,
+    targets_after: Vec<String>,
+    attempted_concrete_path: String,
+    validation_error: String,
+    repair_source: &'static str,
+    model_call_consumed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MutationPreflightDecision {
+    repeated: bool,
+    halt_orchestration: bool,
+}
+
+const fn one_u32() -> u32 {
+    1
+}
+
+#[derive(Debug)]
+struct MutationPreflightError {
+    code: &'static str,
+    change_id: String,
+    target: String,
+    message: String,
+    repair_strategy: &'static str,
+}
+
+impl std::fmt::Display for MutationPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MutationPreflightError {}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IntendedChangeRecord {
+    change_id: String,
     intent: String,
     status: IntendedChangeStatus,
+    #[serde(default, skip_serializing)]
+    target: String,
+    #[serde(default)]
+    targets: Vec<PlannedTarget>,
     #[serde(default)]
     attempts: Vec<WriteAttemptRecord>,
     #[serde(default)]
@@ -1800,6 +1905,8 @@ struct ToolUsage {
     writes: u32,
     successful_writes: u32,
     failed_writes: u32,
+    write_preflight_rejections: u32,
+    write_execution_failures: u32,
     validation_commands: u32,
 }
 
@@ -1839,6 +1946,8 @@ struct WorkerNotebook {
     intended_changes: Vec<IntendedChangeRecord>,
     #[serde(default)]
     write_attempts: Vec<WriteAttemptRecord>,
+    #[serde(default)]
+    write_preflight_rejections: Vec<MutationPreflightRecord>,
     #[serde(default)]
     completed_changes: Vec<String>,
     #[serde(default)]
@@ -2076,6 +2185,7 @@ fn new_worker_notebook(
         planned_changes: Vec::new(),
         intended_changes: Vec::new(),
         write_attempts: Vec::new(),
+        write_preflight_rejections: Vec::new(),
         completed_changes: Vec::new(),
         failed_changes: Vec::new(),
         remaining_work: Vec::new(),
@@ -2225,7 +2335,7 @@ fn reconcile_failed_write_attempts(
                 planned_by_id
                     .values()
                     .copied()
-                    .find(|change| change.path == target)
+                    .find(|change| change.targets.iter().any(|planned| planned.path == target))
             });
         let later_success = successful_attempts.iter().find(|attempt| {
             attempt.attempt_index > failure.attempt_index
@@ -2297,14 +2407,77 @@ fn attempt_modified_target(attempt: &WriteAttemptRecord) -> bool {
 }
 
 fn deterministic_change_id(index: usize, change: &PlannedChange) -> String {
-    let material = format!("{}\0{}\0{}", change.path, change.change, change.reason);
+    let material = format!(
+        "{}\0{}\0{}",
+        change
+            .targets
+            .iter()
+            .map(|target| target.path.as_str())
+            .collect::<Vec<_>>()
+            .join("\0"),
+        change.change,
+        change.reason
+    );
     let digest = hex::encode(Sha256::digest(material.as_bytes()));
     format!("change-{}-{}", index + 1, &digest[..12])
 }
 
-fn normalize_planned_changes(changes: &mut [PlannedChange]) -> Result<()> {
+fn normalized_planned_paths(raw: &str) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for entry in raw.split(';') {
+        let path = entry.trim().replace('\\', "/");
+        if path.is_empty() {
+            bail!("implementation plan target contains an empty path entry");
+        }
+        let path = path.strip_prefix("./").unwrap_or(&path).to_owned();
+        if path.contains(';') || path.contains('\n') || path.contains('\r') {
+            bail!("implementation plan target must contain exactly one repository path");
+        }
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn normalize_planned_changes(changes: &mut [PlannedChange]) -> Result<usize> {
     let mut ids = BTreeSet::new();
+    let mut normalized_legacy_targets = 0;
     for (index, change) in changes.iter_mut().enumerate() {
+        if !change.path.trim().is_empty() {
+            let normalized = normalized_planned_paths(&change.path)?;
+            normalized_legacy_targets += usize::from(normalized.len() > 1);
+            for path in normalized {
+                if !change.targets.iter().any(|target| target.path == path) {
+                    change.targets.push(PlannedTarget {
+                        path,
+                        role: change.reason.clone(),
+                        new_file: false,
+                        status: IntendedChangeStatus::Planned,
+                    });
+                }
+            }
+            change.path.clear();
+        }
+        let mut seen_paths = BTreeSet::new();
+        let mut targets = Vec::new();
+        for mut target in std::mem::take(&mut change.targets) {
+            let normalized = normalized_planned_paths(&target.path)?;
+            normalized_legacy_targets += usize::from(normalized.len() > 1);
+            for path in normalized {
+                if seen_paths.insert(path.clone()) {
+                    target.path = path;
+                    if target.role.trim().is_empty() {
+                        target.role = change.reason.clone();
+                    }
+                    targets.push(target.clone());
+                }
+            }
+        }
+        change.targets = targets;
+        if change.targets.is_empty() {
+            bail!("every implementation plan change requires at least one target");
+        }
         if change.change_id.trim().is_empty() {
             change.change_id = deterministic_change_id(index, change);
         }
@@ -2318,8 +2491,202 @@ fn normalize_planned_changes(changes: &mut [PlannedChange]) -> Result<()> {
         {
             bail!("implementation plan change_id values must be unique safe identifiers");
         }
+        if change.parent_change_id.as_deref().is_some_and(|parent| {
+            parent.is_empty()
+                || parent.len() > 100
+                || !parent.chars().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || matches!(character, '-' | '_')
+                })
+        }) {
+            bail!("implementation plan parent_change_id must be a safe identifier");
+        }
+    }
+    Ok(normalized_legacy_targets)
+}
+
+fn repair_implementation_plan(
+    changes: &mut [PlannedChange],
+    change_id: &str,
+    attempted_concrete_path: &str,
+) -> Result<Option<ImplementationPlanRepair>> {
+    let targets_before = changes
+        .iter()
+        .find(|change| change.change_id == change_id)
+        .map(|change| {
+            change
+                .path
+                .trim()
+                .is_empty()
+                .then(Vec::new)
+                .unwrap_or_else(|| vec![change.path.clone()])
+                .into_iter()
+                .chain(change.targets.iter().map(|target| target.path.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let normalized_legacy_targets = normalize_planned_changes(changes)?;
+    if normalized_legacy_targets == 0 {
+        return Ok(None);
+    }
+    let targets_after = changes
+        .iter()
+        .find(|change| change.change_id == change_id)
+        .map(|change| {
+            change
+                .targets
+                .iter()
+                .map(|target| target.path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Some(ImplementationPlanRepair {
+        change_id: change_id.to_owned(),
+        targets_before,
+        targets_after,
+        attempted_concrete_path: attempted_concrete_path.to_owned(),
+        validation_error: "legacy compound target metadata required normalization".into(),
+        repair_source: "orchestrator_normalization",
+        model_call_consumed: false,
+    }))
+}
+
+fn record_mutation_preflight_rejection(
+    notebook: &mut WorkerNotebook,
+    usage: &mut ToolUsage,
+    preflight: &MutationPreflightError,
+) -> MutationPreflightDecision {
+    usage.write_preflight_rejections = usage.write_preflight_rejections.saturating_add(1);
+    let repeated_index = notebook
+        .write_preflight_rejections
+        .iter()
+        .position(|record| {
+            record.change_id == preflight.change_id
+                && record.target == preflight.target
+                && record.failure_code == preflight.code
+                && record.plan_revision == notebook.revision
+        });
+    let repeated = repeated_index.is_some();
+    if let Some(index) = repeated_index {
+        notebook.write_preflight_rejections[index].occurrences = notebook
+            .write_preflight_rejections[index]
+            .occurrences
+            .saturating_add(1);
+    } else {
+        notebook
+            .write_preflight_rejections
+            .push(MutationPreflightRecord {
+                change_id: preflight.change_id.clone(),
+                target: preflight.target.clone(),
+                failure_code: preflight.code.into(),
+                plan_revision: notebook.revision,
+                retryable_with_same_plan: false,
+                repair_strategy: preflight.repair_strategy.into(),
+                mutation_attempted: false,
+                mutation_preflight_failed: true,
+                deterministic_repair_attempted: preflight.repair_strategy == "repair_plan_metadata",
+                occurrences: 1,
+            });
+    }
+    MutationPreflightDecision {
+        repeated,
+        halt_orchestration: true,
+    }
+}
+
+fn validate_planned_change_paths(root: &Path, changes: &[PlannedChange]) -> Result<()> {
+    for change in changes {
+        for target in &change.targets {
+            if target.path.contains(';') {
+                bail!("invalid multi-path scalar target cannot reach implementation");
+            }
+            let may_be_absent = target.new_file
+                || matches!(
+                    target.status,
+                    IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+                );
+            let resolved = safe_repo_path(root, &target.path, may_be_absent).map_err(|error| {
+                anyhow!(
+                    "implementation plan target `{}` is invalid: {error:#}",
+                    target.path
+                )
+            })?;
+            if !may_be_absent && !resolved.exists() {
+                bail!(
+                    "implementation plan target `{}` does not exist and is not marked new_file",
+                    target.path
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn authorize_planned_target<'a>(
+    plan: &'a ImplementationPlan,
+    change_id: &str,
+    path: &str,
+) -> std::result::Result<&'a PlannedTarget, MutationPreflightError> {
+    let Some(change) = plan
+        .planned_changes
+        .iter()
+        .find(|change| change.change_id == change_id)
+    else {
+        return Err(MutationPreflightError {
+            code: "mutation_change_id_unknown",
+            change_id: change_id.into(),
+            target: path.into(),
+            message: "source-changing tool change_id is not in the implementation plan".into(),
+            repair_strategy: "repair_plan_metadata",
+        });
+    };
+    change
+        .targets
+        .iter()
+        .find(|target| target.path == path)
+        .ok_or_else(|| MutationPreflightError {
+            code: "mutation_plan_metadata_mismatch",
+            change_id: change_id.into(),
+            target: path.into(),
+            message: "source-changing tool target is not a member of its planned target set".into(),
+            repair_strategy: "repair_plan_metadata",
+        })
+}
+
+fn roll_up_target_statuses(targets: &[PlannedTarget]) -> IntendedChangeStatus {
+    if !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| target.status == IntendedChangeStatus::Verified)
+    {
+        IntendedChangeStatus::Verified
+    } else if !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| target.status == IntendedChangeStatus::Applied)
+    {
+        IntendedChangeStatus::Applied
+    } else if !targets.is_empty()
+        && targets
+            .iter()
+            .all(|target| target.status == IntendedChangeStatus::Unresolved)
+    {
+        IntendedChangeStatus::Unresolved
+    } else if targets.iter().any(|target| {
+        matches!(
+            target.status,
+            IntendedChangeStatus::InProgress
+                | IntendedChangeStatus::Applied
+                | IntendedChangeStatus::Verified
+                | IntendedChangeStatus::Partial
+                | IntendedChangeStatus::Unresolved
+        )
+    }) {
+        IntendedChangeStatus::Partial
+    } else {
+        IntendedChangeStatus::Planned
+    }
 }
 
 fn intended_changes_from_plan(changes: &[PlannedChange]) -> Vec<IntendedChangeRecord> {
@@ -2327,20 +2694,82 @@ fn intended_changes_from_plan(changes: &[PlannedChange]) -> Vec<IntendedChangeRe
         .iter()
         .map(|change| IntendedChangeRecord {
             change_id: change.change_id.clone(),
-            target: change.path.clone(),
             intent: change.change.clone(),
             status: IntendedChangeStatus::Planned,
+            target: String::new(),
+            targets: change.targets.clone(),
             attempts: Vec::new(),
             recovery: None,
         })
         .collect()
 }
 
-fn normalize_notebook_intended_changes(notebook: &mut WorkerNotebook) -> Result<()> {
+fn normalize_notebook_intended_changes(notebook: &mut WorkerNotebook, root: &Path) -> Result<()> {
     normalize_planned_changes(&mut notebook.planned_changes)?;
     if notebook.intended_changes.is_empty() && !notebook.planned_changes.is_empty() {
         notebook.intended_changes = intended_changes_from_plan(&notebook.planned_changes);
     }
+    for intended in &mut notebook.intended_changes {
+        if !intended.target.trim().is_empty() {
+            for path in normalized_planned_paths(&intended.target)? {
+                if !intended.targets.iter().any(|target| target.path == path) {
+                    intended.targets.push(PlannedTarget {
+                        path,
+                        role: intended.intent.clone(),
+                        new_file: false,
+                        status: intended.status,
+                    });
+                }
+            }
+            intended.target.clear();
+        }
+        let mut normalized_targets = Vec::new();
+        let mut seen_paths = BTreeSet::new();
+        for target in std::mem::take(&mut intended.targets) {
+            for path in normalized_planned_paths(&target.path)? {
+                if seen_paths.insert(path.clone()) {
+                    normalized_targets.push(PlannedTarget {
+                        path,
+                        role: if target.role.trim().is_empty() {
+                            intended.intent.clone()
+                        } else {
+                            target.role.clone()
+                        },
+                        new_file: target.new_file,
+                        status: target.status,
+                    });
+                }
+            }
+        }
+        intended.targets = normalized_targets;
+        if intended.targets.is_empty() {
+            bail!(
+                "persisted intended change `{}` requires at least one target",
+                intended.change_id
+            );
+        }
+        intended.status = roll_up_target_statuses(&intended.targets);
+    }
+    for planned in &mut notebook.planned_changes {
+        if let Some(intended) = notebook
+            .intended_changes
+            .iter()
+            .find(|intended| intended.change_id == planned.change_id)
+        {
+            for target in &mut planned.targets {
+                if let Some(persisted) = intended
+                    .targets
+                    .iter()
+                    .find(|persisted| persisted.path == target.path)
+                {
+                    target.status = persisted.status;
+                    target.new_file |= persisted.new_file;
+                }
+            }
+            planned.status = intended.status;
+        }
+    }
+    validate_planned_change_paths(root, &notebook.planned_changes)?;
     if notebook.write_attempts.is_empty() {
         notebook.write_attempts = notebook
             .intended_changes
@@ -2368,7 +2797,9 @@ fn validate_write_repair_strategy(
             attempt.change_id == change_id
                 && attempt.target == target
                 && attempt.status == WriteAttemptStatus::Failed
-                && attempt.error_code.as_deref() == Some("replace_match_not_unique")
+                && (attempt.error_code.as_deref() == Some("replace_match_not_unique")
+                    || (attempt.error_code.as_deref() == Some("mutation_content_conflict")
+                        && attempt.match_count.is_some_and(|count| count != 1)))
         })
         .count();
     if tool == "replace_text" {
@@ -2383,19 +2814,9 @@ fn validate_write_repair_strategy(
             );
         }
     }
-    if target_failures >= MAX_TARGET_REPAIR_FAILURES
-        && !matches!(
-            tool,
-            "replace_range"
-                | "insert_after_symbol"
-                | "insert_before_symbol"
-                | "apply_unified_diff"
-                | "rewrite_small_file"
-                | "delete_file"
-        )
-    {
+    if target_failures >= MAX_TARGET_REPAIR_FAILURES {
         bail!(
-            "generic repair limit reached for {target}; use one deterministic range, symbol, unified-diff, or small-file rewrite strategy"
+            "content repair circuit breaker opened for {target} after {MAX_TARGET_REPAIR_FAILURES} executed write failures"
         );
     }
     Ok(())
@@ -3658,6 +4079,71 @@ struct GatewayAgent<'a> {
     budget_advisory_percent: u8,
     last_cache_prefix_sha256: Option<String>,
     last_tool_order_sha256: Option<String>,
+    implementation_progress_baseline: ImplementationProgressBaseline,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ImplementationProgressBaseline {
+    calls: usize,
+    successful_writes: u32,
+    changed_paths: BTreeSet<String>,
+    failure_counts: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ImplementationProgressWindow {
+    calls: usize,
+    new_successful_writes: u32,
+    new_changed_paths: usize,
+    repeated_failure_codes: BTreeMap<String, u32>,
+    zero_progress: bool,
+}
+
+fn mutation_failure_counts(
+    attempts: &[WriteAttemptRecord],
+    preflight_rejections: &[MutationPreflightRecord],
+) -> BTreeMap<String, u32> {
+    let mut counts = BTreeMap::new();
+    for code in attempts
+        .iter()
+        .filter(|attempt| attempt.status == WriteAttemptStatus::Failed)
+        .filter_map(|attempt| attempt.error_code.as_deref())
+    {
+        *counts.entry(code.to_owned()).or_default() += 1;
+    }
+    for rejection in preflight_rejections {
+        *counts.entry(rejection.failure_code.clone()).or_default() += rejection.occurrences;
+    }
+    counts
+}
+
+fn implementation_progress_window(
+    baseline: &ImplementationProgressBaseline,
+    calls: usize,
+    successful_writes: u32,
+    changed_paths: &BTreeSet<String>,
+    failure_counts: &BTreeMap<String, u32>,
+) -> Option<ImplementationProgressWindow> {
+    let calls = calls.saturating_sub(baseline.calls);
+    if calls < 5 {
+        return None;
+    }
+    let new_successful_writes = successful_writes.saturating_sub(baseline.successful_writes);
+    let new_changed_paths = changed_paths.difference(&baseline.changed_paths).count();
+    let repeated_failure_codes = failure_counts
+        .iter()
+        .filter_map(|(code, count)| {
+            let new_count = count.saturating_sub(*baseline.failure_counts.get(code).unwrap_or(&0));
+            (new_count >= 2).then(|| (code.clone(), new_count))
+        })
+        .collect();
+    Some(ImplementationProgressWindow {
+        calls,
+        new_successful_writes,
+        new_changed_paths,
+        repeated_failure_codes,
+        zero_progress: new_successful_writes == 0 && new_changed_paths == 0,
+    })
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -3703,7 +4189,7 @@ impl<'a> GatewayAgent<'a> {
                 &notebook.searches_completed,
             );
         }
-        normalize_notebook_intended_changes(&mut notebook)?;
+        normalize_notebook_intended_changes(&mut notebook, &repo.root)?;
         if let Some(partial_run) = &partial_run {
             if notebook.impact_map.is_empty() {
                 notebook = new_worker_notebook(
@@ -3833,6 +4319,18 @@ impl<'a> GatewayAgent<'a> {
                 });
         let mut phases = PhaseLedger::new(total_calls, initial_phase);
         phases.ensure_finalization_minimum(notebook.acceptance_criteria.len());
+        let implementation_progress_baseline = ImplementationProgressBaseline {
+            calls: phases.implementation_repair_calls(),
+            successful_writes: 0,
+            changed_paths: completion_changed_paths(repo, &manifest.github.base_sha)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            failure_counts: mutation_failure_counts(
+                &notebook.write_attempts,
+                &notebook.write_preflight_rejections,
+            ),
+        };
         Ok(Self {
             api,
             manifest,
@@ -3865,6 +4363,7 @@ impl<'a> GatewayAgent<'a> {
             budget_advisory_percent: 0,
             last_cache_prefix_sha256: None,
             last_tool_order_sha256: None,
+            implementation_progress_baseline,
         })
     }
 
@@ -3930,6 +4429,57 @@ impl<'a> GatewayAgent<'a> {
                 false
             }
         }
+    }
+
+    fn observe_implementation_progress(&mut self) -> Result<bool> {
+        if !matches!(
+            self.phases.active(),
+            ExecutionPhase::Implementation | ExecutionPhase::Repair
+        ) {
+            return Ok(false);
+        }
+        let calls = self.phases.implementation_repair_calls();
+        let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let failure_counts = mutation_failure_counts(
+            &self.notebook.write_attempts,
+            &self.notebook.write_preflight_rejections,
+        );
+        let Some(window) = implementation_progress_window(
+            &self.implementation_progress_baseline,
+            calls,
+            self.tool_usage.successful_writes,
+            &changed_paths,
+            &failure_counts,
+        ) else {
+            return Ok(false);
+        };
+        let halt = window.zero_progress && !window.repeated_failure_codes.is_empty();
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.implementation_progress_window",
+                "calls": window.calls,
+                "new_successful_writes": window.new_successful_writes,
+                "new_changed_paths": window.new_changed_paths,
+                "repeated_failure_codes": window.repeated_failure_codes,
+                "zero_progress": window.zero_progress,
+                "orchestration_action": if halt {
+                    "return_resumable_partial_result"
+                } else {
+                    "continue"
+                },
+            }),
+            "implementation progress window",
+        );
+        self.implementation_progress_baseline = ImplementationProgressBaseline {
+            calls,
+            successful_writes: self.tool_usage.successful_writes,
+            changed_paths,
+            failure_counts,
+        };
+        Ok(halt)
     }
 
     fn record_cache_observability(&mut self, request: &Value, response: &Value) {
@@ -4885,6 +5435,7 @@ impl<'a> GatewayAgent<'a> {
                     explicit_declaration: self.declaration.clone(),
                 });
             }
+            let mut mutation_preflight_halt = None;
             for (call_id, name, arguments) in function_calls {
                 ensure_running(self.running)?;
                 if name == "record_impact_map" {
@@ -4912,15 +5463,6 @@ impl<'a> GatewayAgent<'a> {
                     .and_then(|path| repo_file_sha256(&self.repo.root, path));
                 let intended_change_sha256 =
                     is_source_mutation_tool(&name).then(|| tool_intent_sha256(&name, &arguments));
-                if let Some(change_id) = change_id.as_deref()
-                    && let Some(change) = self
-                        .notebook
-                        .intended_changes
-                        .iter_mut()
-                        .find(|change| change.change_id == change_id)
-                {
-                    change.status = IntendedChangeStatus::InProgress;
-                }
                 let result = match self.execute_tool(&name, &arguments) {
                     Ok(output) => {
                         self.last_successful_action = json!({
@@ -4954,7 +5496,19 @@ impl<'a> GatewayAgent<'a> {
                                 .iter_mut()
                                 .find(|change| change.change_id == attempt.change_id)
                             {
-                                change.status = IntendedChangeStatus::Applied;
+                                for target in &mut change.targets {
+                                    if target.path == attempt.target {
+                                        target.status = IntendedChangeStatus::Applied;
+                                    }
+                                }
+                                change.status =
+                                    if change.targets.iter().all(|target| {
+                                        target.status == IntendedChangeStatus::Applied
+                                    }) {
+                                        IntendedChangeStatus::Applied
+                                    } else {
+                                        roll_up_target_statuses(&change.targets)
+                                    };
                                 change.attempts.push(attempt);
                             }
                             self.diff_reviewed = false;
@@ -5151,12 +5705,53 @@ impl<'a> GatewayAgent<'a> {
                                     }
                                 }
                             }
+                        } else if let Some(preflight) =
+                            error.downcast_ref::<MutationPreflightError>()
+                        {
+                            let decision = record_mutation_preflight_rejection(
+                                &mut self.notebook,
+                                &mut self.tool_usage,
+                                preflight,
+                            );
+                            self.append_event_recoverable(
+                                "progress",
+                                json!({
+                                    "event_type": "worker.mutation_preflight_rejected",
+                                    "change_id": preflight.change_id,
+                                    "target": preflight.target,
+                                    "failure_code": preflight.code,
+                                    "plan_revision": self.notebook.revision,
+                                    "retryable_with_same_plan": false,
+                                    "repair_strategy": preflight.repair_strategy,
+                                    "mutation_attempted": false,
+                                    "mutation_preflight_failed": true,
+                                    "circuit_breaker_open": decision.repeated,
+                                    "orchestration_halted": decision.halt_orchestration,
+                                }),
+                                "mutation preflight rejection",
+                            );
+                            mutation_preflight_halt = Some(format!(
+                                "Implementation paused after non-retryable mutation preflight rejection `{}` for `{}`. Repair the persisted plan metadata and resume without repeating discovery or planning.",
+                                preflight.code, preflight.target
+                            ));
+                            json!({
+                                "ok": false,
+                                "error": preflight.message,
+                                "error_code": preflight.code,
+                                "retryable_with_same_plan": false,
+                                "repair_strategy": preflight.repair_strategy,
+                                "mutation_attempted": false,
+                                "mutation_preflight_failed": true,
+                                "circuit_breaker_open": decision.repeated,
+                            })
                         } else {
                             let error = truncate_text(&format!("{error:#}"), 4_000);
                             if is_source_mutation_tool(&name) {
                                 let (error_code, match_count) = classify_write_failure(&error);
                                 self.tool_usage.failed_writes =
                                     self.tool_usage.failed_writes.saturating_add(1);
+                                self.tool_usage.write_execution_failures =
+                                    self.tool_usage.write_execution_failures.saturating_add(1);
                                 let attempt_index = self.notebook.write_attempts.len();
                                 let attempt = WriteAttemptRecord {
                                     attempt_index,
@@ -5260,6 +5855,18 @@ impl<'a> GatewayAgent<'a> {
                     "output": serde_json::to_string(&result)?
                 }));
             }
+            if self.observe_implementation_progress()? {
+                mutation_preflight_halt.get_or_insert_with(|| {
+                    "Implementation paused after a five-call zero-progress window repeated the same mutation failure. Resume from the persisted notebook after repairing the recorded blocker; do not repeat discovery or planning.".into()
+                });
+            }
+            if let Some(summary) = mutation_preflight_halt {
+                return Ok(ImplementationOutcome {
+                    summary,
+                    budget_exhausted: false,
+                    explicit_declaration: self.declaration.clone(),
+                });
+            }
             turns.push_back(turn);
             compact_hosted_turns(&mut turns);
         }
@@ -5294,6 +5901,22 @@ impl<'a> GatewayAgent<'a> {
         let declaration = implementation.explicit_declaration.as_ref();
         let declaration_complete =
             declaration.is_some_and(|value| value.implementation_status == "complete");
+        let path_completion_evidence = planned_changes
+            .iter()
+            .flat_map(|change| {
+                change.targets.iter().map(|target| {
+                    json!({
+                        "path": target.path,
+                        "planned": true,
+                        "changed": changed.contains(target.path.as_str()),
+                        "verified": changed.contains(target.path.as_str())
+                            && all_validation_passed
+                            && declaration_complete,
+                        "blocking_criteria": change.acceptance_criteria,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
 
         for intended in &mut self.notebook.intended_changes {
             intended.attempts = self
@@ -5314,17 +5937,33 @@ impl<'a> GatewayAgent<'a> {
             intended.recovery = related_failures
                 .iter()
                 .find_map(|failure| failure.recovery.clone());
-            intended.status = if unresolved {
-                IntendedChangeStatus::Unresolved
-            } else if changed.contains(intended.target.as_str())
-                && all_validation_passed
-                && declaration_complete
+            for target in &mut intended.targets {
+                let target_unresolved = related_failures.iter().any(|failure| {
+                    failure.target.as_deref() == Some(target.path.as_str())
+                        && failure.reconciliation == FailureReconciliation::StillUnresolved
+                });
+                target.status = if target_unresolved {
+                    IntendedChangeStatus::Unresolved
+                } else if changed.contains(target.path.as_str())
+                    && all_validation_passed
+                    && declaration_complete
+                {
+                    IntendedChangeStatus::Verified
+                } else if changed.contains(target.path.as_str()) {
+                    IntendedChangeStatus::Applied
+                } else {
+                    IntendedChangeStatus::Planned
+                };
+            }
+            intended.status = if unresolved
+                && intended
+                    .targets
+                    .iter()
+                    .all(|target| target.status == IntendedChangeStatus::Unresolved)
             {
-                IntendedChangeStatus::Verified
-            } else if changed.contains(intended.target.as_str()) {
-                IntendedChangeStatus::Applied
+                IntendedChangeStatus::Unresolved
             } else {
-                IntendedChangeStatus::Planned
+                roll_up_target_statuses(&intended.targets)
             };
         }
         self.notebook.failed_changes = self.tool_failures.clone();
@@ -5335,6 +5974,7 @@ impl<'a> GatewayAgent<'a> {
                 "intended_changes": self.notebook.intended_changes,
                 "failed_attempts": self.tool_failures,
                 "final_changed_paths": changed_paths,
+                "path_completion_evidence": path_completion_evidence,
                 "validation": validation,
             }),
             "intended-change reconciliation",
@@ -5520,6 +6160,105 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
         Ok(fallback)
     }
 
+    fn preflight_source_mutation(
+        &mut self,
+        name: &str,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<()> {
+        if self.impact_map.is_none() {
+            return Err(MutationPreflightError {
+                code: "mutation_policy_denied",
+                change_id: String::new(),
+                target: String::new(),
+                message: "record_impact_map is required before source-changing tools".into(),
+                repair_strategy: "complete_required_artifact",
+            }
+            .into());
+        }
+        let Some(plan) = self.implementation_plan.as_mut() else {
+            return Err(MutationPreflightError {
+                code: "mutation_policy_denied",
+                change_id: String::new(),
+                target: String::new(),
+                message: "record_implementation_plan is required before source-changing tools"
+                    .into(),
+                repair_strategy: "complete_required_artifact",
+            }
+            .into());
+        };
+        let change_id = required_tool_string(object, "change_id", 100)?.to_owned();
+        let raw_path = required_tool_string(object, "path", 4_096)?;
+        let normalized_paths =
+            normalized_planned_paths(raw_path).map_err(|error| MutationPreflightError {
+                code: "mutation_target_path_invalid",
+                change_id: change_id.clone(),
+                target: raw_path.to_owned(),
+                message: error.to_string(),
+                repair_strategy: "repair_plan_metadata",
+            })?;
+        if normalized_paths.len() != 1 {
+            return Err(MutationPreflightError {
+                code: "mutation_target_path_invalid",
+                change_id,
+                target: raw_path.to_owned(),
+                message: "source-changing tool target must be one concrete repository path".into(),
+                repair_strategy: "repair_plan_metadata",
+            }
+            .into());
+        }
+        let path = normalized_paths[0].as_str();
+
+        if let Some(repair) =
+            repair_implementation_plan(&mut plan.planned_changes, &change_id, path)?
+        {
+            validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
+            self.notebook.planned_changes = plan.planned_changes.clone();
+            self.notebook.intended_changes = intended_changes_from_plan(&plan.planned_changes);
+            self.api.append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.implementation_plan_repaired",
+                    "change_id": repair.change_id,
+                    "targets_before": repair.targets_before,
+                    "targets_after": repair.targets_after,
+                    "attempted_concrete_path": repair.attempted_concrete_path,
+                    "validation_error": repair.validation_error,
+                    "repair_source": repair.repair_source,
+                    "model_call_consumed": repair.model_call_consumed,
+                }),
+            )?;
+        }
+        let target = authorize_planned_target(plan, &change_id, path)?;
+        safe_repo_path(&self.repo.root, path, target.new_file).map_err(|error| {
+            MutationPreflightError {
+                code: if error.to_string().contains("escape") {
+                    "mutation_target_outside_repository"
+                } else {
+                    "mutation_target_path_invalid"
+                },
+                change_id: change_id.clone(),
+                target: path.to_owned(),
+                message: error.to_string(),
+                repair_strategy: "repair_plan_metadata",
+            }
+        })?;
+        validate_write_repair_strategy(
+            &self.notebook.write_attempts,
+            path,
+            &change_id,
+            name,
+            self.repair_read_targets.contains(path),
+        )
+        .map_err(|error| MutationPreflightError {
+            code: "mutation_content_conflict",
+            change_id: change_id.clone(),
+            target: path.to_owned(),
+            message: error.to_string(),
+            repair_strategy: "return_partial_result",
+        })?;
+        Ok(())
+    }
+
     fn execute_tool(&mut self, name: &str, raw_arguments: &str) -> Result<String> {
         let arguments: Value =
             serde_json::from_str(raw_arguments).context("tool arguments are not valid JSON")?;
@@ -5528,33 +6267,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             .context("tool arguments must be an object")?;
         self.validate_tool_for_phase(name, object)?;
         if is_source_mutation_tool(name) {
-            let change_id = required_tool_string(object, "change_id", 100)?;
-            let path = required_tool_string(object, "path", 4_096)?;
-            let planned = self
-                .implementation_plan
-                .as_ref()
-                .and_then(|plan| {
-                    plan.planned_changes
-                        .iter()
-                        .find(|change| change.change_id == change_id)
-                })
-                .context("source-changing tool change_id is not in the implementation plan")?;
-            if planned.path != path {
-                bail!("source-changing tool target does not match its planned change_id");
-            }
-            validate_write_repair_strategy(
-                &self.notebook.write_attempts,
-                path,
-                change_id,
-                name,
-                self.repair_read_targets.contains(path),
-            )?;
-        }
-        if is_source_mutation_tool(name) && self.impact_map.is_none() {
-            bail!("record_impact_map is required before source-changing tools");
-        }
-        if is_source_mutation_tool(name) && self.implementation_plan.is_none() {
-            bail!("record_implementation_plan is required before source-changing tools");
+            self.preflight_source_mutation(name, object)?;
         }
         if name != "search_text" {
             self.search_guard.record_non_search();
@@ -5915,11 +6628,13 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 let mut plan: ImplementationPlan =
                     serde_json::from_value(Value::Object(object.clone()))
                         .context("implementation plan is malformed")?;
-                normalize_planned_changes(&mut plan.planned_changes)?;
+                let normalized_legacy_targets =
+                    normalize_planned_changes(&mut plan.planned_changes)?;
+                validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
                 if !matches!(plan.implementation_status.as_str(), "ready" | "blocked")
                     || (plan.implementation_status == "ready" && plan.planned_changes.is_empty())
                     || plan.planned_changes.iter().any(|change| {
-                        change.path.trim().is_empty()
+                        change.targets.is_empty()
                             || change.change.trim().is_empty()
                             || change.reason.trim().is_empty()
                             || change.acceptance_criteria.is_empty()
@@ -5952,13 +6667,34 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         "ready implementation plan must map every impact-map acceptance criterion"
                     );
                 }
+                let target_count = plan
+                    .planned_changes
+                    .iter()
+                    .map(|change| change.targets.len())
+                    .sum::<usize>();
+                self.api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "worker.implementation_plan_validated",
+                        "change_count": plan.planned_changes.len(),
+                        "target_count": target_count,
+                        "normalized_legacy_targets": normalized_legacy_targets,
+                        "normalization_source": (normalized_legacy_targets > 0)
+                            .then_some("legacy_semicolon_target"),
+                    }),
+                )?;
                 self.notebook.planned_changes = plan.planned_changes.clone();
                 self.notebook.intended_changes = intended_changes_from_plan(&plan.planned_changes);
                 self.notebook.write_attempts.clear();
                 self.notebook.remaining_work = plan
                     .planned_changes
                     .iter()
-                    .map(|change| format!("{}: {}", change.path, change.change))
+                    .flat_map(|change| {
+                        change
+                            .targets
+                            .iter()
+                            .map(|target| format!("{}: {}", target.path, change.change))
+                    })
                     .collect();
                 self.notebook.blocking_unknowns = plan.blocking_unknowns.clone();
                 let ready = plan.implementation_status == "ready";
@@ -6132,7 +6868,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
         self.implementation_plan.as_ref().is_some_and(|plan| {
             plan.planned_changes
                 .iter()
-                .any(|change| related(&change.path))
+                .flat_map(|change| &change.targets)
+                .any(|target| related(&target.path))
                 || plan.planned_new_files.iter().any(|file| related(file))
                 || plan.planned_test_changes.iter().any(|file| related(file))
         }) || self.impact_map.as_ref().is_some_and(|map| {
@@ -6233,13 +6970,29 @@ fn hosted_tools() -> Vec<Value> {
                             "type": "object",
                             "properties": {
                                 "change_id": {"type": "string"},
-                                "path": {"type": "string"},
-                                "change": {"type": "string"},
+                                "parent_change_id": {"type": ["string", "null"]},
+                                "intent": {"type": "string"},
                                 "reason": {"type": "string"},
+                                "targets": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": {"type": "string"},
+                                            "role": {"type": "string"},
+                                            "new_file": {"type": "boolean"},
+                                            "status": {"type": "string", "enum": ["planned", "in_progress", "applied", "verified", "partial", "unresolved"]}
+                                        },
+                                        "required": ["path", "role", "new_file", "status"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "status": {"type": "string", "enum": ["planned", "in_progress", "applied", "verified", "partial", "unresolved"]},
                                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                                 "test_coverage": {"type": "array", "items": {"type": "string"}}
                             },
-                            "required": ["change_id", "path", "change", "reason", "acceptance_criteria", "test_coverage"],
+                            "required": ["change_id", "parent_change_id", "intent", "reason", "targets", "status", "acceptance_criteria", "test_coverage"],
                             "additionalProperties": false
                         }
                     },
@@ -6629,6 +7382,11 @@ replace_text for the first targeted edit. After an ambiguous replacement, perfor
 read_file; after a second ambiguity, switch to replace_range, a unique-symbol insertion, \
 apply_unified_diff, or rewrite_small_file for a small file. write_file is appropriate only when \
 replacing a complete file. Every source-changing call must cite the stable change_id from the plan. \
+Prefer one planned change per independently editable file; use parent_change_id only to group \
+related file changes. When one logical change genuinely has multiple targets, represent them as \
+structured target objects and mutate one concrete member path per tool call. Never encode multiple \
+paths in one string. A mutation authorization or plan-metadata rejection is not a content-edit \
+failure: do not switch editing tools; allow the orchestrator to repair metadata deterministically. \
 run_focused_command starts one executable directly without a shell; never pass shell operators, \
 pipelines, redirects, heredocs, or chained commands to it, and never use it to mutate files. Never \
 commit, push, switch branches, modify Git remotes, open pull requests, read environment variables, \
@@ -7829,6 +8587,34 @@ fn hosted_pull_request_body(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let partial_summary = if requires_implementation_continuation(completeness.status) {
+        let completed = completeness
+            .criteria
+            .iter()
+            .flat_map(|criterion| &criterion.evidence)
+            .map(|evidence| evidence.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|path| format!("- `{path}`"))
+            .collect::<Vec<_>>();
+        let root_cause = completeness
+            .unrecovered_tool_failures
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "The planned-versus-changed path evidence is incomplete.".into());
+        format!(
+            "### Completed\n{}\n\n### Not completed\n{}\n\n### Root cause\n{}\n\n### Resume action\nNormalize the planned target set and resume implementation from the persisted notebook without repeating discovery, planning, or completed work.\n\n",
+            if completed.is_empty() {
+                "- No planned target has complete diff evidence yet.".into()
+            } else {
+                completed.join("\n")
+            },
+            render_items(&completeness.remaining_implementation_work),
+            root_cause,
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{}\n\nRustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
 Execution: `{}` (attempt {})\nModel: `{}`\nMaximum cost: `${}`\n\n\
@@ -7838,7 +8624,7 @@ Criterion evidence:\n{}\n\n\
 Remaining implementation work:\n{}\n\n\
 Remaining automated verification:\n{}\n\n\
 External review checklist:\n{}\n\n\
-Optional follow-up:\n{}\n\nTechnical validation:\n{}\n\n\
+Optional follow-up:\n{}\n\n{}Technical validation:\n{}\n\n\
 _The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
         completeness_heading,
         manifest.ticket_key,
@@ -7861,6 +8647,7 @@ _The OpenAI credential remained encrypted in RustGrid and was never sent to this
         render_items(&completeness.remaining_automated_verification),
         review_checklist,
         render_items(&completeness.optional_follow_up),
+        partial_summary,
         if checks.is_empty() {
             "- No required validation commands configured.".into()
         } else {
@@ -8115,6 +8902,22 @@ fn completion_fallback(
             .enumerate()
             .map(|(index, criterion)| {
                 let mut verification_type = verification_type_for_criterion(criterion);
+                let required_planned_paths = implementation_plan
+                    .into_iter()
+                    .flat_map(|plan| plan.planned_changes.iter())
+                    .filter(|change| {
+                        change
+                            .acceptance_criteria
+                            .iter()
+                            .any(|mapped| mapped.trim() == criterion.trim())
+                    })
+                    .flat_map(|change| change.targets.iter().map(|target| target.path.clone()))
+                    .collect::<BTreeSet<_>>();
+                let unchanged_required_paths = required_planned_paths
+                    .iter()
+                    .filter(|path| !valid_paths.contains(path))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let mut evidence = declaration
                     .into_iter()
                     .flat_map(|declaration| declaration.criteria_evidence.iter())
@@ -8159,11 +8962,20 @@ fn completion_fallback(
                                 .iter()
                                 .any(|mapped| mapped.trim() == criterion.trim())
                         })
-                        .filter(|change| valid_paths.contains(&change.path))
-                        .map(|change| CompletionEvidence {
-                                path: change.path.clone(),
-                                description: change.reason.clone(),
-                            })
+                        .flat_map(|change| {
+                            change
+                                .targets
+                                .iter()
+                                .filter(|target| valid_paths.contains(&target.path))
+                                .map(|target| CompletionEvidence {
+                                    path: target.path.clone(),
+                                    description: if target.role.is_empty() {
+                                        change.reason.clone()
+                                    } else {
+                                        target.role.clone()
+                                    },
+                                })
+                        })
                         .collect();
                 }
                 let mandatory_e2e_missing = browser_e2e_is_mandatory_and_missing(
@@ -8186,6 +8998,18 @@ fn completion_fallback(
                             CriterionStatus::Unsatisfied,
                             vec!["Project policy requires browser E2E coverage for this theme change.".into()],
                             Some("Add and pass the required authenticated browser E2E coverage.".into()),
+                        )
+                    } else if !unchanged_required_paths.is_empty() {
+                        (
+                            CriterionStatus::Unsatisfied,
+                            vec![format!(
+                                "Required planned paths were unchanged: {}.",
+                                unchanged_required_paths.join(", ")
+                            )],
+                            Some(format!(
+                                "Implement and verify the unchanged required paths: {}.",
+                                unchanged_required_paths.join(", ")
+                            )),
                         )
                     } else if !unrecovered.is_empty() {
                         (
@@ -8612,22 +9436,20 @@ fn classify_write_failure(error: &str) -> (String, Option<usize>) {
             .nth(1)
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse().ok());
-        ("replace_match_not_unique".into(), match_count)
+        ("mutation_content_conflict".into(), match_count)
     } else if error.contains("symbol_match_not_unique") {
         let match_count = error
             .split("found ")
             .nth(1)
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse().ok());
-        ("symbol_match_not_unique".into(), match_count)
-    } else if error.contains("strategy exhausted") {
-        ("repair_strategy_exhausted".into(), None)
-    } else if error.contains("line range") {
-        ("replace_range_invalid".into(), None)
+        ("mutation_content_conflict".into(), match_count)
+    } else if error.contains("strategy exhausted") || error.contains("line range") {
+        ("mutation_content_conflict".into(), None)
     } else if error.contains("unified diff") {
-        ("unified_diff_invalid".into(), None)
+        ("mutation_patch_failed".into(), None)
     } else {
-        ("source_mutation_failed".into(), None)
+        ("mutation_content_conflict".into(), None)
     }
 }
 
@@ -10708,8 +11530,245 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("generic repair limit")
+            .contains("content repair circuit breaker")
         );
+        assert!(
+            validate_write_repair_strategy(
+                &four,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "rewrite_small_file",
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn multi_file_plans_normalize_legacy_targets_and_authorize_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src/components/theme")).unwrap();
+        for path in ["ThemeProvider.tsx", "ThemeToggle.tsx"] {
+            fs::write(
+                directory.path().join("src/components/theme").join(path),
+                "export {};\n",
+            )
+            .unwrap();
+        }
+        let mut change = test_planned_change();
+        change.change_id = "theme-registry-light-blue".into();
+        change.parent_change_id = Some("theme-registry".into());
+        change.path = "src/components/theme/ThemeProvider.tsx; src/components/theme/ThemeToggle.tsx; src/components/theme/ThemeProvider.tsx".into();
+        change.targets.clear();
+        let repair = repair_implementation_plan(
+            std::slice::from_mut(&mut change),
+            "theme-registry-light-blue",
+            "src/components/theme/ThemeProvider.tsx",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!repair.model_call_consumed);
+        assert_eq!(repair.repair_source, "orchestrator_normalization");
+        assert_eq!(repair.targets_before.len(), 1);
+        assert_eq!(
+            change
+                .targets
+                .iter()
+                .map(|target| target.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "src/components/theme/ThemeProvider.tsx",
+                "src/components/theme/ThemeToggle.tsx"
+            ]
+        );
+        validate_planned_change_paths(directory.path(), std::slice::from_ref(&change)).unwrap();
+        let plan = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes: vec![change],
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        assert!(
+            authorize_planned_target(
+                &plan,
+                "theme-registry-light-blue",
+                "src/components/theme/ThemeProvider.tsx"
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_planned_target(
+                &plan,
+                "theme-registry-light-blue",
+                "src/components/theme/ThemeToggle.tsx"
+            )
+            .is_ok()
+        );
+        let rejected =
+            authorize_planned_target(&plan, "theme-registry-light-blue", "src/styles/globals.css")
+                .unwrap_err();
+        assert_eq!(rejected.code, "mutation_plan_metadata_mismatch");
+        assert_eq!(rejected.repair_strategy, "repair_plan_metadata");
+        let serialized = serde_json::to_value(&plan).unwrap();
+        assert!(serialized["planned_changes"][0].get("path").is_none());
+        assert!(serialized["planned_changes"][0]["targets"].is_array());
+        assert_eq!(
+            serialized["planned_changes"][0]["parent_change_id"],
+            "theme-registry"
+        );
+    }
+
+    #[test]
+    fn independently_editable_changes_may_share_one_logical_parent() {
+        let mut provider = test_planned_change();
+        provider.change_id = "theme-provider-light-blue".into();
+        provider.parent_change_id = Some("theme-registry-light-blue".into());
+        let mut toggle = test_planned_change();
+        toggle.change_id = "theme-toggle-light-blue".into();
+        toggle.parent_change_id = Some("theme-registry-light-blue".into());
+        toggle.targets[0].path = "src/components/theme/ThemeToggle.tsx".into();
+
+        normalize_planned_changes(&mut [provider.clone(), toggle.clone()]).unwrap();
+
+        assert_eq!(provider.parent_change_id, toggle.parent_change_id);
+        assert_ne!(provider.change_id, toggle.change_id);
+    }
+
+    #[test]
+    fn preflight_rejection_is_not_an_executed_write_and_halts_tool_switching() {
+        let mut notebook = test_discovery_notebook(ExecutionPhase::Implementation);
+        let mut usage = ToolUsage::default();
+        let preflight = MutationPreflightError {
+            code: "mutation_plan_metadata_mismatch",
+            change_id: "theme-registry-light-blue".into(),
+            target: "src/components/theme/ThemeProvider.tsx".into(),
+            message: "target is not a member of its planned target set".into(),
+            repair_strategy: "repair_plan_metadata",
+        };
+
+        let first = record_mutation_preflight_rejection(&mut notebook, &mut usage, &preflight);
+        assert!(first.halt_orchestration);
+        assert!(!first.repeated);
+        assert_eq!(usage.write_preflight_rejections, 1);
+        assert_eq!(usage.write_execution_failures, 0);
+        assert_eq!(usage.failed_writes, 0);
+        assert!(notebook.write_attempts.is_empty());
+        assert!(!notebook.write_preflight_rejections[0].mutation_attempted);
+
+        let repeated = record_mutation_preflight_rejection(&mut notebook, &mut usage, &preflight);
+        assert!(repeated.repeated);
+        assert_eq!(notebook.write_preflight_rejections[0].occurrences, 2);
+        assert_eq!(usage.write_execution_failures, 0);
+    }
+
+    #[test]
+    fn five_call_zero_progress_window_stops_repeated_failure_loops() {
+        let baseline = ImplementationProgressBaseline::default();
+        let repeated = BTreeMap::from([("mutation_plan_metadata_mismatch".into(), 5)]);
+        assert!(
+            implementation_progress_window(&baseline, 4, 0, &BTreeSet::new(), &repeated).is_none()
+        );
+
+        let window =
+            implementation_progress_window(&baseline, 5, 0, &BTreeSet::new(), &repeated).unwrap();
+        assert!(window.zero_progress);
+        assert_eq!(window.new_successful_writes, 0);
+        assert_eq!(window.new_changed_paths, 0);
+        assert_eq!(
+            window.repeated_failure_codes["mutation_plan_metadata_mismatch"],
+            5
+        );
+
+        let progress = implementation_progress_window(
+            &baseline,
+            5,
+            1,
+            &BTreeSet::from(["src/styles/globals.css".into()]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(!progress.zero_progress);
+    }
+
+    #[test]
+    fn persisted_legacy_intended_change_resumes_with_structured_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("provider.tsx"), "export {};\n").unwrap();
+        let mut notebook = test_discovery_notebook(ExecutionPhase::Implementation);
+        notebook.planned_changes = vec![
+            serde_json::from_value(json!({
+                "change_id": "theme-registry-light-blue",
+                "path": "provider.tsx; toggle.tsx",
+                "change": "Expose light blue theme",
+                "reason": "Theme selection",
+                "acceptance_criteria": ["ac-1"]
+            }))
+            .unwrap(),
+        ];
+        notebook.intended_changes = vec![
+            serde_json::from_value(json!({
+                "change_id": "theme-registry-light-blue",
+                "intent": "Expose light blue theme",
+                "status": "applied",
+                "target": "provider.tsx; toggle.tsx"
+            }))
+            .unwrap(),
+        ];
+
+        normalize_notebook_intended_changes(&mut notebook, directory.path()).unwrap();
+
+        assert_eq!(
+            notebook.intended_changes[0].status,
+            IntendedChangeStatus::Applied
+        );
+        assert_eq!(
+            notebook.intended_changes[0]
+                .targets
+                .iter()
+                .map(|target| target.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider.tsx", "toggle.tsx"]
+        );
+        let persisted = serde_json::to_value(&notebook.intended_changes[0]).unwrap();
+        assert!(persisted.get("target").is_none());
+        assert_eq!(persisted["targets"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn per_target_status_rolls_up_without_claiming_multi_file_completion() {
+        let mut change = test_planned_change();
+        change.targets.push(PlannedTarget {
+            path: "src/components/theme/ThemeToggle.tsx".into(),
+            role: "selector cycling".into(),
+            new_file: false,
+            status: IntendedChangeStatus::Planned,
+        });
+        change.targets[0].status = IntendedChangeStatus::Applied;
+        assert_eq!(
+            roll_up_target_statuses(&change.targets),
+            IntendedChangeStatus::Partial
+        );
+        for target in &mut change.targets {
+            target.status = IntendedChangeStatus::Verified;
+        }
+        assert_eq!(
+            roll_up_target_statuses(&change.targets),
+            IntendedChangeStatus::Verified
+        );
+    }
+
+    #[test]
+    fn plan_validation_rejects_missing_paths_unless_explicitly_new() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut change = test_planned_change();
+        change.targets[0].path = "src/new-theme.ts".into();
+        assert!(
+            validate_planned_change_paths(directory.path(), std::slice::from_ref(&change)).is_err()
+        );
+        change.targets[0].new_file = true;
+        validate_planned_change_paths(directory.path(), std::slice::from_ref(&change)).unwrap();
     }
 
     #[test]
@@ -10939,6 +11998,45 @@ mod tests {
         assert_eq!(
             criterion.validation_evidence,
             vec!["npm test", "npm run build"]
+        );
+    }
+
+    #[test]
+    fn passing_validation_cannot_complete_an_unchanged_required_target() {
+        let implementation = test_complete_implementation();
+        let mut change = test_planned_change();
+        change.targets.push(PlannedTarget {
+            path: "src/components/theme/ThemeToggle.tsx".into(),
+            role: "selector cycling".into(),
+            new_file: false,
+            status: IntendedChangeStatus::Planned,
+        });
+        let plan = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes: vec![change],
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        let result = completion_fallback(
+            &implementation,
+            None,
+            Some(&plan),
+            &[],
+            &["tests/theme-provider.test.tsx".into()],
+            &["Theme can be selected".into()],
+            &[test_passed_validation("npm test")],
+            ProjectVerificationPolicy::default(),
+        );
+
+        assert_eq!(result.criteria[0].status, CriterionStatus::Unsatisfied);
+        assert_ne!(
+            result.implementation_completeness,
+            ImplementationCompleteness::Complete
+        );
+        assert!(
+            result.criteria[0].missing_evidence[0].contains("src/components/theme/ThemeToggle.tsx")
         );
     }
 
@@ -11383,9 +12481,12 @@ Implement theme support.\n\n\
             searches_completed: vec!["literal:src:theme".into()],
             planned_changes: vec![PlannedChange {
                 change_id: "change-1-theme".into(),
+                parent_change_id: None,
                 path: "src/theme.css".into(),
+                targets: vec![],
                 change: "Update tokens".into(),
                 reason: "Central propagation".into(),
+                status: IntendedChangeStatus::Planned,
                 acceptance_criteria: vec!["All surfaces use the theme".into()],
                 test_coverage: vec!["theme snapshot".into()],
             }],
@@ -11393,6 +12494,7 @@ Implement theme support.\n\n\
             failed_changes: vec![],
             intended_changes: vec![],
             write_attempts: vec![],
+            write_preflight_rejections: vec![],
             remaining_work: vec!["Update tokens".into()],
             blocking_unknowns: vec![],
             validation_failures: vec![],
@@ -11594,6 +12696,11 @@ Implement theme support.\n\n\
         assert!(body.contains("INCOMPLETE"));
         assert!(body.contains("Add settings integration"));
         assert!(body.contains("partial"));
+        assert!(body.contains("### Completed"));
+        assert!(body.contains("### Not completed"));
+        assert!(body.contains("### Root cause"));
+        assert!(body.contains("### Resume action"));
+        assert!(body.contains("without repeating discovery, planning, or completed work"));
         assert!(title.starts_with("[INCOMPLETE]"));
     }
 
@@ -12042,6 +13149,7 @@ Implement theme support.\n\n\
             failed_changes: vec![],
             intended_changes: vec![],
             write_attempts: vec![],
+            write_preflight_rejections: vec![],
             remaining_work: vec![],
             blocking_unknowns: vec![],
             validation_failures: vec![],
@@ -12053,9 +13161,17 @@ Implement theme support.\n\n\
     fn test_planned_change() -> PlannedChange {
         PlannedChange {
             change_id: "theme-tests".into(),
-            path: "tests/theme-provider.test.tsx".into(),
+            parent_change_id: None,
+            path: String::new(),
+            targets: vec![PlannedTarget {
+                path: "tests/theme-provider.test.tsx".into(),
+                role: "focused theme coverage".into(),
+                new_file: false,
+                status: IntendedChangeStatus::Planned,
+            }],
             change: "Add light-blue theme coverage.".into(),
             reason: "Verify registration, persistence, cycling, and fallback behavior.".into(),
+            status: IntendedChangeStatus::Planned,
             acceptance_criteria: vec!["Theme can be selected".into()],
             test_coverage: vec!["npm test".into()],
         }

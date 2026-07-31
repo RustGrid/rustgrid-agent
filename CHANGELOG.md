@@ -5,6 +5,48 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.16 - 2026-07-31
+
+### Changed
+
+- Represent hosted implementation-plan targets as structured per-file records,
+  with optional logical parent IDs and independently persisted target status.
+- Normalize legacy semicolon-separated plan and notebook targets before
+  implementation, and expose deterministic `repair_implementation_plan`
+  evidence without consuming a model call.
+- Emit five-call implementation progress windows with successful-write,
+  changed-path, and repeated-failure accounting.
+- Include planned-versus-changed path evidence and explicit completed,
+  incomplete, root-cause, and resume sections in partial pull requests.
+
+### Fixed
+
+- Authorize concrete mutations by membership in the planned target set instead
+  of comparing against a compound serialized target.
+- Classify authorization, plan metadata, repository-policy, patch, and content
+  failures separately; do not count preflight rejection as an executed write.
+- Halt non-retryable mutation strategies immediately and cap genuine content
+  repair at four failed writes per target.
+- Prevent passing tests from satisfying criteria whose required planned paths
+  are unchanged, while preserving successful resumable partial publication.
+- Preserve legacy implementation notebooks, including applied or verified
+  deletion targets, without repeating discovery or planning.
+
+## 1.4.15 - 2026-07-31
+
+### Changed
+
+- Version and validate the `rustgrid.impact_map.v2` contract across the worker,
+  RustGrid ingestion, generated projections, and AgentOps rendering.
+- Preserve normalized impact-map evidence and compact deterministic repair
+  state across hosted continuation attempts.
+
+### Fixed
+
+- Continue directly to planning when deterministic impact-map recovery is
+  sufficient, while rejecting malformed or schema-drifted artifacts before
+  persistence.
+
 ## 1.4.14 - 2026-07-31
 
 ### Changed
