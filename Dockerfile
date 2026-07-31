@@ -4,6 +4,7 @@ ARG NODE_RUNTIME_IMAGE=node:24-trixie-slim
 FROM ${RUST_BUILDER_IMAGE} AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY contracts/impact-map-v2.schema.json ./contracts/impact-map-v2.schema.json
 COPY src ./src
 COPY README.md LICENSE ./
 RUN cargo build --locked --release
