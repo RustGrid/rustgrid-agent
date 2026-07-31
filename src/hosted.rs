@@ -7,7 +7,7 @@
 //! process and is stripped from every repository subprocess.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -71,6 +71,9 @@ const MAX_MODEL_CALLS_HARD_LIMIT: usize = 100;
 const MAX_HOSTED_TURN_WINDOWS: usize = 3;
 const MAX_REPAIR_ATTEMPTS: usize = 2;
 const MAX_AI_REGISTRATION_ATTEMPTS: usize = 3;
+const MAX_SMALL_FILE_REWRITE_BYTES: usize = 64 * 1024;
+const MAX_AMBIGUOUS_REPLACEMENT_FAILURES: usize = 2;
+const MAX_TARGET_REPAIR_FAILURES: usize = 4;
 const HOSTED_NAMESPACE: Uuid = Uuid::from_u128(0xc4e820c0_9ee5_4d13_87d0_05582a548e76);
 const EXECUTION_PERMISSIONS: [&str; 7] = [
     "ai:invoke",
@@ -1578,6 +1581,8 @@ struct ImplementationPlan {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PlannedChange {
+    #[serde(default)]
+    change_id: String,
     path: String,
     change: String,
     reason: String,
@@ -1612,12 +1617,92 @@ struct ImplementationCriterionEvidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ToolFailureRecord {
+    #[serde(default)]
+    attempt_index: usize,
+    #[serde(default)]
+    change_id: Option<String>,
     tool: String,
     target: Option<String>,
+    #[serde(default)]
+    error_code: String,
+    #[serde(default)]
+    match_count: Option<usize>,
     error: String,
     recovered: bool,
     #[serde(default)]
+    reconciliation: FailureReconciliation,
+    #[serde(default)]
+    recovery: Option<IntendedChangeRecovery>,
+    #[serde(default)]
     intended_change_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureReconciliation {
+    Recovered,
+    Superseded,
+    #[default]
+    StillUnresolved,
+    Unrelated,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IntendedChangeRecovery {
+    recovered: bool,
+    method: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IntendedChangeStatus {
+    #[default]
+    Planned,
+    InProgress,
+    Applied,
+    Verified,
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WriteAttemptStatus {
+    Applied,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct WriteAttemptRecord {
+    #[serde(default)]
+    attempt_index: usize,
+    change_id: String,
+    target: String,
+    tool: String,
+    status: WriteAttemptStatus,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    match_count: Option<usize>,
+    #[serde(default)]
+    intended_change_sha256: Option<String>,
+    #[serde(default)]
+    before_sha256: Option<String>,
+    #[serde(default)]
+    after_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IntendedChangeRecord {
+    change_id: String,
+    target: String,
+    intent: String,
+    status: IntendedChangeStatus,
+    #[serde(default)]
+    attempts: Vec<WriteAttemptRecord>,
+    #[serde(default)]
+    recovery: Option<IntendedChangeRecovery>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1720,6 +1805,10 @@ struct WorkerNotebook {
     searches_completed: Vec<String>,
     #[serde(default)]
     planned_changes: Vec<PlannedChange>,
+    #[serde(default)]
+    intended_changes: Vec<IntendedChangeRecord>,
+    #[serde(default)]
+    write_attempts: Vec<WriteAttemptRecord>,
     #[serde(default)]
     completed_changes: Vec<String>,
     #[serde(default)]
@@ -1936,6 +2025,8 @@ fn new_worker_notebook(
         files_inspected: Vec::new(),
         searches_completed: Vec::new(),
         planned_changes: Vec::new(),
+        intended_changes: Vec::new(),
+        write_attempts: Vec::new(),
         completed_changes: Vec::new(),
         failed_changes: Vec::new(),
         remaining_work: Vec::new(),
@@ -2014,6 +2105,226 @@ fn notebook_orchestration_state(
         ExecutionPhase::Discovery
     };
     (impact_map, implementation_plan, phase)
+}
+
+fn reconcile_failed_write_attempts(
+    failures: &mut [ToolFailureRecord],
+    planned_changes: &[PlannedChange],
+    write_attempts: &[WriteAttemptRecord],
+    implementation: &ImplementationOutcome,
+    validation: &[ValidationResult],
+    changed_paths: &[String],
+) {
+    let changed = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let all_validation_passed =
+        !validation.is_empty() && validation.iter().all(|result| result.status == "passed");
+    let declaration = implementation.explicit_declaration.as_ref();
+    let declaration_complete =
+        declaration.is_some_and(|value| value.implementation_status == "complete");
+    let successful_attempts = write_attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.status == WriteAttemptStatus::Applied && attempt_modified_target(attempt)
+        })
+        .collect::<Vec<_>>();
+    let planned_by_id = planned_changes
+        .iter()
+        .map(|change| (change.change_id.as_str(), change))
+        .collect::<BTreeMap<_, _>>();
+
+    for failure in failures {
+        if failure.recovered {
+            continue;
+        }
+        let Some(target) = failure.target.as_deref() else {
+            failure.reconciliation = FailureReconciliation::Unrelated;
+            continue;
+        };
+        let planned = failure
+            .change_id
+            .as_deref()
+            .and_then(|change_id| planned_by_id.get(change_id).copied())
+            .or_else(|| {
+                planned_by_id
+                    .values()
+                    .copied()
+                    .find(|change| change.path == target)
+            });
+        let later_success = successful_attempts.iter().find(|attempt| {
+            attempt.attempt_index > failure.attempt_index
+                && attempt.target == target
+                && (failure.change_id.as_deref() == Some(attempt.change_id.as_str())
+                    || matches!(attempt.tool.as_str(), "write_file" | "rewrite_small_file"))
+        });
+        if let Some(success) = later_success {
+            failure.recovered = true;
+            failure.reconciliation = FailureReconciliation::Superseded;
+            failure.recovery = Some(IntendedChangeRecovery {
+                recovered: true,
+                method: "later_successful_target_write".into(),
+                evidence: vec![
+                    format!(
+                        "{target} was modified by a later successful {}.",
+                        success.tool
+                    ),
+                    format!(
+                        "The final target hash is {}.",
+                        success.after_sha256.as_deref().unwrap_or("recorded")
+                    ),
+                ],
+            });
+            continue;
+        }
+        if !changed.contains(target) {
+            failure.reconciliation = if planned.is_some() {
+                FailureReconciliation::StillUnresolved
+            } else {
+                FailureReconciliation::Unrelated
+            };
+            continue;
+        }
+        let declaration_maps_target = declaration.is_some_and(|value| {
+            value.changed_paths.iter().any(|path| path == target)
+                && (value
+                    .criteria_evidence
+                    .iter()
+                    .any(|evidence| evidence.paths.iter().any(|path| path == target))
+                    || !value.completed_work.is_empty())
+        });
+        if planned.is_some()
+            && declaration_complete
+            && declaration_maps_target
+            && all_validation_passed
+        {
+            failure.recovered = true;
+            failure.reconciliation = FailureReconciliation::Recovered;
+            failure.recovery = Some(IntendedChangeRecovery {
+                recovered: true,
+                method: "final_diff_and_validation".into(),
+                evidence: std::iter::once(format!("{target} is present in the final diff."))
+                    .chain(
+                        validation
+                            .iter()
+                            .map(|result| format!("{} passed.", result.command)),
+                    )
+                    .collect(),
+            });
+        } else {
+            failure.reconciliation = FailureReconciliation::StillUnresolved;
+        }
+    }
+}
+
+fn attempt_modified_target(attempt: &WriteAttemptRecord) -> bool {
+    attempt.before_sha256 != attempt.after_sha256
+}
+
+fn deterministic_change_id(index: usize, change: &PlannedChange) -> String {
+    let material = format!("{}\0{}\0{}", change.path, change.change, change.reason);
+    let digest = hex::encode(Sha256::digest(material.as_bytes()));
+    format!("change-{}-{}", index + 1, &digest[..12])
+}
+
+fn normalize_planned_changes(changes: &mut [PlannedChange]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for (index, change) in changes.iter_mut().enumerate() {
+        if change.change_id.trim().is_empty() {
+            change.change_id = deterministic_change_id(index, change);
+        }
+        if change.change_id.len() > 100
+            || !change.change_id.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '-' | '_')
+            })
+            || !ids.insert(change.change_id.clone())
+        {
+            bail!("implementation plan change_id values must be unique safe identifiers");
+        }
+    }
+    Ok(())
+}
+
+fn intended_changes_from_plan(changes: &[PlannedChange]) -> Vec<IntendedChangeRecord> {
+    changes
+        .iter()
+        .map(|change| IntendedChangeRecord {
+            change_id: change.change_id.clone(),
+            target: change.path.clone(),
+            intent: change.change.clone(),
+            status: IntendedChangeStatus::Planned,
+            attempts: Vec::new(),
+            recovery: None,
+        })
+        .collect()
+}
+
+fn normalize_notebook_intended_changes(notebook: &mut WorkerNotebook) -> Result<()> {
+    normalize_planned_changes(&mut notebook.planned_changes)?;
+    if notebook.intended_changes.is_empty() && !notebook.planned_changes.is_empty() {
+        notebook.intended_changes = intended_changes_from_plan(&notebook.planned_changes);
+    }
+    if notebook.write_attempts.is_empty() {
+        notebook.write_attempts = notebook
+            .intended_changes
+            .iter()
+            .flat_map(|change| change.attempts.clone())
+            .collect();
+    }
+    Ok(())
+}
+
+fn validate_write_repair_strategy(
+    attempts: &[WriteAttemptRecord],
+    target: &str,
+    change_id: &str,
+    tool: &str,
+    bounded_repair_read_completed: bool,
+) -> Result<()> {
+    let target_failures = attempts
+        .iter()
+        .filter(|attempt| attempt.target == target && attempt.status == WriteAttemptStatus::Failed)
+        .count();
+    let ambiguous_failures = attempts
+        .iter()
+        .filter(|attempt| {
+            attempt.change_id == change_id
+                && attempt.target == target
+                && attempt.status == WriteAttemptStatus::Failed
+                && attempt.error_code.as_deref() == Some("replace_match_not_unique")
+        })
+        .count();
+    if tool == "replace_text" {
+        if ambiguous_failures >= MAX_AMBIGUOUS_REPLACEMENT_FAILURES {
+            bail!(
+                "replace_text strategy exhausted for {target}; use replace_range, insert_after_symbol, insert_before_symbol, apply_unified_diff, or rewrite_small_file"
+            );
+        }
+        if ambiguous_failures == 1 && !bounded_repair_read_completed {
+            bail!(
+                "a bounded read_file around the intended location is required before retrying replace_text for {target}"
+            );
+        }
+    }
+    if target_failures >= MAX_TARGET_REPAIR_FAILURES
+        && !matches!(
+            tool,
+            "replace_range"
+                | "insert_after_symbol"
+                | "insert_before_symbol"
+                | "apply_unified_diff"
+                | "rewrite_small_file"
+                | "delete_file"
+        )
+    {
+        bail!(
+            "generic repair limit reached for {target}; use one deterministic range, symbol, unified-diff, or small-file rewrite strategy"
+        );
+    }
+    Ok(())
 }
 
 fn validate_impact_map(map: &ImpactMap) -> Result<()> {
@@ -2606,10 +2917,13 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             })
             .context("could not report resumable partial hosted execution")?;
             println!(
-                "[partial] Execution {execution_id} preserved resumable work in draft pull request #{} at {}",
+                "[invalid] Execution {execution_id} published work but produced an invalid terminal result in pull request #{} at {}",
                 result.pull_request.number, result.pull_request.url
             );
-            Ok(())
+            Err(anyhow!(
+                "hosted execution produced invalid terminal mission outcome `{}`",
+                result.completeness.status.as_str()
+            ))
         }
         Err(error) => {
             let cancelled = !running.load(Ordering::SeqCst) || shutdown::requested();
@@ -2651,13 +2965,14 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
 }
 
 fn hosted_result_can_succeed(result: &HostedResult) -> bool {
-    matches!(
-        result.completeness.status,
-        CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview
-    ) && result
-        .validation
-        .iter()
-        .all(|validation| validation.status == "passed")
+    match result.completeness.status {
+        CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview => result
+            .validation
+            .iter()
+            .all(|validation| validation.status == "passed"),
+        CompletionStatus::Partial | CompletionStatus::Blocked => true,
+        CompletionStatus::Incomplete | CompletionStatus::Uncertain => false,
+    }
 }
 
 const fn completion_request_status(status: CompletionStatus) -> &'static str {
@@ -2846,7 +3161,7 @@ fn run_hosted_execution(
         running,
         &containment,
         partial_run,
-    );
+    )?;
     if let Some(partial_run) = &agent.partial_run {
         api.append_event(
             "progress",
@@ -3227,6 +3542,7 @@ struct GatewayAgent<'a> {
     tool_usage: ToolUsage,
     notebook: WorkerNotebook,
     search_guard: SearchGuard,
+    repair_read_targets: BTreeSet<String>,
     diff_reviewed: bool,
     diff_review_cursor: usize,
     diff_review_digest: Option<String>,
@@ -3249,7 +3565,7 @@ impl<'a> GatewayAgent<'a> {
         running: &'a Arc<AtomicBool>,
         containment: &'a command::HostedProcessContainment,
         partial_run: Option<PartialRunContext>,
-    ) -> Self {
+    ) -> Result<Self> {
         let budget = manifest
             .budget_audit()
             .expect("hosted manifest budget was validated before agent construction");
@@ -3274,6 +3590,7 @@ impl<'a> GatewayAgent<'a> {
         let mut notebook = restored.unwrap_or_else(|| {
             new_worker_notebook(manifest, repository_fingerprint, partial_run.as_ref())
         });
+        normalize_notebook_intended_changes(&mut notebook)?;
         if let Some(partial_run) = &partial_run {
             if notebook.impact_map.is_empty() {
                 notebook = new_worker_notebook(
@@ -3311,7 +3628,7 @@ impl<'a> GatewayAgent<'a> {
             notebook_orchestration_state(&notebook);
         let mut phases = PhaseLedger::new(total_calls, initial_phase);
         phases.ensure_finalization_minimum(notebook.acceptance_criteria.len());
-        Self {
+        Ok(Self {
             api,
             manifest,
             repo,
@@ -3330,6 +3647,7 @@ impl<'a> GatewayAgent<'a> {
                 ..notebook
             },
             search_guard: SearchGuard::default(),
+            repair_read_targets: BTreeSet::new(),
             diff_reviewed: false,
             diff_review_cursor: 0,
             diff_review_digest: None,
@@ -3342,7 +3660,7 @@ impl<'a> GatewayAgent<'a> {
             budget_advisory_percent: 0,
             last_cache_prefix_sha256: None,
             last_tool_order_sha256: None,
-        }
+        })
     }
 
     fn implement(&mut self) -> Result<ImplementationOutcome> {
@@ -4313,8 +4631,21 @@ impl<'a> GatewayAgent<'a> {
             for (call_id, name, arguments) in function_calls {
                 ensure_running(self.running)?;
                 let target = tool_target(&arguments);
+                let change_id = tool_change_id(&arguments);
+                let before_sha256 = target
+                    .as_deref()
+                    .and_then(|path| repo_file_sha256(&self.repo.root, path));
                 let intended_change_sha256 =
                     is_source_mutation_tool(&name).then(|| tool_intent_sha256(&name, &arguments));
+                if let Some(change_id) = change_id.as_deref()
+                    && let Some(change) = self
+                        .notebook
+                        .intended_changes
+                        .iter_mut()
+                        .find(|change| change.change_id == change_id)
+                {
+                    change.status = IntendedChangeStatus::InProgress;
+                }
                 let result = match self.execute_tool(&name, &arguments) {
                     Ok(output) => {
                         self.last_successful_action = json!({
@@ -4326,17 +4657,58 @@ impl<'a> GatewayAgent<'a> {
                         if is_source_mutation_tool(&name) {
                             self.tool_usage.successful_writes =
                                 self.tool_usage.successful_writes.saturating_add(1);
+                            let attempt = WriteAttemptRecord {
+                                attempt_index: self.notebook.write_attempts.len(),
+                                change_id: change_id.clone().unwrap_or_default(),
+                                target: target.clone().unwrap_or_default(),
+                                tool: name.clone(),
+                                status: WriteAttemptStatus::Applied,
+                                error_code: None,
+                                match_count: None,
+                                intended_change_sha256: intended_change_sha256.clone(),
+                                before_sha256,
+                                after_sha256: target
+                                    .as_deref()
+                                    .and_then(|path| repo_file_sha256(&self.repo.root, path)),
+                            };
+                            let target_was_modified = attempt_modified_target(&attempt);
+                            self.notebook.write_attempts.push(attempt.clone());
+                            if let Some(change) = self
+                                .notebook
+                                .intended_changes
+                                .iter_mut()
+                                .find(|change| change.change_id == attempt.change_id)
+                            {
+                                change.status = IntendedChangeStatus::Applied;
+                                change.attempts.push(attempt);
+                            }
                             self.diff_reviewed = false;
                             self.diff_review_cursor = 0;
                             self.diff_review_digest = None;
                             self.declaration = None;
                             for failure in &mut self.tool_failures {
-                                if !failure.recovered
+                                if target_was_modified
+                                    && !failure.recovered
                                     && failure.target.is_some()
                                     && failure.target == target
-                                    && failure.intended_change_sha256 == intended_change_sha256
+                                    && (failure.change_id == change_id
+                                        || failure.intended_change_sha256 == intended_change_sha256
+                                        || matches!(
+                                            name.as_str(),
+                                            "write_file" | "rewrite_small_file"
+                                        ))
                                 {
                                     failure.recovered = true;
+                                    failure.reconciliation = FailureReconciliation::Superseded;
+                                    failure.recovery = Some(IntendedChangeRecovery {
+                                        recovered: true,
+                                        method: "later_successful_target_write".into(),
+                                        evidence: vec![format!(
+                                            "A later successful {} modified {}.",
+                                            name,
+                                            target.as_deref().unwrap_or("the same target")
+                                        )],
+                                    });
                                 }
                             }
                             self.notebook.failed_changes = self.tool_failures.clone();
@@ -4425,13 +4797,42 @@ impl<'a> GatewayAgent<'a> {
                         } else {
                             let error = truncate_text(&format!("{error:#}"), 4_000);
                             if is_source_mutation_tool(&name) {
+                                let (error_code, match_count) = classify_write_failure(&error);
                                 self.tool_usage.failed_writes =
                                     self.tool_usage.failed_writes.saturating_add(1);
+                                let attempt_index = self.notebook.write_attempts.len();
+                                let attempt = WriteAttemptRecord {
+                                    attempt_index,
+                                    change_id: change_id.clone().unwrap_or_default(),
+                                    target: target.clone().unwrap_or_default(),
+                                    tool: name.clone(),
+                                    status: WriteAttemptStatus::Failed,
+                                    error_code: Some(error_code.clone()),
+                                    match_count,
+                                    intended_change_sha256: intended_change_sha256.clone(),
+                                    before_sha256,
+                                    after_sha256: None,
+                                };
+                                self.notebook.write_attempts.push(attempt.clone());
+                                if let Some(change) = self
+                                    .notebook
+                                    .intended_changes
+                                    .iter_mut()
+                                    .find(|change| change.change_id == attempt.change_id)
+                                {
+                                    change.attempts.push(attempt);
+                                }
                                 self.tool_failures.push(ToolFailureRecord {
+                                    attempt_index,
+                                    change_id,
                                     tool: name.clone(),
                                     target: target.clone(),
+                                    error_code,
+                                    match_count,
                                     error: error.clone(),
                                     recovered: false,
+                                    reconciliation: FailureReconciliation::StillUnresolved,
+                                    recovery: None,
                                     intended_change_sha256: intended_change_sha256.clone(),
                                 });
                                 self.notebook.failed_changes = self.tool_failures.clone();
@@ -4507,18 +4908,94 @@ impl<'a> GatewayAgent<'a> {
         }
     }
 
+    fn reconcile_write_failures(
+        &mut self,
+        implementation: &ImplementationOutcome,
+        validation: &[ValidationResult],
+        changed_paths: &[String],
+    ) -> Vec<ToolFailureRecord> {
+        let empty_plan = Vec::new();
+        let planned_changes = self
+            .implementation_plan
+            .as_ref()
+            .map(|plan| &plan.planned_changes)
+            .unwrap_or(&empty_plan);
+        reconcile_failed_write_attempts(
+            &mut self.tool_failures,
+            planned_changes,
+            &self.notebook.write_attempts,
+            implementation,
+            validation,
+            changed_paths,
+        );
+        let changed = changed_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let all_validation_passed =
+            !validation.is_empty() && validation.iter().all(|result| result.status == "passed");
+        let declaration = implementation.explicit_declaration.as_ref();
+        let declaration_complete =
+            declaration.is_some_and(|value| value.implementation_status == "complete");
+
+        for intended in &mut self.notebook.intended_changes {
+            intended.attempts = self
+                .notebook
+                .write_attempts
+                .iter()
+                .filter(|attempt| attempt.change_id == intended.change_id)
+                .cloned()
+                .collect();
+            let related_failures = self
+                .tool_failures
+                .iter()
+                .filter(|failure| failure.change_id.as_deref() == Some(&intended.change_id))
+                .collect::<Vec<_>>();
+            let unresolved = related_failures
+                .iter()
+                .any(|failure| failure.reconciliation == FailureReconciliation::StillUnresolved);
+            intended.recovery = related_failures
+                .iter()
+                .find_map(|failure| failure.recovery.clone());
+            intended.status = if unresolved {
+                IntendedChangeStatus::Unresolved
+            } else if changed.contains(intended.target.as_str())
+                && all_validation_passed
+                && declaration_complete
+            {
+                IntendedChangeStatus::Verified
+            } else if changed.contains(intended.target.as_str()) {
+                IntendedChangeStatus::Applied
+            } else {
+                IntendedChangeStatus::Planned
+            };
+        }
+        self.notebook.failed_changes = self.tool_failures.clone();
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.intended_changes_reconciled",
+                "intended_changes": self.notebook.intended_changes,
+                "failed_attempts": self.tool_failures,
+                "final_changed_paths": changed_paths,
+                "validation": validation,
+            }),
+            "intended-change reconciliation",
+        );
+        self.tool_failures
+            .iter()
+            .filter(|failure| failure.reconciliation == FailureReconciliation::StillUnresolved)
+            .cloned()
+            .collect()
+    }
+
     fn evaluate_completion(
         &mut self,
         implementation: &ImplementationOutcome,
         validation: &[ValidationResult],
         changed_paths: &[String],
     ) -> Result<CompletionEvaluation> {
-        let unrecovered = self
-            .tool_failures
-            .iter()
-            .filter(|failure| !failure.recovered)
-            .cloned()
-            .collect::<Vec<_>>();
+        let unrecovered = self.reconcile_write_failures(implementation, validation, changed_paths);
         let fallback = completion_fallback(
             implementation,
             self.impact_map.as_ref(),
@@ -4562,7 +5039,7 @@ uncertain or incomplete. An unrecovered edit failure blocks complete. A broad ta
 diff needs explicit architectural evidence. Classify human, design, accessibility, visual, \
 product-approval, and deployment-environment checks as external review rather than missing source \
 implementation. Apply the supplied browser-test policy exactly. Return only one JSON object matching the requested \
-schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nProject verification policy:\n{}\n\nImpact map:\n{}\n\nImplementation plan:\n{}\n\nWorker notebook:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nUnrecovered tool failures:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
+schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nProject verification policy:\n{}\n\nImpact map:\n{}\n\nImplementation plan:\n{}\n\nWorker notebook:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nGenuinely unresolved intended changes:\n{}\n\nReconciled intended changes:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
             self.manifest.ticket_title,
             self.manifest.run.input_prompt,
             serde_json::to_string(&project_verification_policy(self.manifest))
@@ -4575,6 +5052,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             implementation.budget_exhausted,
             changed_paths.join("\n"),
             serde_json::to_string(&unrecovered).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&self.notebook.intended_changes).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(validation).unwrap_or_else(|_| "[]".into()),
             truncate_text(&diff, 96 * 1024),
         );
@@ -4692,6 +5170,29 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             .as_object()
             .context("tool arguments must be an object")?;
         self.validate_tool_for_phase(name, object)?;
+        if is_source_mutation_tool(name) {
+            let change_id = required_tool_string(object, "change_id", 100)?;
+            let path = required_tool_string(object, "path", 4_096)?;
+            let planned = self
+                .implementation_plan
+                .as_ref()
+                .and_then(|plan| {
+                    plan.planned_changes
+                        .iter()
+                        .find(|change| change.change_id == change_id)
+                })
+                .context("source-changing tool change_id is not in the implementation plan")?;
+            if planned.path != path {
+                bail!("source-changing tool target does not match its planned change_id");
+            }
+            validate_write_repair_strategy(
+                &self.notebook.write_attempts,
+                path,
+                change_id,
+                name,
+                self.repair_read_targets.contains(path),
+            )?;
+        }
         if is_source_mutation_tool(name) && self.impact_map.is_none() {
             bail!("record_impact_map is required before source-changing tools");
         }
@@ -4727,6 +5228,9 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .unwrap_or(start_line.saturating_add(399))
                     .min(start_line.saturating_add(999));
                 push_unique(&mut self.notebook.files_inspected, path.to_owned());
+                if self.phases.active() == ExecutionPhase::Repair {
+                    self.repair_read_targets.insert(path.to_owned());
+                }
                 read_repo_file(&self.repo.root, path, start_line, end_line)
             }
             "read_files" => {
@@ -4847,19 +5351,9 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
-                let target = safe_repo_path(&self.repo.root, path, true)?;
-                if content.len() > MAX_MODEL_FILE_BYTES {
-                    bail!("write_file content exceeds the hosted tool limit");
-                }
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("could not create repository directory {}", parent.display())
-                    })?;
-                }
-                fs::write(&target, content.as_bytes())
-                    .with_context(|| format!("could not write repository file {path}"))?;
+                let output = write_repo_file(&self.repo.root, path, content, false)?;
                 push_unique(&mut self.notebook.completed_changes, path.to_owned());
-                Ok(format!("wrote {} bytes to {path}", content.len()))
+                Ok(output)
             }
             "replace_text" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
@@ -4874,17 +5368,63 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 push_unique(&mut self.notebook.completed_changes, path.to_owned());
                 Ok(output)
             }
+            "replace_range" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let start_line = object
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .context("replace_range start_line is missing or invalid")?;
+                let end_line = object
+                    .get("end_line")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .context("replace_range end_line is missing or invalid")?;
+                let new_text = required_tool_string(object, "new_text", MAX_MODEL_FILE_BYTES)?;
+                let output =
+                    replace_repo_range(&self.repo.root, path, start_line, end_line, new_text)?;
+                push_unique(&mut self.notebook.completed_changes, path.to_owned());
+                Ok(output)
+            }
+            "insert_after_symbol" | "insert_before_symbol" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let symbol = required_tool_string(object, "symbol", MAX_MODEL_FILE_BYTES)?;
+                let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
+                let output = insert_relative_to_symbol(
+                    &self.repo.root,
+                    path,
+                    symbol,
+                    content,
+                    name == "insert_after_symbol",
+                )?;
+                push_unique(&mut self.notebook.completed_changes, path.to_owned());
+                Ok(output)
+            }
+            "apply_unified_diff" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let patch = required_tool_string(object, "patch", MAX_MODEL_FILE_BYTES)?;
+                let output = apply_repo_unified_diff(&self.repo.root, path, patch)?;
+                push_unique(&mut self.notebook.completed_changes, path.to_owned());
+                Ok(output)
+            }
+            "rewrite_small_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let content =
+                    required_tool_string(object, "content", MAX_SMALL_FILE_REWRITE_BYTES)?;
+                let output = write_repo_file(&self.repo.root, path, content, true)?;
+                push_unique(&mut self.notebook.completed_changes, path.to_owned());
+                Ok(output)
+            }
             "delete_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
-                let target = safe_repo_path(&self.repo.root, path, false)?;
-                if !target.is_file() {
-                    bail!("delete_file target is not a regular file");
-                }
-                fs::remove_file(&target)
-                    .with_context(|| format!("could not delete repository file {path}"))?;
+                let output = delete_repo_file(&self.repo.root, path)?;
                 push_unique(&mut self.notebook.completed_changes, path.to_owned());
-                Ok(format!("deleted {path}"))
+                Ok(output)
             }
             "run_focused_command" => {
                 self.tool_usage.validation_commands =
@@ -5014,9 +5554,10 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 self.accept_impact_map(map, "record_impact_map arguments", None)
             }
             "record_implementation_plan" => {
-                let plan: ImplementationPlan =
+                let mut plan: ImplementationPlan =
                     serde_json::from_value(Value::Object(object.clone()))
                         .context("implementation plan is malformed")?;
+                normalize_planned_changes(&mut plan.planned_changes)?;
                 if !matches!(plan.implementation_status.as_str(), "ready" | "blocked")
                     || (plan.implementation_status == "ready" && plan.planned_changes.is_empty())
                     || plan.planned_changes.iter().any(|change| {
@@ -5047,6 +5588,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     );
                 }
                 self.notebook.planned_changes = plan.planned_changes.clone();
+                self.notebook.intended_changes = intended_changes_from_plan(&plan.planned_changes);
+                self.notebook.write_attempts.clear();
                 self.notebook.remaining_work = plan
                     .planned_changes
                     .iter()
@@ -5268,6 +5811,11 @@ fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "related_tests"
                 | "write_file"
                 | "replace_text"
+                | "replace_range"
+                | "insert_after_symbol"
+                | "insert_before_symbol"
+                | "apply_unified_diff"
+                | "rewrite_small_file"
                 | "delete_file"
                 | "run_focused_command"
                 | "repository_snapshot"
@@ -5281,6 +5829,11 @@ fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "related_tests"
                 | "write_file"
                 | "replace_text"
+                | "replace_range"
+                | "insert_after_symbol"
+                | "insert_before_symbol"
+                | "apply_unified_diff"
+                | "rewrite_small_file"
                 | "delete_file"
                 | "run_focused_command"
                 | "repository_snapshot"
@@ -5346,13 +5899,14 @@ fn hosted_tools() -> Vec<Value> {
                         "items": {
                             "type": "object",
                             "properties": {
+                                "change_id": {"type": "string"},
                                 "path": {"type": "string"},
                                 "change": {"type": "string"},
                                 "reason": {"type": "string"},
                                 "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
                                 "test_coverage": {"type": "array", "items": {"type": "string"}}
                             },
-                            "required": ["path", "change", "reason", "acceptance_criteria", "test_coverage"],
+                            "required": ["change_id", "path", "change", "reason", "acceptance_criteria", "test_coverage"],
                             "additionalProperties": false
                         }
                     },
@@ -5461,10 +6015,11 @@ fn hosted_tools() -> Vec<Value> {
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "change_id": {"type": "string"},
                     "path": {"type": "string"},
                     "content": {"type": "string"}
                 },
-                "required": ["path", "content"],
+                "required": ["change_id", "path", "content"],
                 "additionalProperties": false
             },
             "strict": true
@@ -5476,11 +6031,96 @@ fn hosted_tools() -> Vec<Value> {
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "change_id": {"type": "string"},
                     "path": {"type": "string"},
                     "old_text": {"type": "string"},
                     "new_text": {"type": "string"}
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["change_id", "path", "old_text", "new_text"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "replace_range",
+            "description": "Replace an inclusive one-based line range in one UTF-8 file. Prefer this after an exact replacement is ambiguous.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                    "new_text": {"type": "string"}
+                },
+                "required": ["change_id", "path", "start_line", "end_line", "new_text"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "insert_after_symbol",
+            "description": "Insert UTF-8 content immediately after one exact unique symbol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["change_id", "path", "symbol", "content"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "insert_before_symbol",
+            "description": "Insert UTF-8 content immediately before one exact unique symbol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["change_id", "path", "symbol", "content"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "apply_unified_diff",
+            "description": "Apply one bounded unified diff that modifies only the declared repository path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "patch": {"type": "string"}
+                },
+                "required": ["change_id", "path", "patch"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "rewrite_small_file",
+            "description": "Deterministically replace the complete contents of an existing UTF-8 file no larger than 64 KiB. Prefer this for small test files after repeated ambiguous edits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["change_id", "path", "content"],
                 "additionalProperties": false
             },
             "strict": true
@@ -5491,8 +6131,11 @@ fn hosted_tools() -> Vec<Value> {
             "description": "Delete one regular repository file.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "required": ["change_id", "path"],
                 "additionalProperties": false
             },
             "strict": true
@@ -5615,14 +6258,18 @@ Use only the provided repository tools. Inspect the smallest relevant scope, fol
 instructions, and record a repository-level impact map before editing. Batch repository discovery \
 within each response instead of spending one model call per file. Implement the mission, add focused \
 tests, and inspect repository status plus the complete diff before finishing. Use \
-replace_text for targeted edits and write_file only when replacing a complete file is appropriate. \
+replace_text for the first targeted edit. After an ambiguous replacement, perform one bounded \
+read_file; after a second ambiguity, switch to replace_range, a unique-symbol insertion, \
+apply_unified_diff, or rewrite_small_file for a small file. write_file is appropriate only when \
+replacing a complete file. Every source-changing call must cite the stable change_id from the plan. \
 run_focused_command starts one executable directly without a shell; never pass shell operators, \
 pipelines, redirects, heredocs, or chained commands to it, and never use it to mutate files. Never \
 commit, push, switch branches, modify Git remotes, open pull requests, read environment variables, \
 read files outside the repository, or attempt to discover credentials. The RustGrid worker owns \
 full quality gates and publication. Call declare_implementation after diff review, then end with a \
 concise implementation and focused-validation summary. Never declare complete while planned work, \
-acceptance criteria, or an unrecovered source-changing tool failure remains.",
+acceptance criteria, or a genuinely unresolved intended change remains. Failed tool attempts are \
+diagnostic history and do not invalidate a later verified intended change.",
         phase.as_str()
     )
 }
@@ -6941,7 +7588,9 @@ uncertain, external_review_required, or not_applicable. Evidence contains reposi
 path and description. Never use passing tests or builds alone as functional evidence and never \
 infer missing implementation optimistically. Human, design, product, visual, manual \
 accessibility, and deployment-environment verification is external_review_required, not missing \
-source code. Include exactly one criterion result for every acceptance criterion in the worker \
+source code. Treat the final repository, complete diff, authoritative validation, and reconciled \
+intended changes as higher precedence than raw tool-attempt history. Only genuinely unresolved \
+intended changes may block completeness. Include exactly one criterion result for every acceptance criterion in the worker \
 notebook, preserving its ac-N identifier, order, and text verbatim."
 }
 
@@ -7197,8 +7846,11 @@ fn completion_fallback(
                     verification_type,
                     status,
                     evidence,
-                    validation_evidence: if verification_type
-                        == VerificationType::AutomatedTest
+                    validation_evidence: if status == CriterionStatus::Satisfied
+                        && matches!(
+                            verification_type,
+                            VerificationType::Code | VerificationType::AutomatedTest
+                        )
                     {
                         validation
                             .iter()
@@ -7259,7 +7911,13 @@ fn reconcile_model_completion_evaluation(
             candidate.criterion_id == expected.criterion_id
                 && candidate.criterion == expected.criterion
         }) {
-            *expected = candidate.clone();
+            let mut candidate = candidate.clone();
+            if candidate.status == CriterionStatus::Satisfied {
+                for validation in &expected.validation_evidence {
+                    push_unique(&mut candidate.validation_evidence, validation.clone());
+                }
+            }
+            *expected = candidate;
             matched = matched.saturating_add(1);
         }
     }
@@ -7545,7 +8203,17 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 }
 
 fn is_source_mutation_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "replace_text" | "delete_file")
+    matches!(
+        name,
+        "write_file"
+            | "replace_text"
+            | "replace_range"
+            | "insert_after_symbol"
+            | "insert_before_symbol"
+            | "apply_unified_diff"
+            | "rewrite_small_file"
+            | "delete_file"
+    )
 }
 
 fn tool_target(arguments: &str) -> Option<String> {
@@ -7554,6 +8222,46 @@ fn tool_target(arguments: &str) -> Option<String> {
         .get("path")?
         .as_str()
         .map(|path| truncate_text(path, 4_096))
+}
+
+fn tool_change_id(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("change_id")?
+        .as_str()
+        .map(|change_id| truncate_text(change_id, 100))
+}
+
+fn repo_file_sha256(root: &Path, path: &str) -> Option<String> {
+    let target = safe_repo_path(root, path, false).ok()?;
+    let bytes = fs::read(target).ok()?;
+    Some(hex::encode(Sha256::digest(bytes)))
+}
+
+fn classify_write_failure(error: &str) -> (String, Option<usize>) {
+    if error.contains("replace_match_not_unique") {
+        let match_count = error
+            .split("found ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok());
+        ("replace_match_not_unique".into(), match_count)
+    } else if error.contains("symbol_match_not_unique") {
+        let match_count = error
+            .split("found ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse().ok());
+        ("symbol_match_not_unique".into(), match_count)
+    } else if error.contains("strategy exhausted") {
+        ("repair_strategy_exhausted".into(), None)
+    } else if error.contains("line range") {
+        ("replace_range_invalid".into(), None)
+    } else if error.contains("unified diff") {
+        ("unified_diff_invalid".into(), None)
+    } else {
+        ("source_mutation_failed".into(), None)
+    }
 }
 
 fn tool_intent_sha256(name: &str, arguments: &str) -> String {
@@ -8207,23 +8915,295 @@ fn replace_unique_repo_text(
     let target = safe_repo_path(root, path, false)?;
     let content = fs::read_to_string(&target)
         .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
-    let matches = content.match_indices(old_text).count();
+    let positions = content
+        .match_indices(old_text)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let matches = positions.len();
     if matches != 1 {
         bail!(
-            "replace_text requires exactly one match in {path}; found {matches}. Read a more specific surrounding range and retry."
+            "replace_match_not_unique: replace_text requires exactly one match in {path}; found {matches}"
         );
     }
+    let before_sha256 = sha256_text(&content);
+    let start_line = content[..positions[0]]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let end_line = start_line + old_text.lines().count().max(1) - 1;
     let updated = content.replacen(old_text, new_text, 1);
     if updated.len() > MAX_MODEL_FILE_BYTES {
         bail!("replace_text result exceeds the hosted tool limit");
     }
     fs::write(&target, updated.as_bytes())
         .with_context(|| format!("could not write repository file {path}"))?;
-    Ok(format!(
-        "replaced {} bytes with {} bytes in {path}",
-        old_text.len(),
-        new_text.len()
-    ))
+    mutation_output(
+        path,
+        Some(before_sha256),
+        Some(sha256_text(&updated)),
+        format!("{start_line}-{end_line}"),
+        format!(
+            "replaced {} bytes with {} bytes",
+            old_text.len(),
+            new_text.len()
+        ),
+    )
+}
+
+fn sha256_text(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn mutation_output(
+    path: &str,
+    before_sha256: Option<String>,
+    after_sha256: Option<String>,
+    changed_range: String,
+    diff_summary: String,
+) -> Result<String> {
+    serde_json::to_string(&json!({
+        "path": path,
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+        "changed_range": changed_range,
+        "diff_summary": diff_summary,
+    }))
+    .context("could not serialize mutation result")
+}
+
+fn write_repo_file(root: &Path, path: &str, content: &str, small_only: bool) -> Result<String> {
+    let target = safe_repo_path(root, path, true)?;
+    let previous = fs::read_to_string(&target).ok();
+    if small_only
+        && previous
+            .as_ref()
+            .is_none_or(|value| value.len() > MAX_SMALL_FILE_REWRITE_BYTES)
+    {
+        bail!(
+            "rewrite_small_file requires an existing UTF-8 file no larger than {MAX_SMALL_FILE_REWRITE_BYTES} bytes"
+        );
+    }
+    if content.len() > MAX_MODEL_FILE_BYTES
+        || (small_only && content.len() > MAX_SMALL_FILE_REWRITE_BYTES)
+    {
+        bail!("complete file content exceeds the hosted tool limit");
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("could not create repository directory {}", parent.display())
+        })?;
+    }
+    fs::write(&target, content.as_bytes())
+        .with_context(|| format!("could not write repository file {path}"))?;
+    mutation_output(
+        path,
+        previous.as_deref().map(sha256_text),
+        Some(sha256_text(content)),
+        "complete_file".into(),
+        format!(
+            "{} complete UTF-8 file with {} bytes",
+            if small_only { "rewrote" } else { "wrote" },
+            content.len()
+        ),
+    )
+}
+
+fn replace_repo_range(
+    root: &Path,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    new_text: &str,
+) -> Result<String> {
+    if start_line == 0 || end_line < start_line {
+        bail!("replace_range requires a valid inclusive line range");
+    }
+    let target = safe_repo_path(root, path, false)?;
+    let content = fs::read_to_string(&target)
+        .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    if end_line > lines.len().max(1) {
+        bail!("replace_range line range exceeds {path}");
+    }
+    let start_offset = lines
+        .iter()
+        .take(start_line - 1)
+        .map(|line| line.len())
+        .sum::<usize>();
+    let end_offset = lines
+        .iter()
+        .take(end_line)
+        .map(|line| line.len())
+        .sum::<usize>();
+    let mut updated = String::with_capacity(
+        content
+            .len()
+            .saturating_sub(end_offset.saturating_sub(start_offset))
+            .saturating_add(new_text.len()),
+    );
+    updated.push_str(&content[..start_offset]);
+    updated.push_str(new_text);
+    updated.push_str(&content[end_offset..]);
+    if updated.len() > MAX_MODEL_FILE_BYTES {
+        bail!("replace_range result exceeds the hosted tool limit");
+    }
+    fs::write(&target, updated.as_bytes())
+        .with_context(|| format!("could not write repository file {path}"))?;
+    mutation_output(
+        path,
+        Some(sha256_text(&content)),
+        Some(sha256_text(&updated)),
+        format!("{start_line}-{end_line}"),
+        format!("replaced inclusive line range {start_line}-{end_line}"),
+    )
+}
+
+fn insert_relative_to_symbol(
+    root: &Path,
+    path: &str,
+    symbol: &str,
+    inserted: &str,
+    after: bool,
+) -> Result<String> {
+    let target = safe_repo_path(root, path, false)?;
+    let content = fs::read_to_string(&target)
+        .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    let positions = content
+        .match_indices(symbol)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if positions.len() != 1 {
+        bail!(
+            "symbol_match_not_unique: symbol insertion requires one match in {path}; found {}",
+            positions.len()
+        );
+    }
+    let offset = positions[0] + usize::from(after) * symbol.len();
+    let mut updated = String::with_capacity(content.len().saturating_add(inserted.len()));
+    updated.push_str(&content[..offset]);
+    updated.push_str(inserted);
+    updated.push_str(&content[offset..]);
+    if updated.len() > MAX_MODEL_FILE_BYTES {
+        bail!("symbol insertion result exceeds the hosted tool limit");
+    }
+    fs::write(&target, updated.as_bytes())
+        .with_context(|| format!("could not write repository file {path}"))?;
+    let line = content[..positions[0]]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    mutation_output(
+        path,
+        Some(sha256_text(&content)),
+        Some(sha256_text(&updated)),
+        line.to_string(),
+        format!(
+            "inserted {} bytes {} unique symbol",
+            inserted.len(),
+            if after { "after" } else { "before" }
+        ),
+    )
+}
+
+fn apply_repo_unified_diff(root: &Path, path: &str, patch: &str) -> Result<String> {
+    let target = safe_repo_path(root, path, false)?;
+    let content = fs::read_to_string(&target)
+        .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    let expected_diff = format!("diff --git a/{path} b/{path}");
+    let expected_old = format!("--- a/{path}");
+    let expected_new = format!("+++ b/{path}");
+    let diff_headers = patch
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .collect::<Vec<_>>();
+    let old_headers = patch
+        .lines()
+        .filter(|line| line.starts_with("--- "))
+        .collect::<Vec<_>>();
+    let new_headers = patch
+        .lines()
+        .filter(|line| line.starts_with("+++ "))
+        .collect::<Vec<_>>();
+    let unsafe_metadata = patch.lines().any(|line| {
+        [
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+            "new file mode ",
+            "deleted file mode ",
+            "old mode ",
+            "new mode ",
+            "GIT binary patch",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    });
+    if (!diff_headers.is_empty() && diff_headers != [expected_diff.as_str()])
+        || old_headers != [expected_old.as_str()]
+        || new_headers != [expected_new.as_str()]
+        || unsafe_metadata
+    {
+        bail!("apply_unified_diff must modify exactly the declared existing path");
+    }
+    if patch.len() > MAX_MODEL_FILE_BYTES {
+        bail!("unified diff exceeds the hosted tool limit");
+    }
+    let patch_path = env::temp_dir().join(format!(
+        "rustgrid-agent-unified-diff-{}.patch",
+        Uuid::new_v4().simple()
+    ));
+    fs::write(&patch_path, patch.as_bytes()).context("could not write patch file")?;
+    let patch_path_text = patch_path.to_string_lossy().into_owned();
+    let checked = command::checked(
+        "git",
+        [
+            "apply",
+            "--check",
+            "--whitespace=nowarn",
+            patch_path_text.as_str(),
+        ],
+        root,
+    )
+    .context("unified diff validation failed")
+    .and_then(|_| {
+        command::checked(
+            "git",
+            ["apply", "--whitespace=nowarn", patch_path_text.as_str()],
+            root,
+        )
+        .context("unified diff application failed")
+    });
+    let _ = fs::remove_file(&patch_path);
+    checked?;
+    let updated = fs::read_to_string(&target)
+        .with_context(|| format!("could not read patched UTF-8 repository file {path}"))?;
+    mutation_output(
+        path,
+        Some(sha256_text(&content)),
+        Some(sha256_text(&updated)),
+        "unified_diff".into(),
+        format!("applied {}-byte unified diff", patch.len()),
+    )
+}
+
+fn delete_repo_file(root: &Path, path: &str) -> Result<String> {
+    let target = safe_repo_path(root, path, false)?;
+    if !target.is_file() {
+        bail!("delete_file target is not a regular file");
+    }
+    let content = fs::read_to_string(&target)
+        .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    fs::remove_file(&target).with_context(|| format!("could not delete repository file {path}"))?;
+    mutation_output(
+        path,
+        Some(sha256_text(&content)),
+        None,
+        "complete_file".into(),
+        format!("deleted {}-byte file", content.len()),
+    )
 }
 
 fn validate_model_command(value: &str) -> Result<()> {
@@ -9215,6 +10195,443 @@ mod tests {
     }
 
     #[test]
+    fn safer_write_tools_are_deterministic_and_report_mutation_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("theme.test.ts");
+        fs::write(&path, "one\nmarker\ntwo\n").unwrap();
+
+        let range = replace_repo_range(directory.path(), "theme.test.ts", 1, 1, "first").unwrap();
+        let range: Value = serde_json::from_str(&range).unwrap();
+        assert!(range["before_sha256"].is_string());
+        assert!(range["after_sha256"].is_string());
+        assert_eq!(range["changed_range"], "1-1");
+        assert!(range["diff_summary"].as_str().unwrap().contains("line"));
+
+        let inserted = insert_relative_to_symbol(
+            directory.path(),
+            "theme.test.ts",
+            "marker",
+            "\ninserted",
+            true,
+        )
+        .unwrap();
+        let inserted: Value = serde_json::from_str(&inserted).unwrap();
+        assert_ne!(inserted["before_sha256"], inserted["after_sha256"]);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("marker\ninserted")
+        );
+
+        let rewritten =
+            write_repo_file(directory.path(), "theme.test.ts", "final\n", true).unwrap();
+        let rewritten: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(rewritten["changed_range"], "complete_file");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "final\n");
+    }
+
+    #[test]
+    fn unified_diff_tool_is_path_scoped_and_reports_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], directory.path()).unwrap();
+        let path = directory.path().join("theme.test.ts");
+        fs::write(&path, "old\n").unwrap();
+        let output = apply_repo_unified_diff(
+            directory.path(),
+            "theme.test.ts",
+            "--- a/theme.test.ts\n+++ b/theme.test.ts\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_ne!(output["before_sha256"], output["after_sha256"]);
+        assert_eq!(output["changed_range"], "unified_diff");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(
+            apply_repo_unified_diff(
+                directory.path(),
+                "theme.test.ts",
+                "--- a/other.ts\n+++ b/other.ts\n@@ -1 +1 @@\n-old\n+new\n",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn replacement_repair_is_bounded_and_forces_a_safer_strategy() {
+        let failed = |error_code: &str| WriteAttemptRecord {
+            attempt_index: 0,
+            change_id: "theme-tests".into(),
+            target: "tests/theme-provider.test.tsx".into(),
+            tool: "replace_text".into(),
+            status: WriteAttemptStatus::Failed,
+            error_code: Some(error_code.into()),
+            match_count: Some(2),
+            intended_change_sha256: None,
+            before_sha256: None,
+            after_sha256: None,
+        };
+        let one = vec![failed("replace_match_not_unique")];
+        assert!(
+            validate_write_repair_strategy(
+                &one,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "replace_text",
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bounded read_file")
+        );
+        assert!(
+            validate_write_repair_strategy(
+                &one,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "replace_text",
+                true,
+            )
+            .is_ok()
+        );
+
+        let two = vec![
+            failed("replace_match_not_unique"),
+            failed("replace_match_not_unique"),
+        ];
+        assert!(
+            validate_write_repair_strategy(
+                &two,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "replace_text",
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("strategy exhausted")
+        );
+        assert!(
+            validate_write_repair_strategy(
+                &two,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "rewrite_small_file",
+                true,
+            )
+            .is_ok()
+        );
+
+        let four = vec![
+            failed("replace_match_not_unique"),
+            failed("replace_match_not_unique"),
+            failed("replace_match_not_unique"),
+            failed("replace_match_not_unique"),
+        ];
+        assert!(
+            validate_write_repair_strategy(
+                &four,
+                "tests/theme-provider.test.tsx",
+                "theme-tests",
+                "write_file",
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("generic repair limit")
+        );
+    }
+
+    #[test]
+    fn later_equivalent_write_recovers_different_attempt_hashes_by_change_id() {
+        let mut failures = vec![test_write_failure(
+            "theme-tests",
+            "tests/theme-provider.test.tsx",
+            "first-hash",
+        )];
+        let attempts = vec![WriteAttemptRecord {
+            attempt_index: 1,
+            change_id: "theme-tests".into(),
+            target: "tests/theme-provider.test.tsx".into(),
+            tool: "replace_range".into(),
+            status: WriteAttemptStatus::Applied,
+            error_code: None,
+            match_count: None,
+            intended_change_sha256: Some("different-hash".into()),
+            before_sha256: Some("before".into()),
+            after_sha256: Some("after".into()),
+        }];
+        reconcile_failed_write_attempts(
+            &mut failures,
+            &[test_planned_change()],
+            &attempts,
+            &test_complete_implementation(),
+            &[test_passed_validation("npm test")],
+            &["tests/theme-provider.test.tsx".into()],
+        );
+        assert!(failures[0].recovered);
+        assert_eq!(
+            failures[0].reconciliation,
+            FailureReconciliation::Superseded
+        );
+    }
+
+    #[test]
+    fn successful_noop_attempt_does_not_supersede_a_failed_change() {
+        let mut failures = vec![test_write_failure(
+            "theme-tests",
+            "tests/theme-provider.test.tsx",
+            "first-hash",
+        )];
+        let attempts = vec![WriteAttemptRecord {
+            attempt_index: 1,
+            change_id: "theme-tests".into(),
+            target: "tests/theme-provider.test.tsx".into(),
+            tool: "replace_range".into(),
+            status: WriteAttemptStatus::Applied,
+            error_code: None,
+            match_count: None,
+            intended_change_sha256: Some("different-hash".into()),
+            before_sha256: Some("unchanged".into()),
+            after_sha256: Some("unchanged".into()),
+        }];
+        reconcile_failed_write_attempts(
+            &mut failures,
+            &[test_planned_change()],
+            &attempts,
+            &ImplementationOutcome {
+                summary: String::new(),
+                budget_exhausted: false,
+                explicit_declaration: None,
+            },
+            &[],
+            &[],
+        );
+        assert!(!failures[0].recovered);
+        assert_eq!(
+            failures[0].reconciliation,
+            FailureReconciliation::StillUnresolved
+        );
+    }
+
+    #[test]
+    fn an_earlier_success_does_not_supersede_a_later_failure() {
+        let mut failure = test_write_failure(
+            "theme-tests",
+            "tests/theme-provider.test.tsx",
+            "failed-hash",
+        );
+        failure.attempt_index = 1;
+        let attempts = vec![WriteAttemptRecord {
+            attempt_index: 0,
+            change_id: "theme-tests".into(),
+            target: "tests/theme-provider.test.tsx".into(),
+            tool: "replace_range".into(),
+            status: WriteAttemptStatus::Applied,
+            error_code: None,
+            match_count: None,
+            intended_change_sha256: Some("earlier-hash".into()),
+            before_sha256: Some("before".into()),
+            after_sha256: Some("after".into()),
+        }];
+        reconcile_failed_write_attempts(
+            std::slice::from_mut(&mut failure),
+            &[test_planned_change()],
+            &attempts,
+            &ImplementationOutcome {
+                summary: String::new(),
+                budget_exhausted: false,
+                explicit_declaration: None,
+            },
+            &[],
+            &[],
+        );
+        assert!(!failure.recovered);
+    }
+
+    #[test]
+    fn whole_file_write_supersedes_all_prior_failures_on_its_target() {
+        let mut failures = vec![
+            test_write_failure("theme-tests", "tests/theme-provider.test.tsx", "hash-a"),
+            test_write_failure("other-intent", "tests/theme-provider.test.tsx", "hash-b"),
+        ];
+        let attempts = vec![WriteAttemptRecord {
+            attempt_index: 2,
+            change_id: "theme-tests".into(),
+            target: "tests/theme-provider.test.tsx".into(),
+            tool: "rewrite_small_file".into(),
+            status: WriteAttemptStatus::Applied,
+            error_code: None,
+            match_count: None,
+            intended_change_sha256: Some("hash-c".into()),
+            before_sha256: Some("before".into()),
+            after_sha256: Some("after".into()),
+        }];
+        reconcile_failed_write_attempts(
+            &mut failures,
+            &[test_planned_change()],
+            &attempts,
+            &test_complete_implementation(),
+            &[test_passed_validation("npm test")],
+            &["tests/theme-provider.test.tsx".into()],
+        );
+        assert!(failures.iter().all(|failure| failure.recovered));
+        assert!(
+            failures
+                .iter()
+                .all(|failure| { failure.reconciliation == FailureReconciliation::Superseded })
+        );
+    }
+
+    #[test]
+    fn final_diff_and_validation_recover_incident_but_validation_alone_does_not() {
+        let mut recovered = vec![test_write_failure(
+            "theme-tests",
+            "tests/theme-provider.test.tsx",
+            "hash-a",
+        )];
+        let validation = vec![
+            test_passed_validation("npm test"),
+            test_passed_validation("npm run build"),
+        ];
+        reconcile_failed_write_attempts(
+            &mut recovered,
+            &[test_planned_change()],
+            &[],
+            &test_complete_implementation(),
+            &validation,
+            &["tests/theme-provider.test.tsx".into()],
+        );
+        assert_eq!(
+            recovered[0].reconciliation,
+            FailureReconciliation::Recovered
+        );
+        assert!(
+            recovered[0]
+                .recovery
+                .as_ref()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|evidence| evidence == "npm run build passed.")
+        );
+
+        let mut absent = vec![test_write_failure(
+            "theme-tests",
+            "tests/theme-provider.test.tsx",
+            "hash-a",
+        )];
+        reconcile_failed_write_attempts(
+            &mut absent,
+            &[test_planned_change()],
+            &[],
+            &test_complete_implementation(),
+            &validation,
+            &[],
+        );
+        assert!(!absent[0].recovered);
+        assert_eq!(
+            absent[0].reconciliation,
+            FailureReconciliation::StillUnresolved
+        );
+    }
+
+    #[test]
+    fn fallback_populates_code_evidence_and_passed_validation_from_final_state() {
+        let implementation = test_complete_implementation();
+        let plan = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes: vec![test_planned_change()],
+            planned_new_files: vec![],
+            planned_test_changes: vec!["tests/theme-provider.test.tsx".into()],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        let result = completion_fallback(
+            &implementation,
+            None,
+            Some(&plan),
+            &[],
+            &["tests/theme-provider.test.tsx".into()],
+            &["Theme can be selected".into()],
+            &[
+                test_passed_validation("npm test"),
+                test_passed_validation("npm run build"),
+            ],
+            ProjectVerificationPolicy {
+                browser_e2e_required_for_theme_changes: false,
+                manual_browser_verification_required: false,
+            },
+        );
+        let criterion = &result.criteria[0];
+        assert_eq!(criterion.status, CriterionStatus::Satisfied);
+        assert!(!criterion.evidence.is_empty());
+        assert_eq!(
+            criterion.validation_evidence,
+            vec!["npm test", "npm run build"]
+        );
+    }
+
+    #[test]
+    fn planned_changes_receive_stable_unique_change_ids() {
+        let mut first = test_planned_change();
+        first.change_id.clear();
+        let mut second = first.clone();
+        second.path = "src/components/theme/ThemeProvider.tsx".into();
+        normalize_planned_changes(&mut [first.clone(), second]).unwrap();
+
+        let mut repeated = vec![first];
+        normalize_planned_changes(&mut repeated).unwrap();
+        let first_id = repeated[0].change_id.clone();
+        normalize_planned_changes(&mut repeated).unwrap();
+        assert_eq!(repeated[0].change_id, first_id);
+
+        let mut duplicates = vec![test_planned_change(), test_planned_change()];
+        assert!(normalize_planned_changes(&mut duplicates).is_err());
+    }
+
+    #[test]
+    fn partial_and_blocked_domain_outcomes_are_healthy_even_with_incomplete_gates() {
+        for status in [CompletionStatus::Partial, CompletionStatus::Blocked] {
+            let result = HostedResult {
+                summary: "Published resumable work.".into(),
+                branch: "rustgrid/resumable".into(),
+                commit: "a".repeat(40),
+                pull_request: PullRequestResult {
+                    number: 143,
+                    url: "https://github.com/RustGrid/example/pull/143".into(),
+                },
+                validation: vec![ValidationResult {
+                    id: "test".into(),
+                    command: "npm test".into(),
+                    status: "failed".into(),
+                    output: "one remaining failure".into(),
+                }],
+                completeness: test_completion_evaluation(status),
+            };
+            assert!(hosted_result_can_succeed(&result));
+        }
+        let mut complete = HostedResult {
+            summary: "Complete.".into(),
+            branch: "rustgrid/complete".into(),
+            commit: "b".repeat(40),
+            pull_request: PullRequestResult {
+                number: 144,
+                url: "https://github.com/RustGrid/example/pull/144".into(),
+            },
+            validation: vec![ValidationResult {
+                id: "build".into(),
+                command: "npm run build".into(),
+                status: "failed".into(),
+                output: String::new(),
+            }],
+            completeness: test_completion_evaluation(CompletionStatus::Complete),
+        };
+        assert!(!hosted_result_can_succeed(&complete));
+        complete.completeness.status = CompletionStatus::Uncertain;
+        assert!(!hosted_result_can_succeed(&complete));
+    }
+
+    #[test]
     fn model_budget_handoff_preserves_work_without_claiming_completion() {
         let empty = Vec::new();
         assert!(model_budget_handoff_summary(true, &empty).is_none());
@@ -9580,6 +10997,7 @@ Implement theme support.\n\n\
             files_inspected: vec!["src/theme.css".into()],
             searches_completed: vec!["literal:src:theme".into()],
             planned_changes: vec![PlannedChange {
+                change_id: "change-1-theme".into(),
                 path: "src/theme.css".into(),
                 change: "Update tokens".into(),
                 reason: "Central propagation".into(),
@@ -9588,6 +11006,8 @@ Implement theme support.\n\n\
             }],
             completed_changes: vec![],
             failed_changes: vec![],
+            intended_changes: vec![],
+            write_attempts: vec![],
             remaining_work: vec!["Update tokens".into()],
             blocking_unknowns: vec![],
             validation_failures: vec![],
@@ -9615,10 +11035,16 @@ Implement theme support.\n\n\
             }),
         };
         let failures = vec![ToolFailureRecord {
+            attempt_index: 0,
             tool: "replace_text".into(),
             target: Some("src/theme.css".into()),
             error: "found zero matches".into(),
             recovered: false,
+            change_id: Some("change-1-theme".into()),
+            error_code: "replace_match_not_unique".into(),
+            match_count: Some(0),
+            reconciliation: FailureReconciliation::StillUnresolved,
+            recovery: None,
             intended_change_sha256: Some("a".repeat(64)),
         }];
         let result = completion_fallback(
@@ -9779,9 +11205,11 @@ Implement theme support.\n\n\
             summary: "Budget exhausted after one theme-provider edit.".into(),
         };
         let body = hosted_pull_request_body(&manifest, &[], &completeness);
+        let title = hosted_pull_request_title(&manifest, true);
         assert!(body.contains("INCOMPLETE"));
         assert!(body.contains("Add settings integration"));
         assert!(body.contains("partial"));
+        assert!(title.starts_with("[INCOMPLETE]"));
     }
 
     #[test]
@@ -9946,9 +11374,11 @@ Implement theme support.\n\n\
             ProjectVerificationPolicy::default(),
         );
         let body = hosted_pull_request_body(&manifest, &[], &completeness);
+        let title = hosted_pull_request_title(&manifest, false);
         assert!(body.contains("IMPLEMENTATION COMPLETE"));
         assert!(body.contains("External review checklist"));
         assert!(!body.contains("INCOMPLETE — continue implementation"));
+        assert!(!title.starts_with("[INCOMPLETE]"));
         assert!(!requires_implementation_continuation(completeness.status));
     }
 
@@ -10092,11 +11522,98 @@ Implement theme support.\n\n\
             planned_changes: vec![],
             completed_changes: vec![],
             failed_changes: vec![],
+            intended_changes: vec![],
+            write_attempts: vec![],
             remaining_work: vec![],
             blocking_unknowns: vec![],
             validation_failures: vec![],
             phase_budget: json!({}),
             last_successful_action: json!({"tool": "read_files"}),
+        }
+    }
+
+    fn test_planned_change() -> PlannedChange {
+        PlannedChange {
+            change_id: "theme-tests".into(),
+            path: "tests/theme-provider.test.tsx".into(),
+            change: "Add light-blue theme coverage.".into(),
+            reason: "Verify registration, persistence, cycling, and fallback behavior.".into(),
+            acceptance_criteria: vec!["Theme can be selected".into()],
+            test_coverage: vec!["npm test".into()],
+        }
+    }
+
+    fn test_write_failure(
+        change_id: &str,
+        target: &str,
+        intended_change_sha256: &str,
+    ) -> ToolFailureRecord {
+        ToolFailureRecord {
+            attempt_index: 0,
+            change_id: Some(change_id.into()),
+            tool: "replace_text".into(),
+            target: Some(target.into()),
+            error_code: "replace_match_not_unique".into(),
+            match_count: Some(2),
+            error: "replace_match_not_unique: found 2 matches".into(),
+            recovered: false,
+            reconciliation: FailureReconciliation::StillUnresolved,
+            recovery: None,
+            intended_change_sha256: Some(intended_change_sha256.into()),
+        }
+    }
+
+    fn test_complete_implementation() -> ImplementationOutcome {
+        ImplementationOutcome {
+            summary: "Implemented and validated the theme.".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(ImplementationDeclaration {
+                implementation_status: "complete".into(),
+                completed_work: vec!["Added light-blue theme coverage.".into()],
+                remaining_work: vec![],
+                known_risks: vec![],
+                changed_paths: vec!["tests/theme-provider.test.tsx".into()],
+                criteria_evidence: vec![ImplementationCriterionEvidence {
+                    criterion: "Theme can be selected".into(),
+                    paths: vec!["tests/theme-provider.test.tsx".into()],
+                    evidence: "Registration and persistence assertions are present.".into(),
+                }],
+            }),
+        }
+    }
+
+    fn test_passed_validation(command: &str) -> ValidationResult {
+        ValidationResult {
+            id: command.replace(' ', "-"),
+            command: command.into(),
+            status: "passed".into(),
+            output: String::new(),
+        }
+    }
+
+    fn test_completion_evaluation(status: CompletionStatus) -> CompletionEvaluation {
+        CompletionEvaluation {
+            status,
+            implementation_completeness: match status {
+                CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview => {
+                    ImplementationCompleteness::Complete
+                }
+                CompletionStatus::Partial => ImplementationCompleteness::Partial,
+                CompletionStatus::Blocked
+                | CompletionStatus::Incomplete
+                | CompletionStatus::Uncertain => ImplementationCompleteness::Incomplete,
+            },
+            verification_readiness: VerificationReadiness::Blocked,
+            evaluation_source: EvaluationSource::OrchestratorFallback,
+            confidence: 1.0,
+            criteria: vec![],
+            remaining_implementation_work: vec![],
+            remaining_automated_verification: vec![],
+            pending_external_review: vec![],
+            optional_follow_up: vec![],
+            review_checklist: vec![],
+            unrecovered_tool_failures: vec![],
+            summary: status.as_str().into(),
         }
     }
 
