@@ -18327,6 +18327,12 @@ mod tests {
         )
         .unwrap();
         command::checked("git", ["push", "-q", "origin", "main"], work.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "--local", "--unset-all", rewrite_key.as_str()],
+            work.path(),
+        )
+        .unwrap();
         let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
         let branch = "rustgrid/recovery-publication";
         command::checked("git", ["switch", "-q", "-c", branch], work.path()).unwrap();
@@ -18482,11 +18488,19 @@ mod tests {
             &anyhow!("illegal hosted lifecycle transition from repair to completion_evaluation"),
             |already_pushed, commit| {
                 assert!(!already_pushed);
-                repo.push(
-                    &manifest.github.branch,
-                    commit,
-                    "fixture-token",
-                    &manifest.github.web_base_url,
+                assert_eq!(
+                    command::checked("git", ["rev-parse", "HEAD"], work.path())?,
+                    commit
+                );
+                command::checked(
+                    "git",
+                    [
+                        "push",
+                        "-q",
+                        local_remote.as_str(),
+                        manifest.github.branch.as_str(),
+                    ],
+                    work.path(),
                 )?;
                 Ok(())
             },
