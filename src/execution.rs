@@ -1273,26 +1273,69 @@ fn run_quality_gates(
 }
 
 fn source_tree_hash(root: &std::path::Path) -> Result<String> {
-    let status = command::capture("git", ["status", "--porcelain=v1", "-z"], root)?;
+    fn append_field(digest: &mut Sha256, name: &str, value: &[u8]) {
+        digest.update((name.len() as u64).to_be_bytes());
+        digest.update(name.as_bytes());
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    let head = command::checked("git", ["rev-parse", "HEAD"], root)?;
+    let origin = command::capture("git", ["remote", "get-url", "origin"], root)?;
+    let identity = if origin.status.success() {
+        origin.stdout.trim().to_owned()
+    } else {
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
     let diff = command::capture("git", ["diff", "--binary", "HEAD", "--"], root)?;
     let untracked = command::capture(
         "git",
         ["ls-files", "--others", "--exclude-standard", "-z"],
         root,
     )?;
+    if !diff.status.success() || !untracked.status.success() {
+        bail!("could not fingerprint the repository working tree");
+    }
     let mut digest = Sha256::new();
-    digest.update(status.stdout.as_bytes());
-    digest.update(diff.stdout.as_bytes());
-    for relative in untracked
+    append_field(&mut digest, "repository", identity.as_bytes());
+    append_field(&mut digest, "head", head.trim().as_bytes());
+    append_field(&mut digest, "tracked_diff", diff.stdout.as_bytes());
+    let mut untracked_paths = untracked
         .stdout
         .split('\0')
         .filter(|value| !value.is_empty())
-    {
-        digest.update(relative.as_bytes());
+        .collect::<Vec<_>>();
+    untracked_paths.sort_unstable();
+    for relative in untracked_paths {
+        append_field(&mut digest, "untracked_path", relative.as_bytes());
         let path = root.join(relative);
         if path.is_file() {
-            digest.update(
-                std::fs::read(&path)
+            let content = std::fs::read(&path)
+                .with_context(|| format!("could not fingerprint {}", path.display()))?;
+            append_field(
+                &mut digest,
+                "untracked_sha256",
+                hex::encode(Sha256::digest(content)).as_bytes(),
+            );
+        }
+    }
+    for lockfile in [
+        "Cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+    ] {
+        let path = root.join(lockfile);
+        if path.is_file() {
+            append_field(&mut digest, "lockfile_name", lockfile.as_bytes());
+            append_field(
+                &mut digest,
+                "lockfile_content",
+                &std::fs::read(&path)
                     .with_context(|| format!("could not fingerprint {}", path.display()))?,
             );
         }
@@ -1980,29 +2023,84 @@ mod tests {
         assert_eq!(budget.max_cumulative_cached_input_tokens, 200_000);
     }
 
-    #[test]
-    fn source_tree_hash_changes_with_untracked_file_contents() {
+    fn initialized_source_hash_repository() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
-        command::capture("git", ["init"], directory.path()).unwrap();
-        command::capture(
+        command::checked("git", ["init", "--quiet"], directory.path()).unwrap();
+        std::fs::write(directory.path().join("tracked.txt"), "one\n").unwrap();
+        command::checked("git", ["add", "tracked.txt"], directory.path()).unwrap();
+        command::checked(
             "git",
             [
                 "-c",
                 "user.name=Test",
                 "-c",
                 "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
-                "--allow-empty",
+                "--quiet",
                 "-m",
                 "base",
             ],
             directory.path(),
         )
         .unwrap();
+        directory
+    }
+
+    #[test]
+    fn source_tree_hash_for_clean_repository_is_not_empty_digest() {
+        let directory = initialized_source_hash_repository();
+        let clean = source_tree_hash(directory.path()).unwrap();
+
+        assert_ne!(clean, hex::encode(Sha256::digest(b"")));
+    }
+
+    #[test]
+    fn source_tree_hash_changes_for_tracked_edit_and_reverts_to_clean_value() {
+        let directory = initialized_source_hash_repository();
+        let clean = source_tree_hash(directory.path()).unwrap();
+
+        // Change exactly one byte (`o` to `O`) without changing the file length.
+        std::fs::write(directory.path().join("tracked.txt"), "One\n").unwrap();
+        let edited = source_tree_hash(directory.path()).unwrap();
+        assert_ne!(edited, clean);
+
+        std::fs::write(directory.path().join("tracked.txt"), "one\n").unwrap();
+        let reverted = source_tree_hash(directory.path()).unwrap();
+        assert_eq!(reverted, clean);
+    }
+
+    #[test]
+    fn source_tree_hash_changes_for_an_untracked_file_only() {
+        let directory = initialized_source_hash_repository();
+        let clean = source_tree_hash(directory.path()).unwrap();
+
+        std::fs::write(directory.path().join("new.txt"), "one").unwrap();
+        let with_untracked_file = source_tree_hash(directory.path()).unwrap();
+
+        assert_ne!(with_untracked_file, clean);
+    }
+
+    #[test]
+    fn source_tree_hash_changes_with_untracked_file_contents() {
+        let directory = initialized_source_hash_repository();
         std::fs::write(directory.path().join("new.txt"), "one").unwrap();
         let first = source_tree_hash(directory.path()).unwrap();
+
         std::fs::write(directory.path().join("new.txt"), "two").unwrap();
         let second = source_tree_hash(directory.path()).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn source_tree_hash_distinguishes_different_repositories() {
+        let first = initialized_source_hash_repository();
+        let second = initialized_source_hash_repository();
+
+        assert_ne!(
+            source_tree_hash(first.path()).unwrap(),
+            source_tree_hash(second.path()).unwrap()
+        );
     }
 }

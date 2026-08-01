@@ -145,6 +145,41 @@ pub fn evidence_catalog(files: &[String], searches: &[String]) -> Vec<EvidenceRe
     result
 }
 
+fn split_path_evidence_reference(reference: &str) -> (&str, Option<&str>) {
+    let Some((path, suffix)) = reference.rsplit_once(':') else {
+        return (reference, None);
+    };
+    let valid_range = suffix.split_once('-').is_some_and(|(start, end)| {
+        !start.is_empty()
+            && !end.is_empty()
+            && start.bytes().all(|byte| byte.is_ascii_digit())
+            && end.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if suffix.bytes().all(|byte| byte.is_ascii_digit()) || valid_range {
+        (path, Some(suffix))
+    } else {
+        (reference, None)
+    }
+}
+
+fn resolve_evidence_reference<'a>(
+    reference: &str,
+    catalog: &'a [EvidenceReference],
+) -> Option<(&'a EvidenceReference, Option<String>)> {
+    if let Some(item) = catalog.iter().find(|item| item.evidence_id == reference) {
+        return Some((item, None));
+    }
+    let (path, range) = split_path_evidence_reference(reference);
+    let mut matches = catalog.iter().filter(|item| {
+        item.evidence_type == EvidenceType::FileRead && item.path.as_deref() == Some(path)
+    });
+    let item = matches.next()?;
+    matches
+        .next()
+        .is_none()
+        .then_some((item, range.map(str::to_owned)))
+}
+
 fn strings(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -220,10 +255,6 @@ pub fn normalize(
         return Err(vec![required("$.areas")]);
     };
     let catalog = evidence_catalog(inspected_files, completed_searches);
-    let by_id = catalog
-        .iter()
-        .map(|item| (item.evidence_id.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
     let mut normalized = Vec::new();
     let mut errors = Vec::new();
     for (index, raw) in areas.iter().enumerate() {
@@ -256,12 +287,15 @@ pub fn normalize(
         let refs = strings(raw.get("evidence_refs"));
         let mut evidence = Vec::new();
         for reference in refs {
-            match by_id.get(reference.as_str()) {
-                Some(item) => evidence.push(ImpactEvidence {
+            match resolve_evidence_reference(&reference, &catalog) {
+                Some((item, range)) => evidence.push(ImpactEvidence {
                     evidence_type: item.evidence_type,
                     path: item.path.clone(),
                     query: item.query.clone(),
-                    description: item.description.clone(),
+                    description: range.as_deref().map_or_else(
+                        || item.description.clone(),
+                        |range| format!("{} Referenced lines {range}.", item.description),
+                    ),
                 }),
                 None => errors.push(ValidationError {
                     path: format!("{base}.evidence_refs"),
@@ -587,6 +621,34 @@ mod tests {
             map.areas[0].evidence[0].evidence_type,
             EvidenceType::FileRead
         );
+    }
+    #[test]
+    fn path_evidence_references_normalize_to_file_read_evidence() {
+        let (f, s, c) = notebook();
+        for (reference, expected_range) in [
+            ("src/theme.rs", None),
+            ("src/theme.rs:4", Some("4")),
+            ("src/theme.rs:4-12", Some("4-12")),
+        ] {
+            let mut value = compact();
+            value["areas"][0]["evidence_refs"] = json!([reference]);
+
+            let (map, source) = normalize(&value, &f, &s, &c).unwrap();
+            assert_eq!(source, ArtifactSource::NormalizedModel);
+            assert_eq!(map.areas[0].evidence.len(), 1);
+            let evidence = &map.areas[0].evidence[0];
+            assert_eq!(evidence.evidence_type, EvidenceType::FileRead);
+            assert_eq!(evidence.path.as_deref(), Some("src/theme.rs"));
+            match expected_range {
+                Some(range) => assert!(
+                    evidence
+                        .description
+                        .contains(&format!("Referenced lines {range}.")),
+                    "missing range in normalized evidence for {reference}"
+                ),
+                None => assert!(!evidence.description.contains("Referenced lines")),
+            }
+        }
     }
     #[test]
     fn unknown_evidence_reference_fails_clearly() {

@@ -54,11 +54,13 @@ use impact_map::{
 };
 
 use lifecycle::{
-    ImplementationCompletionStatus, RemainingWorkItem, RequiredGate, ValidationEvidence,
-    ValidationGateType, ValidationSource, ValidationStatus, canonical_running_state,
-    derive_remaining_work, implementation_completion_status, legacy_remaining_work,
-    new_running_evidence, passed_evidence, supersede_stale_validation,
-    validate_lifecycle_invariants, validation_fingerprint,
+    ImplementationCompletionStatus, ImplementationProgressAction, ImplementationSubstate,
+    RemainingWorkItem, RequiredGate, ToolProgressClass, ValidationEntryDecision,
+    ValidationEvidence, ValidationGateType, ValidationSource, ValidationStatus,
+    canonical_running_state, derive_remaining_work, implementation_completion_status,
+    implementation_progress_action, legacy_remaining_work, new_running_evidence, passed_evidence,
+    supersede_stale_validation, validate_lifecycle_invariants, validation_entry_decision,
+    validation_fingerprint,
 };
 #[cfg(test)]
 use orchestration::phase_budget_allocation;
@@ -77,6 +79,7 @@ const MAX_PROVIDER_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_PROVIDER_ERROR_PARAMETER_BYTES: usize = 512;
 const MAX_PROVIDER_RESPONSE_BODY_BYTES: usize = 48 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 48 * 1024;
+const MAX_DISCOVERY_REQUEST_BYTES: usize = 48 * 1024;
 const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
 // The backend remains authoritative: the worker only accepts and enforces the
 // signed mission budget. This ceiling must accommodate repository-wide hosted
@@ -84,6 +87,7 @@ const MAX_MODEL_FILE_BYTES: usize = 512 * 1024;
 const MAX_MODEL_CALLS_HARD_LIMIT: usize = 100;
 const MAX_HOSTED_TURN_WINDOWS: usize = 3;
 const MAX_REPAIR_ATTEMPTS: usize = 2;
+const MAX_HOSTED_EXECUTION_DURATION: Duration = Duration::from_secs(10 * 60);
 const MAX_AI_REGISTRATION_ATTEMPTS: usize = 3;
 const MAX_SMALL_FILE_REWRITE_BYTES: usize = 64 * 1024;
 const MAX_AMBIGUOUS_REPLACEMENT_FAILURES: usize = 2;
@@ -791,7 +795,18 @@ impl HostedApiClient {
         SecretString::new(issued.token, "GitHub repository token")
     }
 
+    #[cfg(test)]
     fn ai_response(&self, body: Value, registration: &AiCallRegistration) -> Result<Value> {
+        self.ai_response_until(body, registration, None)
+    }
+
+    fn ai_response_until(
+        &self,
+        body: Value,
+        registration: &AiCallRegistration,
+        execution_deadline: Option<Instant>,
+    ) -> Result<Value> {
+        ai_request_timeout(execution_deadline)?;
         self.ensure_fresh()?;
         let token = self.current_token()?;
         let path = format!("executions/{}/ai/responses", self.execution_id);
@@ -800,6 +815,7 @@ impl HostedApiClient {
             .join(&path)
             .with_context(|| format!("invalid RustGrid API path {path}"))?;
         for attempt in 0..3 {
+            let request_timeout = ai_request_timeout(execution_deadline)?;
             let response = self
                 .http
                 .post(url.clone())
@@ -817,6 +833,7 @@ impl HostedApiClient {
                     registration.registration_attempt.to_string(),
                 )
                 .json(&body)
+                .timeout(request_timeout)
                 .send();
             match response {
                 Ok(response) if response.status().is_success() => {
@@ -829,12 +846,14 @@ impl HostedApiClient {
                         .downcast_ref::<HostedHttpError>()
                         .is_some_and(HostedHttpError::retryable_gateway_transport_failure);
                     if can_retry_transport && attempt < 2 {
-                        thread::sleep(retry_delay(attempt));
+                        sleep_before_ai_retry(execution_deadline, attempt)?;
                     } else {
                         return Err(error);
                     }
                 }
-                Err(_) if attempt < 2 => thread::sleep(retry_delay(attempt)),
+                Err(_) if attempt < 2 => {
+                    sleep_before_ai_retry(execution_deadline, attempt)?;
+                }
                 Err(_) => bail!("RustGrid {path} transport failed"),
             }
         }
@@ -1343,6 +1362,23 @@ struct HostedResult {
     pull_request: PullRequestResult,
     validation: Vec<ValidationResult>,
     completeness: CompletionEvaluation,
+    terminal_telemetry: TerminalTelemetry,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct TerminalTelemetry {
+    model_calls_used: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    estimated_cost_micros: u64,
+    usage: ToolUsage,
+    changed_paths: Vec<String>,
+    last_successful_action: Value,
+    phase_reached: Option<ExecutionPhase>,
+    plan: Vec<PlannedChange>,
+    remaining_work: Vec<RemainingWorkItem>,
+    validation_evidence: Vec<ValidationEvidence>,
+    notebook_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1707,6 +1743,7 @@ enum IntendedChangeStatus {
 #[serde(rename_all = "snake_case")]
 enum WriteAttemptStatus {
     Applied,
+    NoChange,
     Failed,
 }
 
@@ -1909,6 +1946,7 @@ struct PartialRunContext {
 #[derive(Clone, Debug, Default, Serialize)]
 struct ToolUsage {
     reads: u32,
+    failed_reads: u32,
     searches: u32,
     writes: u32,
     successful_writes: u32,
@@ -1922,6 +1960,210 @@ struct ToolUsage {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct ToolProgressRecord {
+    #[serde(default)]
+    execution_attempt: i32,
+    model_call: usize,
+    phase: ExecutionPhase,
+    tool: String,
+    #[serde(default)]
+    target: Option<String>,
+    class: ToolProgressClass,
+    outcome_signature: String,
+    detail: String,
+    repository_progress: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ImplementationReadProgress {
+    consecutive_preparation_reads: usize,
+    recoverable_read_failures: usize,
+    repeated_identical_read_failures: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_tool_progress_record(
+    execution_attempt: i32,
+    model_call: usize,
+    phase: ExecutionPhase,
+    tool: &str,
+    target: Option<String>,
+    class: ToolProgressClass,
+    detail: impl Into<String>,
+    repository_progress: bool,
+) -> ToolProgressRecord {
+    let detail = truncate_text(&detail.into(), 1_000);
+    let outcome_signature = sha256_text(&format!(
+        "{tool}\0{}\0{detail}",
+        target.as_deref().unwrap_or_default()
+    ));
+    ToolProgressRecord {
+        execution_attempt,
+        model_call,
+        phase,
+        tool: tool.to_owned(),
+        target,
+        class,
+        outcome_signature,
+        detail,
+        repository_progress,
+    }
+}
+
+fn implementation_read_progress(
+    records: &[ToolProgressRecord],
+    execution_attempt: i32,
+) -> ImplementationReadProgress {
+    let records = records
+        .iter()
+        .filter(|record| {
+            record.execution_attempt == execution_attempt
+                && matches!(
+                    record.phase,
+                    ExecutionPhase::Implementation | ExecutionPhase::Repair
+                )
+                && matches!(
+                    record.tool.as_str(),
+                    "read_file" | "search_text" | "related_tests"
+                )
+        })
+        .collect::<Vec<_>>();
+    let consecutive_preparation_reads = records
+        .iter()
+        .rev()
+        .take_while(|record| {
+            matches!(
+                record.class,
+                ToolProgressClass::Productive
+                    | ToolProgressClass::Neutral
+                    | ToolProgressClass::Duplicate
+            )
+        })
+        .count();
+    let recoverable_read_failures = records
+        .iter()
+        .filter(|record| record.class == ToolProgressClass::RecoverableFailure)
+        .count();
+    let repeated_identical_read_failures = records
+        .iter()
+        .filter(|record| record.class == ToolProgressClass::RecoverableFailure)
+        .fold(BTreeMap::<&str, usize>::new(), |mut counts, record| {
+            *counts.entry(record.outcome_signature.as_str()).or_default() += 1;
+            counts
+        })
+        .into_values()
+        .max()
+        .unwrap_or_default();
+    ImplementationReadProgress {
+        consecutive_preparation_reads,
+        recoverable_read_failures,
+        repeated_identical_read_failures,
+    }
+}
+
+fn unresolved_preparation_blockers(
+    records: &[ToolProgressRecord],
+    execution_attempt: i32,
+    implementation_calls: usize,
+    successful_writes: u32,
+) -> Vec<String> {
+    let mut unresolved = BTreeMap::<(String, Option<String>), (usize, String, String)>::new();
+    for (index, record) in records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.execution_attempt == execution_attempt)
+    {
+        let key = (record.tool.clone(), record.target.clone());
+        match record.class {
+            ToolProgressClass::RecoverableFailure | ToolProgressClass::BlockingFailure => {
+                unresolved.insert(
+                    key,
+                    (
+                        index,
+                        record.outcome_signature.clone(),
+                        format!(
+                            "{}{}: {}",
+                            record.tool,
+                            record
+                                .target
+                                .as_deref()
+                                .map(|target| format!(" `{target}`"))
+                                .unwrap_or_default(),
+                            truncate_text(&record.detail, 500),
+                        ),
+                    ),
+                );
+            }
+            ToolProgressClass::Productive => {
+                unresolved.remove(&key);
+            }
+            ToolProgressClass::Neutral | ToolProgressClass::Duplicate => {}
+        }
+    }
+    let mut unresolved = unresolved.into_values().collect::<Vec<_>>();
+    unresolved.sort_by_key(|(index, _, _)| *index);
+    let mut seen = BTreeSet::new();
+    let mut blockers = unresolved
+        .into_iter()
+        .rev()
+        .filter(|(_, signature, _)| seen.insert(signature.clone()))
+        .take(6)
+        .map(|(_, _, summary)| summary)
+        .collect::<Vec<_>>();
+    blockers.reverse();
+    if blockers.is_empty()
+        && successful_writes == 0
+        && implementation_calls >= lifecycle::FIRST_WRITE_DELAY_CALL
+    {
+        blockers.push(format!(
+            "{implementation_calls} implementation turns produced no repository operation or verified mutation; the guided recovery turn must act on the current target"
+        ));
+    }
+    blockers
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct PlanningRepairState {
+    #[serde(default)]
+    valid_planned_changes: Vec<PlannedChange>,
+    #[serde(default)]
+    valid_planned_change_positions: Vec<usize>,
+    #[serde(default)]
+    original_change_ids: Vec<Option<String>>,
+    #[serde(default)]
+    original_change_count: usize,
+    #[serde(default)]
+    invalid_fields: Vec<String>,
+    model_call: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ImplementationStartContext {
+    goal: String,
+    target_order: Vec<ImplementationTarget>,
+    acceptance_criteria_ids: Vec<String>,
+    exact_files_already_read: Vec<String>,
+    missing_file_contents: Vec<String>,
+    source_tree_hash: String,
+    remaining_call_budget: usize,
+    current_target: Option<ImplementationTarget>,
+    guided_recovery: bool,
+    unresolved_preparation_blockers: Vec<String>,
+    instruction: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ImplementationTarget {
+    change_id: String,
+    path: String,
+    role: String,
+    new_file: bool,
+    intent: String,
+    acceptance_criteria: Vec<String>,
+    status: IntendedChangeStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct WorkerNotebook {
     schema_version: u32,
     revision: u64,
@@ -1931,6 +2173,8 @@ struct WorkerNotebook {
     #[serde(default)]
     acceptance_criteria_v2: Vec<impact_map::AcceptanceCriterion>,
     phase: ExecutionPhase,
+    #[serde(default)]
+    implementation_substate: ImplementationSubstate,
     repository_base_sha: String,
     branch: String,
     repository_fingerprint: String,
@@ -1950,9 +2194,15 @@ struct WorkerNotebook {
     #[serde(default)]
     files_inspected: Vec<String>,
     #[serde(default)]
+    read_ranges_inspected: Vec<String>,
+    #[serde(default)]
     searches_completed: Vec<String>,
     #[serde(default)]
+    discovery_paths_sampled: Vec<String>,
+    #[serde(default)]
     planned_changes: Vec<PlannedChange>,
+    #[serde(default)]
+    planning_repair: Option<PlanningRepairState>,
     #[serde(default)]
     intended_changes: Vec<IntendedChangeRecord>,
     #[serde(default)]
@@ -1963,6 +2213,8 @@ struct WorkerNotebook {
     completed_changes: Vec<String>,
     #[serde(default)]
     failed_changes: Vec<ToolFailureRecord>,
+    #[serde(default)]
+    tool_progress: Vec<ToolProgressRecord>,
     #[serde(default)]
     remaining_work: Vec<String>,
     #[serde(default)]
@@ -1979,6 +2231,177 @@ struct WorkerNotebook {
     phase_budget: Value,
     #[serde(default)]
     last_successful_action: Value,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LocalizedDiscoveryCoverage {
+    provider: bool,
+    selector: bool,
+    token_source: bool,
+    focused_tests: bool,
+    validation_commands: bool,
+    centralized_abstraction: bool,
+    representative_consumers: usize,
+}
+
+fn localized_visual_goal(goal: &str) -> bool {
+    let goal = goal.to_ascii_lowercase();
+    [
+        "theme",
+        "color scheme",
+        "colour scheme",
+        "design token",
+        "css variable",
+        "visual system",
+    ]
+    .iter()
+    .any(|needle| goal.contains(needle))
+}
+
+fn localized_discovery_core_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [
+        "themeprovider",
+        "theme-provider",
+        "themetoggle",
+        "theme-toggle",
+        "token",
+        "variable",
+        "global.css",
+        "globals.css",
+        "test",
+        "package.json",
+        "cargo.toml",
+    ]
+    .iter()
+    .any(|needle| path.contains(needle))
+}
+
+fn localized_discovery_coverage(notebook: &WorkerNotebook) -> LocalizedDiscoveryCoverage {
+    let evidence = notebook
+        .files_inspected
+        .iter()
+        .chain(notebook.searches_completed.iter())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let contains = |needles: &[&str]| {
+        evidence
+            .iter()
+            .any(|value| needles.iter().any(|needle| value.contains(needle)))
+    };
+    let centralized_abstraction = notebook.architecture_findings.iter().any(|finding| {
+        let finding = finding.to_ascii_lowercase();
+        (finding.contains("central") || finding.contains("semantic"))
+            && (finding.contains("token")
+                || finding.contains("variable")
+                || finding.contains("theme"))
+    });
+    LocalizedDiscoveryCoverage {
+        provider: contains(&["themeprovider", "theme-provider", "theme provider"]),
+        selector: contains(&["themetoggle", "theme-toggle", "theme selector"]),
+        token_source: contains(&["globals.css", "global.css", "design token", "css variable"]),
+        focused_tests: contains(&["theme-provider.test", "theme-tokens.test", "theme test"]),
+        validation_commands: contains(&["package.json", "cargo.toml", "npm test", "npm run"]),
+        centralized_abstraction,
+        representative_consumers: notebook
+            .files_inspected
+            .iter()
+            .chain(notebook.discovery_paths_sampled.iter())
+            .filter(|path| !localized_discovery_core_path(path))
+            .collect::<BTreeSet<_>>()
+            .len(),
+    }
+}
+
+fn localized_discovery_should_stop(coverage: LocalizedDiscoveryCoverage) -> bool {
+    coverage.centralized_abstraction
+        && coverage.provider
+        && coverage.selector
+        && coverage.token_source
+        && coverage.focused_tests
+        && coverage.validation_commands
+}
+
+fn validate_localized_discovery_scope(
+    notebook: &WorkerNotebook,
+    requested_paths: &[&str],
+) -> Result<()> {
+    if !localized_visual_goal(&notebook.goal) {
+        return Ok(());
+    }
+    let coverage = localized_discovery_coverage(notebook);
+    if localized_discovery_should_stop(coverage) {
+        bail!(
+            "localized_discovery_complete: record the compact impact map instead of inspecting more repository files"
+        );
+    }
+    if coverage.centralized_abstraction {
+        let new_consumers = requested_paths
+            .iter()
+            .filter(|path| !localized_discovery_core_path(path))
+            .filter(|path| {
+                !notebook.files_inspected.iter().any(|seen| seen == **path)
+                    && !notebook
+                        .discovery_paths_sampled
+                        .iter()
+                        .any(|seen| seen == **path)
+            })
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len();
+        if coverage
+            .representative_consumers
+            .saturating_add(new_consumers)
+            > 3
+        {
+            bail!(
+                "localized_discovery_consumer_limit: centralized theme architecture permits at most three representative consumers"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn discovery_requested_paths<'a>(
+    name: &str,
+    arguments: &'a serde_json::Map<String, Value>,
+) -> Vec<&'a str> {
+    match name {
+        "read_file" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .into_iter()
+            .collect(),
+        "search_text" => arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| Path::new(path).extension().is_some())
+            .into_iter()
+            .collect(),
+        "read_files" | "related_tests" => arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn record_centralized_discovery_finding(notebook: &mut WorkerNotebook, reason: &str) {
+    if notebook.phase != ExecutionPhase::Discovery || !localized_visual_goal(&notebook.goal) {
+        return;
+    }
+    let reason = reason.to_ascii_lowercase();
+    if (reason.contains("central") || reason.contains("semantic"))
+        && (reason.contains("token") || reason.contains("variable") || reason.contains("theme"))
+    {
+        push_unique(
+            &mut notebook.architecture_findings,
+            "Centralized semantic theme abstraction confirmed by targeted discovery.".into(),
+        );
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2009,6 +2432,15 @@ struct HostedAgentExecutionFailure {
     phase_calls_limit: usize,
     last_successful_action: Value,
     usage: ToolUsage,
+    estimated_cost_micros: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    changed_paths: Vec<String>,
+    remaining_work: Vec<RemainingWorkItem>,
+    failed_tool_operations: Vec<ToolProgressRecord>,
+    current_plan: Vec<PlannedChange>,
+    validation_evidence: Vec<ValidationEvidence>,
+    notebook_revision: u64,
     recoverable: bool,
     resume_phase: String,
     recommended_action: String,
@@ -2063,6 +2495,54 @@ impl std::fmt::Display for HostedAgentExecutionFailure {
 }
 
 impl std::error::Error for HostedAgentExecutionFailure {}
+
+fn classify_implementation_preparation_failure(
+    mut failure: HostedAgentExecutionFailure,
+    remaining_work: &[RemainingWorkItem],
+) -> HostedAgentExecutionFailure {
+    failure.status = "blocked";
+    failure.category = "implementation_blocked";
+    failure.process_health = "healthy";
+    failure.mission_outcome = "blocked";
+    failure.blocker = Some("implementation_preparation_failed".into());
+    failure.resumable = true;
+    failure.code = "implementation_preparation_failed".into();
+    failure.resume_phase = ExecutionPhase::Implementation.as_str().into();
+    failure.recommended_action = "Resume in implementation at the current planned target using the persisted read failures and recovery data.".into();
+    failure.remaining_work = remaining_work.to_vec();
+    failure
+}
+
+fn blocked_result_event_payload(
+    failure: &HostedAgentExecutionFailure,
+    diagnostics: Value,
+) -> Value {
+    json!({
+        "status": "blocked",
+        "mission_outcome": "blocked",
+        "process_health": "healthy",
+        "reason_code": failure.code,
+        "resumable": failure.resumable,
+        "resume_phase": failure.resume_phase,
+        "changed_paths": failure.changed_paths,
+        "remaining_work": failure.remaining_work,
+        "terminal_telemetry": {
+            "model_calls_used": failure.model_calls_used,
+            "input_tokens": failure.input_tokens,
+            "output_tokens": failure.output_tokens,
+            "estimated_cost_micros": failure.estimated_cost_micros,
+            "usage": failure.usage,
+            "changed_paths": failure.changed_paths,
+            "last_successful_action": failure.last_successful_action,
+            "phase_reached": failure.phase,
+            "plan": failure.current_plan,
+            "remaining_work": failure.remaining_work,
+            "validation_evidence": failure.validation_evidence,
+            "notebook_revision": failure.notebook_revision,
+        },
+        "failure": diagnostics,
+    })
+}
 
 fn acceptance_criteria_from_ticket(ticket: &str) -> Vec<String> {
     let mut criteria = Vec::new();
@@ -2187,6 +2667,7 @@ fn new_worker_notebook(
         acceptance_criteria: acceptance_criteria.clone(),
         acceptance_criteria_v2: impact_map::acceptance_criteria(&acceptance_criteria),
         phase: ExecutionPhase::Discovery,
+        implementation_substate: ImplementationSubstate::Preparing,
         repository_base_sha: manifest.github.base_sha.clone(),
         branch: manifest.github.branch.clone(),
         repository_fingerprint,
@@ -2198,13 +2679,17 @@ fn new_worker_notebook(
         impact_map_invalid_payload: None,
         impact_evidence: Vec::new(),
         files_inspected: Vec::new(),
+        read_ranges_inspected: Vec::new(),
         searches_completed: Vec::new(),
+        discovery_paths_sampled: Vec::new(),
         planned_changes: Vec::new(),
+        planning_repair: None,
         intended_changes: Vec::new(),
         write_attempts: Vec::new(),
         write_preflight_rejections: Vec::new(),
         completed_changes: Vec::new(),
         failed_changes: Vec::new(),
+        tool_progress: Vec::new(),
         remaining_work: Vec::new(),
         remaining_work_v2: Vec::new(),
         blocking_unknowns: Vec::new(),
@@ -2426,6 +2911,85 @@ fn attempt_modified_target(attempt: &WriteAttemptRecord) -> bool {
     attempt.before_sha256 != attempt.after_sha256
 }
 
+fn deterministic_complete_declaration(
+    planned_changes: &[PlannedChange],
+    acceptance_criteria: &[String],
+    changed_paths: &[String],
+    remaining_work: &[RemainingWorkItem],
+    tool_failures: &[ToolFailureRecord],
+) -> Option<ImplementationDeclaration> {
+    if planned_changes.is_empty()
+        || !remaining_work.is_empty()
+        || tool_failures.iter().any(|failure| {
+            !failure.recovered && failure.reconciliation == FailureReconciliation::StillUnresolved
+        })
+    {
+        return None;
+    }
+    let changed = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if planned_changes
+        .iter()
+        .flat_map(|change| &change.targets)
+        .any(|target| !changed.contains(target.path.as_str()))
+    {
+        return None;
+    }
+    let criteria_evidence = if acceptance_criteria.is_empty() {
+        planned_changes
+            .iter()
+            .map(|change| ImplementationCriterionEvidence {
+                criterion: change.change.clone(),
+                paths: change
+                    .targets
+                    .iter()
+                    .map(|target| target.path.clone())
+                    .collect(),
+                evidence: format!(
+                    "The authoritative diff contains every target for planned change `{}` and all required gates passed.",
+                    change.change_id
+                ),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        acceptance_criteria
+            .iter()
+            .map(|criterion| {
+                let mut paths = planned_changes
+                    .iter()
+                    .filter(|change| {
+                        change
+                            .acceptance_criteria
+                            .iter()
+                            .any(|mapped| mapped.trim() == criterion.trim())
+                    })
+                    .flat_map(|change| change.targets.iter().map(|target| target.path.clone()))
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths.dedup();
+                (!paths.is_empty()).then(|| ImplementationCriterionEvidence {
+                    criterion: criterion.clone(),
+                    paths,
+                    evidence: "The authoritative target reconciliation, repository diff, and required validation gates all passed.".into(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some(ImplementationDeclaration {
+        implementation_status: "complete".into(),
+        completed_work: planned_changes
+            .iter()
+            .map(|change| change.change.clone())
+            .collect(),
+        remaining_work: Vec::new(),
+        known_risks: Vec::new(),
+        changed_paths: changed_paths.to_vec(),
+        criteria_evidence,
+    })
+}
+
 fn deterministic_change_id(index: usize, change: &PlannedChange) -> String {
     let material = format!(
         "{}\0{}\0{}",
@@ -2524,6 +3088,129 @@ fn normalize_planned_changes(changes: &mut [PlannedChange]) -> Result<usize> {
         }
     }
     Ok(normalized_legacy_targets)
+}
+
+fn recover_planning_repair_state(
+    root: &Path,
+    object: &serde_json::Map<String, Value>,
+    model_call: usize,
+) -> PlanningRepairState {
+    let mut state = PlanningRepairState {
+        model_call,
+        ..PlanningRepairState::default()
+    };
+    let Some(changes) = object.get("planned_changes").and_then(Value::as_array) else {
+        state
+            .invalid_fields
+            .push("$.planned_changes: expected an array".into());
+        return state;
+    };
+    state.original_change_count = changes.len();
+    let mut ids = BTreeSet::new();
+    for (index, raw) in changes.iter().enumerate() {
+        state.original_change_ids.push(
+            raw.get("change_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        let mut change = match serde_json::from_value::<PlannedChange>(raw.clone()) {
+            Ok(change) => change,
+            Err(error) => {
+                state.invalid_fields.push(format!(
+                    "$.planned_changes[{index}]: {}",
+                    truncate_text(&error.to_string(), 500)
+                ));
+                continue;
+            }
+        };
+        if change.change_id.trim().is_empty() {
+            change.change_id = deterministic_change_id(index, &change);
+        }
+        let mut one = vec![change];
+        let validation = normalize_planned_changes(&mut one)
+            .and_then(|_| validate_planned_change_paths(root, &one))
+            .and_then(|_| {
+                let change = &one[0];
+                if change.change.trim().is_empty() {
+                    bail!("intent is required");
+                }
+                if change.reason.trim().is_empty() {
+                    bail!("reason is required");
+                }
+                if change.acceptance_criteria.is_empty() {
+                    bail!("acceptance_criteria requires at least one entry");
+                }
+                if !ids.insert(change.change_id.clone()) {
+                    bail!("change_id must be unique");
+                }
+                Ok(())
+            });
+        match validation {
+            Ok(()) => {
+                state.valid_planned_change_positions.push(index);
+                state.valid_planned_changes.push(one.remove(0));
+            }
+            Err(error) => state.invalid_fields.push(format!(
+                "$.planned_changes[{index}]: {}",
+                truncate_text(&error.to_string(), 500)
+            )),
+        }
+    }
+    state
+}
+
+fn merge_preserved_plan_fragments(
+    planned_changes: &mut Vec<PlannedChange>,
+    repair: Option<&PlanningRepairState>,
+) {
+    let Some(repair) = repair else {
+        return;
+    };
+    if repair.valid_planned_change_positions.len() == repair.valid_planned_changes.len()
+        && repair.original_change_count > 0
+    {
+        let preserved = repair
+            .valid_planned_change_positions
+            .iter()
+            .copied()
+            .zip(repair.valid_planned_changes.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        planned_changes.retain(|candidate| {
+            !repair
+                .valid_planned_changes
+                .iter()
+                .any(|valid| valid.change_id == candidate.change_id)
+        });
+        let mut repaired = std::mem::take(planned_changes);
+        let mut merged = Vec::with_capacity(repair.original_change_count + repaired.len());
+        for index in 0..repair.original_change_count {
+            if let Some(valid) = preserved.get(&index) {
+                merged.push(valid.clone());
+                continue;
+            }
+            let original_id = repair
+                .original_change_ids
+                .get(index)
+                .and_then(Option::as_deref);
+            let repaired_index = original_id
+                .and_then(|id| repaired.iter().position(|change| change.change_id == id))
+                .unwrap_or_default();
+            if !repaired.is_empty() {
+                merged.push(repaired.remove(repaired_index.min(repaired.len() - 1)));
+            }
+        }
+        merged.append(&mut repaired);
+        *planned_changes = merged;
+        return;
+    }
+    for preserved in &repair.valid_planned_changes {
+        if !planned_changes
+            .iter()
+            .any(|change| change.change_id == preserved.change_id)
+        {
+            planned_changes.push(preserved.clone());
+        }
+    }
 }
 
 fn repair_implementation_plan(
@@ -2706,6 +3393,25 @@ fn roll_up_target_statuses(targets: &[PlannedTarget]) -> IntendedChangeStatus {
         IntendedChangeStatus::Partial
     } else {
         IntendedChangeStatus::Planned
+    }
+}
+
+fn reconcile_changed_target_statuses(
+    intended_changes: &mut [IntendedChangeRecord],
+    changed_paths: &BTreeSet<String>,
+) {
+    for intended in intended_changes {
+        for target in &mut intended.targets {
+            let repository_contains_target_change = changed_paths.contains(&target.path);
+            target.status = match (repository_contains_target_change, target.status) {
+                (false, IntendedChangeStatus::Applied | IntendedChangeStatus::Verified) => {
+                    IntendedChangeStatus::Planned
+                }
+                (true, IntendedChangeStatus::Planned) => IntendedChangeStatus::InProgress,
+                _ => target.status,
+            };
+        }
+        intended.status = roll_up_target_statuses(&intended.targets);
     }
 }
 
@@ -3374,54 +4080,7 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
     let terminal_at = now_rfc3339();
     match result {
         Ok(result) if hosted_result_can_succeed(&result) => {
-            send_execution_telemetry(
-                &api,
-                execution_id,
-                &started_at,
-                Some(&terminal_at),
-                ExecutionStatus::Succeeded,
-                2,
-            );
-            if let Err(error) = api.append_event(
-                "result",
-                json!({
-                    "status": completion_request_status(result.completeness.status),
-                    "mission_outcome": result.completeness.status,
-                    "process_health": "healthy",
-                    "branch": result.branch,
-                    "head_sha": result.commit,
-                    "pull_request_number": result.pull_request.number,
-                    "pull_request_url": result.pull_request.url,
-                    "implementation_completeness": result.completeness,
-                    "technical_validation": result.validation
-                }),
-            ) {
-                eprintln!(
-                    "[warning] hosted result-event delivery failed before terminal completion: {error:#}"
-                );
-            }
-            api.complete(&CompletionRequest {
-                status: completion_request_status(result.completeness.status).into(),
-                mission_outcome: Some(result.completeness.status),
-                process_health: Some("healthy".into()),
-                completion_evaluation: Some(result.completeness.clone()),
-                output_summary: Some(truncate_text(&result.summary, 16_000)),
-                failure_code: None,
-                failure_message: None,
-                head_branch: Some(result.branch.clone()),
-                head_sha: Some(result.commit.clone()),
-                pull_request_number: Some(
-                    i64::try_from(result.pull_request.number)
-                        .context("pull request number is too large")?,
-                ),
-                pull_request_url: Some(result.pull_request.url.clone()),
-            })
-            .context("could not complete the hosted execution")?;
-            println!(
-                "[complete] Execution {execution_id} opened or reused pull request #{} at {}",
-                result.pull_request.number, result.pull_request.url
-            );
-            Ok(())
+            report_successful_hosted_result(&api, execution_id, &started_at, &terminal_at, &result)
         }
         Ok(result) => {
             send_execution_telemetry(
@@ -3444,6 +4103,7 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
                     "pull_request_url": result.pull_request.url,
                     "implementation_completeness": result.completeness,
                     "technical_validation": result.validation,
+                    "terminal_telemetry": result.terminal_telemetry,
                     "resumable": requires_implementation_continuation(
                         result.completeness.status
                     )
@@ -3477,6 +4137,43 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
                 "hosted execution produced invalid terminal mission outcome `{}`",
                 result.completeness.status.as_str()
             ))
+        }
+        Err(error)
+            if error
+                .downcast_ref::<HostedAgentExecutionFailure>()
+                .is_some_and(|failure| failure.mission_outcome == "blocked") =>
+        {
+            let failure = error
+                .downcast_ref::<HostedAgentExecutionFailure>()
+                .expect("guard checked structured blocked outcome");
+            send_execution_telemetry(
+                &api,
+                execution_id,
+                &started_at,
+                Some(&terminal_at),
+                ExecutionStatus::NeedsContinuation,
+                2,
+            );
+            let diagnostics = failure_diagnostics(&error, false);
+            api.append_event("result", blocked_result_event_payload(failure, diagnostics))?;
+            api.complete(&CompletionRequest {
+                status: "blocked".into(),
+                mission_outcome: Some(CompletionStatus::Blocked),
+                process_health: Some("healthy".into()),
+                completion_evaluation: None,
+                output_summary: Some(failure.message.clone()),
+                failure_code: Some(failure.code.clone()),
+                failure_message: Some(failure.message.clone()),
+                head_branch: Some(manifest.github.branch.clone()),
+                head_sha: None,
+                pull_request_number: None,
+                pull_request_url: None,
+            })
+            .context("could not report structured blocked hosted execution")?;
+            println!(
+                "[blocked] Execution {execution_id} preserved implementation state without running validation or creating a pull request"
+            );
+            Ok(())
         }
         Err(error) => {
             let cancelled = !running.load(Ordering::SeqCst) || shutdown::requested();
@@ -3524,6 +4221,64 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
     }
 }
 
+fn report_successful_hosted_result(
+    api: &HostedApiClient,
+    execution_id: Uuid,
+    started_at: &str,
+    terminal_at: &str,
+    result: &HostedResult,
+) -> Result<()> {
+    send_execution_telemetry(
+        api,
+        execution_id,
+        started_at,
+        Some(terminal_at),
+        ExecutionStatus::Succeeded,
+        2,
+    );
+    if let Err(error) = api.append_event(
+        "result",
+        json!({
+            "status": completion_request_status(result.completeness.status),
+            "mission_outcome": result.completeness.status,
+            "process_health": "healthy",
+            "branch": result.branch,
+            "head_sha": result.commit,
+            "pull_request_number": result.pull_request.number,
+            "pull_request_url": result.pull_request.url,
+            "implementation_completeness": result.completeness,
+            "technical_validation": result.validation,
+            "terminal_telemetry": result.terminal_telemetry
+        }),
+    ) {
+        eprintln!(
+            "[warning] hosted result-event delivery failed before terminal completion: {error:#}"
+        );
+    }
+    api.complete(&CompletionRequest {
+        status: completion_request_status(result.completeness.status).into(),
+        mission_outcome: Some(result.completeness.status),
+        process_health: Some("healthy".into()),
+        completion_evaluation: Some(result.completeness.clone()),
+        output_summary: Some(truncate_text(&result.summary, 16_000)),
+        failure_code: None,
+        failure_message: None,
+        head_branch: Some(result.branch.clone()),
+        head_sha: Some(result.commit.clone()),
+        pull_request_number: Some(
+            i64::try_from(result.pull_request.number)
+                .context("pull request number is too large")?,
+        ),
+        pull_request_url: Some(result.pull_request.url.clone()),
+    })
+    .context("could not complete the hosted execution")?;
+    println!(
+        "[complete] Execution {execution_id} opened or reused pull request #{} at {}",
+        result.pull_request.number, result.pull_request.url
+    );
+    Ok(())
+}
+
 fn hosted_result_can_succeed(result: &HostedResult) -> bool {
     match result.completeness.status {
         CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview => result
@@ -3549,7 +4304,10 @@ const fn completion_request_status(status: CompletionStatus) -> &'static str {
 const fn requires_implementation_continuation(status: CompletionStatus) -> bool {
     matches!(
         status,
-        CompletionStatus::Partial | CompletionStatus::Incomplete | CompletionStatus::Uncertain
+        CompletionStatus::Partial
+            | CompletionStatus::Incomplete
+            | CompletionStatus::Uncertain
+            | CompletionStatus::Blocked
     )
 }
 
@@ -3722,212 +4480,384 @@ fn run_hosted_execution(
         &containment,
         partial_run,
     )?;
-    if let Some(partial_run) = &agent.partial_run {
-        api.append_event(
-            "progress",
-            json!({
-                "event_type": "worker.partial_run_detected",
-                "step": "implementation",
-                "status": "continuing",
-                "branch": manifest.github.branch,
-                "execution_attempt": manifest.execution.attempt_number,
-                "pull_request_number": partial_run.pull_request_number,
-                "changed_paths": partial_run.changed_paths,
-                "remaining_work": agent.notebook.remaining_work,
-                "resume_phase": agent.phases.active(),
-                "resumable": true
-            }),
-        )?;
-    }
-    bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment)?;
-    let mut implementation = if !should_continue_implementation(
-        existing_pr.is_some(),
-        resumed,
-        manifest.execution.attempt_number,
-    ) {
-        ImplementationOutcome {
-            summary: "Recovered an existing hosted execution branch and pull request.".to_owned(),
-            budget_exhausted: false,
-            explicit_declaration: None,
-        }
-    } else {
-        if existing_pr.is_some() && resumed {
+    let execution_result = (|| -> Result<HostedResult> {
+        if let Some(partial_run) = &agent.partial_run {
             api.append_event(
                 "progress",
                 json!({
+                    "event_type": "worker.partial_run_detected",
                     "step": "implementation",
                     "status": "continuing",
                     "branch": manifest.github.branch,
                     "execution_attempt": manifest.execution.attempt_number,
+                    "pull_request_number": partial_run.pull_request_number,
+                    "changed_paths": partial_run.changed_paths,
+                    "remaining_work": agent.notebook.remaining_work,
+                    "resume_phase": agent.phases.active(),
                     "resumable": true
                 }),
             )?;
         }
-        agent
-            .implement()
-            .context("the RustGrid AI gateway implementation session failed")?
-    };
-    ensure_running(running)?;
+        bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment)?;
+        let mut implementation = if !should_continue_implementation(
+            existing_pr.is_some(),
+            resumed,
+            manifest.execution.attempt_number,
+        ) {
+            ImplementationOutcome {
+                summary: "Recovered an existing hosted execution branch and pull request."
+                    .to_owned(),
+                budget_exhausted: false,
+                explicit_declaration: None,
+            }
+        } else {
+            if existing_pr.is_some() && resumed {
+                api.append_event(
+                    "progress",
+                    json!({
+                        "step": "implementation",
+                        "status": "continuing",
+                        "branch": manifest.github.branch,
+                        "execution_attempt": manifest.execution.attempt_number,
+                        "resumable": true
+                    }),
+                )?;
+            }
+            agent
+                .implement()
+                .context("the RustGrid AI gateway implementation session failed")?
+        };
+        ensure_running(running)?;
+        ensure_hosted_execution_deadline(agent.execution_started_at)?;
 
-    agent.transition_phase(
-        ExecutionPhase::Validation,
-        "implementation session ended; worker-owned validation started",
-    )?;
-    api.update_state("validating")?;
-    let mut validation_round = 1_u32;
-    let validation_started = Instant::now();
-    let mut validation = run_quality_gates(
-        api,
-        manifest,
-        &repo,
-        running,
-        &manifest.execution_policy,
-        &containment,
-        validation_round,
-        &mut agent.notebook.validation_evidence,
-        &mut agent.notebook.required_gates,
-        &mut agent.tool_usage,
-        validation_started,
-    )?;
-    agent.checkpoint_validation_ledger()?;
-    agent.ensure_active_or_checkpoint_cancellation()?;
-    for repair_attempt in 0..MAX_REPAIR_ATTEMPTS {
-        let failures = validation
-            .iter()
-            .filter(|result| result.status != "passed")
-            .cloned()
-            .collect::<Vec<_>>();
-        if failures.is_empty() {
-            break;
+        let implementation_status = agent.reconcile_authoritative_target_state()?;
+        let implementation_changed_paths =
+            completion_changed_paths(&repo, &manifest.github.base_sha)?;
+        let validation_entry = validation_entry_decision(
+            implementation_status,
+            implementation_changed_paths.len(),
+            agent.partial_run.is_some(),
+            implementation.budget_exhausted
+                || agent.write_blocker.is_some()
+                || !agent.notebook.blocking_unknowns.is_empty(),
+        );
+        if !validation_entry_allows_gates(validation_entry) {
+            let reason_code = if implementation_changed_paths.is_empty() {
+                "no_implementation_changes"
+            } else {
+                "implementation_not_ready_for_validation"
+            };
+            agent.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_skipped",
+                    "reason_code": reason_code,
+                    "implementation_status": implementation_status,
+                    "implementation_substate": agent.notebook.implementation_substate,
+                    "changed_paths": implementation_changed_paths,
+                    "remaining_work": agent.notebook.remaining_work_v2,
+                    "model_calls_used": agent.phases.total_calls(),
+                    "cost": agent.cost_guard,
+                    "tool_usage": agent.tool_usage,
+                }),
+                "validation skip invariant",
+            );
+            agent.write_blocker.get_or_insert_with(|| {
+                "repository validation is forbidden until implementation produces relevant changes"
+                    .into()
+            });
+            agent.checkpoint_notebook(false)?;
+            return Err(agent.implementation_preparation_failure());
         }
-        implementation = agent.repair(&failures, repair_attempt + 1)?;
+
         agent.transition_phase(
             ExecutionPhase::Validation,
-            "validation repair ended; rerunning required quality gates",
+            "implementation session ended; worker-owned validation started",
         )?;
-        validation_round = validation_round.saturating_add(1);
-        validation = run_quality_gates(
-            api,
-            manifest,
-            &repo,
-            running,
-            &manifest.execution_policy,
-            &containment,
-            validation_round,
-            &mut agent.notebook.validation_evidence,
-            &mut agent.notebook.required_gates,
-            &mut agent.tool_usage,
-            validation_started,
-        )?;
+        api.update_state("validating")?;
+        let mut validation_round = 1_u32;
+        let validation_started = Instant::now();
+        let mut validation = dispatch_validation_gates(validation_entry, || {
+            run_quality_gates(
+                api,
+                manifest,
+                &repo,
+                running,
+                &manifest.execution_policy,
+                &containment,
+                validation_round,
+                &mut agent.notebook.validation_evidence,
+                &mut agent.notebook.required_gates,
+                &mut agent.tool_usage,
+                validation_started,
+                agent.execution_started_at,
+            )
+        })?
+        .context("validation entry policy rejected worker-owned quality gates")?;
         agent.checkpoint_validation_ledger()?;
         agent.ensure_active_or_checkpoint_cancellation()?;
-    }
-    let validation_passed = validation.iter().all(|result| result.status == "passed");
-    let review_paths = if validation_passed {
-        agent.deterministic_diff_review()?
-    } else {
-        completion_changed_paths(&repo, &manifest.github.base_sha)?
-    };
-    let completeness = agent.evaluate_completion(&implementation, &validation, &review_paths)?;
-    api.append_event(
-        "result",
-        json!({
-            "status": "implementation_evaluated",
-            "implementation_completeness": completeness,
-            "technical_validation": {
-                "status": "passed",
-                "gates": validation
-            },
-            "budget": agent.budget_telemetry(),
-            "tool_usage": agent.tool_usage,
-            "changed_path_count": review_paths.len(),
-            "resumable": requires_implementation_continuation(completeness.status)
-        }),
-    )?;
-
-    agent.transition_phase(
-        ExecutionPhase::Publication,
-        "completion evaluation finished; publishing preserved work",
-    )?;
-    if repo.hosted_local_config()? != trusted_git_config {
-        bail!("repository-controlled execution modified the protected local Git configuration");
-    }
-    repo.verify_hosted_origin(
-        &repo_config.owner,
-        &repo_config.name,
-        &manifest.github.web_base_url,
-    )?;
-    if command::checked("git", ["rev-parse", "HEAD"], &repo.root)? != trusted_head {
-        bail!("repository-controlled execution modified Git history before publication");
-    }
-    let dirty = repo.new_agent_paths(&baseline)?;
-    let mut commit = if dirty.is_empty() {
-        if existing_pr.is_none() {
-            bail!("the hosted execution produced no committable changes");
+        for repair_attempt in 0..MAX_REPAIR_ATTEMPTS {
+            let failures = validation
+                .iter()
+                .filter(|result| result.status != "passed")
+                .cloned()
+                .collect::<Vec<_>>();
+            if failures.is_empty() {
+                break;
+            }
+            let repair_tree_before =
+                repository_state_fingerprint(&repo, &manifest.github.base_sha)?;
+            implementation = agent.repair(&failures, repair_attempt + 1)?;
+            let repair_tree_after = repository_state_fingerprint(&repo, &manifest.github.base_sha)?;
+            if repair_tree_after == repair_tree_before {
+                agent.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_stopped",
+                    "reason_code": "repair_produced_no_source_mutation",
+                    "source_tree_hash": repair_tree_after,
+                    "failed_gates": failures.iter().map(|failure| &failure.id).collect::<Vec<_>>(),
+                    "rerun_skipped": true,
+                }),
+                "validation repair no-mutation guard",
+            );
+                implementation.budget_exhausted = true;
+                break;
+            }
+            agent.transition_phase(
+                ExecutionPhase::Validation,
+                "validation repair ended; rerunning required quality gates",
+            )?;
+            validation_round = validation_round.saturating_add(1);
+            validation = run_quality_gates(
+                api,
+                manifest,
+                &repo,
+                running,
+                &manifest.execution_policy,
+                &containment,
+                validation_round,
+                &mut agent.notebook.validation_evidence,
+                &mut agent.notebook.required_gates,
+                &mut agent.tool_usage,
+                validation_started,
+                agent.execution_started_at,
+            )?;
+            agent.checkpoint_validation_ledger()?;
+            agent.ensure_active_or_checkpoint_cancellation()?;
         }
-        command::checked("git", ["rev-parse", "HEAD"], &repo.root)?
-    } else {
-        let commit = repo.commit_paths(
-            &dirty,
-            &format!("{}: {}", manifest.ticket_key, manifest.ticket_title),
-        )?;
+        let validation_passed = validation.iter().all(|result| result.status == "passed");
+        let review_paths = if validation_passed {
+            agent.deterministic_diff_review()?
+        } else {
+            completion_changed_paths(&repo, &manifest.github.base_sha)?
+        };
+        if validation_passed
+            && implementation.explicit_declaration.is_none()
+            && let Some(declaration) = deterministic_complete_declaration(
+                &agent.notebook.planned_changes,
+                &agent.notebook.acceptance_criteria,
+                &review_paths,
+                &agent.notebook.remaining_work_v2,
+                &agent.tool_failures,
+            )
+        {
+            agent.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.implementation_declaration_reconciled",
+                    "source": "authoritative_target_and_diff_state",
+                    "implementation_status": declaration.implementation_status,
+                    "changed_paths": declaration.changed_paths,
+                    "criteria_evidence": declaration.criteria_evidence,
+                }),
+                "deterministic implementation declaration",
+            );
+            agent.declaration = Some(declaration.clone());
+            implementation.explicit_declaration = Some(declaration);
+        }
+        let completeness =
+            agent.evaluate_completion(&implementation, &validation, &review_paths)?;
         api.append_event(
-            "progress",
+            "result",
             json!({
-                "step": "commit",
-                "status": "completed",
-                "head_sha": commit,
-                "changed_paths": dirty
+                "status": "implementation_evaluated",
+                "implementation_completeness": completeness,
+                "technical_validation": {
+                    "status": if validation_passed { "passed" } else { "failed" },
+                    "gates": validation
+                },
+                "budget": agent.budget_telemetry(),
+                "tool_usage": agent.tool_usage,
+                "changed_path_count": review_paths.len(),
+                "resumable": requires_implementation_continuation(completeness.status)
             }),
         )?;
-        commit
-    };
 
-    ensure_running(running)?;
-    publish_hosted_branch(
-        HostedPublicationContext {
-            api,
+        agent.transition_phase(
+            ExecutionPhase::Publication,
+            "completion evaluation finished; publishing preserved work",
+        )?;
+        if repo.hosted_local_config()? != trusted_git_config {
+            bail!("repository-controlled execution modified the protected local Git configuration");
+        }
+        repo.verify_hosted_origin(
+            &repo_config.owner,
+            &repo_config.name,
+            &manifest.github.web_base_url,
+        )?;
+        if command::checked("git", ["rev-parse", "HEAD"], &repo.root)? != trusted_head {
+            bail!("repository-controlled execution modified Git history before publication");
+        }
+        let dirty = repo.new_agent_paths(&baseline)?;
+        let mut commit = if dirty.is_empty() {
+            let (commit, committed_paths) =
+                committed_head_for_publication(&repo, &manifest.github.base_sha)?
+                    .context("the hosted execution produced no committable changes")?;
+            if existing_pr.is_none() {
+                api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "worker.publication_recovered_committed_head",
+                        "head_sha": commit,
+                        "changed_paths": committed_paths,
+                        "reason": "resumed branch contains base-to-head changes but no pull request",
+                    }),
+                )?;
+            }
+            commit
+        } else {
+            let commit = repo.commit_paths(
+                &dirty,
+                &format!("{}: {}", manifest.ticket_key, manifest.ticket_title),
+            )?;
+            api.append_event(
+                "progress",
+                json!({
+                    "step": "commit",
+                    "status": "completed",
+                    "head_sha": commit,
+                    "changed_paths": dirty
+                }),
+            )?;
+            commit
+        };
+
+        ensure_running(running)?;
+        publish_hosted_branch(
+            HostedPublicationContext {
+                api,
+                manifest,
+                repo: &repo,
+                repo_config: &repo_config,
+                running,
+                trusted_git_config: &trusted_git_config,
+                containment: &containment,
+                validation_round: &mut validation_round,
+                validation_evidence: &mut agent.notebook.validation_evidence,
+                required_gates: &mut agent.notebook.required_gates,
+                tool_usage: &mut agent.tool_usage,
+                validation_started_at: Instant::now(),
+                execution_started_at: agent.execution_started_at,
+            },
+            &mut commit,
+            &mut validation,
+        )?;
+        ensure_hosted_execution_deadline(agent.execution_started_at)?;
+        api.update_state("creating_pull_request")?;
+        containment.drain()?;
+        let publication_token = api.github_token(&manifest.github.repository)?;
+        let github = GitHubClient::new(publication_token.expose(), &manifest.github.web_base_url)?;
+        let partial = requires_implementation_continuation(completeness.status);
+        let pull = find_or_create_hosted_pull_request(
+            &github,
+            &repo_config,
             manifest,
-            repo: &repo,
-            repo_config: &repo_config,
-            running,
-            trusted_git_config: &trusted_git_config,
-            containment: &containment,
-            validation_round: &mut validation_round,
-            validation_evidence: &mut agent.notebook.validation_evidence,
-            required_gates: &mut agent.notebook.required_gates,
-            tool_usage: &mut agent.tool_usage,
-            validation_started_at: Instant::now(),
-        },
-        &mut commit,
-        &mut validation,
-    )?;
-    api.update_state("creating_pull_request")?;
-    containment.drain()?;
-    let publication_token = api.github_token(&manifest.github.repository)?;
-    let github = GitHubClient::new(publication_token.expose(), &manifest.github.web_base_url)?;
-    let partial = requires_implementation_continuation(completeness.status);
-    let pull = find_or_create_hosted_pull_request(
-        &github,
-        &repo_config,
-        manifest,
-        &validation,
-        &completeness,
-        partial,
-    )?;
-    drop(github);
-    drop(publication_token);
-    Ok(HostedResult {
-        summary: implementation.summary,
-        branch: manifest.github.branch.clone(),
-        commit,
-        pull_request: PullRequestResult {
-            number: pull.number,
-            url: pull.html_url,
-        },
-        validation,
-        completeness,
-    })
+            &validation,
+            &completeness,
+            partial,
+        )?;
+        drop(github);
+        drop(publication_token);
+        let terminal_telemetry = TerminalTelemetry {
+            model_calls_used: agent.phases.total_calls(),
+            input_tokens: agent.cost_guard.input_tokens,
+            output_tokens: agent.cost_guard.output_tokens,
+            estimated_cost_micros: agent.cost_guard.estimated_cost_micros,
+            usage: agent.tool_usage.clone(),
+            changed_paths: completion_changed_paths(&repo, &manifest.github.base_sha)?,
+            last_successful_action: agent.last_successful_action.clone(),
+            phase_reached: Some(agent.phases.active()),
+            plan: agent.notebook.planned_changes.clone(),
+            remaining_work: agent.notebook.remaining_work_v2.clone(),
+            validation_evidence: agent.notebook.validation_evidence.clone(),
+            notebook_revision: agent.notebook.revision,
+        };
+        Ok(HostedResult {
+            summary: implementation.summary,
+            branch: manifest.github.branch.clone(),
+            commit,
+            pull_request: PullRequestResult {
+                number: pull.number,
+                url: pull.html_url,
+            },
+            validation,
+            completeness,
+            terminal_telemetry,
+        })
+    })();
+    match execution_result {
+        Ok(result) => Ok(result),
+        Err(error)
+            if error
+                .downcast_ref::<HostedAgentExecutionFailure>()
+                .is_some() =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            let (code, message) = safe_failure(&error, false);
+            Err(agent.execution_failure(
+                &code,
+                message,
+                Some(&error),
+                true,
+                "Resume from the persisted notebook after resolving the exact validation or publication failure.",
+            ))
+        }
+    }
+}
+
+const fn validation_entry_allows_gates(decision: ValidationEntryDecision) -> bool {
+    matches!(
+        decision,
+        ValidationEntryDecision::CompleteImplementation
+            | ValidationEntryDecision::UsefulPartialImplementation
+            | ValidationEntryDecision::ResumedImplementation
+    )
+}
+
+fn committed_head_for_publication(
+    repo: &Repo,
+    base_sha: &str,
+) -> Result<Option<(String, Vec<String>)>> {
+    let changed_paths = completion_changed_paths(repo, base_sha)?;
+    if changed_paths.is_empty() {
+        return Ok(None);
+    }
+    let commit = command::checked("git", ["rev-parse", "HEAD"], &repo.root)?;
+    Ok(Some((commit, changed_paths)))
+}
+
+fn dispatch_validation_gates<T>(
+    decision: ValidationEntryDecision,
+    run: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    if validation_entry_allows_gates(decision) {
+        run().map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn find_or_create_hosted_pull_request(
@@ -3994,6 +4924,7 @@ struct HostedPublicationContext<'a> {
     required_gates: &'a mut Vec<RequiredGate>,
     tool_usage: &'a mut ToolUsage,
     validation_started_at: Instant,
+    execution_started_at: Instant,
 }
 
 fn publish_hosted_branch(
@@ -4014,9 +4945,11 @@ fn publish_hosted_branch(
         required_gates,
         tool_usage,
         validation_started_at,
+        execution_started_at,
     } = context;
     for attempt in 1..=3 {
         ensure_running(running)?;
+        ensure_hosted_execution_deadline(execution_started_at)?;
         ensure_hosted_repository_integrity(
             repo,
             repo_config,
@@ -4059,6 +4992,7 @@ fn publish_hosted_branch(
                 required_gates,
                 tool_usage,
                 validation_started_at,
+                execution_started_at,
             )?;
             if validation.iter().any(|result| result.status != "passed") {
                 bail!("required hosted execution validation failed after branch reconciliation");
@@ -4137,7 +5071,6 @@ struct GatewayAgent<'a> {
     diff_reviewed: bool,
     diff_review_cursor: usize,
     diff_review_digest: Option<String>,
-    write_progress_reported: bool,
     write_blocker: Option<String>,
     blocked_plan_recorded_at: Option<usize>,
     impact_map_failure: Option<ImpactMapFailure>,
@@ -4146,19 +5079,12 @@ struct GatewayAgent<'a> {
     budget_advisory_percent: u8,
     last_cache_prefix_sha256: Option<String>,
     last_tool_order_sha256: Option<String>,
-    implementation_progress_baseline: ImplementationProgressBaseline,
+    guided_first_write_recovery_issued: bool,
+    last_repository_progress_call: usize,
     cost_guard: CostGuard,
     execution_started_at: Instant,
     phase_started_at: Instant,
     last_source_progress_call: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ImplementationProgressBaseline {
-    calls: usize,
-    successful_writes: u32,
-    changed_paths: BTreeSet<String>,
-    failure_counts: BTreeMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -4167,8 +5093,65 @@ struct CostGuard {
     call_count: u32,
     input_tokens: u64,
     output_tokens: u64,
+    usage_estimate_fallbacks: u32,
     repository_progress_score: f32,
     hard_limit_micros: u64,
+}
+
+const fn model_cost_limit_for_target_count(target_count: usize) -> u64 {
+    match target_count {
+        0 | 1 => 1_000_000,
+        2..=8 => 2_000_000,
+        9..=12 => 5_000_000,
+        _ => 10_000_000,
+    }
+}
+
+fn constrain_request_to_cost_limit(request: &mut Value, guard: &CostGuard) -> Result<bool> {
+    let configured_output = request
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .context("provider request is missing max_output_tokens")?;
+    let request_bytes = u64::try_from(serde_json::to_vec(request)?.len()).unwrap_or(u64::MAX);
+    // A tokenizer cannot emit more tokens than the number of encoded input bytes. Reserve that
+    // conservative input cost first, then cap the provider's output allowance to the remaining
+    // estimated-cost envelope before dispatch.
+    let input_cost_upper_bound = request_bytes.saturating_mul(5);
+    let remaining = guard
+        .hard_limit_micros
+        .saturating_sub(guard.estimated_cost_micros);
+    if remaining <= input_cost_upper_bound.saturating_add(15) {
+        return Ok(false);
+    }
+    let affordable_output = remaining
+        .saturating_sub(input_cost_upper_bound)
+        .checked_div(15)
+        .unwrap_or_default()
+        .min(configured_output);
+    if affordable_output == 0 {
+        return Ok(false);
+    }
+    request["max_output_tokens"] = json!(affordable_output);
+    Ok(true)
+}
+
+fn model_usage_for_accounting(request: &Value, response: &Value) -> Result<(u64, u64, bool)> {
+    let reported_input = response
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64);
+    let reported_output = response
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_u64);
+    let conservative_input = u64::try_from(serde_json::to_vec(request)?.len()).unwrap_or(u64::MAX);
+    let conservative_output = request
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .context("provider request is missing max_output_tokens")?;
+    Ok((
+        reported_input.unwrap_or(conservative_input),
+        reported_output.unwrap_or(conservative_output),
+        reported_input.is_none() || reported_output.is_none(),
+    ))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4184,60 +5167,171 @@ struct CancellationResult {
     resume_phase: ExecutionPhase,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-struct ImplementationProgressWindow {
-    calls: usize,
-    new_successful_writes: u32,
-    new_changed_paths: usize,
-    repeated_failure_codes: BTreeMap<String, u32>,
-    zero_progress: bool,
-}
-
-fn mutation_failure_counts(
-    attempts: &[WriteAttemptRecord],
-    preflight_rejections: &[MutationPreflightRecord],
-) -> BTreeMap<String, u32> {
-    let mut counts = BTreeMap::new();
-    for code in attempts
+fn ordered_implementation_targets_from_notebook(
+    notebook: &WorkerNotebook,
+) -> Vec<ImplementationTarget> {
+    notebook
+        .intended_changes
         .iter()
-        .filter(|attempt| attempt.status == WriteAttemptStatus::Failed)
-        .filter_map(|attempt| attempt.error_code.as_deref())
-    {
-        *counts.entry(code.to_owned()).or_default() += 1;
-    }
-    for rejection in preflight_rejections {
-        *counts.entry(rejection.failure_code.clone()).or_default() += rejection.occurrences;
-    }
-    counts
-}
-
-fn implementation_progress_window(
-    baseline: &ImplementationProgressBaseline,
-    calls: usize,
-    successful_writes: u32,
-    changed_paths: &BTreeSet<String>,
-    failure_counts: &BTreeMap<String, u32>,
-) -> Option<ImplementationProgressWindow> {
-    let calls = calls.saturating_sub(baseline.calls);
-    if calls < 4 {
-        return None;
-    }
-    let new_successful_writes = successful_writes.saturating_sub(baseline.successful_writes);
-    let new_changed_paths = changed_paths.difference(&baseline.changed_paths).count();
-    let repeated_failure_codes = failure_counts
-        .iter()
-        .filter_map(|(code, count)| {
-            let new_count = count.saturating_sub(*baseline.failure_counts.get(code).unwrap_or(&0));
-            (new_count >= 2).then(|| (code.clone(), new_count))
+        .flat_map(|change| {
+            change
+                .targets
+                .iter()
+                .map(move |target| ImplementationTarget {
+                    change_id: change.change_id.clone(),
+                    path: target.path.clone(),
+                    role: target.role.clone(),
+                    new_file: target.new_file,
+                    intent: change.intent.clone(),
+                    acceptance_criteria: notebook
+                        .planned_changes
+                        .iter()
+                        .find(|planned| planned.change_id == change.change_id)
+                        .map(|planned| planned.acceptance_criteria.clone())
+                        .unwrap_or_default(),
+                    status: target.status,
+                })
         })
+        .collect()
+}
+
+fn implementation_start_context_from_notebook(
+    notebook: &WorkerNotebook,
+    source_tree_hash: String,
+    remaining_call_budget: usize,
+    guided_recovery: bool,
+    implementation_calls: usize,
+    successful_writes: u32,
+) -> ImplementationStartContext {
+    let validation_repair =
+        notebook.phase == ExecutionPhase::Repair && !notebook.validation_failures.is_empty();
+    let target_order = ordered_implementation_targets_from_notebook(notebook)
+        .into_iter()
+        .filter(|target| {
+            validation_repair
+                || !matches!(
+                    target.status,
+                    IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+                )
+        })
+        .collect::<Vec<_>>();
+    let target_paths = target_order
+        .iter()
+        .map(|target| target.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let exact_files_already_read = notebook
+        .files_inspected
+        .iter()
+        .filter(|path| target_paths.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let inspected = exact_files_already_read
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing_file_contents = target_order
+        .iter()
+        .filter(|target| !target.new_file && !inspected.contains(target.path.as_str()))
+        .map(|target| target.path.clone())
         .collect();
-    Some(ImplementationProgressWindow {
-        calls,
-        new_successful_writes,
-        new_changed_paths,
-        repeated_failure_codes,
-        zero_progress: new_successful_writes == 0 && new_changed_paths == 0,
-    })
+    let current_target = target_order
+        .iter()
+        .find(|target| {
+            !matches!(
+                target.status,
+                IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+            )
+        })
+        .cloned()
+        .or_else(|| target_order.first().cloned());
+    let unresolved_preparation_blockers = if guided_recovery {
+        unresolved_preparation_blockers(
+            &notebook.tool_progress,
+            notebook.execution_attempt,
+            implementation_calls,
+            successful_writes,
+        )
+    } else {
+        Vec::new()
+    };
+    ImplementationStartContext {
+        goal: notebook.goal.clone(),
+        target_order,
+        acceptance_criteria_ids: notebook
+            .acceptance_criteria_v2
+            .iter()
+            .map(|criterion| criterion.id.clone())
+            .collect(),
+        exact_files_already_read,
+        missing_file_contents,
+        source_tree_hash,
+        remaining_call_budget,
+        current_target,
+        guided_recovery,
+        unresolved_preparation_blockers,
+        instruction: if guided_recovery {
+            "FIRST-WRITE RECOVERY: work only on current_target. Use its existing read evidence or perform one bounded read of that exact path, then attempt its authorized mutation. Do not inspect another target, re-run discovery, or perform validation.".into()
+        } else {
+            "Read only the exact files still needed. Begin source mutations as soon as sufficient context exists. Do not re-run discovery. Do not perform final repository validation; the worker runs authoritative validation after all targets are applied.".into()
+        },
+    }
+}
+
+fn validate_current_target_scope(
+    current_target: Option<&ImplementationTarget>,
+    guided_recovery: bool,
+    successful_writes: u32,
+    paths: &[&str],
+    source_mutation: bool,
+) -> Result<()> {
+    let Some(current_target) = current_target else {
+        return Ok(());
+    };
+    if source_mutation
+        && paths
+            .first()
+            .is_some_and(|path| *path != current_target.path)
+    {
+        bail!("active_target_mismatch: mutate the current planned target before later targets");
+    }
+    if guided_recovery
+        && successful_writes == 0
+        && paths.iter().any(|path| *path != current_target.path)
+    {
+        bail!(
+            "first_write_recovery_target_mismatch: guided recovery is constrained to the current planned target"
+        );
+    }
+    Ok(())
+}
+
+fn mark_post_write_stagnation(write_blocker: &mut Option<String>, successful_writes: u32) -> bool {
+    if successful_writes == 0 {
+        return false;
+    }
+    write_blocker.get_or_insert_with(|| {
+        "post_write_stagnation: useful repository changes are preserved, but explicit planned work remains unresolved"
+            .into()
+    });
+    true
+}
+
+fn mark_mutation_preflight_blocker(write_blocker: &mut Option<String>, target: &str) -> bool {
+    write_blocker.get_or_insert_with(|| {
+        format!(
+            "mutation_preflight_rejected: target `{target}` requires persisted plan repair before implementation can continue"
+        )
+    });
+    true
+}
+
+fn record_validation_repair_start(notebook: &mut WorkerNotebook, failures: &[ValidationResult]) {
+    notebook.validation_failures.extend(
+        failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.id, failure.status)),
+    );
+    notebook.implementation_substate = ImplementationSubstate::Repairing;
 }
 
 impl<'a> GatewayAgent<'a> {
@@ -4413,18 +5507,6 @@ impl<'a> GatewayAgent<'a> {
                 });
         let mut phases = PhaseLedger::new(total_calls, initial_phase);
         phases.ensure_finalization_minimum(notebook.acceptance_criteria.len());
-        let implementation_progress_baseline = ImplementationProgressBaseline {
-            calls: phases.implementation_repair_calls(),
-            successful_writes: 0,
-            changed_paths: completion_changed_paths(repo, &manifest.github.base_sha)
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-            failure_counts: mutation_failure_counts(
-                &notebook.write_attempts,
-                &notebook.write_preflight_rejections,
-            ),
-        };
         Ok(Self {
             api,
             manifest,
@@ -4448,7 +5530,6 @@ impl<'a> GatewayAgent<'a> {
             diff_reviewed: false,
             diff_review_cursor: 0,
             diff_review_digest: None,
-            write_progress_reported: false,
             write_blocker: None,
             blocked_plan_recorded_at: None,
             impact_map_failure,
@@ -4457,9 +5538,12 @@ impl<'a> GatewayAgent<'a> {
             budget_advisory_percent: 0,
             last_cache_prefix_sha256: None,
             last_tool_order_sha256: None,
-            implementation_progress_baseline,
+            guided_first_write_recovery_issued: false,
+            last_repository_progress_call: 0,
             cost_guard: CostGuard {
-                hard_limit_micros: 5_000_000,
+                // Localized work is provisionally capped at EUR 2 before planning reveals the
+                // authoritative target count. Larger plans may raise this bound explicitly.
+                hard_limit_micros: 2_000_000,
                 ..CostGuard::default()
             },
             execution_started_at: Instant::now(),
@@ -4577,6 +5661,35 @@ impl<'a> GatewayAgent<'a> {
         bail!("hosted execution was cancelled after preserving a resumable checkpoint")
     }
 
+    fn record_tool_progress(
+        &mut self,
+        tool: &str,
+        target: Option<String>,
+        class: ToolProgressClass,
+        detail: impl Into<String>,
+        repository_progress: bool,
+    ) {
+        let record = new_tool_progress_record(
+            self.manifest.execution.attempt_number,
+            self.phases.total_calls(),
+            self.phases.active(),
+            tool,
+            target,
+            class,
+            detail,
+            repository_progress,
+        );
+        if repository_progress {
+            self.last_repository_progress_call = self.phases.implementation_repair_calls();
+        }
+        self.notebook.tool_progress.push(record);
+        if self.notebook.tool_progress.len() > 64 {
+            self.notebook
+                .tool_progress
+                .drain(..self.notebook.tool_progress.len().saturating_sub(64));
+        }
+    }
+
     fn observe_implementation_progress(&mut self) -> Result<bool> {
         if !matches!(
             self.phases.active(),
@@ -4591,48 +5704,87 @@ impl<'a> GatewayAgent<'a> {
         let current_tree_hash =
             repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         supersede_stale_validation(&mut self.notebook.validation_evidence, &current_tree_hash);
-        let failure_counts = mutation_failure_counts(
-            &self.notebook.write_attempts,
-            &self.notebook.write_preflight_rejections,
+        let read_progress = implementation_read_progress(
+            &self.notebook.tool_progress,
+            self.manifest.execution.attempt_number,
         );
-        let Some(window) = implementation_progress_window(
-            &self.implementation_progress_baseline,
+        let calls_since_repository_progress =
+            calls.saturating_sub(self.last_repository_progress_call);
+        let action = implementation_progress_action(
             calls,
             self.tool_usage.successful_writes,
-            &changed_paths,
-            &failure_counts,
-        ) else {
-            return Ok(false);
-        };
-        let halt = window.zero_progress;
+            read_progress.consecutive_preparation_reads,
+            read_progress.recoverable_read_failures,
+            read_progress.repeated_identical_read_failures,
+            self.guided_first_write_recovery_issued,
+            calls_since_repository_progress,
+        );
+        let halt = matches!(
+            action,
+            ImplementationProgressAction::BlockedBeforeFirstWrite
+                | ImplementationProgressAction::BlockedAfterWrite
+        );
+        if action == ImplementationProgressAction::FirstWriteDelayed {
+            self.guided_first_write_recovery_issued = true;
+        }
         self.append_event_recoverable(
             "progress",
             json!({
-                "event_type": if halt {
-                    "worker.no_progress_detected"
-                } else {
-                    "worker.implementation_progress_window"
+                "event_type": match action {
+                    ImplementationProgressAction::FirstWriteDelayed => "worker.first_write_delayed",
+                    ImplementationProgressAction::BlockedBeforeFirstWrite
+                    | ImplementationProgressAction::BlockedAfterWrite => "worker.no_progress_detected",
+                    ImplementationProgressAction::Continue => "worker.implementation_progress_window",
                 },
-                "calls": window.calls,
-                "new_successful_writes": window.new_successful_writes,
-                "new_changed_paths": window.new_changed_paths,
-                "repeated_failure_codes": window.repeated_failure_codes,
-                "zero_progress": window.zero_progress,
+                "implementation_calls": calls,
+                "implementation_substate": self.notebook.implementation_substate,
+                "successful_writes": self.tool_usage.successful_writes,
+                "changed_paths": changed_paths,
+                "consecutive_preparation_reads": read_progress.consecutive_preparation_reads,
+                "recoverable_read_failures": read_progress.recoverable_read_failures,
+                "repeated_identical_read_failures": read_progress.repeated_identical_read_failures,
+                "calls_since_repository_progress": calls_since_repository_progress,
+                "guided_recovery_issued": self.guided_first_write_recovery_issued,
+                "unresolved_preparation_blockers": unresolved_preparation_blockers(
+                    &self.notebook.tool_progress,
+                    self.manifest.execution.attempt_number,
+                    calls,
+                    self.tool_usage.successful_writes,
+                ),
+                "last_six_tool_outcomes": self.notebook.tool_progress.iter().rev().take(6).collect::<Vec<_>>(),
                 "orchestration_action": if halt {
                     "return_resumable_partial_result"
+                } else if action == ImplementationProgressAction::FirstWriteDelayed {
+                    "guided_single_target_recovery"
                 } else {
                     "continue"
                 },
             }),
             "implementation progress window",
         );
-        self.implementation_progress_baseline = ImplementationProgressBaseline {
-            calls,
-            successful_writes: self.tool_usage.successful_writes,
-            changed_paths,
-            failure_counts,
-        };
         Ok(halt)
+    }
+
+    fn implementation_progress_halt_summary(&mut self) -> Result<Option<String>> {
+        if !self.observe_implementation_progress()? {
+            return Ok(None);
+        }
+        if self.tool_usage.successful_writes == 0 {
+            self.write_blocker.get_or_insert_with(|| {
+                "implementation preparation remained blocked after the bounded guided first-write recovery"
+                    .into()
+            });
+            Ok(Some(
+                "Implementation preparation stopped only after the eight-call allowance and guided single-target recovery were exhausted. No validation should run until a relevant repository change exists."
+                    .into(),
+            ))
+        } else {
+            mark_post_write_stagnation(&mut self.write_blocker, self.tool_usage.successful_writes);
+            Ok(Some(
+                "Implementation paused after four consecutive post-write calls without a new write, changed path, resolved mutation failure, applied target, or phase transition. Preserved changes remain resumable."
+                    .into(),
+            ))
+        }
     }
 
     fn record_cache_observability(&mut self, request: &Value, response: &Value) {
@@ -4647,24 +5799,37 @@ impl<'a> GatewayAgent<'a> {
         self.last_tool_order_sha256 = Some(tool_order_sha256);
     }
 
-    fn observe_model_cost(&mut self, response: &Value) {
-        let input_tokens = response
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let output_tokens = response
-            .pointer("/usage/output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
+    fn observe_model_cost(&mut self, request: &Value, response: &Value) -> Result<()> {
+        let (input_tokens, output_tokens, estimated) =
+            model_usage_for_accounting(request, response)?;
         self.cost_guard.call_count = self.cost_guard.call_count.saturating_add(1);
         self.cost_guard.input_tokens = self.cost_guard.input_tokens.saturating_add(input_tokens);
         self.cost_guard.output_tokens = self.cost_guard.output_tokens.saturating_add(output_tokens);
+        if estimated {
+            self.cost_guard.usage_estimate_fallbacks =
+                self.cost_guard.usage_estimate_fallbacks.saturating_add(1);
+        }
         // Conservative provider-independent estimate: EUR 5/M input and EUR 15/M output.
         self.cost_guard.estimated_cost_micros = self
             .cost_guard
             .estimated_cost_micros
             .saturating_add(input_tokens.saturating_mul(5))
             .saturating_add(output_tokens.saturating_mul(15));
+        if estimated {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.model_usage_estimated",
+                    "reason_code": "provider_usage_missing_or_invalid",
+                    "input_tokens_accounted": input_tokens,
+                    "output_tokens_accounted": output_tokens,
+                    "usage_estimate_fallbacks": self.cost_guard.usage_estimate_fallbacks,
+                    "estimated_cost_micros": self.cost_guard.estimated_cost_micros,
+                }),
+                "conservative model usage accounting",
+            );
+        }
+        Ok(())
     }
 
     fn enforce_cost_and_time_guardrails(
@@ -4675,9 +5840,8 @@ impl<'a> GatewayAgent<'a> {
             .phases
             .total_calls()
             .saturating_sub(self.last_source_progress_call);
-        let cost_triggered = self.cost_guard.estimated_cost_micros
-            >= self.cost_guard.hard_limit_micros
-            && calls_without_progress >= 4;
+        let cost_triggered =
+            self.cost_guard.estimated_cost_micros >= self.cost_guard.hard_limit_micros;
         let phase_limit = match self.phases.active() {
             ExecutionPhase::Discovery => Duration::from_secs(3 * 60),
             ExecutionPhase::ArtifactRepair | ExecutionPhase::Planning => {
@@ -4690,7 +5854,10 @@ impl<'a> GatewayAgent<'a> {
             }
             ExecutionPhase::Publication => Duration::from_secs(3 * 60),
         };
-        let wall_clock_triggered = self.phase_started_at.elapsed() >= phase_limit;
+        let phase_wall_clock_triggered = self.phase_started_at.elapsed() >= phase_limit;
+        let execution_wall_clock_triggered =
+            self.execution_started_at.elapsed() >= MAX_HOSTED_EXECUTION_DURATION;
+        let wall_clock_triggered = phase_wall_clock_triggered || execution_wall_clock_triggered;
         if !cost_triggered && !wall_clock_triggered {
             return Ok(None);
         }
@@ -4708,6 +5875,9 @@ impl<'a> GatewayAgent<'a> {
                 "cost_guard": self.cost_guard,
                 "phase_elapsed_ms": self.phase_started_at.elapsed().as_millis(),
                 "execution_elapsed_ms": self.execution_started_at.elapsed().as_millis(),
+                "phase_wall_clock_triggered": phase_wall_clock_triggered,
+                "execution_wall_clock_triggered": execution_wall_clock_triggered,
+                "execution_limit_seconds": MAX_HOSTED_EXECUTION_DURATION.as_secs(),
                 "calls_without_source_progress": calls_without_progress,
                 "resumable": true,
             }),
@@ -4724,6 +5894,17 @@ impl<'a> GatewayAgent<'a> {
                 budget_exhausted: true,
                 explicit_declaration: self.declaration.clone(),
             }));
+        }
+        if matches!(
+            self.phases.active(),
+            ExecutionPhase::Implementation | ExecutionPhase::Repair
+        ) && self.tool_usage.successful_writes == 0
+            && changed_paths.is_empty()
+        {
+            self.write_blocker.get_or_insert_with(|| {
+                "implementation preparation reached its cost or wall-clock guardrail before a verified repository mutation".into()
+            });
+            return Err(self.implementation_preparation_failure());
         }
         Err(self.execution_failure(
             event_type,
@@ -4762,6 +5943,15 @@ impl<'a> GatewayAgent<'a> {
             );
         }
         self.phases.transition(phase);
+        if self.tool_usage.successful_writes > 0
+            && matches!(
+                (previous, phase),
+                (ExecutionPhase::Implementation, ExecutionPhase::Repair)
+                    | (ExecutionPhase::Repair, ExecutionPhase::Implementation)
+            )
+        {
+            self.last_repository_progress_call = self.phases.implementation_repair_calls();
+        }
         self.phase_started_at = Instant::now();
         self.notebook.phase = phase;
         self.checkpoint_notebook(false)?;
@@ -4831,6 +6021,39 @@ impl<'a> GatewayAgent<'a> {
         Ok(())
     }
 
+    fn ordered_implementation_targets(&self) -> Vec<ImplementationTarget> {
+        ordered_implementation_targets_from_notebook(&self.notebook)
+    }
+
+    fn current_implementation_target(&self) -> Option<ImplementationTarget> {
+        if self.phases.active() == ExecutionPhase::Repair
+            && !self.notebook.validation_failures.is_empty()
+        {
+            return None;
+        }
+        self.ordered_implementation_targets()
+            .into_iter()
+            .find(|target| {
+                !matches!(
+                    target.status,
+                    IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+                )
+            })
+    }
+
+    fn implementation_start_context(&self) -> Result<ImplementationStartContext> {
+        Ok(implementation_start_context_from_notebook(
+            &self.notebook,
+            repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?,
+            self.phases
+                .phase_limit(self.phases.active())
+                .saturating_sub(self.phases.phase_calls(self.phases.active())),
+            self.guided_first_write_recovery_issued,
+            self.phases.implementation_repair_calls(),
+            self.tool_usage.successful_writes,
+        ))
+    }
+
     fn reconcile_authoritative_target_state(&mut self) -> Result<ImplementationCompletionStatus> {
         let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?
             .into_iter()
@@ -4838,9 +6061,7 @@ impl<'a> GatewayAgent<'a> {
         let current_tree_hash =
             repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         supersede_stale_validation(&mut self.notebook.validation_evidence, &current_tree_hash);
-        for intended in &mut self.notebook.intended_changes {
-            intended.status = roll_up_target_statuses(&intended.targets);
-        }
+        reconcile_changed_target_statuses(&mut self.notebook.intended_changes, &changed_paths);
         if let Some(plan) = self.implementation_plan.as_mut() {
             for planned in &mut plan.planned_changes {
                 if let Some(intended) = self
@@ -4882,11 +6103,36 @@ impl<'a> GatewayAgent<'a> {
             unresolved,
             self.write_blocker.is_some() || !self.notebook.blocking_unknowns.is_empty(),
         );
+        self.notebook.implementation_substate = match status {
+            ImplementationCompletionStatus::ReadyForValidation => {
+                ImplementationSubstate::ReadyForValidation
+            }
+            ImplementationCompletionStatus::PartialReadyForValidation
+            | ImplementationCompletionStatus::InProgress
+            | ImplementationCompletionStatus::Blocked
+                if unresolved =>
+            {
+                ImplementationSubstate::Repairing
+            }
+            ImplementationCompletionStatus::InProgress
+            | ImplementationCompletionStatus::PartialReadyForValidation => {
+                ImplementationSubstate::Mutating
+            }
+            ImplementationCompletionStatus::Preparing
+                if !self.notebook.write_attempts.is_empty() =>
+            {
+                ImplementationSubstate::Mutating
+            }
+            ImplementationCompletionStatus::NotStarted
+            | ImplementationCompletionStatus::Preparing
+            | ImplementationCompletionStatus::Blocked => ImplementationSubstate::Preparing,
+        };
         self.append_event_recoverable(
             "progress",
             json!({
                 "event_type": "worker.implementation_completion_reconciled",
                 "status": status,
+                "implementation_substate": self.notebook.implementation_substate,
                 "changed_paths": changed_paths,
                 "remaining_work": self.notebook.remaining_work_v2,
                 "notebook_revision": self.notebook.revision,
@@ -5089,16 +6335,37 @@ impl<'a> GatewayAgent<'a> {
                 message: underlying_message,
                 stack_reference,
             },
-            model_calls_used: self.phases.budgeted_calls(),
+            model_calls_used: self.phases.total_calls(),
             model_calls_limit: self.phases.total_limit(),
             model_calls_remaining: self
                 .phases
                 .total_limit()
-                .saturating_sub(self.phases.budgeted_calls()),
+                .saturating_sub(self.phases.total_calls()),
             phase_calls_used: self.phases.phase_calls(phase),
             phase_calls_limit: self.phases.phase_limit(phase),
             last_successful_action: self.last_successful_action.clone(),
             usage: self.tool_usage.clone(),
+            estimated_cost_micros: self.cost_guard.estimated_cost_micros,
+            input_tokens: self.cost_guard.input_tokens,
+            output_tokens: self.cost_guard.output_tokens,
+            changed_paths: completion_changed_paths(self.repo, &self.manifest.github.base_sha)
+                .unwrap_or_default(),
+            remaining_work: self.notebook.remaining_work_v2.clone(),
+            failed_tool_operations: self
+                .notebook
+                .tool_progress
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.class,
+                        ToolProgressClass::RecoverableFailure | ToolProgressClass::BlockingFailure
+                    )
+                })
+                .cloned()
+                .collect(),
+            current_plan: self.notebook.planned_changes.clone(),
+            validation_evidence: self.notebook.validation_evidence.clone(),
+            notebook_revision: self.notebook.revision,
             recoverable,
             resume_phase: phase.as_str().into(),
             recommended_action: recommended_action.to_owned(),
@@ -5133,6 +6400,22 @@ impl<'a> GatewayAgent<'a> {
         })
     }
 
+    fn implementation_preparation_failure(&self) -> anyhow::Error {
+        let error = self.execution_failure(
+            "implementation_preparation_failed",
+            "Implementation could not begin after the bounded preparation allowance and guided single-target recovery.",
+            None,
+            true,
+            "Resume in implementation at the current planned target using the persisted read failures and recovery data.",
+        );
+        let mut failure = error
+            .downcast::<HostedAgentExecutionFailure>()
+            .expect("execution_failure always returns HostedAgentExecutionFailure");
+        failure =
+            classify_implementation_preparation_failure(failure, &self.notebook.remaining_work_v2);
+        anyhow!(failure)
+    }
+
     fn impact_map_execution_failure(
         &self,
         code: &str,
@@ -5144,7 +6427,7 @@ impl<'a> GatewayAgent<'a> {
         let phase = self.phases.active();
         anyhow!(HostedAgentExecutionFailure {
             status: "blocked",
-            category: "hosted_agent_execution_failed",
+            category: "artifact_blocked",
             process_health: "healthy",
             mission_outcome: "blocked",
             blocker: Some("impact_map_artifact_invalid".into()),
@@ -5162,11 +6445,32 @@ impl<'a> GatewayAgent<'a> {
             model_calls_remaining: self
                 .phases
                 .total_limit()
-                .saturating_sub(self.phases.budgeted_calls()),
+                .saturating_sub(self.phases.total_calls()),
             phase_calls_used: self.phases.phase_calls(phase),
             phase_calls_limit: self.phases.phase_limit(phase),
             last_successful_action: self.last_successful_action.clone(),
             usage: self.tool_usage.clone(),
+            estimated_cost_micros: self.cost_guard.estimated_cost_micros,
+            input_tokens: self.cost_guard.input_tokens,
+            output_tokens: self.cost_guard.output_tokens,
+            changed_paths: completion_changed_paths(self.repo, &self.manifest.github.base_sha)
+                .unwrap_or_default(),
+            remaining_work: self.notebook.remaining_work_v2.clone(),
+            failed_tool_operations: self
+                .notebook
+                .tool_progress
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.class,
+                        ToolProgressClass::RecoverableFailure | ToolProgressClass::BlockingFailure
+                    )
+                })
+                .cloned()
+                .collect(),
+            current_plan: self.notebook.planned_changes.clone(),
+            validation_evidence: self.notebook.validation_evidence.clone(),
+            notebook_revision: self.notebook.revision,
             recoverable: true,
             resume_phase: "artifact_repair".into(),
             recommended_action: recommended_action.to_owned(),
@@ -5203,7 +6507,7 @@ impl<'a> GatewayAgent<'a> {
                 return Ok(Some(outcome));
             }
             if let Some((threshold, code, message)) =
-                hosted_budget_advisory(self.phases.budgeted_calls(), self.phases.total_limit())
+                hosted_budget_advisory(self.phases.total_calls(), self.phases.total_limit())
                     .filter(|(threshold, _, _)| *threshold > self.budget_advisory_percent)
             {
                 self.budget_advisory_percent = threshold;
@@ -5343,6 +6647,13 @@ impl<'a> GatewayAgent<'a> {
                             explicit_declaration: self.declaration.clone(),
                         }));
                     }
+                    if self.tool_usage.successful_writes == 0 && changed_paths.is_empty() {
+                        self.write_blocker.get_or_insert_with(|| {
+                            "implementation preparation exhausted its bounded call allowance without a verified repository mutation".into()
+                        });
+                        self.checkpoint_notebook(false)?;
+                        return Err(self.implementation_preparation_failure());
+                    }
                     return Err(self.execution_failure(
                         "implementation_progress_missing",
                         "Implementation reached its bounded call limit without an applied target.",
@@ -5387,44 +6698,6 @@ impl<'a> GatewayAgent<'a> {
             }
         }
 
-        let total_calls = self.phases.total_calls();
-        if matches!(
-            self.phases.active(),
-            ExecutionPhase::Implementation | ExecutionPhase::Repair
-        ) && self.tool_usage.successful_writes == 0
-        {
-            if total_calls >= self.phases.successful_write_deadline() {
-                let blocker =
-                    self.write_blocker
-                        .as_deref()
-                        .unwrap_or(if self.write_progress_reported {
-                            "the structured progress response did not lead to a successful write"
-                        } else {
-                            "the model did not provide the required structured blocker"
-                        });
-                self.emit_guardrail(
-                    "implementation_progress_missing",
-                    "terminate",
-                    &format!(
-                        "The successful-write deadline was reached without a repository write: {blocker}"
-                    ),
-                )?;
-                return Err(self.execution_failure(
-                    "implementation_progress_missing",
-                    format!("No successful write existed by model call {total_calls}: {blocker}"),
-                    None,
-                    true,
-                    "Continue from the preserved plan and perform the declared next write.",
-                ));
-            }
-            if total_calls.saturating_add(1) >= self.phases.first_write_attempt_deadline() {
-                self.emit_guardrail(
-                    "first_write_threshold_approaching",
-                    "write_or_report_blocker",
-                    "The next response must attempt a planned write or report a precise blocker.",
-                )?;
-            }
-        }
         if self
             .phases
             .phase_calls(self.phases.active())
@@ -5441,11 +6714,7 @@ impl<'a> GatewayAgent<'a> {
         failures: &[ValidationResult],
         attempt: usize,
     ) -> Result<ImplementationOutcome> {
-        self.notebook.validation_failures.extend(
-            failures
-                .iter()
-                .map(|failure| format!("{}: {}", failure.id, failure.status)),
-        );
+        record_validation_repair_start(&mut self.notebook, failures);
         self.transition_phase(ExecutionPhase::Repair, "required validation failed")?;
         let diagnostics = failures
             .iter()
@@ -5464,7 +6733,7 @@ impl<'a> GatewayAgent<'a> {
                 "Repair validation attempt {attempt} for RustGrid ticket {}. Inspect the current diff and make the smallest correct changes needed for these failures. Do not commit, push, create branches, or open pull requests.\n\n{diagnostics}",
                 self.manifest.ticket_key
             ),
-            false,
+            true,
         )
     }
 
@@ -5476,14 +6745,33 @@ impl<'a> GatewayAgent<'a> {
         let mut initial = json!({"role": "user", "content": prompt});
         let mut turns = VecDeque::<Vec<Value>>::new();
         let mut registration_attempt = 0;
+        let mut previous_context_phase = None;
         loop {
             self.ensure_active_or_checkpoint_cancellation()?;
             if let Some(outcome) = self.prepare_next_model_call(allow_budget_handoff)? {
                 return Ok(outcome);
             }
             let artifact_repair = self.phases.active() == ExecutionPhase::ArtifactRepair;
+            let active_context_phase = self.phases.active();
+            if previous_context_phase.is_some_and(|phase| phase != active_context_phase) {
+                turns.clear();
+            }
+            previous_context_phase = Some(active_context_phase);
             initial["content"] = Value::String(if artifact_repair {
                 compact_impact_map_repair_context(self.impact_map_failure.as_ref(), &self.notebook)
+            } else if matches!(
+                active_context_phase,
+                ExecutionPhase::Implementation | ExecutionPhase::Repair
+            ) {
+                let context = serde_json::to_string(&self.implementation_start_context()?)?;
+                let repair_context = if active_context_phase == ExecutionPhase::Repair {
+                    truncate_text(prompt, 12_000)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{repair_context}\n\nRustGrid implementation start context (authoritative):\n{context}"
+                )
             } else {
                 format!(
                     "{prompt}\n\nRustGrid worker notebook (authoritative compact continuation state):\n{}",
@@ -5521,8 +6809,34 @@ impl<'a> GatewayAgent<'a> {
                 &mut request,
                 &initial,
                 &mut turns,
-                usize::try_from(self.manifest.ai_gateway.maximum_input_tokens).unwrap_or_default(),
+                phase_request_input_ceiling(
+                    active_phase,
+                    usize::try_from(self.manifest.ai_gateway.maximum_input_tokens)
+                        .unwrap_or_default(),
+                ),
             )?;
+            validate_provider_request_envelope(&request)?;
+            if !constrain_request_to_cost_limit(&mut request, &self.cost_guard)? {
+                self.checkpoint_notebook(false)?;
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.model_cost_preflight_stopped",
+                        "phase": active_phase,
+                        "estimated_cost_micros": self.cost_guard.estimated_cost_micros,
+                        "hard_limit_micros": self.cost_guard.hard_limit_micros,
+                        "model_calls_used": self.phases.total_calls(),
+                        "source_mutation_observed": self.tool_usage.successful_writes > 0,
+                        "resumable": true,
+                    }),
+                    "model cost preflight",
+                );
+                return Ok(ImplementationOutcome {
+                    summary: "The next model call could not fit inside the hard estimated-cost envelope; preserved work is resumable.".into(),
+                    budget_exhausted: true,
+                    explicit_declaration: self.declaration.clone(),
+                });
+            }
             validate_provider_request_envelope(&request)?;
 
             let call_phase = self.phases.active();
@@ -5547,7 +6861,12 @@ impl<'a> GatewayAgent<'a> {
                     "budget": self.budget_telemetry(),
                 }),
             )?;
-            let response = match self.api.ai_response(request.clone(), &registration) {
+            let execution_deadline = hosted_execution_deadline(self.execution_started_at)?;
+            let response = match self.api.ai_response_until(
+                request.clone(),
+                &registration,
+                Some(execution_deadline),
+            ) {
                 Ok(response) => {
                     registration_attempt = 0;
                     response
@@ -5612,10 +6931,14 @@ impl<'a> GatewayAgent<'a> {
                                 "AI request registration failure telemetry",
                             );
                             if retryable {
-                                thread::sleep(registration_retry_delay(
-                                    registration_attempt,
-                                    registration.semantic_call_id,
-                                ));
+                                sleep_before_execution_retry(
+                                    Some(execution_deadline),
+                                    registration_retry_delay(
+                                        registration_attempt,
+                                        registration.semantic_call_id,
+                                    ),
+                                    "AI request registration retry",
+                                )?;
                                 registration_attempt = registration_attempt.saturating_add(1);
                                 continue;
                             }
@@ -5630,7 +6953,7 @@ impl<'a> GatewayAgent<'a> {
                                     self.api.execution_attempt,
                                     model_call,
                                     self.manifest.ai_gateway.model.as_str(),
-                                    self.phases.budgeted_calls(),
+                                    self.phases.total_calls(),
                                     self.budget_telemetry(),
                                     json!(&self.notebook),
                                 ),
@@ -5683,7 +7006,7 @@ impl<'a> GatewayAgent<'a> {
                 }
             };
             self.record_cache_observability(&request, &response);
-            self.observe_model_cost(&response);
+            self.observe_model_cost(&request, &response)?;
             let output = response
                 .get("output")
                 .and_then(Value::as_array)
@@ -5796,6 +7119,17 @@ impl<'a> GatewayAgent<'a> {
                             "RustGrid guardrail: do not finish yet; {required_action} using the required structured tool."
                         )
                     }));
+                    if matches!(
+                        self.phases.active(),
+                        ExecutionPhase::Implementation | ExecutionPhase::Repair
+                    ) && let Some(summary) = self.implementation_progress_halt_summary()?
+                    {
+                        return Ok(ImplementationOutcome {
+                            summary,
+                            budget_exhausted: false,
+                            explicit_declaration: self.declaration.clone(),
+                        });
+                    }
                     turns.push_back(turn);
                     compact_hosted_turns(&mut turns);
                     continue;
@@ -5844,6 +7178,13 @@ impl<'a> GatewayAgent<'a> {
                     .and_then(|path| repo_file_sha256(&self.repo.root, path));
                 let intended_change_sha256 =
                     is_source_mutation_tool(&name).then(|| tool_intent_sha256(&name, &arguments));
+                let inspected_before = self.notebook.files_inspected.len();
+                let read_ranges_before = self.notebook.read_ranges_inspected.len();
+                let searches_before = self.notebook.searches_completed.len();
+                let failed_reads_before = self.tool_usage.failed_reads;
+                let mut progress_class = ToolProgressClass::Neutral;
+                let mut progress_detail = String::new();
+                let mut verified_repository_progress = false;
                 let result = match self.execute_tool(&name, &arguments) {
                     Ok(output) => {
                         self.last_successful_action = json!({
@@ -5853,11 +7194,9 @@ impl<'a> GatewayAgent<'a> {
                             "target": target,
                         });
                         if is_source_mutation_tool(&name) {
-                            self.tool_usage.successful_writes =
-                                self.tool_usage.successful_writes.saturating_add(1);
-                            self.last_source_progress_call = self.phases.total_calls();
-                            self.cost_guard.repository_progress_score += 1.0;
-                            let attempt = WriteAttemptRecord {
+                            self.notebook.implementation_substate =
+                                ImplementationSubstate::Mutating;
+                            let mut attempt = WriteAttemptRecord {
                                 attempt_index: self.notebook.write_attempts.len(),
                                 change_id: change_id.clone().unwrap_or_default(),
                                 target: target.clone().unwrap_or_default(),
@@ -5871,7 +7210,15 @@ impl<'a> GatewayAgent<'a> {
                                     .as_deref()
                                     .and_then(|path| repo_file_sha256(&self.repo.root, path)),
                             };
-                            let target_was_modified = attempt_modified_target(&attempt);
+                            let changed_paths = completion_changed_paths(
+                                self.repo,
+                                &self.manifest.github.base_sha,
+                            )?;
+                            let target_was_modified = attempt_modified_target(&attempt)
+                                && changed_paths.contains(&attempt.target);
+                            if !target_was_modified {
+                                attempt.status = WriteAttemptStatus::NoChange;
+                            }
                             self.notebook.write_attempts.push(attempt.clone());
                             if let Some(change) = self
                                 .notebook
@@ -5880,19 +7227,28 @@ impl<'a> GatewayAgent<'a> {
                                 .find(|change| change.change_id == attempt.change_id)
                             {
                                 for target in &mut change.targets {
-                                    if target.path == attempt.target {
+                                    if target_was_modified && target.path == attempt.target {
                                         target.status = IntendedChangeStatus::Applied;
                                     }
                                 }
-                                change.status =
-                                    if change.targets.iter().all(|target| {
-                                        target.status == IntendedChangeStatus::Applied
-                                    }) {
-                                        IntendedChangeStatus::Applied
-                                    } else {
-                                        roll_up_target_statuses(&change.targets)
-                                    };
+                                change.status = roll_up_target_statuses(&change.targets);
                                 change.attempts.push(attempt);
+                            }
+                            if target_was_modified {
+                                self.tool_usage.successful_writes =
+                                    self.tool_usage.successful_writes.saturating_add(1);
+                                self.last_source_progress_call = self.phases.total_calls();
+                                self.cost_guard.repository_progress_score += 1.0;
+                                self.notebook.implementation_substate =
+                                    ImplementationSubstate::Mutating;
+                                verified_repository_progress = true;
+                                progress_class = ToolProgressClass::Productive;
+                                progress_detail = "verified repository mutation".into();
+                            } else {
+                                progress_class = ToolProgressClass::Duplicate;
+                                progress_detail =
+                                    "mutation tool returned successfully but repository content did not change"
+                                        .into();
                             }
                             self.diff_reviewed = false;
                             self.diff_review_cursor = 0;
@@ -5924,8 +7280,43 @@ impl<'a> GatewayAgent<'a> {
                                 }
                             }
                             self.notebook.failed_changes = self.tool_failures.clone();
-                            self.invalidate_validation_after_mutation()?;
+                            if target_was_modified {
+                                self.invalidate_validation_after_mutation()?;
+                            }
                             self.reconcile_authoritative_target_state()?;
+                        } else if matches!(
+                            name.as_str(),
+                            "read_file" | "read_files" | "related_tests"
+                        ) {
+                            let (class, detail) = successful_read_progress(
+                                &name,
+                                self.notebook.files_inspected.len() > inspected_before,
+                                self.notebook.read_ranges_inspected.len() > read_ranges_before,
+                                self.notebook.searches_completed.len() > searches_before,
+                                self.tool_usage.failed_reads > failed_reads_before,
+                            );
+                            progress_class = class;
+                            progress_detail = detail.into();
+                        } else if name == "search_text" {
+                            if self.notebook.searches_completed.len() > searches_before {
+                                progress_class = ToolProgressClass::Productive;
+                                progress_detail = "new targeted repository search completed".into();
+                            } else {
+                                progress_class = ToolProgressClass::Duplicate;
+                                progress_detail =
+                                    "repository search did not add new evidence".into();
+                            }
+                        } else if name == "report_write_progress" {
+                            let semantics = informational_write_progress_semantics();
+                            progress_class = semantics.0;
+                            verified_repository_progress = semantics.1;
+                            progress_detail =
+                                "informational progress report; repository state was not changed"
+                                    .into();
+                        } else {
+                            progress_class = ToolProgressClass::Productive;
+                            progress_detail =
+                                "orchestration artifact or focused action completed".into();
                         }
                         json!({"ok": true, "output": truncate_text(&output, MAX_TOOL_OUTPUT_BYTES)})
                     }
@@ -6115,6 +7506,10 @@ impl<'a> GatewayAgent<'a> {
                                 }),
                                 "mutation preflight rejection",
                             );
+                            mark_mutation_preflight_blocker(
+                                &mut self.write_blocker,
+                                &preflight.target,
+                            );
                             mutation_preflight_halt = Some(format!(
                                 "Implementation paused after non-retryable mutation preflight rejection `{}` for `{}`. Repair the persisted plan metadata and resume without repeating discovery or planning.",
                                 preflight.code, preflight.target
@@ -6182,9 +7577,46 @@ impl<'a> GatewayAgent<'a> {
                         }
                     }
                 };
-                if let Err(error) =
-                    self.checkpoint_notebook(result["ok"] == true && is_source_mutation_tool(&name))
-                {
+                if result["ok"] != true {
+                    let error = result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool operation failed");
+                    progress_detail = truncate_text(error, 1_000);
+                    if matches!(name.as_str(), "read_file" | "read_files" | "related_tests") {
+                        if name != "read_files" {
+                            self.tool_usage.failed_reads =
+                                self.tool_usage.failed_reads.saturating_add(1);
+                        }
+                        progress_class = read_error_progress_class(error);
+                    } else if name == "search_text" {
+                        progress_class = if error.contains("duplicate_search") {
+                            ToolProgressClass::Duplicate
+                        } else {
+                            ToolProgressClass::RecoverableFailure
+                        };
+                    } else if name == "run_focused_command" {
+                        progress_class = ToolProgressClass::RecoverableFailure;
+                        self.notebook.implementation_substate = ImplementationSubstate::Repairing;
+                        self.transition_phase(
+                            ExecutionPhase::Repair,
+                            "focused implementation validation failed and requires source repair",
+                        )?;
+                    } else if is_source_mutation_tool(&name) {
+                        progress_class = ToolProgressClass::RecoverableFailure;
+                        self.notebook.implementation_substate = ImplementationSubstate::Repairing;
+                    } else {
+                        progress_class = ToolProgressClass::BlockingFailure;
+                    }
+                }
+                self.record_tool_progress(
+                    &name,
+                    target.clone(),
+                    progress_class,
+                    progress_detail,
+                    verified_repository_progress,
+                );
+                if let Err(error) = self.checkpoint_notebook(verified_repository_progress) {
                     self.append_event_recoverable(
                         "progress",
                         json!({
@@ -6218,6 +7650,8 @@ impl<'a> GatewayAgent<'a> {
                         "status": if result["ok"] == true { "completed" } else { "failed" },
                         "phase": self.phases.active(),
                         "model_call": self.phases.total_calls(),
+                        "progress_class": progress_class,
+                        "repository_progress": verified_repository_progress,
                         "usage": self.tool_usage,
                         "budget": self.budget_telemetry(),
                         "notebook": event_notebook,
@@ -6240,10 +7674,8 @@ impl<'a> GatewayAgent<'a> {
                     "output": serde_json::to_string(&result)?
                 }));
             }
-            if self.observe_implementation_progress()? {
-                mutation_preflight_halt.get_or_insert_with(|| {
-                    "Implementation paused after a four-call zero-progress window. Target state was reconciled and the preserved result is resumable without repeating discovery or planning.".into()
-                });
+            if let Some(summary) = self.implementation_progress_halt_summary()? {
+                mutation_preflight_halt.get_or_insert(summary);
             }
             if self.reconcile_authoritative_target_state()?
                 == ImplementationCompletionStatus::ReadyForValidation
@@ -6459,7 +7891,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             serde_json::to_string(validation).unwrap_or_else(|_| "[]".into()),
             truncate_text(&diff, 96 * 1024),
         );
-        let request = json!({
+        let mut request = json!({
             "model": self.manifest.ai_gateway.model,
             "input": [{"role": "user", "content": prompt}],
             "instructions": completion_evaluator_instructions(),
@@ -6484,6 +7916,23 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .phase_calls(ExecutionPhase::CompletionEvaluation),
             );
         for evaluator_attempt in 0..attempts_available {
+            if !constrain_request_to_cost_limit(&mut request, &self.cost_guard)? {
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.model_cost_preflight_stopped",
+                        "phase": ExecutionPhase::CompletionEvaluation,
+                        "estimated_cost_micros": self.cost_guard.estimated_cost_micros,
+                        "hard_limit_micros": self.cost_guard.hard_limit_micros,
+                        "model_calls_used": self.phases.total_calls(),
+                        "source_mutation_observed": !changed_paths.is_empty(),
+                        "resumable": true,
+                    }),
+                    "completion evaluation model cost preflight",
+                );
+                break;
+            }
+            validate_provider_request_envelope(&request)?;
             let model_call = self.phases.begin_model_call()?;
             self.api.append_event(
                 "progress",
@@ -6504,10 +7953,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 ExecutionPhase::CompletionEvaluation,
                 0,
             );
-            let evaluated_response = match self.api.ai_response(request.clone(), &registration) {
+            let execution_deadline = hosted_execution_deadline(self.execution_started_at)?;
+            let evaluated_response = match self.api.ai_response_until(
+                request.clone(),
+                &registration,
+                Some(execution_deadline),
+            ) {
                 Ok(response) => {
                     self.record_cache_observability(&request, &response);
-                    self.observe_model_cost(&response);
+                    self.observe_model_cost(&request, &response)?;
                     Some(response)
                 }
                 Err(error) => {
@@ -6528,7 +7982,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                                     self.api.execution_attempt,
                                     model_call,
                                     self.manifest.ai_gateway.model.as_str(),
-                                    self.phases.budgeted_calls(),
+                                    self.phases.total_calls(),
                                     self.budget_telemetry(),
                                     json!(&self.notebook),
                                 ),
@@ -6744,11 +8198,32 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .and_then(Value::as_u64)
                     .unwrap_or(start_line.saturating_add(399))
                     .min(start_line.saturating_add(999));
+                let result = read_repo_file_result(
+                    &self.repo.root,
+                    path,
+                    start_line,
+                    end_line,
+                    MAX_TOOL_OUTPUT_BYTES,
+                );
+                if result.status == FileReadStatus::Error {
+                    bail!(
+                        "{}: {}",
+                        result.error_code.as_deref().unwrap_or("read_failed"),
+                        result.error_message.as_deref().unwrap_or("read failed")
+                    );
+                }
+                push_unique(
+                    &mut self.notebook.read_ranges_inspected,
+                    format!("{path}:{start_line}-{end_line}"),
+                );
+                if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+                    record_centralized_discovery_finding(&mut self.notebook, reason);
+                }
                 push_unique(&mut self.notebook.files_inspected, path.to_owned());
                 if self.phases.active() == ExecutionPhase::Repair {
                     self.repair_read_targets.insert(path.to_owned());
                 }
-                read_repo_file(&self.repo.root, path, start_line, end_line)
+                Ok(serde_json::to_string(&result)?)
             }
             "read_files" => {
                 self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
@@ -6759,23 +8234,113 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 if paths.is_empty() || paths.len() > 20 {
                     bail!("read_files requires between 1 and 20 paths");
                 }
-                let mut output = String::new();
-                for path in paths {
-                    let path = path
-                        .as_str()
-                        .filter(|path| !path.is_empty() && path.len() <= 4_096)
-                        .context("read_files path is malformed")?;
-                    push_unique(&mut self.notebook.files_inspected, path.to_owned());
-                    if !output.is_empty() {
-                        output.push_str("\n\n");
-                    }
-                    output.push_str(&format!("===== {path} =====\n"));
-                    output.push_str(&read_repo_file(&self.repo.root, path, 1, 800)?);
-                    if output.len() > MAX_TOOL_OUTPUT_BYTES {
-                        break;
+                let maximum_lines = object
+                    .get("maximum_lines_per_file")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(800)
+                    .clamp(1, 1_000);
+                let inspected_before_batch = self
+                    .notebook
+                    .files_inspected
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                // Admission is a distinct first pass: every requested path receives structured
+                // malformed, unsafe, missing, or ready metadata before any valid file is read.
+                let prevalidated = prevalidate_batch_read_paths(&self.repo.root, paths);
+                let (batch, batch_failures) = read_prevalidated_repo_files_with_fallback(
+                    &self.repo.root,
+                    &prevalidated,
+                    maximum_lines,
+                    MAX_TOOL_OUTPUT_BYTES,
+                );
+                let files = batch.files;
+                for result in &files {
+                    if result.status == FileReadStatus::Success {
+                        push_unique(&mut self.notebook.files_inspected, result.path.clone());
+                        if self.phases.active() == ExecutionPhase::Repair {
+                            self.repair_read_targets.insert(result.path.clone());
+                        }
                     }
                 }
-                Ok(truncate_text(&output, MAX_TOOL_OUTPUT_BYTES))
+                self.tool_usage.failed_reads =
+                    self.tool_usage.failed_reads.saturating_add(batch_failures);
+                if files
+                    .iter()
+                    .any(|result| result.status == FileReadStatus::Success)
+                    && let Some(reason) = object.get("reason").and_then(Value::as_str)
+                {
+                    record_centralized_discovery_finding(&mut self.notebook, reason);
+                }
+                for failed in files
+                    .iter()
+                    .filter(|result| result.status == FileReadStatus::Error)
+                {
+                    self.record_tool_progress(
+                        "read_file",
+                        Some(failed.path.clone()),
+                        read_error_progress_class(
+                            failed.error_code.as_deref().unwrap_or("read_failed"),
+                        ),
+                        format!(
+                            "{}: {}; valid_line_range={}; individual_fallback_attempted={}",
+                            failed.error_code.as_deref().unwrap_or("read_failed"),
+                            failed.error_message.as_deref().unwrap_or("read failed"),
+                            failed.valid_line_range.as_deref().unwrap_or("unavailable"),
+                            failed.fallback_attempted,
+                        ),
+                        false,
+                    );
+                }
+                for succeeded in files
+                    .iter()
+                    .filter(|result| result.status == FileReadStatus::Success)
+                {
+                    let new_evidence = !inspected_before_batch.contains(succeeded.path.as_str());
+                    self.record_tool_progress(
+                        "read_file",
+                        Some(succeeded.path.clone()),
+                        if new_evidence {
+                            ToolProgressClass::Productive
+                        } else {
+                            ToolProgressClass::Duplicate
+                        },
+                        if !new_evidence {
+                            "batch read repeated previously inspected repository content"
+                        } else if succeeded.fallback_attempted {
+                            "individual fallback recovered the batch read"
+                        } else {
+                            "batch read returned repository content"
+                        },
+                        false,
+                    );
+                }
+                let fallback_results = files
+                    .iter()
+                    .filter(|result| result.fallback_attempted)
+                    .map(|result| {
+                        json!({
+                            "path": result.path,
+                            "status": result.status,
+                            "error_code": result.error_code,
+                            "error_message": result.error_message,
+                            "valid_line_range": result.valid_line_range,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if !fallback_results.is_empty() {
+                    self.append_event_recoverable(
+                        "progress",
+                        json!({
+                            "event_type": "worker.batch_read_fallback",
+                            "fallback": "individual_read_once",
+                            "results": fallback_results,
+                            "model_call_consumed": false,
+                        }),
+                        "batch-read individual fallback",
+                    );
+                }
+                Ok(serde_json::to_string(&BatchReadResult { files })?)
             }
             "search_text" => {
                 self.tool_usage.searches = self.tool_usage.searches.saturating_add(1);
@@ -6816,12 +8381,44 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     )?;
                     return Err(error);
                 }
-                let result = search_repo(&self.repo.root, path, query, &extensions, context_lines)?;
+                let discovery_coverage = localized_discovery_coverage(&self.notebook);
+                let known_consumers = self
+                    .notebook
+                    .files_inspected
+                    .iter()
+                    .chain(self.notebook.discovery_paths_sampled.iter())
+                    .filter(|path| !localized_discovery_core_path(path))
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let maximum_new_consumers = (self.phases.active() == ExecutionPhase::Discovery
+                    && localized_visual_goal(&self.notebook.goal)
+                    && discovery_coverage.centralized_abstraction)
+                    .then(|| 3_usize.saturating_sub(discovery_coverage.representative_consumers));
+                let result = search_repo(
+                    &self.repo.root,
+                    path,
+                    query,
+                    &extensions,
+                    context_lines,
+                    maximum_new_consumers,
+                    &known_consumers,
+                )?;
                 self.search_guard.record(signature, result.truncated);
+                if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+                    record_centralized_discovery_finding(&mut self.notebook, reason);
+                }
                 push_unique(
                     &mut self.notebook.searches_completed,
                     format!("{mode}:{path}:{query}"),
                 );
+                for matched_path in &result.matched_paths {
+                    if !localized_discovery_core_path(matched_path) {
+                        push_unique(
+                            &mut self.notebook.discovery_paths_sampled,
+                            matched_path.clone(),
+                        );
+                    }
+                }
                 if self.tool_usage.searches == 4 && self.impact_map.is_none() {
                     self.emit_guardrail(
                         "discovery_search_warning",
@@ -6858,6 +8455,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     })
                     .take(100)
                     .collect::<Vec<_>>();
+                if let Some(reason) = object.get("reason").and_then(Value::as_str) {
+                    record_centralized_discovery_finding(&mut self.notebook, reason);
+                }
+                for path in &related {
+                    push_unique(
+                        &mut self.notebook.searches_completed,
+                        format!("related_test:{path}"),
+                    );
+                }
                 Ok(if related.is_empty() {
                     "no related test files found".into()
                 } else {
@@ -6957,12 +8563,14 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     &source_tree_hash,
                 );
                 let dependency_lock_hash = dependency_lock_fingerprint(&self.repo.root)?;
+                let environment_fingerprint =
+                    relevant_environment_fingerprint(&self.manifest.execution_policy)?;
                 let fingerprint = validation_fingerprint(
                     command_text,
                     self.repo.root.to_string_lossy().as_ref(),
                     &source_tree_hash,
                     &dependency_lock_hash,
-                    &self.manifest.execution_policy.sandbox.mode,
+                    &environment_fingerprint,
                 );
                 if let Some(evidence) =
                     passed_evidence(&self.notebook.validation_evidence, &fingerprint).cloned()
@@ -7209,12 +8817,57 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 self.accept_impact_map(map, source, 1.0, None)
             }
             "record_implementation_plan" => {
+                let mut repair = recover_planning_repair_state(
+                    &self.repo.root,
+                    object,
+                    self.phases.total_calls(),
+                );
                 let mut plan: ImplementationPlan =
-                    serde_json::from_value(Value::Object(object.clone()))
-                        .context("implementation plan is malformed")?;
+                    match serde_json::from_value(Value::Object(object.clone())) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            repair
+                                .invalid_fields
+                                .push(format!("$: {}", truncate_text(&error.to_string(), 500)));
+                            self.notebook.planning_repair = Some(repair.clone());
+                            self.append_event_recoverable(
+                                "progress",
+                                json!({
+                                    "event_type": "worker.implementation_plan_repair_required",
+                                    "valid_planned_changes": repair.valid_planned_changes,
+                                    "invalid_fields": repair.invalid_fields,
+                                    "repair_scope": "invalid_fields_only",
+                                }),
+                                "implementation plan repair",
+                            );
+                            bail!(
+                                "implementation_plan_repair_required: {}",
+                                serde_json::to_string(&repair.invalid_fields)?
+                            );
+                        }
+                    };
+                merge_preserved_plan_fragments(
+                    &mut plan.planned_changes,
+                    self.notebook.planning_repair.as_ref(),
+                );
                 let normalized_legacy_targets =
-                    normalize_planned_changes(&mut plan.planned_changes)?;
-                validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
+                    match normalize_planned_changes(&mut plan.planned_changes).and_then(|count| {
+                        validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
+                        Ok(count)
+                    }) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            repair.invalid_fields.push(format!(
+                                "$.planned_changes: {}",
+                                truncate_text(&error.to_string(), 500)
+                            ));
+                            self.notebook.planning_repair = Some(repair.clone());
+                            bail!(
+                                "implementation_plan_repair_required: {}",
+                                serde_json::to_string(&repair.invalid_fields)?
+                            );
+                        }
+                    };
                 if !matches!(plan.implementation_status.as_str(), "ready" | "blocked")
                     || (plan.implementation_status == "ready" && plan.planned_changes.is_empty())
                     || plan.planned_changes.iter().any(|change| {
@@ -7224,7 +8877,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                             || change.acceptance_criteria.is_empty()
                     })
                 {
-                    bail!("implementation plan is incomplete or malformed");
+                    repair.invalid_fields.push(
+                        "$: implementation_status and every planned change require complete fields"
+                            .into(),
+                    );
+                    self.notebook.planning_repair = Some(repair.clone());
+                    bail!(
+                        "implementation_plan_repair_required: {}",
+                        serde_json::to_string(&repair.invalid_fields)?
+                    );
                 }
                 if plan.implementation_status == "ready"
                     && self.impact_map.as_ref().is_some_and(|map| {
@@ -7247,8 +8908,14 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                             .any(|criterion| !planned_criteria.contains(criterion.trim()))
                     })
                 {
+                    repair.invalid_fields.push(
+                        "$.planned_changes[*].acceptance_criteria: ready plan must map every impact-map criterion"
+                            .into(),
+                    );
+                    self.notebook.planning_repair = Some(repair.clone());
                     bail!(
-                        "ready implementation plan must map every impact-map acceptance criterion"
+                        "implementation_plan_repair_required: {}",
+                        serde_json::to_string(&repair.invalid_fields)?
                     );
                 }
                 let target_count = plan
@@ -7257,12 +8924,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .map(|change| change.targets.len())
                     .sum::<usize>();
                 let complexity_call_limit = self.phases.apply_ticket_complexity(target_count);
-                self.cost_guard.hard_limit_micros = match target_count {
-                    0 | 1 => 1_000_000,
-                    2..=4 => 2_000_000,
-                    5..=12 => 5_000_000,
-                    _ => 10_000_000,
-                };
+                self.cost_guard.hard_limit_micros = model_cost_limit_for_target_count(target_count);
                 self.api.append_event(
                     "progress",
                     json!({
@@ -7277,6 +8939,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 )?;
                 self.notebook.planned_changes = plan.planned_changes.clone();
                 self.notebook.intended_changes = intended_changes_from_plan(&plan.planned_changes);
+                self.notebook.implementation_substate = ImplementationSubstate::Preparing;
+                self.notebook.planning_repair = None;
                 self.notebook.write_attempts.clear();
                 self.notebook.remaining_work_v2 =
                     derive_remaining_work(&self.notebook.intended_changes);
@@ -7285,6 +8949,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 self.notebook.blocking_unknowns = plan.blocking_unknowns.clone();
                 let ready = plan.implementation_status == "ready";
                 self.implementation_plan = Some(plan);
+                self.guided_first_write_recovery_issued = false;
+                self.last_repository_progress_call = 0;
                 if ready {
                     self.blocked_plan_recorded_at = None;
                     self.transition_phase(
@@ -7305,15 +8971,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             "report_write_progress" => {
                 let status = required_tool_string(object, "status", 64)?;
                 let reason = required_tool_string(object, "reason", 2_000)?;
-                if !matches!(status, "blocked" | "ready_to_write" | "no_change_required") {
-                    bail!("write progress status is unsupported");
-                }
-                self.write_progress_reported = true;
-                if status == "blocked" {
-                    push_unique(&mut self.notebook.blocking_unknowns, reason.to_owned());
-                    self.write_blocker = Some(reason.to_owned());
-                }
-                Ok(format!("recorded write progress: {status}: {reason}"))
+                informational_write_progress(status, reason)
             }
             "declare_implementation" => {
                 if !self.diff_reviewed {
@@ -7390,18 +9048,6 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 phase.as_str()
             );
         }
-        if matches!(
-            phase,
-            ExecutionPhase::Implementation | ExecutionPhase::Repair
-        ) && self.phases.total_calls() >= self.phases.first_write_attempt_deadline()
-            && self.tool_usage.writes == 0
-            && !is_source_mutation_tool(name)
-            && name != "report_write_progress"
-        {
-            bail!(
-                "first_write_threshold_reached: attempt a planned write or report a precise blocker"
-            );
-        }
         if name == "search_text"
             && phase != ExecutionPhase::Discovery
             && arguments
@@ -7422,6 +9068,27 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             .is_empty()
         {
             bail!("targeted repository inspection requires a concrete reason");
+        }
+        if phase == ExecutionPhase::Discovery
+            && matches!(
+                name,
+                "list_files" | "read_file" | "read_files" | "search_text" | "related_tests"
+            )
+        {
+            let requested_paths = discovery_requested_paths(name, arguments);
+            validate_localized_discovery_scope(&self.notebook, &requested_paths)?;
+        }
+        if name == "run_focused_command"
+            && matches!(
+                phase,
+                ExecutionPhase::Implementation | ExecutionPhase::Repair
+            )
+            && self.tool_usage.successful_writes == 0
+            && completion_changed_paths(self.repo, &self.manifest.github.base_sha)?.is_empty()
+        {
+            bail!(
+                "validation_forbidden_no_implementation_changes: apply at least one planned target before focused validation"
+            );
         }
         if matches!(
             phase,
@@ -7445,6 +9112,11 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .and_then(Value::as_str)
                     .into_iter()
                     .collect::<Vec<_>>(),
+                _ if is_source_mutation_tool(name) => arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
             if !paths.is_empty() && paths.iter().any(|path| !self.path_is_targeted(path)) {
@@ -7452,6 +9124,14 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     "implementation and repair reads must target a planned edit, mapped criterion, or failed write"
                 );
             }
+            let current_target = self.current_implementation_target();
+            validate_current_target_scope(
+                current_target.as_ref(),
+                self.guided_first_write_recovery_issued,
+                self.tool_usage.successful_writes,
+                &paths,
+                is_source_mutation_tool(name),
+            )?;
         }
         Ok(())
     }
@@ -7663,7 +9343,7 @@ fn hosted_tools() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "read_files",
-            "description": "Read up to 20 selected UTF-8 repository files in one batched operation.",
+            "description": "Read up to 20 selected UTF-8 repository files with independent per-file results and deterministic individual fallback for failures.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -7673,9 +9353,10 @@ fn hosted_tools() -> Vec<Value> {
                         "minItems": 1,
                         "maxItems": 20
                     },
+                    "maximum_lines_per_file": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000},
                     "reason": {"type": "string"}
                 },
-                "required": ["paths", "reason"],
+                "required": ["paths", "maximum_lines_per_file", "reason"],
                 "additionalProperties": false
             },
             "strict": true
@@ -7995,10 +9676,11 @@ The active hard execution phase is `{}`. Use only tools admitted for that phase 
 soon as its required structured artifact is complete. Discovery must end with record_impact_map; \
 planning must end with record_implementation_plan; implementation must make planned edits rather \
 than restart broad exploration; diff review must use repository_snapshot and \
-declare_implementation. For theme or visual-system work, the impact map must explicitly consider \
-the theme provider, design tokens and CSS variables, global styles, component-library \
-configuration, shared primitives, layouts, navigation, hardcoded page colors, interaction and \
-semantic states, charts, illustrations/assets, light/dark behavior, and tests or snapshots. \
+declare_implementation. For localized theme or visual-system work, discovery should identify the \
+theme provider, selector, centralized token source, focused tests, and package validation commands. \
+Once centralized semantic variables are confirmed, sample at most three representative consumers \
+and stop discovery unless a targeted search proves a direct hardcoded-color exception. Keep each \
+discovery request below roughly 12,000 input tokens where possible. \
 Use only the provided repository tools. Inspect the smallest relevant scope, follow repository \
 instructions, and record a repository-level impact map before editing. Batch repository discovery \
 within each response instead of spending one model call per file. Implement the mission, add focused \
@@ -8103,11 +9785,11 @@ fn visual_impact_guidance(ticket: &str) -> &'static str {
     .iter()
     .any(|needle| ticket.contains(needle))
     {
-        "\n\nVisual-system impact-map minimums: inspect the theme provider; design tokens \
-and CSS variables; global styles; Tailwind or component-library configuration; shared \
-components; layouts and navigation; hardcoded colors; charts; illustrations and assets; \
-light/dark behavior; and tests or visual snapshots. Record explicit evidence when an area \
-is not applicable or one shared abstraction is sufficient."
+        "\n\nVisual-system discovery scope: identify the theme provider, selector, centralized \
+design-token or CSS-variable source, existing focused tests, and package validation commands. \
+If centralized semantic variables are confirmed, inspect at most three representative consumers. \
+Do not enumerate every shared UI component unless a targeted search reveals direct hardcoded \
+colors. Record the compact impact map as soon as those boundaries are established."
     } else {
         ""
     }
@@ -8204,7 +9886,61 @@ fn run_quality_gates(
     required_gates: &mut Vec<RequiredGate>,
     usage: &mut ToolUsage,
     validation_started_at: Instant,
+    execution_started_at: Instant,
 ) -> Result<Vec<ValidationResult>> {
+    run_quality_gates_with_capture(
+        api,
+        manifest,
+        repo,
+        running,
+        policy,
+        validation_round,
+        ledger,
+        required_gates,
+        usage,
+        validation_started_at,
+        execution_started_at,
+        |command_text, cwd, running, timeout, max_output_bytes, environment_allowlist, limits| {
+            command::capture_hosted_cancellable_with_environment(
+                command_text,
+                cwd,
+                running,
+                timeout,
+                max_output_bytes,
+                environment_allowlist,
+                limits,
+                containment,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_quality_gates_with_capture<F>(
+    api: &HostedApiClient,
+    manifest: &HostedManifest,
+    repo: &Repo,
+    running: &Arc<AtomicBool>,
+    policy: &HostedExecutionPolicy,
+    validation_round: u32,
+    ledger: &mut Vec<ValidationEvidence>,
+    required_gates: &mut Vec<RequiredGate>,
+    usage: &mut ToolUsage,
+    validation_started_at: Instant,
+    execution_started_at: Instant,
+    capture: F,
+) -> Result<Vec<ValidationResult>>
+where
+    F: Fn(
+        &str,
+        &Path,
+        &AtomicBool,
+        Duration,
+        usize,
+        Option<&[String]>,
+        Option<command::ChildLimits>,
+    ) -> Result<command::CommandOutput>,
+{
     let allowlist = policy.child_environment_allowlist();
     let workflow_run_attempt = manifest
         .execution
@@ -8213,11 +9949,27 @@ fn run_quality_gates(
         .and_then(|execution| execution.workflow_run_attempt)
         .context("validated manifest has no GitHub workflow run attempt")?;
     let mut results = Vec::new();
-    for gate in policy.quality_gates.iter().filter(|gate| gate.required) {
+    let mut ordered_gates = policy
+        .quality_gates
+        .iter()
+        .filter(|gate| gate.required)
+        .collect::<Vec<_>>();
+    ordered_gates.sort_by_key(|gate| {
+        usize::from(
+            classify_validation_gate(&gate.id, &gate.command) != ValidationGateType::FocusedTest,
+        )
+    });
+    for gate in ordered_gates {
         ensure_running(running)?;
-        let Some(validation_remaining) = Duration::from_secs(8 * 60)
+        let validation_remaining = Duration::from_secs(8 * 60)
             .checked_sub(validation_started_at.elapsed())
-            .filter(|remaining| !remaining.is_zero())
+            .filter(|remaining| !remaining.is_zero());
+        let execution_remaining = MAX_HOSTED_EXECUTION_DURATION
+            .checked_sub(execution_started_at.elapsed())
+            .filter(|remaining| !remaining.is_zero());
+        let Some(validation_remaining) = validation_remaining
+            .zip(execution_remaining)
+            .map(|(validation, execution)| validation.min(execution))
         else {
             api.append_event(
                 "validation",
@@ -8225,7 +9977,8 @@ fn run_quality_gates(
                     "event_type": "worker.wall_clock_guard_triggered",
                     "phase": "validation",
                     "gate_id": gate.id,
-                    "limit_seconds": 8 * 60,
+                    "validation_limit_seconds": 8 * 60,
+                    "execution_limit_seconds": MAX_HOSTED_EXECUTION_DURATION.as_secs(),
                     "status": "timed_out",
                 }),
             )?;
@@ -8240,12 +9993,13 @@ fn run_quality_gates(
         let source_tree_hash = repository_state_fingerprint(repo, &manifest.github.base_sha)?;
         supersede_stale_validation(ledger, &source_tree_hash);
         let dependency_lock_hash = dependency_lock_fingerprint(&repo.root)?;
+        let environment_fingerprint = relevant_environment_fingerprint(policy)?;
         let fingerprint = validation_fingerprint(
             &gate.command,
             repo.root.to_string_lossy().as_ref(),
             &source_tree_hash,
             &dependency_lock_hash,
-            &policy.sandbox.mode,
+            &environment_fingerprint,
         );
         let gate_type = classify_validation_gate(&gate.id, &gate.command);
         if let Some(evidence) = passed_evidence(ledger, &fingerprint).cloned() {
@@ -8327,9 +10081,13 @@ fn run_quality_gates(
                     evidence.evidence_id
                 ),
             });
+            if gate_type == ValidationGateType::FocusedTest {
+                break;
+            }
             continue;
         }
         usage.required_validations = usage.required_validations.saturating_add(1);
+        usage.validation_commands = usage.validation_commands.saturating_add(1);
         let phase_started_at = now_rfc3339();
         send_quality_gate_phase_telemetry(
             api,
@@ -8363,7 +10121,7 @@ fn run_quality_gates(
             dependency_lock_hash,
             ValidationSource::WorkerRequired,
         ));
-        let output = command::capture_hosted_cancellable_with_environment(
+        let output = capture(
             &gate.command,
             &repo.root,
             running,
@@ -8372,7 +10130,6 @@ fn run_quality_gates(
             2 * 1024 * 1024,
             Some(&allowlist),
             None,
-            containment,
         );
         let (result, evidence_status, exit_code, stdout, stderr) = match output {
             Ok(output) => {
@@ -8473,7 +10230,12 @@ fn run_quality_gates(
                 ,"source_tree_hash": source_tree_hash
             }),
         )?;
+        let focused_gate_failed =
+            gate_type == ValidationGateType::FocusedTest && result.status != "passed";
         results.push(result);
+        if focused_gate_failed {
+            break;
+        }
         if !running.load(Ordering::SeqCst) || shutdown::requested() {
             break;
         }
@@ -8482,8 +10244,12 @@ fn run_quality_gates(
 }
 
 fn classify_validation_gate(id: &str, command: &str) -> ValidationGateType {
-    let value = format!("{id} {command}").to_ascii_lowercase();
-    if value.contains("build") {
+    let id = id.to_ascii_lowercase();
+    let command = command.to_ascii_lowercase();
+    let value = format!("{id} {command}");
+    if id.contains("focused") || command.contains("test --") {
+        ValidationGateType::FocusedTest
+    } else if value.contains("build") {
         ValidationGateType::Build
     } else if value.contains("lint") || value.contains("fmt") {
         ValidationGateType::Lint
@@ -8512,6 +10278,23 @@ fn dependency_lock_fingerprint(root: &Path) -> Result<String> {
             material.extend_from_slice(&fs::read(path)?);
             material.push(0);
         }
+    }
+    Ok(hex::encode(Sha256::digest(material)))
+}
+
+fn relevant_environment_fingerprint(policy: &HostedExecutionPolicy) -> Result<String> {
+    let mut names = policy.child_environment_allowlist();
+    names.sort();
+    names.dedup();
+    let mut material = serde_json::to_vec(&policy.sandbox)
+        .context("could not fingerprint hosted sandbox policy")?;
+    for name in names {
+        append_fingerprint_field(&mut material, "environment_name", name.as_bytes());
+        append_fingerprint_field(
+            &mut material,
+            "environment_value",
+            env::var(&name).unwrap_or_default().as_bytes(),
+        );
     }
     Ok(hex::encode(Sha256::digest(material)))
 }
@@ -8964,6 +10747,41 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(250_u64.saturating_mul(1_u64 << attempt.min(5)))
 }
 
+fn ai_request_timeout(execution_deadline: Option<Instant>) -> Result<Duration> {
+    execution_deadline
+        .map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .context("hosted execution deadline was reached before the AI gateway request")
+                .map(|remaining| remaining.min(Duration::from_secs(90)))
+        })
+        .transpose()
+        .map(|timeout| timeout.unwrap_or(Duration::from_secs(90)))
+}
+
+fn sleep_before_execution_retry(
+    execution_deadline: Option<Instant>,
+    delay: Duration,
+    operation: &str,
+) -> Result<()> {
+    if let Some(deadline) = execution_deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| *remaining > delay)
+            .with_context(|| {
+                format!("hosted execution deadline was reached before the {operation} could start")
+            })?;
+        debug_assert!(remaining > delay);
+    }
+    thread::sleep(delay);
+    Ok(())
+}
+
+fn sleep_before_ai_retry(execution_deadline: Option<Instant>, attempt: usize) -> Result<()> {
+    sleep_before_execution_retry(execution_deadline, retry_delay(attempt), "AI gateway retry")
+}
+
 fn registration_retry_delay(attempt: usize, semantic_call_id: Uuid) -> Duration {
     let base_millis = [250_u64, 1_000, 3_000]
         .get(attempt)
@@ -9061,6 +10879,22 @@ fn ensure_running(running: &AtomicBool) -> Result<()> {
         bail!("hosted execution was cancelled or lost its mission lease");
     }
     Ok(())
+}
+
+fn ensure_hosted_execution_deadline(started_at: Instant) -> Result<()> {
+    if started_at.elapsed() >= MAX_HOSTED_EXECUTION_DURATION {
+        bail!(
+            "hosted_execution_wall_clock_exceeded: execution reached its {} second limit",
+            MAX_HOSTED_EXECUTION_DURATION.as_secs()
+        );
+    }
+    Ok(())
+}
+
+fn hosted_execution_deadline(started_at: Instant) -> Result<Instant> {
+    started_at
+        .checked_add(MAX_HOSTED_EXECUTION_DURATION)
+        .context("hosted execution deadline could not be represented")
 }
 
 fn send_execution_telemetry(
@@ -9389,6 +11223,12 @@ fn hosted_pull_request_body(
             "⚠️ **INCOMPLETE — continue implementation before review or merge**"
         }
     };
+    let external_review_notice =
+        if completeness.status == CompletionStatus::CompletePendingExternalReview {
+            "Implementation complete.\nManual visual/product review remains.\n\n"
+        } else {
+            ""
+        };
     let render_items = |items: &[String]| {
         if items.is_empty() {
             "- None.".into()
@@ -9463,7 +11303,7 @@ fn hosted_pull_request_body(
         String::new()
     };
     format!(
-        "{}\n\nRustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
+        "{}\n\n{}RustGrid ticket **{}** through the ephemeral GitHub Actions provider.\n\n\
 Execution: `{}` (attempt {})\nModel: `{}`\nMaximum cost: `${}`\n\n\
 Completion evaluator: `{}` at {:.0}% confidence\n\
 Implementation: `{}` · verification: `{}` · source: `{}`\n\n{}\n\n\
@@ -9474,6 +11314,7 @@ External review checklist:\n{}\n\n\
 Optional follow-up:\n{}\n\n{}Technical validation:\n{}\n\n\
 _The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
         completeness_heading,
+        external_review_notice,
         manifest.ticket_key,
         manifest.execution.execution_id,
         manifest.execution.attempt_number,
@@ -10152,16 +11993,11 @@ fn classify_remaining_work(work: &str, evaluation: &mut CompletionEvaluation) {
 }
 
 fn completion_review_diff(root: &Path, changed_paths: &[String], base_sha: &str) -> Result<String> {
-    let dirty = command::capture("git", ["status", "--porcelain=v1"], root)?;
-    let diff = if dirty.stdout.trim().is_empty() {
-        command::capture(
-            "git",
-            ["diff", "--no-ext-diff", "--binary", base_sha, "HEAD", "--"],
-            root,
-        )?
-    } else {
-        command::capture("git", ["diff", "--no-ext-diff", "--binary", "--"], root)?
-    };
+    let diff = command::capture(
+        "git",
+        ["diff", "--no-ext-diff", "--binary", base_sha, "--"],
+        root,
+    )?;
     if !diff.status.success() {
         bail!("git diff exited with {}: {}", diff.status, diff.stderr);
     }
@@ -10190,10 +12026,10 @@ fn completion_review_diff(root: &Path, changed_paths: &[String], base_sha: &str)
 }
 
 fn completion_changed_paths(repo: &Repo, base_sha: &str) -> Result<Vec<String>> {
-    let dirty = repo.new_agent_paths(&BTreeSet::new())?;
-    if !dirty.is_empty() {
-        return Ok(dirty);
-    }
+    let mut changed_paths = repo
+        .new_agent_paths(&BTreeSet::new())?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let output = command::capture(
         "git",
         ["diff", "--name-only", "-z", base_sha, "HEAD", "--"],
@@ -10206,19 +12042,133 @@ fn completion_changed_paths(repo: &Repo, base_sha: &str) -> Result<Vec<String>> 
             output.stderr
         );
     }
-    Ok(output
-        .stdout
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .collect())
+    changed_paths.extend(
+        output
+            .stdout
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned),
+    );
+    Ok(changed_paths.into_iter().collect())
+}
+
+fn append_fingerprint_field(material: &mut Vec<u8>, name: &str, value: &[u8]) {
+    material.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    material.extend_from_slice(name.as_bytes());
+    material.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    material.extend_from_slice(value);
 }
 
 fn repository_state_fingerprint(repo: &Repo, base_sha: &str) -> Result<String> {
-    let paths = completion_changed_paths(repo, base_sha)?;
-    let diff = completion_review_diff(&repo.root, &paths, base_sha)?;
-    let mut material = paths.join("\0").into_bytes();
-    material.extend_from_slice(diff.as_bytes());
+    let head = command::checked("git", ["rev-parse", "HEAD"], &repo.root)?;
+    let comparison_base = if base_sha.trim().is_empty() {
+        head.trim()
+    } else {
+        base_sha.trim()
+    };
+    let identity = command::capture("git", ["remote", "get-url", "origin"], &repo.root)?;
+    let repository_identity = if identity.status.success() {
+        identity.stdout.trim().to_owned()
+    } else {
+        repo.root
+            .canonicalize()
+            .unwrap_or_else(|_| repo.root.clone())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let base_paths = command::capture(
+        "git",
+        ["ls-tree", "-r", "--name-only", "-z", comparison_base],
+        &repo.root,
+    )?;
+    if !base_paths.status.success() {
+        bail!(
+            "git base-tree listing for repository fingerprint failed: {}",
+            base_paths.stderr
+        );
+    }
+    let current_paths = command::capture(
+        "git",
+        [
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        &repo.root,
+    )?;
+    if !current_paths.status.success() {
+        bail!(
+            "git worktree listing for repository fingerprint failed: {}",
+            current_paths.stderr
+        );
+    }
+    let mut material = Vec::new();
+    append_fingerprint_field(&mut material, "repository", repository_identity.as_bytes());
+    append_fingerprint_field(&mut material, "base_head", comparison_base.as_bytes());
+    let paths = base_paths
+        .stdout
+        .split('\0')
+        .chain(current_paths.stdout.split('\0'))
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        if Path::new(&path).is_absolute()
+            || Path::new(&path)
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("git returned an unsafe repository path while fingerprinting state");
+        }
+        append_fingerprint_field(&mut material, "path", path.as_bytes());
+        let target = repo.root.join(&path);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                append_fingerprint_field(&mut material, "type", b"symlink");
+                let destination = fs::read_link(&target)
+                    .with_context(|| format!("could not hash repository symlink target {path}"))?;
+                append_fingerprint_field(
+                    &mut material,
+                    "symlink_target",
+                    destination.to_string_lossy().as_bytes(),
+                );
+            }
+            Ok(metadata) if metadata.is_file() => {
+                append_fingerprint_field(&mut material, "type", b"file");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    append_fingerprint_field(
+                        &mut material,
+                        "mode",
+                        &metadata.permissions().mode().to_be_bytes(),
+                    );
+                }
+                let bytes = fs::read(&target)
+                    .with_context(|| format!("could not hash repository file {path}"))?;
+                append_fingerprint_field(
+                    &mut material,
+                    "content_sha256",
+                    hex::encode(Sha256::digest(bytes)).as_bytes(),
+                );
+            }
+            Ok(_) => append_fingerprint_field(&mut material, "type", b"directory_or_gitlink"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                append_fingerprint_field(&mut material, "type", b"missing");
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not inspect repository path {path}"));
+            }
+        }
+    }
+    append_fingerprint_field(
+        &mut material,
+        "dependency_lock",
+        dependency_lock_fingerprint(&repo.root)?.as_bytes(),
+    );
     Ok(hex::encode(Sha256::digest(material)))
 }
 
@@ -10252,6 +12202,19 @@ fn is_source_mutation_tool(name: &str) -> bool {
             | "rewrite_small_file"
             | "delete_file"
     )
+}
+
+fn informational_write_progress(status: &str, reason: &str) -> Result<String> {
+    if !matches!(status, "blocked" | "ready_to_write" | "no_change_required") {
+        bail!("write progress status is unsupported");
+    }
+    Ok(format!(
+        "recorded informational write progress (repository_progress=false): {status}: {reason}"
+    ))
+}
+
+const fn informational_write_progress_semantics() -> (ToolProgressClass, bool) {
+    (ToolProgressClass::Neutral, false)
 }
 
 fn tool_target(arguments: &str) -> Option<String> {
@@ -10909,6 +12872,17 @@ fn fit_request_to_input_ceiling(
     Ok(())
 }
 
+fn phase_request_input_ceiling(phase: ExecutionPhase, signed_maximum: usize) -> usize {
+    if matches!(
+        phase,
+        ExecutionPhase::Discovery | ExecutionPhase::ArtifactRepair
+    ) {
+        signed_maximum.min(MAX_DISCOVERY_REQUEST_BYTES)
+    } else {
+        signed_maximum
+    }
+}
+
 fn hosted_budget_advisory(used: usize, limit: usize) -> Option<(u8, &'static str, &'static str)> {
     let percent = used.saturating_mul(100) / limit.max(1);
     if percent >= 90 {
@@ -10957,16 +12931,28 @@ fn compact_notebook_for_phase(notebook: &WorkerNotebook, phase: ExecutionPhase) 
             "searches_completed": notebook.searches_completed,
             "blocking_unknowns": notebook.blocking_unknowns,
         }),
-        ExecutionPhase::Planning => json!({
-            "goal": notebook.goal,
-            "criteria": notebook.acceptance_criteria_v2,
-            "impact_areas": notebook.impact_map.iter().map(|area| json!({
-                "area_id": area.area_id,
-                "candidate_paths": area.candidate_paths,
-                "acceptance_criteria_ids": area.acceptance_criteria_ids,
-            })).collect::<Vec<_>>(),
-            "blocking_unknowns": notebook.blocking_unknowns,
-        }),
+        ExecutionPhase::Planning => {
+            if let Some(repair) = &notebook.planning_repair {
+                json!({
+                    "instruction": "Repair only the listed invalid fields. Preserve the valid planned changes and call record_implementation_plan once without repeating discovery.",
+                    "goal": notebook.goal,
+                    "valid_planned_changes": repair.valid_planned_changes,
+                    "invalid_fields": repair.invalid_fields,
+                    "acceptance_criteria_ids": notebook.acceptance_criteria_v2.iter().map(|criterion| &criterion.id).collect::<Vec<_>>(),
+                })
+            } else {
+                json!({
+                    "goal": notebook.goal,
+                    "criteria": notebook.acceptance_criteria_v2,
+                    "impact_areas": notebook.impact_map.iter().map(|area| json!({
+                        "area_id": area.area_id,
+                        "candidate_paths": area.candidate_paths,
+                        "acceptance_criteria_ids": area.acceptance_criteria_ids,
+                    })).collect::<Vec<_>>(),
+                    "blocking_unknowns": notebook.blocking_unknowns,
+                })
+            }
+        }
         ExecutionPhase::Implementation | ExecutionPhase::Repair => json!({
             "goal": notebook.goal,
             "planned_changes": notebook.planned_changes,
@@ -11456,19 +13442,238 @@ fn collect_repo_files(root: &Path, start: &Path, maximum: usize) -> Result<Vec<S
     Ok(files)
 }
 
-fn read_repo_file(root: &Path, value: &str, start_line: u64, end_line: u64) -> Result<String> {
-    let path = safe_repo_path(root, value, false)?;
-    let metadata = fs::metadata(&path)?;
-    if !metadata.is_file() || metadata.len() > MAX_MODEL_FILE_BYTES as u64 {
-        bail!("read_file target is not a bounded regular file");
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FileReadStatus {
+    Success,
+    Error,
+}
+
+fn read_error_progress_class(error: &str) -> ToolProgressClass {
+    if error.contains("repository_access_failed") {
+        ToolProgressClass::BlockingFailure
+    } else if error.contains("duplicate") {
+        ToolProgressClass::Duplicate
+    } else {
+        ToolProgressClass::RecoverableFailure
     }
-    let bytes = fs::read(&path)?;
+}
+
+fn successful_read_progress(
+    tool: &str,
+    new_file: bool,
+    new_range: bool,
+    new_related_test: bool,
+    partial_failure: bool,
+) -> (ToolProgressClass, &'static str) {
+    if new_file || new_range {
+        (
+            ToolProgressClass::Productive,
+            "new planned repository content inspected",
+        )
+    } else if tool == "related_tests" && new_related_test {
+        (
+            ToolProgressClass::Productive,
+            "new related test file identified",
+        )
+    } else if partial_failure {
+        (
+            ToolProgressClass::RecoverableFailure,
+            "batch read returned recoverable per-file errors",
+        )
+    } else {
+        (
+            ToolProgressClass::Duplicate,
+            "repository content was already inspected",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FileReadResult {
+    path: String,
+    status: FileReadStatus,
+    content: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    line_count: Option<u32>,
+    file_size: Option<u64>,
+    valid_line_range: Option<String>,
+    truncated: bool,
+    fallback_attempted: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BatchReadResult {
+    files: Vec<FileReadResult>,
+}
+
+#[derive(Clone, Debug)]
+struct PrevalidatedRepoFile {
+    requested_path: String,
+    resolved_path: PathBuf,
+    file_size: u64,
+}
+
+#[derive(Clone, Debug)]
+enum PrevalidatedBatchReadPath {
+    Ready(PrevalidatedRepoFile),
+    Rejected {
+        result: FileReadResult,
+        fallback_path: Option<String>,
+    },
+}
+
+fn failed_file_read(
+    path: &str,
+    code: &str,
+    message: impl Into<String>,
+    file_size: Option<u64>,
+    line_count: Option<u32>,
+) -> FileReadResult {
+    FileReadResult {
+        path: path.to_owned(),
+        status: FileReadStatus::Error,
+        content: None,
+        error_code: Some(code.to_owned()),
+        error_message: Some(message.into()),
+        line_count,
+        file_size,
+        valid_line_range: line_count.map(|count| format!("1-{}", count.max(1))),
+        truncated: false,
+        fallback_attempted: false,
+    }
+}
+
+fn prevalidate_repo_file(
+    root: &Path,
+    value: &str,
+) -> std::result::Result<PrevalidatedRepoFile, Box<FileReadResult>> {
+    let path = match safe_repo_path(root, value, false) {
+        Ok(path) => path,
+        Err(error) => {
+            let message = error.to_string();
+            let code = if message.contains("could not inspect repository path") {
+                "path_not_found"
+            } else if message.contains("symbolic")
+                || message.contains("escape")
+                || message.contains("absolute")
+                || message.contains("cannot access .git")
+                || message.contains("must be relative")
+            {
+                "path_not_allowed"
+            } else {
+                "repository_access_failed"
+            };
+            return Err(Box::new(failed_file_read(value, code, message, None, None)));
+        }
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Box::new(failed_file_read(
+                value,
+                "path_not_found",
+                format!("repository path `{value}` does not exist"),
+                None,
+                None,
+            )));
+        }
+        Err(error) => {
+            return Err(Box::new(failed_file_read(
+                value,
+                "repository_access_failed",
+                format!("could not inspect repository file `{value}`: {error}"),
+                None,
+                None,
+            )));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(Box::new(failed_file_read(
+            value,
+            "not_regular_file",
+            format!("repository path `{value}` is not a regular file"),
+            Some(metadata.len()),
+            None,
+        )));
+    }
+    if metadata.len() > MAX_MODEL_FILE_BYTES as u64 {
+        return Err(Box::new(failed_file_read(
+            value,
+            "file_too_large",
+            format!(
+                "repository file `{value}` is {} bytes; the read limit is {MAX_MODEL_FILE_BYTES} bytes",
+                metadata.len()
+            ),
+            Some(metadata.len()),
+            None,
+        )));
+    }
+    Ok(PrevalidatedRepoFile {
+        requested_path: value.to_owned(),
+        resolved_path: path,
+        file_size: metadata.len(),
+    })
+}
+
+fn read_prevalidated_repo_file_result(
+    file: &PrevalidatedRepoFile,
+    start_line: u64,
+    end_line: u64,
+    maximum_output_bytes: usize,
+) -> FileReadResult {
+    let value = file.requested_path.as_str();
+    let bytes = match fs::read(&file.resolved_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return failed_file_read(
+                value,
+                "repository_access_failed",
+                format!("could not read repository file `{value}`: {error}"),
+                Some(file.file_size),
+                None,
+            );
+        }
+    };
     if bytes.contains(&0) {
-        bail!("read_file does not expose binary files");
+        return failed_file_read(
+            value,
+            "binary_file",
+            format!("repository file `{value}` is binary and cannot be exposed"),
+            Some(file.file_size),
+            None,
+        );
     }
-    let text = String::from_utf8(bytes).context("read_file target is not UTF-8")?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return failed_file_read(
+                value,
+                "not_utf8",
+                format!("repository file `{value}` is not valid UTF-8"),
+                Some(file.file_size),
+                None,
+            );
+        }
+    };
+    let lines = text.lines().collect::<Vec<_>>();
+    let line_count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+    if start_line == 0 || end_line < start_line || start_line > u64::from(line_count.max(1)) {
+        return failed_file_read(
+            value,
+            "line_range_invalid",
+            format!(
+                "requested lines {start_line}-{end_line} are outside `{value}`; valid line range is 1-{}",
+                line_count.max(1)
+            ),
+            Some(file.file_size),
+            Some(line_count),
+        );
+    }
     let mut output = String::new();
-    for (index, line) in text.lines().enumerate() {
+    let mut truncated = false;
+    for (index, line) in lines.iter().enumerate() {
         let line_number = index as u64 + 1;
         if line_number < start_line {
             continue;
@@ -11476,18 +13681,129 @@ fn read_repo_file(root: &Path, value: &str, start_line: u64, end_line: u64) -> R
         if line_number > end_line {
             break;
         }
-        output.push_str(&format!("{line_number:>6} | {line}\n"));
-        if output.len() >= MAX_TOOL_OUTPUT_BYTES {
+        let formatted = format!("{line_number:>6} | {line}\n");
+        if output.len().saturating_add(formatted.len()) > maximum_output_bytes {
             output.push_str("[read output truncated]\n");
+            truncated = true;
             break;
         }
+        output.push_str(&formatted);
     }
-    Ok(output)
+    FileReadResult {
+        path: value.to_owned(),
+        status: FileReadStatus::Success,
+        content: Some(output),
+        error_code: None,
+        error_message: None,
+        line_count: Some(line_count),
+        file_size: Some(file.file_size),
+        valid_line_range: Some(format!("1-{}", line_count.max(1))),
+        truncated,
+        fallback_attempted: false,
+    }
+}
+
+fn read_repo_file_result(
+    root: &Path,
+    value: &str,
+    start_line: u64,
+    end_line: u64,
+    maximum_output_bytes: usize,
+) -> FileReadResult {
+    match prevalidate_repo_file(root, value) {
+        Ok(file) => {
+            read_prevalidated_repo_file_result(&file, start_line, end_line, maximum_output_bytes)
+        }
+        Err(result) => *result,
+    }
+}
+
+fn prevalidate_batch_read_paths(root: &Path, paths: &[Value]) -> Vec<PrevalidatedBatchReadPath> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let Some(path) = value
+                .as_str()
+                .filter(|path| !path.is_empty() && path.len() <= 4_096)
+            else {
+                return PrevalidatedBatchReadPath::Rejected {
+                    result: failed_file_read(
+                        &format!("<paths[{index}]>"),
+                        "path_malformed",
+                        "read_files path must be a non-empty repository-relative string",
+                        None,
+                        None,
+                    ),
+                    fallback_path: None,
+                };
+            };
+            match prevalidate_repo_file(root, path) {
+                Ok(file) => PrevalidatedBatchReadPath::Ready(file),
+                Err(result) => PrevalidatedBatchReadPath::Rejected {
+                    result: *result,
+                    fallback_path: Some(path.to_owned()),
+                },
+            }
+        })
+        .collect()
+}
+
+fn read_prevalidated_repo_files_with_fallback(
+    root: &Path,
+    paths: &[PrevalidatedBatchReadPath],
+    maximum_lines: u64,
+    maximum_output_bytes: usize,
+) -> (BatchReadResult, u32) {
+    let per_file_bytes = (maximum_output_bytes / paths.len().max(1)).max(1_024);
+    let mut fallback_paths = Vec::with_capacity(paths.len());
+    let mut files = paths
+        .iter()
+        .map(|path| match path {
+            PrevalidatedBatchReadPath::Ready(file) => {
+                fallback_paths.push(Some(file.requested_path.clone()));
+                read_prevalidated_repo_file_result(file, 1, maximum_lines, per_file_bytes)
+            }
+            PrevalidatedBatchReadPath::Rejected {
+                result,
+                fallback_path,
+            } => {
+                fallback_paths.push(fallback_path.clone());
+                result.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let initial_failures = u32::try_from(
+        files
+            .iter()
+            .filter(|result| result.status == FileReadStatus::Error)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    for (result, fallback_path) in files.iter_mut().zip(fallback_paths) {
+        if result.status != FileReadStatus::Error {
+            continue;
+        }
+        let Some(fallback_path) = fallback_path else {
+            continue;
+        };
+        let mut fallback =
+            read_repo_file_result(root, &fallback_path, 1, maximum_lines, per_file_bytes);
+        fallback.fallback_attempted = true;
+        if fallback.status == FileReadStatus::Error
+            && let Some(message) = fallback.error_message.as_mut()
+        {
+            message.push_str("; individual read fallback also failed");
+        }
+        *result = fallback;
+    }
+    (BatchReadResult { files }, initial_failures)
 }
 
 struct SearchResult {
     output: String,
     truncated: bool,
+    matched_paths: Vec<String>,
 }
 
 fn search_repo(
@@ -11496,6 +13812,8 @@ fn search_repo(
     query: &str,
     extensions: &[String],
     context_lines: u64,
+    maximum_new_consumers: Option<usize>,
+    known_consumers: &BTreeSet<String>,
 ) -> Result<SearchResult> {
     if query.is_empty() || query.contains('\0') {
         bail!("search query is invalid");
@@ -11517,6 +13835,7 @@ fn search_repo(
         .map(|extension| extension.trim_start_matches('.'))
         .collect::<BTreeSet<_>>();
     let mut groups = Vec::<(String, Vec<(usize, String)>, usize)>::new();
+    let mut new_consumer_count = 0_usize;
     let mut truncated = false;
     for candidate in candidates {
         if candidate.starts_with('[') {
@@ -11565,6 +13884,13 @@ fn search_repo(
             }
         }
         if file_count > 0 {
+            if !localized_discovery_core_path(&candidate) && !known_consumers.contains(&candidate) {
+                if maximum_new_consumers.is_some_and(|maximum| new_consumer_count >= maximum) {
+                    truncated = true;
+                    break;
+                }
+                new_consumer_count = new_consumer_count.saturating_add(1);
+            }
             groups.push((candidate, file_matches, file_count));
         }
         if groups.len() >= 40 {
@@ -11573,6 +13899,10 @@ fn search_repo(
         }
     }
     let total_matches = groups.iter().map(|group| group.2).sum::<usize>();
+    let matched_paths = groups
+        .iter()
+        .map(|group| group.0.clone())
+        .collect::<Vec<_>>();
     let mut output = format!(
         "search_summary: {total_matches} match(es) across {} file(s)\n",
         groups.len()
@@ -11601,6 +13931,7 @@ fn search_repo(
     Ok(SearchResult {
         output: truncate_text(&output, MAX_TOOL_OUTPUT_BYTES),
         truncated,
+        matched_paths,
     })
 }
 
@@ -11683,6 +14014,72 @@ mod tests {
             handle,
         )
             .into()
+    }
+
+    fn delayed_no_response_server(
+        delay: Duration,
+    ) -> Option<(Url, Receiver<String>, thread::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("test HTTP server should bind: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let _ = sender.send(request);
+            thread::sleep(delay);
+            listener.set_nonblocking(true).unwrap();
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        let _ = sender.send("additional request".into());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        panic!("test HTTP server should inspect queued requests: {error}")
+                    }
+                }
+            }
+        });
+        Some((
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            receiver,
+            handle,
+        ))
+    }
+
+    fn request_sequence_server(
+        responses: Vec<(&'static str, Value)>,
+    ) -> Option<(Url, Receiver<String>, thread::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("test HTTP server should bind: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let _ = sender.send(request);
+                let body = body.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        Some((
+            Url::parse(&format!("http://{address}/")).unwrap(),
+            receiver,
+            handle,
+        ))
     }
 
     fn exchange_response(execution_id: Uuid) -> ExchangeResponse {
@@ -11770,6 +14167,15 @@ mod tests {
             phase_calls_limit: 8,
             last_successful_action: json!({}),
             usage: ToolUsage::default(),
+            estimated_cost_micros: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            changed_paths: Vec::new(),
+            remaining_work: Vec::new(),
+            failed_tool_operations: Vec::new(),
+            current_plan: Vec::new(),
+            validation_evidence: Vec::new(),
+            notebook_revision: 0,
             recoverable: true,
             resume_phase: "discovery".into(),
             recommended_action: "Inspect the authoritative failure details.".into(),
@@ -12262,6 +14668,311 @@ mod tests {
     }
 
     #[test]
+    fn three_required_gates_execute_once_and_reuse_exact_tree_evidence() {
+        assert_eq!(
+            classify_validation_gate("focused-theme", "npm test -- theme"),
+            ValidationGateType::FocusedTest
+        );
+        let directory = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], directory.path()).unwrap();
+        command::checked("git", ["config", "user.name", "Test"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "user.email", "test@example.com"],
+            directory.path(),
+        )
+        .unwrap();
+        fs::write(directory.path().join("theme.ts"), "export {};\n").unwrap();
+        command::checked("git", ["add", "theme.ts"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        let base_sha = command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+        let execution_id = Uuid::from_u128(0xa0226);
+        let mut manifest = test_manifest(execution_id);
+        manifest.github.base_sha = base_sha;
+        manifest.execution_policy.quality_gates = vec![
+            HostedQualityGate {
+                id: "focused-theme".into(),
+                command: "npm test -- theme".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+            HostedQualityGate {
+                id: "test".into(),
+                command: "npm test".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+            HostedQualityGate {
+                id: "build".into(),
+                command: "npm run build".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+        ];
+        let Some((api_root, requests, server)) = request_sequence_server(
+            std::iter::repeat_with(|| ("200 OK", json!({})))
+                .take(27)
+                .collect(),
+        ) else {
+            return;
+        };
+        let api = test_api_client(api_root, execution_id);
+        let repo = Repo {
+            root: directory.path().to_path_buf(),
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let validation_started = Instant::now();
+        let execution_started = Instant::now();
+        let mut ledger = Vec::new();
+        let mut required_gates = Vec::new();
+        let mut usage = ToolUsage::default();
+        let executed_commands = Arc::new(Mutex::new(Vec::new()));
+
+        let first = run_quality_gates_with_capture(
+            &api,
+            &manifest,
+            &repo,
+            &running,
+            &manifest.execution_policy,
+            1,
+            &mut ledger,
+            &mut required_gates,
+            &mut usage,
+            validation_started,
+            execution_started,
+            |command_text,
+             cwd,
+             running,
+             timeout,
+             max_output_bytes,
+             environment_allowlist,
+             limits| {
+                executed_commands
+                    .lock()
+                    .unwrap()
+                    .push(command_text.to_owned());
+                command::capture_cancellable_with_environment(
+                    "git rev-parse --is-inside-work-tree",
+                    cwd,
+                    running,
+                    timeout,
+                    max_output_bytes,
+                    environment_allowlist,
+                    limits,
+                )
+            },
+        )
+        .unwrap();
+        let second = run_quality_gates_with_capture(
+            &api,
+            &manifest,
+            &repo,
+            &running,
+            &manifest.execution_policy,
+            2,
+            &mut ledger,
+            &mut required_gates,
+            &mut usage,
+            validation_started,
+            execution_started,
+            |command_text,
+             cwd,
+             running,
+             timeout,
+             max_output_bytes,
+             environment_allowlist,
+             limits| {
+                executed_commands
+                    .lock()
+                    .unwrap()
+                    .push(command_text.to_owned());
+                command::capture_cancellable_with_environment(
+                    "git rev-parse --is-inside-work-tree",
+                    cwd,
+                    running,
+                    timeout,
+                    max_output_bytes,
+                    environment_allowlist,
+                    limits,
+                )
+            },
+        )
+        .unwrap();
+
+        // A one-byte mutation creates a new authoritative tree and invalidates all three
+        // fingerprints exactly once.
+        fs::write(directory.path().join("theme.ts"), "Export {};\n").unwrap();
+        let third = run_quality_gates_with_capture(
+            &api,
+            &manifest,
+            &repo,
+            &running,
+            &manifest.execution_policy,
+            3,
+            &mut ledger,
+            &mut required_gates,
+            &mut usage,
+            validation_started,
+            execution_started,
+            |command_text,
+             cwd,
+             running,
+             timeout,
+             max_output_bytes,
+             environment_allowlist,
+             limits| {
+                executed_commands
+                    .lock()
+                    .unwrap()
+                    .push(command_text.to_owned());
+                command::capture_cancellable_with_environment(
+                    "git rev-parse --is-inside-work-tree",
+                    cwd,
+                    running,
+                    timeout,
+                    max_output_bytes,
+                    environment_allowlist,
+                    limits,
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(third.len(), 3);
+        assert!(first.iter().all(|result| result.status == "passed"));
+        assert!(second.iter().all(|result| result.status == "passed"));
+        assert!(third.iter().all(|result| result.status == "passed"));
+        assert_eq!(usage.validation_commands, 6);
+        assert_eq!(usage.required_validations, 6);
+        assert_eq!(usage.deduplicated_validations, 3);
+        assert_eq!(
+            *executed_commands.lock().unwrap(),
+            [
+                "npm test -- theme",
+                "npm test",
+                "npm run build",
+                "npm test -- theme",
+                "npm test",
+                "npm run build",
+            ]
+        );
+        assert_eq!(ledger.len(), 6);
+        assert_ne!(ledger[0].source_tree_hash, ledger[3].source_tree_hash);
+        assert_ne!(ledger[0].command_fingerprint, ledger[3].command_fingerprint);
+        assert_eq!(required_gates.len(), 3);
+        server.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 27);
+    }
+
+    #[test]
+    fn focused_gate_failure_short_circuits_broad_gates_until_source_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], directory.path()).unwrap();
+        command::checked("git", ["config", "user.name", "Test"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "user.email", "test@example.com"],
+            directory.path(),
+        )
+        .unwrap();
+        fs::write(directory.path().join("theme.ts"), "export {};\n").unwrap();
+        command::checked("git", ["add", "theme.ts"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        let execution_id = Uuid::from_u128(0xa0227);
+        let mut manifest = test_manifest(execution_id);
+        manifest.github.base_sha =
+            command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+        manifest.execution_policy.quality_gates = vec![
+            HostedQualityGate {
+                id: "test".into(),
+                command: "npm test".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+            HostedQualityGate {
+                id: "build".into(),
+                command: "npm run build".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+            HostedQualityGate {
+                id: "focused-theme".into(),
+                command: "npm test -- theme".into(),
+                timeout_seconds: 30,
+                required: true,
+            },
+        ];
+        let Some((api_root, requests, server)) = request_sequence_server(
+            std::iter::repeat_with(|| ("200 OK", json!({})))
+                .take(4)
+                .collect(),
+        ) else {
+            return;
+        };
+        let api = test_api_client(api_root, execution_id);
+        let repo = Repo {
+            root: directory.path().to_path_buf(),
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut ledger = Vec::new();
+        let mut required_gates = Vec::new();
+        let mut usage = ToolUsage::default();
+        let results = run_quality_gates_with_capture(
+            &api,
+            &manifest,
+            &repo,
+            &running,
+            &manifest.execution_policy,
+            1,
+            &mut ledger,
+            &mut required_gates,
+            &mut usage,
+            Instant::now(),
+            Instant::now(),
+            |command_text, _, _, _, _, _, _| {
+                executed.lock().unwrap().push(command_text.to_owned());
+                Err(anyhow!("focused theme test failed"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*executed.lock().unwrap(), ["npm test -- theme"]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "failed");
+        assert_eq!(required_gates.len(), 1);
+        assert_eq!(required_gates[0].gate_type, ValidationGateType::FocusedTest);
+        server.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 4);
+    }
+
+    #[test]
     fn repository_tools_cannot_escape_or_traverse_git_metadata() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join(".git")).unwrap();
@@ -12275,6 +14986,537 @@ mod tests {
             std::os::unix::fs::symlink("/tmp", directory.path().join("linked")).unwrap();
             assert!(safe_repo_path(directory.path(), "linked/file", true).is_err());
         }
+    }
+
+    #[test]
+    fn hosted_repository_fingerprint_tracks_content_and_is_stable_across_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], directory.path()).unwrap();
+        fs::write(directory.path().join("tracked.ts"), "one\n").unwrap();
+        command::checked("git", ["add", "tracked.ts"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        let base = command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+        let repo = Repo {
+            root: directory.path().to_path_buf(),
+        };
+        let clean = repository_state_fingerprint(&repo, &base).unwrap();
+        assert_ne!(clean, hex::encode(Sha256::digest(b"")));
+
+        // Change exactly one byte while preserving file length.
+        fs::write(directory.path().join("tracked.ts"), "One\n").unwrap();
+        let edited = repository_state_fingerprint(&repo, &base).unwrap();
+        assert_ne!(edited, clean);
+        fs::write(directory.path().join("tracked.ts"), "one\n").unwrap();
+        assert_eq!(repository_state_fingerprint(&repo, &base).unwrap(), clean);
+
+        fs::write(directory.path().join("untracked.test.ts"), "new\n").unwrap();
+        let untracked_only = repository_state_fingerprint(&repo, &base).unwrap();
+        assert_ne!(untracked_only, clean);
+        fs::remove_file(directory.path().join("untracked.test.ts")).unwrap();
+        assert_eq!(repository_state_fingerprint(&repo, &base).unwrap(), clean);
+
+        fs::write(directory.path().join("tracked.ts"), "two\n").unwrap();
+        fs::write(directory.path().join("new.test.ts"), "new\n").unwrap();
+        let before_commit = repository_state_fingerprint(&repo, &base).unwrap();
+        command::checked(
+            "git",
+            ["add", "tracked.ts", "new.test.ts"],
+            directory.path(),
+        )
+        .unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "implementation",
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        let after_commit = repository_state_fingerprint(&repo, &base).unwrap();
+        assert_eq!(after_commit, before_commit);
+
+        let other = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], other.path()).unwrap();
+        fs::write(other.path().join("different.ts"), "different\n").unwrap();
+        command::checked("git", ["add", "different.ts"], other.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "different base",
+            ],
+            other.path(),
+        )
+        .unwrap();
+        let other_base = command::checked("git", ["rev-parse", "HEAD"], other.path()).unwrap();
+        let other_repo = Repo {
+            root: other.path().to_path_buf(),
+        };
+        assert_ne!(
+            repository_state_fingerprint(&other_repo, &other_base).unwrap(),
+            clean
+        );
+    }
+
+    #[test]
+    fn batch_reads_prevalidate_every_path_before_preserving_success_and_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("present.ts"), "one\ntwo\nthree\n").unwrap();
+        let paths = vec![
+            json!("present.ts"),
+            json!(42),
+            json!("../outside.ts"),
+            json!("missing.ts"),
+        ];
+
+        let prevalidated = prevalidate_batch_read_paths(directory.path(), &paths);
+        let prevalidation_codes = prevalidated
+            .iter()
+            .map(|path| match path {
+                PrevalidatedBatchReadPath::Ready(_) => None,
+                PrevalidatedBatchReadPath::Rejected { result, .. } => result.error_code.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prevalidation_codes,
+            vec![
+                None,
+                Some("path_malformed"),
+                Some("path_not_allowed"),
+                Some("path_not_found"),
+            ]
+        );
+
+        let (batch, initial_failures) = read_prevalidated_repo_files_with_fallback(
+            directory.path(),
+            &prevalidated,
+            2,
+            8 * 1024,
+        );
+
+        assert_eq!(initial_failures, 3);
+        assert_eq!(batch.files.len(), 4);
+        assert_eq!(batch.files[0].status, FileReadStatus::Success);
+        assert!(batch.files[0].content.as_deref().unwrap().contains("one"));
+        assert_eq!(batch.files[0].line_count, Some(3));
+        assert_eq!(batch.files[0].valid_line_range.as_deref(), Some("1-3"));
+        assert_eq!(batch.files[1].status, FileReadStatus::Error);
+        assert_eq!(batch.files[1].path, "<paths[1]>");
+        assert_eq!(batch.files[1].error_code.as_deref(), Some("path_malformed"));
+        assert!(!batch.files[1].fallback_attempted);
+        assert_eq!(batch.files[2].status, FileReadStatus::Error);
+        assert_eq!(
+            batch.files[2].error_code.as_deref(),
+            Some("path_not_allowed")
+        );
+        assert!(batch.files[2].fallback_attempted);
+        assert_eq!(batch.files[3].status, FileReadStatus::Error);
+        assert_eq!(batch.files[3].error_code.as_deref(), Some("path_not_found"));
+        assert!(batch.files[3].fallback_attempted);
+        assert!(
+            batch.files[3]
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("individual read fallback also failed")
+        );
+    }
+
+    #[test]
+    fn invalid_read_range_returns_recovery_metadata_without_losing_file_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("short.ts"), "one\ntwo\n").unwrap();
+
+        let result = read_repo_file_result(directory.path(), "short.ts", 9, 12, 8 * 1024);
+
+        assert_eq!(result.status, FileReadStatus::Error);
+        assert_eq!(result.error_code.as_deref(), Some("line_range_invalid"));
+        assert_eq!(result.line_count, Some(2));
+        assert_eq!(result.valid_line_range.as_deref(), Some("1-2"));
+        assert!(
+            result
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("valid line range is 1-2")
+        );
+    }
+
+    #[test]
+    fn planning_repair_preserves_valid_fragments_and_reports_only_invalid_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        for path in ["src/provider.ts", "src/toggle.ts", "src/tokens.ts"] {
+            fs::write(directory.path().join(path), "export {};\n").unwrap();
+        }
+        let payload = json!({
+            "planned_changes": [
+                {
+                    "change_id": "valid-theme-provider",
+                    "targets": [{"path": "src/provider.ts", "role": "provider"}],
+                    "intent": "Update the provider.",
+                    "reason": "Register the new theme.",
+                    "acceptance_criteria": ["Theme is selectable"]
+                },
+                {
+                    "change_id": "invalid-theme-toggle",
+                    "targets": [{"path": "src/toggle.ts", "role": "selector"}],
+                    "intent": "Update the selector."
+                },
+                {
+                    "change_id": "valid-theme-tokens",
+                    "targets": [{"path": "src/tokens.ts", "role": "tokens"}],
+                    "intent": "Update the tokens.",
+                    "reason": "Complete the palette.",
+                    "acceptance_criteria": ["Theme is selectable"]
+                }
+            ]
+        });
+        let state =
+            recover_planning_repair_state(directory.path(), payload.as_object().unwrap(), 7);
+
+        assert_eq!(state.model_call, 7);
+        assert_eq!(state.valid_planned_changes.len(), 2);
+        assert_eq!(state.valid_planned_change_positions, vec![0, 2]);
+        assert_eq!(state.invalid_fields.len(), 1);
+        assert!(state.invalid_fields[0].starts_with("$.planned_changes[1]:"));
+
+        let repaired_middle: PlannedChange = serde_json::from_value(json!({
+            "change_id": "invalid-theme-toggle",
+            "targets": [{"path": "src/toggle.ts", "role": "selector"}],
+            "intent": "Update the selector.",
+            "reason": "Include the new theme in cycling.",
+            "acceptance_criteria": ["Theme is selectable"]
+        }))
+        .unwrap();
+        let mut repaired = vec![repaired_middle];
+        merge_preserved_plan_fragments(&mut repaired, Some(&state));
+        assert_eq!(
+            repaired
+                .iter()
+                .map(|change| change.change_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "valid-theme-provider",
+                "invalid-theme-toggle",
+                "valid-theme-tokens"
+            ]
+        );
+    }
+
+    #[test]
+    fn reported_write_progress_is_informational_and_cannot_fake_a_repository_write() {
+        assert!(!is_source_mutation_tool("report_write_progress"));
+        assert_eq!(
+            informational_write_progress_semantics(),
+            (ToolProgressClass::Neutral, false)
+        );
+        let report = informational_write_progress("ready_to_write", "target inspected").unwrap();
+        assert!(report.contains("repository_progress=false"));
+        assert!(informational_write_progress("applied", "claim only").is_err());
+    }
+
+    #[test]
+    fn guided_recovery_context_and_admission_are_confined_to_the_current_target() {
+        let paths = [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "src/styles/globals.css",
+            "tests/theme-provider.test.tsx",
+            "tests/theme-tokens.test.ts",
+        ];
+        let mut notebook = test_discovery_notebook(ExecutionPhase::Implementation);
+        notebook.planned_changes = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| PlannedChange {
+                change_id: format!("target-{}", index + 1),
+                parent_change_id: None,
+                path: String::new(),
+                targets: vec![PlannedTarget {
+                    path: (*path).into(),
+                    role: "required target".into(),
+                    new_file: false,
+                    status: IntendedChangeStatus::Planned,
+                }],
+                change: format!("Update {path}"),
+                reason: "Implement the localized theme.".into(),
+                status: IntendedChangeStatus::Planned,
+                acceptance_criteria: vec!["Theme can be selected".into()],
+                test_coverage: vec!["focused theme tests".into()],
+            })
+            .collect();
+        notebook.intended_changes = intended_changes_from_plan(&notebook.planned_changes);
+        notebook.files_inspected = vec![paths[0].into()];
+        notebook.tool_progress.push(new_tool_progress_record(
+            notebook.execution_attempt,
+            6,
+            ExecutionPhase::Implementation,
+            "read_file",
+            Some(paths[0].into()),
+            ToolProgressClass::RecoverableFailure,
+            "line_range_invalid: valid line range is 1-87; retry that exact range",
+            false,
+        ));
+
+        let context = implementation_start_context_from_notebook(
+            &notebook,
+            "tree-aops-226".into(),
+            4,
+            true,
+            6,
+            0,
+        );
+        assert_eq!(context.target_order.len(), 5);
+        assert_eq!(context.current_target.as_ref().unwrap().path, paths[0]);
+        assert_eq!(context.exact_files_already_read, vec![paths[0]]);
+        assert!(context.missing_file_contents.contains(&paths[1].into()));
+        assert!(context.instruction.contains("work only on current_target"));
+        assert_eq!(context.unresolved_preparation_blockers.len(), 1);
+        assert!(context.unresolved_preparation_blockers[0].contains("valid line range is 1-87"));
+
+        let current = context.current_target.as_ref();
+        assert!(validate_current_target_scope(current, true, 0, &[paths[0]], true).is_ok());
+        assert!(validate_current_target_scope(current, true, 0, &[paths[1]], false).is_err());
+        assert!(validate_current_target_scope(current, true, 0, &[paths[1]], true).is_err());
+
+        notebook.intended_changes[0].targets[0].status = IntendedChangeStatus::Applied;
+        let advanced = implementation_start_context_from_notebook(
+            &notebook,
+            "tree-after-first-write".into(),
+            3,
+            false,
+            7,
+            1,
+        );
+        assert_eq!(advanced.current_target.as_ref().unwrap().path, paths[1]);
+        assert_eq!(advanced.target_order.len(), 4);
+
+        for change in &mut notebook.intended_changes {
+            for target in &mut change.targets {
+                target.status = IntendedChangeStatus::Applied;
+            }
+        }
+        notebook.phase = ExecutionPhase::Repair;
+        let focused_failure = ValidationResult {
+            id: "focused-theme".into(),
+            command: "npm test -- theme".into(),
+            status: "failed".into(),
+            output: "light-blue restoration assertion failed".into(),
+        };
+        record_validation_repair_start(&mut notebook, std::slice::from_ref(&focused_failure));
+        assert_eq!(
+            notebook.implementation_substate,
+            ImplementationSubstate::Repairing
+        );
+        let repair_context = implementation_start_context_from_notebook(
+            &notebook,
+            "tree-with-failed-focused-gate".into(),
+            2,
+            false,
+            8,
+            5,
+        );
+        assert_eq!(repair_context.target_order.len(), paths.len());
+        assert_eq!(
+            repair_context.current_target.as_ref().unwrap().path,
+            paths[0]
+        );
+        assert!(
+            repair_context
+                .target_order
+                .iter()
+                .all(|target| paths.contains(&target.path.as_str()))
+        );
+    }
+
+    #[test]
+    fn live_progress_records_classify_reads_repeated_failures_and_informational_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("present.ts"), "one\n").unwrap();
+        let successful = read_repo_file_result(directory.path(), "present.ts", 1, 1, 8 * 1024);
+        assert_eq!(successful.status, FileReadStatus::Success);
+        let failed = read_repo_file_result(directory.path(), "missing.ts", 1, 10, 8 * 1024);
+        let error_code = failed.error_code.as_deref().unwrap();
+        let detail = format!(
+            "{}: {}",
+            error_code,
+            failed.error_message.as_deref().unwrap()
+        );
+        let records = vec![
+            new_tool_progress_record(
+                18,
+                1,
+                ExecutionPhase::Implementation,
+                "read_file",
+                Some("present.ts".into()),
+                ToolProgressClass::Productive,
+                "new repository content inspected",
+                false,
+            ),
+            new_tool_progress_record(
+                18,
+                2,
+                ExecutionPhase::Implementation,
+                "read_file",
+                Some("missing.ts".into()),
+                read_error_progress_class(error_code),
+                &detail,
+                false,
+            ),
+            new_tool_progress_record(
+                18,
+                3,
+                ExecutionPhase::Implementation,
+                "read_file",
+                Some("missing.ts".into()),
+                read_error_progress_class(error_code),
+                &detail,
+                false,
+            ),
+            new_tool_progress_record(
+                18,
+                4,
+                ExecutionPhase::Implementation,
+                "report_write_progress",
+                None,
+                informational_write_progress_semantics().0,
+                "ready to write",
+                informational_write_progress_semantics().1,
+            ),
+        ];
+        let progress = implementation_read_progress(&records, 18);
+        assert_eq!(progress.recoverable_read_failures, 2);
+        assert_eq!(progress.repeated_identical_read_failures, 2);
+        assert_eq!(records[3].class, ToolProgressClass::Neutral);
+        assert!(!records[3].repository_progress);
+        assert_eq!(ToolUsage::default().successful_writes, 0);
+        let recovered_read = vec![
+            new_tool_progress_record(
+                18,
+                1,
+                ExecutionPhase::Implementation,
+                "read_file",
+                Some("present.ts".into()),
+                ToolProgressClass::RecoverableFailure,
+                "line_range_invalid: valid line range is 1-1",
+                false,
+            ),
+            new_tool_progress_record(
+                18,
+                2,
+                ExecutionPhase::Implementation,
+                "read_file",
+                Some("present.ts".into()),
+                ToolProgressClass::Productive,
+                "recovered exact range",
+                false,
+            ),
+        ];
+        assert!(unresolved_preparation_blockers(&recovered_read, 18, 2, 0).is_empty());
+        let no_tool_blockers = unresolved_preparation_blockers(&[], 18, 6, 0);
+        assert_eq!(no_tool_blockers.len(), 1);
+        assert!(no_tool_blockers[0].contains("6 implementation turns"));
+        assert_eq!(
+            successful_read_progress("read_file", false, true, false, false).0,
+            ToolProgressClass::Productive
+        );
+        assert_eq!(
+            successful_read_progress("related_tests", false, false, true, false).0,
+            ToolProgressClass::Productive
+        );
+        assert_eq!(
+            implementation_progress_action(4, 0, 0, 2, 2, false, 4),
+            ImplementationProgressAction::FirstWriteDelayed
+        );
+    }
+
+    #[test]
+    fn post_write_stagnation_marks_useful_partial_work_for_validation() {
+        let mut blocker = None;
+        assert!(mark_post_write_stagnation(&mut blocker, 1));
+        assert!(
+            blocker
+                .as_deref()
+                .unwrap()
+                .contains("post_write_stagnation")
+        );
+        let mut planned = test_planned_change();
+        planned.targets.push(PlannedTarget {
+            path: "src/components/theme/ThemeToggle.tsx".into(),
+            role: "selector".into(),
+            new_file: false,
+            status: IntendedChangeStatus::Planned,
+        });
+        let mut change = intended_changes_from_plan(&[planned]);
+        change[0].targets[0].status = IntendedChangeStatus::Applied;
+        let changed = BTreeSet::from([change[0].targets[0].path.clone()]);
+        let status = implementation_completion_status(&change, &changed, false, true);
+        assert_eq!(
+            status,
+            ImplementationCompletionStatus::PartialReadyForValidation
+        );
+        assert_eq!(
+            validation_entry_decision(status, 1, false, true),
+            ValidationEntryDecision::UsefulPartialImplementation
+        );
+    }
+
+    #[test]
+    fn mutation_preflight_block_after_a_write_preserves_useful_partial_validation() {
+        let mut blocker = None;
+        assert!(mark_mutation_preflight_blocker(
+            &mut blocker,
+            "src/components/theme/ThemeToggle.tsx",
+        ));
+        assert!(
+            blocker
+                .as_deref()
+                .unwrap()
+                .contains("mutation_preflight_rejected")
+        );
+        assert_eq!(
+            validation_entry_decision(
+                ImplementationCompletionStatus::InProgress,
+                1,
+                false,
+                blocker.is_some(),
+            ),
+            ValidationEntryDecision::UsefulPartialImplementation
+        );
     }
 
     #[test]
@@ -12573,28 +15815,27 @@ mod tests {
     }
 
     #[test]
-    fn four_call_zero_progress_window_stops_even_without_a_write_failure() {
-        let baseline = ImplementationProgressBaseline::default();
-        let repeated = BTreeMap::from([("mutation_plan_metadata_mismatch".into(), 5)]);
-        let window =
-            implementation_progress_window(&baseline, 4, 0, &BTreeSet::new(), &repeated).unwrap();
-        assert!(window.zero_progress);
-        assert_eq!(window.new_successful_writes, 0);
-        assert_eq!(window.new_changed_paths, 0);
+    fn preparation_progress_uses_guided_recovery_instead_of_four_call_termination() {
         assert_eq!(
-            window.repeated_failure_codes["mutation_plan_metadata_mismatch"],
-            5
+            implementation_progress_action(4, 0, 4, 2, 1, false, 4),
+            ImplementationProgressAction::Continue
         );
-
-        let progress = implementation_progress_window(
-            &baseline,
-            5,
-            1,
-            &BTreeSet::from(["src/styles/globals.css".into()]),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        assert!(!progress.zero_progress);
+        assert_eq!(
+            implementation_progress_action(6, 0, 6, 2, 1, false, 6),
+            ImplementationProgressAction::FirstWriteDelayed
+        );
+        assert_eq!(
+            implementation_progress_action(7, 0, 1, 3, 1, true, 7),
+            ImplementationProgressAction::Continue
+        );
+        assert_eq!(
+            implementation_progress_action(8, 0, 1, 3, 1, true, 8),
+            ImplementationProgressAction::BlockedBeforeFirstWrite
+        );
+        assert_eq!(
+            implementation_progress_action(12, 1, 0, 0, 0, true, 4),
+            ImplementationProgressAction::BlockedAfterWrite
+        );
     }
 
     #[test]
@@ -12964,6 +16205,839 @@ mod tests {
     }
 
     #[test]
+    fn exact_five_target_diff_produces_an_authoritative_complete_declaration() {
+        let criterion = "Light-blue theme behavior is implemented and covered.".to_owned();
+        let paths = [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "src/styles/globals.css",
+            "tests/theme-provider.test.tsx",
+            "tests/theme-tokens.test.ts",
+        ];
+        let planned = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| PlannedChange {
+                change_id: format!("aops-226-target-{}", index + 1),
+                parent_change_id: None,
+                path: String::new(),
+                targets: vec![PlannedTarget {
+                    path: (*path).into(),
+                    role: "required AOPS-226 target".into(),
+                    new_file: path.starts_with("tests/"),
+                    status: IntendedChangeStatus::Applied,
+                }],
+                change: format!("Implement light-blue behavior in {path}."),
+                reason: "Complete the localized theme change.".into(),
+                status: IntendedChangeStatus::Applied,
+                acceptance_criteria: vec![criterion.clone()],
+                test_coverage: vec!["focused theme tests".into()],
+            })
+            .collect::<Vec<_>>();
+        let changed_paths = paths
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<_>>();
+
+        let declaration = deterministic_complete_declaration(
+            &planned,
+            std::slice::from_ref(&criterion),
+            &changed_paths,
+            &[],
+            &[],
+        )
+        .expect("all five applied targets should produce a declaration");
+
+        assert_eq!(declaration.implementation_status, "complete");
+        assert_eq!(declaration.changed_paths, changed_paths);
+        assert_eq!(declaration.criteria_evidence.len(), 1);
+        assert_eq!(declaration.criteria_evidence[0].paths.len(), 5);
+        assert!(declaration.remaining_work.is_empty());
+    }
+
+    #[test]
+    fn resumed_reconciliation_unions_committed_and_dirty_target_paths() {
+        let work = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], work.path()).unwrap();
+        fs::write(work.path().join("provider.tsx"), "provider base\n").unwrap();
+        fs::write(work.path().join("toggle.tsx"), "toggle base\n").unwrap();
+        command::checked("git", ["add", "."], work.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            work.path(),
+        )
+        .unwrap();
+        let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+
+        fs::write(work.path().join("provider.tsx"), "provider committed\n").unwrap();
+        command::checked("git", ["add", "provider.tsx"], work.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "first resumed target",
+            ],
+            work.path(),
+        )
+        .unwrap();
+        fs::write(work.path().join("toggle.tsx"), "toggle dirty\n").unwrap();
+
+        let repo = Repo {
+            root: work.path().to_path_buf(),
+        };
+        let changed_paths = completion_changed_paths(&repo, &base_sha).unwrap();
+        assert_eq!(changed_paths, ["provider.tsx", "toggle.tsx"]);
+        let review = completion_review_diff(work.path(), &changed_paths, &base_sha).unwrap();
+        assert!(review.contains("provider committed"));
+        assert!(review.contains("toggle dirty"));
+
+        let mut intended_changes = vec![IntendedChangeRecord {
+            change_id: "theme-targets".into(),
+            intent: "Apply both resumed theme targets".into(),
+            status: IntendedChangeStatus::Partial,
+            target: String::new(),
+            targets: vec![
+                PlannedTarget {
+                    path: "provider.tsx".into(),
+                    role: "previously committed target".into(),
+                    new_file: false,
+                    status: IntendedChangeStatus::Applied,
+                },
+                PlannedTarget {
+                    path: "toggle.tsx".into(),
+                    role: "new dirty target".into(),
+                    new_file: false,
+                    status: IntendedChangeStatus::Planned,
+                },
+            ],
+            attempts: Vec::new(),
+            recovery: None,
+        }];
+        reconcile_changed_target_statuses(
+            &mut intended_changes,
+            &changed_paths.into_iter().collect(),
+        );
+        assert_eq!(
+            intended_changes[0].targets[0].status,
+            IntendedChangeStatus::Applied
+        );
+        assert_eq!(
+            intended_changes[0].targets[1].status,
+            IntendedChangeStatus::InProgress
+        );
+        assert_eq!(intended_changes[0].status, IntendedChangeStatus::Partial);
+    }
+
+    #[test]
+    fn aops_226_producing_fixture_reviews_commits_pushes_creates_pr_and_exits_zero() {
+        let fixture_started = Instant::now();
+        let work = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        command::checked(
+            "git",
+            ["init", "--bare", "-q", remote.path().to_str().unwrap()],
+            work.path(),
+        )
+        .unwrap();
+        command::checked("git", ["init", "-q"], work.path()).unwrap();
+        command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "user.email", "test@example.com"],
+            work.path(),
+        )
+        .unwrap();
+        let paths = [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "src/styles/globals.css",
+            "tests/theme-provider.test.tsx",
+            "tests/theme-tokens.test.ts",
+        ];
+        for path in paths {
+            let target = work.path().join(path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, format!("// base {path}\n")).unwrap();
+        }
+        command::checked("git", ["add", "."], work.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            work.path(),
+        )
+        .unwrap();
+        command::checked("git", ["branch", "-M", "main"], work.path()).unwrap();
+        command::checked(
+            "git",
+            ["remote", "add", "origin", remote.path().to_str().unwrap()],
+            work.path(),
+        )
+        .unwrap();
+        command::checked("git", ["push", "-q", "-u", "origin", "main"], work.path()).unwrap();
+        let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+        let branch = "rustgrid/aops-226-fixture";
+        command::checked("git", ["checkout", "-q", "-b", branch], work.path()).unwrap();
+        let mut performance = PhaseLedger::new(60, ExecutionPhase::Discovery);
+        for _ in 0..4 {
+            performance.begin_model_call().unwrap();
+        }
+        performance.transition(ExecutionPhase::Planning);
+        for _ in 0..2 {
+            performance.begin_model_call().unwrap();
+        }
+        assert_eq!(performance.apply_ticket_complexity(paths.len()), 20);
+        performance.transition(ExecutionPhase::Implementation);
+        let mut first_successful_write_call = None;
+        let implemented_files = [
+            (
+                paths[0],
+                r#"export type Theme = "dark" | "light" | "light-blue" | "red";
+export const THEME_STORAGE_KEY = "rustgrid-theme";
+export const THEME_ORDER: Theme[] = ["dark", "light", "light-blue", "red"];
+export const isLightTheme = (theme: Theme) => theme === "light" || theme === "light-blue";
+
+export function restoreTheme(saved: string | null): Theme {
+  return THEME_ORDER.includes(saved as Theme) ? (saved as Theme) : "dark";
+}
+
+export function applyTheme(root: HTMLElement, theme: Theme) {
+  root.classList.remove(...THEME_ORDER.map((value) => `theme-${value}`));
+  root.classList.add(`theme-${theme}`);
+  root.style.colorScheme = isLightTheme(theme) ? "light" : "dark";
+  localStorage.setItem(THEME_STORAGE_KEY, theme);
+}
+"#,
+            ),
+            (
+                paths[1],
+                r#"import { THEME_ORDER, type Theme } from "./ThemeProvider";
+
+export function nextTheme(theme: Theme): Theme {
+  return THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+}
+
+export function themeToggleLabel(theme: Theme) {
+  return `Switch to ${nextTheme(theme)} theme`;
+}
+
+export const themeToggleIcon = (theme: Theme) =>
+  theme === "light" || theme === "light-blue" ? "sun" : "moon";
+"#,
+            ),
+            (
+                paths[2],
+                r#".theme-light-blue {
+  color-scheme: light;
+  --background: 210 60% 98%;
+  --foreground: 218 42% 16%;
+  --card: 210 50% 100%;
+  --card-foreground: 218 42% 16%;
+  --border: 210 32% 78%;
+  --input: 210 32% 82%;
+  --ring: 216 92% 48%;
+  --primary: 224 76% 42%;
+  --primary-foreground: 210 50% 100%;
+  --info: 199 88% 48%;
+  --destructive: 0 72% 45%;
+  --success: 151 58% 34%;
+}
+"#,
+            ),
+            (
+                paths[3],
+                r#"import { applyTheme, restoreTheme, THEME_ORDER } from "../src/components/theme/ThemeProvider";
+
+it("cycles dark -> light -> light-blue -> red -> dark", () => {
+  expect(THEME_ORDER).toEqual(["dark", "light", "light-blue", "red"]);
+});
+
+it("restores and immediately applies a saved light-blue preference", () => {
+  const root = document.documentElement;
+  applyTheme(root, restoreTheme("light-blue"));
+  expect(root.classList.contains("theme-light-blue")).toBe(true);
+  expect(root.classList.contains("theme-dark")).toBe(false);
+  expect(localStorage.getItem("rustgrid-theme")).toBe("light-blue");
+});
+
+it("preserves the dark fallback for missing and invalid preferences", () => {
+  expect(restoreTheme(null)).toBe("dark");
+  expect(restoreTheme("invalid")).toBe("dark");
+});
+"#,
+            ),
+            (
+                paths[4],
+                r#"const requiredTokens = [
+  "background", "foreground", "card", "card-foreground", "border", "input",
+  "ring", "primary", "primary-foreground", "info", "destructive", "success",
+];
+
+it("defines every semantic token for light-blue without conflating primary and info", () => {
+  const lightBlue = readThemeTokens("theme-light-blue");
+  expect(requiredTokens.every((token) => lightBlue[token])).toBe(true);
+  expect(lightBlue.primary).not.toBe(lightBlue.info);
+  expect(contrast(lightBlue.foreground, lightBlue.background)).toBeGreaterThanOrEqual(4.5);
+});
+"#,
+            ),
+        ];
+        for (path, content) in implemented_files {
+            performance.begin_model_call().unwrap();
+            fs::write(work.path().join(path), content).unwrap();
+            first_successful_write_call
+                .get_or_insert(performance.phase_calls(ExecutionPhase::Implementation));
+        }
+        let repo = Repo {
+            root: work.path().to_path_buf(),
+        };
+        let expected_paths = paths
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect::<Vec<_>>();
+        let changed_paths = completion_changed_paths(&repo, &base_sha).unwrap();
+        assert_eq!(changed_paths, expected_paths);
+        let reviewed_diff = completion_review_diff(work.path(), &changed_paths, &base_sha).unwrap();
+        performance.transition(ExecutionPhase::DiffReview);
+        performance.begin_model_call().unwrap();
+        for path in paths {
+            assert!(reviewed_diff.contains(path));
+        }
+        assert!(reviewed_diff.contains("dark\", \"light\", \"light-blue\", \"red"));
+        assert!(reviewed_diff.contains("theme === \"light-blue\""));
+        assert!(reviewed_diff.contains("--primary:"));
+        assert!(reviewed_diff.contains("--info:"));
+        assert!(reviewed_diff.contains("restoreTheme(\"light-blue\")"));
+        assert!(reviewed_diff.contains("toBeGreaterThanOrEqual(4.5)"));
+
+        let criterion = "Light-blue theme behavior is implemented and covered.".to_owned();
+        let planned_changes = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| PlannedChange {
+                change_id: format!("aops-226-target-{}", index + 1),
+                parent_change_id: None,
+                path: String::new(),
+                targets: vec![PlannedTarget {
+                    path: (*path).into(),
+                    role: "required AOPS-226 target".into(),
+                    new_file: false,
+                    status: IntendedChangeStatus::Applied,
+                }],
+                change: format!("Implement light-blue behavior in {path}."),
+                reason: "Complete the localized theme change.".into(),
+                status: IntendedChangeStatus::Applied,
+                acceptance_criteria: vec![criterion.clone()],
+                test_coverage: vec!["focused theme tests".into()],
+            })
+            .collect::<Vec<_>>();
+        let declaration = deterministic_complete_declaration(
+            &planned_changes,
+            std::slice::from_ref(&criterion),
+            &changed_paths,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let implementation = ImplementationOutcome {
+            summary: "Implemented all five light-blue theme targets.".into(),
+            budget_exhausted: false,
+            explicit_declaration: Some(declaration),
+        };
+        let validation = [
+            ("focused-theme", "npm test -- theme"),
+            ("test", "npm test"),
+            ("build", "npm run build"),
+        ]
+        .into_iter()
+        .map(|(id, command)| ValidationResult {
+            id: id.into(),
+            command: command.into(),
+            status: "passed".into(),
+            output: "passed once".into(),
+        })
+        .collect::<Vec<_>>();
+        let plan = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes,
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        let completeness = completion_fallback(
+            &implementation,
+            None,
+            Some(&plan),
+            &[],
+            &changed_paths,
+            std::slice::from_ref(&criterion),
+            &validation,
+            ProjectVerificationPolicy::default(),
+        );
+        assert!(matches!(
+            completeness.status,
+            CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview
+        ));
+        performance.transition(ExecutionPhase::CompletionEvaluation);
+        performance.begin_model_call().unwrap();
+        let estimated_cost_micros = 360_000;
+        assert!(first_successful_write_call.is_some_and(|call| call <= 6));
+        assert!(performance.implementation_repair_calls() <= 10);
+        assert!(performance.total_calls() <= 20);
+        assert!(estimated_cost_micros <= model_cost_limit_for_target_count(paths.len()));
+        assert!(fixture_started.elapsed() <= MAX_HOSTED_EXECUTION_DURATION);
+
+        let commit = repo
+            .commit_paths(&changed_paths, "AOPS-226: Add light-blue theme")
+            .unwrap();
+        assert!(
+            repo.push(branch, &commit, "fixture-token", "https://github.com")
+                .unwrap()
+        );
+        let remote_commit = command::checked(
+            "git",
+            [
+                "--git-dir",
+                remote.path().to_str().unwrap(),
+                "rev-parse",
+                &format!("refs/heads/{branch}"),
+            ],
+            work.path(),
+        )
+        .unwrap();
+        assert_eq!(remote_commit, commit);
+        assert!(repo.new_agent_paths(&BTreeSet::new()).unwrap().is_empty());
+        let (publication_head, publication_paths) =
+            committed_head_for_publication(&repo, &base_sha)
+                .unwrap()
+                .expect("the committed base-to-HEAD implementation must remain publishable");
+        assert_eq!(publication_head, commit);
+        assert_eq!(publication_paths, expected_paths);
+
+        let Some((github_base, requests, server)) = request_sequence_server(vec![
+            ("200 OK", json!([])),
+            (
+                "201 Created",
+                json!({
+                    "number": 226,
+                    "html_url": "https://github.example/RustGrid/example/pull/226",
+                    "node_id": "PR_AOPS_226",
+                    "draft": false
+                }),
+            ),
+        ]) else {
+            return;
+        };
+        let github = GitHubClient::new("fixture-token", github_base.as_str()).unwrap();
+        let mut manifest = test_manifest(Uuid::from_u128(226));
+        manifest.ticket_key = "AOPS-226".into();
+        manifest.ticket_title = "Add the light-blue theme".into();
+        manifest.github.branch = branch.into();
+        manifest.github.base_ref = "main".into();
+        let pull = find_or_create_hosted_pull_request(
+            &github,
+            &RepoConfig {
+                owner: "RustGrid".into(),
+                name: "example".into(),
+            },
+            &manifest,
+            &validation,
+            &completeness,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pull.number, 226);
+        let lookup = requests.recv().unwrap();
+        let creation = requests.recv().unwrap();
+        server.join().unwrap();
+        assert!(lookup.starts_with("GET /api/v3/repos/RustGrid/example/pulls?"));
+        assert!(creation.starts_with("POST /api/v3/repos/RustGrid/example/pulls HTTP/1.1"));
+        let creation_body: Value =
+            serde_json::from_str(creation.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(creation_body["head"], branch);
+        assert_eq!(creation_body["draft"], false);
+
+        let result = HostedResult {
+            summary: implementation.summary,
+            branch: branch.into(),
+            commit: commit.clone(),
+            pull_request: PullRequestResult {
+                number: pull.number,
+                url: pull.html_url,
+            },
+            validation,
+            completeness,
+            terminal_telemetry: TerminalTelemetry {
+                model_calls_used: performance.total_calls(),
+                input_tokens: 48_000,
+                output_tokens: 8_000,
+                estimated_cost_micros,
+                usage: ToolUsage {
+                    reads: 5,
+                    searches: 2,
+                    writes: 5,
+                    successful_writes: 5,
+                    validation_commands: 3,
+                    required_validations: 3,
+                    ..ToolUsage::default()
+                },
+                changed_paths: changed_paths.clone(),
+                last_successful_action: json!({
+                    "phase": "publication",
+                    "action": "pull_request_created",
+                    "pull_request_number": 226,
+                }),
+                phase_reached: Some(ExecutionPhase::Publication),
+                plan: plan.planned_changes.clone(),
+                remaining_work: Vec::new(),
+                validation_evidence: Vec::new(),
+                notebook_revision: 18,
+            },
+        };
+        assert!(hosted_result_can_succeed(&result));
+
+        let execution_id = manifest.execution.execution_id;
+        let Some((api_root, result_requests, result_server)) = request_sequence_server(vec![
+            ("200 OK", json!({})),
+            ("200 OK", json!({})),
+            ("200 OK", json!({})),
+        ]) else {
+            return;
+        };
+        let api = test_api_client(api_root, execution_id);
+        report_successful_hosted_result(
+            &api,
+            execution_id,
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:05:00Z",
+            &result,
+        )
+        .unwrap();
+
+        let telemetry_request = result_requests.recv().unwrap();
+        let result_event_request = result_requests.recv().unwrap();
+        let completion_request = result_requests.recv().unwrap();
+        result_server.join().unwrap();
+
+        assert!(telemetry_request.starts_with(&format!(
+            "POST /api/v1/executions/{execution_id}/telemetry/batch HTTP/1.1"
+        )));
+        let telemetry_body: Value =
+            serde_json::from_str(telemetry_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(telemetry_body["events"][0]["type"], "execution.completed");
+        assert_eq!(
+            telemetry_body["events"][0]["execution"]["status"],
+            "succeeded"
+        );
+
+        assert!(result_event_request.starts_with(&format!(
+            "POST /api/v1/executions/{execution_id}/worker-events HTTP/1.1"
+        )));
+        let result_event_body: Value =
+            serde_json::from_str(result_event_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(result_event_body["event_type"], "result");
+        assert_eq!(result_event_body["data"]["status"], "completed");
+        assert_eq!(result_event_body["data"]["mission_outcome"], "complete");
+        assert_eq!(result_event_body["data"]["head_sha"], commit);
+        assert_eq!(result_event_body["data"]["pull_request_number"], 226);
+        assert_eq!(
+            result_event_body["data"]["terminal_telemetry"]["model_calls_used"],
+            performance.total_calls()
+        );
+        assert_eq!(
+            result_event_body["data"]["terminal_telemetry"]["usage"]["successful_writes"],
+            5
+        );
+        assert_eq!(
+            result_event_body["data"]["terminal_telemetry"]["usage"]["validation_commands"],
+            3
+        );
+        assert_eq!(
+            result_event_body["data"]["terminal_telemetry"]["changed_paths"],
+            json!(changed_paths)
+        );
+
+        assert!(completion_request.starts_with(&format!(
+            "POST /api/v1/executions/{execution_id}/complete HTTP/1.1"
+        )));
+        let completion_body: Value =
+            serde_json::from_str(completion_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(completion_body["status"], "completed");
+        assert_eq!(completion_body["mission_outcome"], "complete");
+        assert_eq!(completion_body["process_health"], "healthy");
+        assert_eq!(
+            completion_body["completion_evaluation"]["status"],
+            "complete"
+        );
+        assert_eq!(completion_body["head_branch"], branch);
+        assert_eq!(completion_body["head_sha"], commit);
+        assert_eq!(completion_body["pull_request_number"], 226);
+        assert_eq!(
+            completion_body["pull_request_url"],
+            "https://github.example/RustGrid/example/pull/226"
+        );
+        assert_eq!(
+            completion_body["output_summary"],
+            "Implemented all five light-blue theme targets."
+        );
+    }
+
+    #[test]
+    fn zero_diff_preparation_block_is_a_healthy_domain_result_with_live_telemetry() {
+        let mut failure = test_execution_failure(
+            "implementation_progress_missing",
+            "Implementation could not begin after guided recovery.",
+        );
+        let current_plan = vec![test_planned_change()];
+        let remaining_work = derive_remaining_work(&intended_changes_from_plan(&current_plan));
+        let failed_read = ToolProgressRecord {
+            execution_attempt: 18,
+            model_call: 7,
+            phase: ExecutionPhase::Implementation,
+            tool: "read_file".into(),
+            target: Some("src/components/theme/ThemeProvider.tsx".into()),
+            class: ToolProgressClass::RecoverableFailure,
+            outcome_signature: "read_file:range_invalid:ThemeProvider.tsx".into(),
+            detail: "requested line range exceeded the file length; valid range is 1-120".into(),
+            repository_progress: false,
+        };
+        let mut stale_validation = new_running_evidence(
+            "focused-old-tree".into(),
+            "focused-theme".into(),
+            ValidationGateType::FocusedTest,
+            "npm test -- theme".into(),
+            "old-fingerprint".into(),
+            "old-tree".into(),
+            "lock".into(),
+            ValidationSource::WorkerRequired,
+        );
+        stale_validation.status = ValidationStatus::Superseded;
+
+        failure.phase = ExecutionPhase::Implementation;
+        failure.model_calls_used = 8;
+        failure.model_calls_limit = 20;
+        failure.model_calls_remaining = 12;
+        failure.phase_calls_used = 8;
+        failure.phase_calls_limit = 8;
+        failure.input_tokens = 12_345;
+        failure.output_tokens = 2_345;
+        failure.estimated_cost_micros = 456_789;
+        failure.usage = ToolUsage {
+            reads: 6,
+            failed_reads: 3,
+            searches: 2,
+            writes: 2,
+            failed_writes: 2,
+            write_preflight_rejections: 1,
+            write_execution_failures: 1,
+            ..ToolUsage::default()
+        };
+        failure.last_successful_action = json!({
+            "model_call": 6,
+            "phase": "implementation",
+            "tool": "search_text",
+            "target": "src/components/theme/ThemeProvider.tsx",
+        });
+        failure.failed_tool_operations = vec![failed_read];
+        failure.current_plan = current_plan.clone();
+        failure.validation_evidence = vec![stale_validation];
+        failure.notebook_revision = 18;
+        let failure = classify_implementation_preparation_failure(failure, &remaining_work);
+
+        assert_eq!(failure.status, "blocked");
+        assert_eq!(failure.category, "implementation_blocked");
+        assert_eq!(failure.process_health, "healthy");
+        assert_eq!(failure.mission_outcome, "blocked");
+        assert_eq!(
+            failure.blocker.as_deref(),
+            Some("implementation_preparation_failed")
+        );
+        assert!(failure.resumable);
+        assert_eq!(failure.code, "implementation_preparation_failed");
+        assert_eq!(failure.phase, ExecutionPhase::Implementation);
+        assert_eq!(
+            failure.message,
+            "Implementation could not begin after guided recovery."
+        );
+        assert_eq!(
+            failure.underlying_error.message,
+            "implementation_progress_missing"
+        );
+        assert!(failure.recoverable);
+        assert_eq!(failure.resume_phase, "implementation");
+        assert_eq!(failure.remaining_work, remaining_work);
+        assert!(
+            failure
+                .recommended_action
+                .contains("current planned target")
+        );
+
+        let error = anyhow::Error::new(failure);
+        let (code, _) = safe_failure(&error, false);
+        let diagnostics = failure_diagnostics(&error, false);
+        let failure = error
+            .downcast_ref::<HostedAgentExecutionFailure>()
+            .expect("the classified failure must remain structured");
+        let event = blocked_result_event_payload(failure, diagnostics.clone());
+
+        assert_eq!(code, "implementation_preparation_failed");
+        assert_ne!(code, "hosted_agent_execution_failed");
+        assert_eq!(diagnostics["process_health"], "healthy");
+        assert_eq!(diagnostics["mission_outcome"], "blocked");
+        assert_eq!(diagnostics["resume_phase"], "implementation");
+        assert_eq!(
+            diagnostics["recommended_action"],
+            failure.recommended_action
+        );
+        assert_eq!(diagnostics["model_calls_used"], 8);
+        assert_eq!(diagnostics["model_calls_limit"], 20);
+        assert_eq!(diagnostics["model_calls_remaining"], 12);
+        assert_eq!(diagnostics["phase_calls_used"], 8);
+        assert_eq!(diagnostics["phase_calls_limit"], 8);
+        assert_eq!(diagnostics["input_tokens"], 12_345);
+        assert_eq!(diagnostics["output_tokens"], 2_345);
+        assert_eq!(diagnostics["estimated_cost_micros"], 456_789);
+        assert_eq!(diagnostics["usage"]["reads"], 6);
+        assert_eq!(diagnostics["usage"]["failed_reads"], 3);
+        assert_eq!(diagnostics["usage"]["searches"], 2);
+        assert_eq!(diagnostics["usage"]["writes"], 2);
+        assert_eq!(diagnostics["usage"]["failed_writes"], 2);
+        assert_eq!(diagnostics["usage"]["write_preflight_rejections"], 1);
+        assert_eq!(diagnostics["usage"]["write_execution_failures"], 1);
+        assert_eq!(diagnostics["usage"]["validation_commands"], 0);
+        assert_eq!(diagnostics["last_successful_action"]["tool"], "search_text");
+        assert_eq!(diagnostics["phase"], "implementation");
+        assert_eq!(diagnostics["current_plan"], json!(current_plan));
+        assert_eq!(diagnostics["remaining_work"], json!(remaining_work));
+        assert_eq!(
+            diagnostics["failed_tool_operations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            diagnostics["validation_evidence"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(diagnostics["notebook_revision"], 18);
+        assert_eq!(diagnostics["changed_paths"], json!([]));
+        assert_eq!(
+            diagnostics["failed_tool_operations"][0]["target"],
+            "src/components/theme/ThemeProvider.tsx"
+        );
+        assert!(
+            diagnostics["failed_tool_operations"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("valid range is 1-120")
+        );
+
+        assert_eq!(event["status"], "blocked");
+        assert_eq!(event["mission_outcome"], "blocked");
+        assert_eq!(event["process_health"], "healthy");
+        assert_eq!(event["reason_code"], "implementation_preparation_failed");
+        assert_eq!(event["resumable"], true);
+        assert_eq!(event["resume_phase"], "implementation");
+        assert_eq!(event["changed_paths"], json!([]));
+        assert_eq!(event["remaining_work"], json!(remaining_work));
+        assert_eq!(event["terminal_telemetry"]["model_calls_used"], 8);
+        assert_eq!(event["terminal_telemetry"]["input_tokens"], 12_345);
+        assert_eq!(event["terminal_telemetry"]["output_tokens"], 2_345);
+        assert_eq!(
+            event["terminal_telemetry"]["estimated_cost_micros"],
+            456_789
+        );
+        assert_eq!(event["terminal_telemetry"]["usage"]["reads"], 6);
+        assert_eq!(event["terminal_telemetry"]["usage"]["failed_reads"], 3);
+        assert_eq!(event["terminal_telemetry"]["usage"]["searches"], 2);
+        assert_eq!(event["terminal_telemetry"]["usage"]["writes"], 2);
+        assert_eq!(event["terminal_telemetry"]["usage"]["failed_writes"], 2);
+        assert_eq!(
+            event["terminal_telemetry"]["usage"]["write_preflight_rejections"],
+            1
+        );
+        assert_eq!(
+            event["terminal_telemetry"]["usage"]["write_execution_failures"],
+            1
+        );
+        assert_eq!(
+            event["terminal_telemetry"]["usage"]["validation_commands"],
+            0
+        );
+        assert_eq!(event["terminal_telemetry"]["changed_paths"], json!([]));
+        assert_eq!(
+            event["terminal_telemetry"]["last_successful_action"]["tool"],
+            "search_text"
+        );
+        assert_eq!(
+            event["terminal_telemetry"]["phase_reached"],
+            "implementation"
+        );
+        assert_eq!(event["terminal_telemetry"]["plan"], json!(current_plan));
+        assert_eq!(
+            event["terminal_telemetry"]["remaining_work"],
+            json!(remaining_work)
+        );
+        assert_eq!(
+            event["terminal_telemetry"]["validation_evidence"][0]["evidence_id"],
+            "focused-old-tree"
+        );
+        assert_eq!(event["terminal_telemetry"]["notebook_revision"], 18);
+        assert_eq!(
+            event["failure"]["failed_tool_operations"][0]["class"],
+            "recoverable_failure"
+        );
+        assert_eq!(event["failure"], diagnostics);
+    }
+
+    #[test]
+    fn zero_diff_validation_entry_executes_zero_repository_gates() {
+        let decision =
+            validation_entry_decision(ImplementationCompletionStatus::Preparing, 0, false, false);
+        let mut executed_gate_count = 0;
+        let dispatched = dispatch_validation_gates(decision, || {
+            executed_gate_count += 1;
+            Ok("gate ran")
+        })
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            ValidationEntryDecision::ForbiddenNoImplementationChanges
+        );
+        assert!(dispatched.is_none());
+        assert_eq!(executed_gate_count, 0);
+    }
+
+    #[test]
     fn partial_and_blocked_domain_outcomes_are_healthy_even_with_incomplete_gates() {
         for status in [CompletionStatus::Partial, CompletionStatus::Blocked] {
             let result = HostedResult {
@@ -12981,6 +17055,7 @@ mod tests {
                     output: "one remaining failure".into(),
                 }],
                 completeness: test_completion_evaluation(status),
+                terminal_telemetry: TerminalTelemetry::default(),
             };
             assert!(hosted_result_can_succeed(&result));
         }
@@ -12999,6 +17074,7 @@ mod tests {
                 output: String::new(),
             }],
             completeness: test_completion_evaluation(CompletionStatus::Complete),
+            terminal_telemetry: TerminalTelemetry::default(),
         };
         assert!(!hosted_result_can_succeed(&complete));
         complete.completeness.status = CompletionStatus::Uncertain;
@@ -13048,6 +17124,7 @@ mod tests {
                 output: String::new(),
             }],
             completeness: result,
+            terminal_telemetry: TerminalTelemetry::default(),
         };
         assert!(!hosted_result_can_succeed(&hosted_result));
     }
@@ -13173,7 +17250,7 @@ mod tests {
                 allocation.diff_review_reserved,
                 allocation.completion_evaluation_reserved,
             ),
-            (5, 3, 6, 3, 3)
+            (5, 3, 10, 1, 1)
         );
     }
 
@@ -13216,6 +17293,118 @@ mod tests {
     }
 
     #[test]
+    fn localized_discovery_has_a_twelve_thousand_token_equivalent_request_ceiling() {
+        assert_eq!(
+            phase_request_input_ceiling(ExecutionPhase::Discovery, 100 * 1024),
+            MAX_DISCOVERY_REQUEST_BYTES
+        );
+        assert_eq!(
+            phase_request_input_ceiling(ExecutionPhase::ArtifactRepair, 100 * 1024),
+            MAX_DISCOVERY_REQUEST_BYTES
+        );
+        assert_eq!(
+            phase_request_input_ceiling(ExecutionPhase::Implementation, 100 * 1024),
+            100 * 1024
+        );
+        let guidance = visual_impact_guidance("Add a light-blue theme");
+        assert!(guidance.contains("at most three representative consumers"));
+        assert!(guidance.contains("Record the compact impact map"));
+    }
+
+    #[test]
+    fn centralized_localized_discovery_stops_after_core_boundaries_and_three_consumers() {
+        let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+        notebook.goal = "Add a light-blue theme".into();
+        notebook.architecture_findings.clear();
+        record_centralized_discovery_finding(
+            &mut notebook,
+            "Centralized semantic CSS variables are confirmed.",
+        );
+        notebook.files_inspected = vec![
+            "src/components/theme/ThemeProvider.tsx".into(),
+            "src/components/theme/ThemeToggle.tsx".into(),
+            "src/styles/globals.css".into(),
+            "tests/theme-provider.test.tsx".into(),
+            "package.json".into(),
+            "src/components/Button.tsx".into(),
+            "src/components/Input.tsx".into(),
+            "src/components/Status.tsx".into(),
+        ];
+        let coverage = localized_discovery_coverage(&notebook);
+        assert!(coverage.centralized_abstraction);
+        assert_eq!(coverage.representative_consumers, 3);
+        assert!(localized_discovery_should_stop(coverage));
+        assert!(
+            validate_localized_discovery_scope(&notebook, &["src/components/Card.tsx"])
+                .unwrap_err()
+                .to_string()
+                .contains("localized_discovery_complete")
+        );
+
+        notebook.files_inspected = vec!["src/components/theme/ThemeProvider.tsx".into()];
+        notebook.discovery_paths_sampled = vec![
+            "src/components/Button.tsx".into(),
+            "src/components/Input.tsx".into(),
+            "src/components/Status.tsx".into(),
+        ];
+        assert!(
+            validate_localized_discovery_scope(&notebook, &["src/components/Card.tsx"])
+                .unwrap_err()
+                .to_string()
+                .contains("localized_discovery_consumer_limit")
+        );
+        assert!(
+            validate_localized_discovery_scope(&notebook, &["src/components/Status.tsx"]).is_ok()
+        );
+        let directory_search = json!({"path": "src"});
+        assert!(
+            discovery_requested_paths("search_text", directory_search.as_object().unwrap())
+                .is_empty()
+        );
+        let directory_listing = json!({"path": "."});
+        assert!(
+            discovery_requested_paths("list_files", directory_listing.as_object().unwrap())
+                .is_empty()
+        );
+        assert!(
+            validate_localized_discovery_scope(&notebook, &["tests/theme-provider.test.tsx"])
+                .is_ok()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src/components")).unwrap();
+        for name in ["Button.tsx", "Card.tsx", "Input.tsx", "Status.tsx"] {
+            fs::write(
+                directory.path().join("src/components").join(name),
+                "const color = 'hardcoded';\n",
+            )
+            .unwrap();
+        }
+        let known = BTreeSet::from([
+            "src/components/Button.tsx".to_owned(),
+            "src/components/Input.tsx".to_owned(),
+        ]);
+        let search = search_repo(
+            directory.path(),
+            "src/components",
+            "hardcoded",
+            &["tsx".into()],
+            0,
+            Some(1),
+            &known,
+        )
+        .unwrap();
+        assert!(
+            search
+                .matched_paths
+                .iter()
+                .filter(|path| !known.contains(*path))
+                .count()
+                <= 1
+        );
+    }
+
+    #[test]
     fn lifecycle_transition_table_rejects_skipping_validation() {
         assert!(legal_phase_transition(
             ExecutionPhase::Implementation,
@@ -13245,6 +17434,60 @@ mod tests {
                 .2
                 .contains("smallest complete validated result")
         );
+    }
+
+    #[test]
+    fn five_target_cost_ceiling_is_enforced_before_provider_dispatch() {
+        assert_eq!(model_cost_limit_for_target_count(5), 2_000_000);
+        let guard = CostGuard {
+            estimated_cost_micros: 1_750_000,
+            hard_limit_micros: model_cost_limit_for_target_count(5),
+            ..CostGuard::default()
+        };
+        let mut request = json!({
+            "input": "implementation context ".repeat(1_000),
+            "max_output_tokens": 16_384,
+        });
+        assert!(constrain_request_to_cost_limit(&mut request, &guard).unwrap());
+        let input_upper = u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap();
+        let output_upper = request["max_output_tokens"].as_u64().unwrap();
+        assert!(output_upper < 16_384);
+        assert!(
+            guard
+                .estimated_cost_micros
+                .saturating_add(input_upper.saturating_mul(5))
+                .saturating_add(output_upper.saturating_mul(15))
+                <= guard.hard_limit_micros
+        );
+
+        let exhausted = CostGuard {
+            estimated_cost_micros: 1_999_999,
+            hard_limit_micros: 2_000_000,
+            ..CostGuard::default()
+        };
+        assert!(!constrain_request_to_cost_limit(&mut request, &exhausted).unwrap());
+    }
+
+    #[test]
+    fn missing_provider_usage_is_accounted_with_the_dispatched_request_upper_bound() {
+        let request = json!({
+            "input": [{"role": "user", "content": "bounded implementation context"}],
+            "max_output_tokens": 512,
+        });
+        let request_bytes = u64::try_from(serde_json::to_vec(&request).unwrap().len()).unwrap();
+        let (input_tokens, output_tokens, estimated) =
+            model_usage_for_accounting(&request, &json!({"output": []})).unwrap();
+        assert_eq!(input_tokens, request_bytes);
+        assert_eq!(output_tokens, 512);
+        assert!(estimated);
+
+        let (input_tokens, output_tokens, estimated) = model_usage_for_accounting(
+            &request,
+            &json!({"usage": {"input_tokens": 23, "output_tokens": 17}}),
+        )
+        .unwrap();
+        assert_eq!((input_tokens, output_tokens), (23, 17));
+        assert!(!estimated);
     }
 
     #[test]
@@ -13385,6 +17628,7 @@ Implement theme support.\n\n\
                 text: "All surfaces use the theme".into(),
             }],
             phase: ExecutionPhase::DiffReview,
+            implementation_substate: ImplementationSubstate::Preparing,
             repository_base_sha: "a".repeat(40),
             branch: "rustgrid/aops-226-deadbeef".into(),
             repository_fingerprint: "b".repeat(64),
@@ -13412,7 +17656,9 @@ Implement theme support.\n\n\
             impact_map_invalid_payload: None,
             impact_evidence: vec![],
             files_inspected: vec!["src/theme.css".into()],
+            read_ranges_inspected: vec!["src/theme.css:1-400".into()],
             searches_completed: vec!["literal:src:theme".into()],
+            discovery_paths_sampled: vec![],
             planned_changes: vec![PlannedChange {
                 change_id: "change-1-theme".into(),
                 parent_change_id: None,
@@ -13424,8 +17670,10 @@ Implement theme support.\n\n\
                 acceptance_criteria: vec!["All surfaces use the theme".into()],
                 test_coverage: vec!["theme snapshot".into()],
             }],
+            planning_repair: None,
             completed_changes: vec![],
             failed_changes: vec![],
+            tool_progress: vec![],
             intended_changes: vec![],
             write_attempts: vec![],
             write_preflight_rejections: vec![],
@@ -13556,6 +17804,7 @@ Implement theme support.\n\n\
                 output: String::new(),
             }],
             completeness: evaluation.clone(),
+            terminal_telemetry: TerminalTelemetry::default(),
         };
         assert!(hosted_result_can_succeed(&hosted_result));
         let mut missing_evidence = evaluation;
@@ -14005,6 +18254,15 @@ Implement theme support.\n\n\
             phase_calls_limit: 1,
             last_successful_action: json!({}),
             usage: ToolUsage::default(),
+            estimated_cost_micros: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            changed_paths: vec![],
+            remaining_work: vec![],
+            failed_tool_operations: vec![],
+            current_plan: vec![],
+            validation_evidence: vec![],
+            notebook_revision: 0,
             recoverable: true,
             resume_phase: "artifact_repair".into(),
             recommended_action: "resume".into(),
@@ -14062,6 +18320,7 @@ Implement theme support.\n\n\
                 text: "All surfaces use the theme".into(),
             }],
             phase,
+            implementation_substate: ImplementationSubstate::Preparing,
             repository_base_sha: "a".repeat(40),
             branch: "rustgrid/aops-226-deadbeef".into(),
             repository_fingerprint: "b".repeat(64),
@@ -14080,10 +18339,14 @@ Implement theme support.\n\n\
                 &["literal:src:ThemeProvider".into()],
             ),
             files_inspected: vec!["src/components/theme/ThemeProvider.tsx".into()],
+            read_ranges_inspected: vec!["src/components/theme/ThemeProvider.tsx:1-400".into()],
             searches_completed: vec!["literal:src:ThemeProvider".into()],
+            discovery_paths_sampled: vec![],
             planned_changes: vec![],
+            planning_repair: None,
             completed_changes: vec![],
             failed_changes: vec![],
+            tool_progress: vec![],
             intended_changes: vec![],
             write_attempts: vec![],
             write_preflight_rejections: vec![],
@@ -15319,6 +19582,51 @@ Implement theme support.\n\n\
         assert!((Duration::from_millis(200)..=Duration::from_millis(300)).contains(&first));
         assert!((Duration::from_millis(800)..=Duration::from_millis(1_200)).contains(&second));
         assert!((Duration::from_millis(2_400)..=Duration::from_millis(3_600)).contains(&third));
+    }
+
+    #[test]
+    fn ai_gateway_request_and_transport_retries_stop_at_execution_deadline() {
+        let execution_id = Uuid::from_u128(0xdead_1e18);
+        let Some((base, requests, server)) = delayed_no_response_server(Duration::from_millis(500))
+        else {
+            return;
+        };
+        let client = test_api_client(base, execution_id);
+        let started = Instant::now();
+        let error = client
+            .ai_response_until(
+                json!({
+                    "model": "gpt-5.6-sol",
+                    "input": "bounded",
+                    "max_output_tokens": 100,
+                    "store": false,
+                    "stream": false
+                }),
+                &ai_call_registration(
+                    execution_id,
+                    1,
+                    Uuid::from_u128(0xdead_1e19),
+                    0,
+                    ExecutionPhase::Implementation,
+                    0,
+                ),
+                Some(Instant::now() + Duration::from_millis(75)),
+            )
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        let requests = requests.try_iter().collect::<Vec<_>>();
+
+        assert!(error.to_string().contains("hosted execution deadline"));
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "deadline-bounded request took {elapsed:?}"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "deadline must suppress transport retries"
+        );
     }
 
     #[test]

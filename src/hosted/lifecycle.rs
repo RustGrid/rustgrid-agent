@@ -49,10 +49,81 @@ pub(super) fn canonical_running_state(phase: ExecutionPhase) -> CanonicalExecuti
 #[serde(rename_all = "snake_case")]
 pub(super) enum ImplementationCompletionStatus {
     NotStarted,
+    Preparing,
     InProgress,
     ReadyForValidation,
+    PartialReadyForValidation,
     Blocked,
-    Partial,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ImplementationSubstate {
+    #[default]
+    Preparing,
+    Mutating,
+    Repairing,
+    ReadyForValidation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ToolProgressClass {
+    Productive,
+    Neutral,
+    RecoverableFailure,
+    BlockingFailure,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ImplementationProgressAction {
+    Continue,
+    FirstWriteDelayed,
+    BlockedBeforeFirstWrite,
+    BlockedAfterWrite,
+}
+
+pub(super) const MAX_PREPARATION_MODEL_CALLS: usize = 8;
+pub(super) const FIRST_WRITE_DELAY_CALL: usize = 6;
+pub(super) const MAX_CONSECUTIVE_PREPARATION_READS: usize = 6;
+pub(super) const MAX_RECOVERABLE_READ_FAILURES: usize = 3;
+pub(super) const MAX_POST_WRITE_STAGNANT_CALLS: usize = 4;
+
+pub(super) fn implementation_progress_action(
+    implementation_calls: usize,
+    successful_writes: u32,
+    consecutive_preparation_reads: usize,
+    recoverable_read_failures: usize,
+    repeated_identical_read_failures: usize,
+    guided_recovery_issued: bool,
+    calls_since_repository_progress: usize,
+) -> ImplementationProgressAction {
+    if successful_writes > 0 {
+        return if calls_since_repository_progress >= MAX_POST_WRITE_STAGNANT_CALLS {
+            ImplementationProgressAction::BlockedAfterWrite
+        } else {
+            ImplementationProgressAction::Continue
+        };
+    }
+
+    if guided_recovery_issued
+        && (implementation_calls >= MAX_PREPARATION_MODEL_CALLS
+            || recoverable_read_failures > MAX_RECOVERABLE_READ_FAILURES
+            || repeated_identical_read_failures >= 3)
+    {
+        return ImplementationProgressAction::BlockedBeforeFirstWrite;
+    }
+
+    if !guided_recovery_issued
+        && (implementation_calls >= FIRST_WRITE_DELAY_CALL
+            || consecutive_preparation_reads >= MAX_CONSECUTIVE_PREPARATION_READS
+            || repeated_identical_read_failures >= 2)
+    {
+        return ImplementationProgressAction::FirstWriteDelayed;
+    }
+
+    ImplementationProgressAction::Continue
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -223,16 +294,78 @@ pub(super) fn implementation_completion_status(
             ) && changed_paths.contains(&target.path)
         })
         .count();
+    let changed_in_progress = targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.status,
+                IntendedChangeStatus::InProgress | IntendedChangeStatus::Partial
+            ) && changed_paths.contains(&target.path)
+        })
+        .count();
     if applied == targets.len() && !has_unresolved_failure {
         return ImplementationCompletionStatus::ReadyForValidation;
     }
-    if has_blocker && applied == 0 {
+    if has_blocker && applied == 0 && changed_in_progress == 0 {
         return ImplementationCompletionStatus::Blocked;
     }
     if applied > 0 && (has_blocker || has_unresolved_failure) {
-        return ImplementationCompletionStatus::Partial;
+        return ImplementationCompletionStatus::PartialReadyForValidation;
+    }
+    if applied == 0 && (has_unresolved_failure || changed_in_progress > 0) {
+        return ImplementationCompletionStatus::InProgress;
+    }
+    if applied == 0 {
+        return ImplementationCompletionStatus::Preparing;
     }
     ImplementationCompletionStatus::InProgress
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ValidationEntryDecision {
+    CompleteImplementation,
+    UsefulPartialImplementation,
+    ResumedImplementation,
+    ForbiddenNoImplementationChanges,
+    ForbiddenIncompletePreparation,
+}
+
+pub(super) fn validation_entry_decision(
+    status: ImplementationCompletionStatus,
+    changed_path_count: usize,
+    resumed_relevant_changes: bool,
+    partial_work_explicitly_unresolved: bool,
+) -> ValidationEntryDecision {
+    if changed_path_count == 0 {
+        return ValidationEntryDecision::ForbiddenNoImplementationChanges;
+    }
+    if resumed_relevant_changes
+        && matches!(
+            status,
+            ImplementationCompletionStatus::ReadyForValidation
+                | ImplementationCompletionStatus::PartialReadyForValidation
+                | ImplementationCompletionStatus::InProgress
+        )
+    {
+        return ValidationEntryDecision::ResumedImplementation;
+    }
+    match status {
+        ImplementationCompletionStatus::ReadyForValidation => {
+            ValidationEntryDecision::CompleteImplementation
+        }
+        ImplementationCompletionStatus::PartialReadyForValidation => {
+            ValidationEntryDecision::UsefulPartialImplementation
+        }
+        ImplementationCompletionStatus::InProgress if partial_work_explicitly_unresolved => {
+            ValidationEntryDecision::UsefulPartialImplementation
+        }
+        ImplementationCompletionStatus::NotStarted
+        | ImplementationCompletionStatus::Preparing
+        | ImplementationCompletionStatus::InProgress
+        | ImplementationCompletionStatus::Blocked => {
+            ValidationEntryDecision::ForbiddenIncompletePreparation
+        }
+    }
 }
 
 pub(super) fn legacy_remaining_work(items: &[RemainingWorkItem]) -> Vec<String> {
@@ -313,6 +446,15 @@ pub(super) fn new_running_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hosted::orchestration::PhaseLedger;
+
+    const AOPS_226_TARGETS: [&str; 5] = [
+        "src/components/theme/ThemeProvider.tsx",
+        "src/components/theme/ThemeToggle.tsx",
+        "src/styles/globals.css",
+        "tests/theme-provider.test.tsx",
+        "tests/theme-tokens.test.ts",
+    ];
 
     fn change(statuses: &[IntendedChangeStatus]) -> IntendedChangeRecord {
         IntendedChangeRecord {
@@ -333,6 +475,356 @@ mod tests {
             attempts: Vec::new(),
             recovery: None,
         }
+    }
+
+    fn aops_226_change(statuses: &[IntendedChangeStatus]) -> IntendedChangeRecord {
+        assert_eq!(statuses.len(), AOPS_226_TARGETS.len());
+        let mut change = change(statuses);
+        change.change_id = "aops-226-light-blue-theme".into();
+        change.intent = "implement the light-blue theme and focused coverage".into();
+        for (target, path) in change.targets.iter_mut().zip(AOPS_226_TARGETS) {
+            target.path = path.into();
+            target.role = if path.starts_with("tests/") {
+                "test"
+            } else {
+                "source"
+            }
+            .into();
+        }
+        change
+    }
+
+    #[test]
+    fn implementation_substates_and_tool_progress_classes_have_stable_wire_names() {
+        assert_eq!(
+            ImplementationSubstate::default(),
+            ImplementationSubstate::Preparing
+        );
+        for (substate, expected) in [
+            (ImplementationSubstate::Preparing, "preparing"),
+            (ImplementationSubstate::Mutating, "mutating"),
+            (ImplementationSubstate::Repairing, "repairing"),
+            (
+                ImplementationSubstate::ReadyForValidation,
+                "ready_for_validation",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(substate).unwrap(), expected);
+        }
+        for (class, expected) in [
+            (ToolProgressClass::Productive, "productive"),
+            (ToolProgressClass::Neutral, "neutral"),
+            (ToolProgressClass::RecoverableFailure, "recoverable_failure"),
+            (ToolProgressClass::BlockingFailure, "blocking_failure"),
+            (ToolProgressClass::Duplicate, "duplicate"),
+        ] {
+            assert_eq!(serde_json::to_value(class).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn preparation_gets_six_productive_calls_then_one_guided_recovery_turn() {
+        for implementation_calls in 1..FIRST_WRITE_DELAY_CALL {
+            assert_eq!(
+                implementation_progress_action(
+                    implementation_calls,
+                    0,
+                    implementation_calls,
+                    0,
+                    0,
+                    false,
+                    implementation_calls,
+                ),
+                ImplementationProgressAction::Continue
+            );
+        }
+        assert_eq!(
+            implementation_progress_action(
+                FIRST_WRITE_DELAY_CALL,
+                0,
+                MAX_CONSECUTIVE_PREPARATION_READS,
+                0,
+                0,
+                false,
+                FIRST_WRITE_DELAY_CALL,
+            ),
+            ImplementationProgressAction::FirstWriteDelayed
+        );
+        assert_eq!(
+            implementation_progress_action(7, 0, 0, 0, 0, true, 7),
+            ImplementationProgressAction::Continue
+        );
+        assert_eq!(
+            implementation_progress_action(MAX_PREPARATION_MODEL_CALLS, 0, 0, 0, 0, true, 8),
+            ImplementationProgressAction::BlockedBeforeFirstWrite
+        );
+    }
+
+    #[test]
+    fn recoverable_read_failures_preserve_partial_progress_and_bound_identical_loops() {
+        // A partially successful batch contributes useful preparation even when one path needs
+        // deterministic individual fallback.
+        let partial_batch = [
+            ToolProgressClass::Productive,
+            ToolProgressClass::RecoverableFailure,
+        ];
+        assert!(partial_batch.contains(&ToolProgressClass::Productive));
+        assert!(partial_batch.contains(&ToolProgressClass::RecoverableFailure));
+        assert_eq!(
+            implementation_progress_action(3, 0, 1, MAX_RECOVERABLE_READ_FAILURES, 1, false, 3),
+            ImplementationProgressAction::Continue
+        );
+
+        // The second identical range/path failure requests recovery but does not terminate the
+        // implementation. Only a third identical failure after that recovery turn blocks it.
+        assert_eq!(
+            implementation_progress_action(2, 0, 0, 2, 2, false, 2),
+            ImplementationProgressAction::FirstWriteDelayed
+        );
+        assert_eq!(
+            implementation_progress_action(3, 0, 0, 3, 3, true, 3),
+            ImplementationProgressAction::BlockedBeforeFirstWrite
+        );
+
+        // A successful individual fallback is productive and therefore provides the caller a
+        // healthy continuation turn.
+        let fallback = [
+            ToolProgressClass::RecoverableFailure,
+            ToolProgressClass::Productive,
+        ];
+        assert_eq!(fallback.last(), Some(&ToolProgressClass::Productive));
+    }
+
+    #[test]
+    fn post_write_stagnation_requires_four_consecutive_calls_and_resets_on_progress() {
+        assert_eq!(
+            implementation_progress_action(8, 1, 0, 0, 0, false, 3),
+            ImplementationProgressAction::Continue
+        );
+        assert_eq!(
+            implementation_progress_action(9, 1, 0, 0, 0, false, MAX_POST_WRITE_STAGNANT_CALLS,),
+            ImplementationProgressAction::BlockedAfterWrite
+        );
+        assert_eq!(
+            implementation_progress_action(10, 2, 0, 0, 0, false, 0),
+            ImplementationProgressAction::Continue
+        );
+    }
+
+    #[test]
+    fn completion_reconciliation_distinguishes_every_implementation_state() {
+        let no_paths = BTreeSet::new();
+        assert_eq!(
+            implementation_completion_status(&[], &no_paths, false, false),
+            ImplementationCompletionStatus::NotStarted
+        );
+
+        let planned = vec![change(&[
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+        ])];
+        assert_eq!(
+            implementation_completion_status(&planned, &no_paths, false, false),
+            ImplementationCompletionStatus::Preparing
+        );
+        assert_eq!(
+            implementation_completion_status(&planned, &no_paths, false, true),
+            ImplementationCompletionStatus::Blocked
+        );
+
+        let partial = vec![change(&[
+            IntendedChangeStatus::Applied,
+            IntendedChangeStatus::Planned,
+        ])];
+        let first_path = BTreeSet::from(["src/0.tsx".into()]);
+        assert_eq!(
+            implementation_completion_status(&partial, &first_path, false, false),
+            ImplementationCompletionStatus::InProgress
+        );
+        assert_eq!(
+            implementation_completion_status(&partial, &first_path, true, false),
+            ImplementationCompletionStatus::PartialReadyForValidation
+        );
+
+        let restored = vec![change(&[
+            IntendedChangeStatus::InProgress,
+            IntendedChangeStatus::InProgress,
+        ])];
+        let restored_paths = BTreeSet::from(["src/0.tsx".into(), "src/1.tsx".into()]);
+        let restored_status =
+            implementation_completion_status(&restored, &restored_paths, false, false);
+        assert_eq!(restored_status, ImplementationCompletionStatus::InProgress);
+        assert_eq!(
+            validation_entry_decision(restored_status, restored_paths.len(), true, false),
+            ValidationEntryDecision::ResumedImplementation
+        );
+
+        let complete = vec![change(&[
+            IntendedChangeStatus::Applied,
+            IntendedChangeStatus::Verified,
+        ])];
+        let all_paths = BTreeSet::from(["src/0.tsx".into(), "src/1.tsx".into()]);
+        assert_eq!(
+            implementation_completion_status(&complete, &all_paths, false, false),
+            ImplementationCompletionStatus::ReadyForValidation
+        );
+    }
+
+    #[test]
+    fn validation_entry_requires_changed_and_reconciled_repository_state() {
+        assert_eq!(
+            validation_entry_decision(ImplementationCompletionStatus::Preparing, 0, false, false,),
+            ValidationEntryDecision::ForbiddenNoImplementationChanges
+        );
+        assert_eq!(
+            validation_entry_decision(ImplementationCompletionStatus::Preparing, 1, false, false,),
+            ValidationEntryDecision::ForbiddenIncompletePreparation
+        );
+        assert_eq!(
+            validation_entry_decision(
+                ImplementationCompletionStatus::ReadyForValidation,
+                5,
+                false,
+                false,
+            ),
+            ValidationEntryDecision::CompleteImplementation
+        );
+        assert_eq!(
+            validation_entry_decision(
+                ImplementationCompletionStatus::PartialReadyForValidation,
+                2,
+                false,
+                true,
+            ),
+            ValidationEntryDecision::UsefulPartialImplementation
+        );
+        assert_eq!(
+            validation_entry_decision(ImplementationCompletionStatus::InProgress, 2, true, true,),
+            ValidationEntryDecision::ResumedImplementation
+        );
+        assert_eq!(
+            validation_entry_decision(
+                ImplementationCompletionStatus::ReadyForValidation,
+                0,
+                true,
+                false,
+            ),
+            ValidationEntryDecision::ForbiddenNoImplementationChanges
+        );
+    }
+
+    #[test]
+    fn aops_226_targets_advance_in_order_and_derive_remaining_work_after_each_write() {
+        let mut changes = vec![aops_226_change(&[
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+        ])];
+        assert_eq!(
+            derive_remaining_work(&changes)
+                .into_iter()
+                .map(|item| item.path)
+                .collect::<Vec<_>>(),
+            AOPS_226_TARGETS
+        );
+
+        let mut changed_paths = BTreeSet::new();
+        for (index, path) in AOPS_226_TARGETS.iter().enumerate() {
+            changes[0].targets[index].status = IntendedChangeStatus::Applied;
+            changed_paths.insert((*path).to_owned());
+            let remaining = derive_remaining_work(&changes);
+            assert_eq!(remaining.len(), AOPS_226_TARGETS.len() - index - 1);
+            assert_eq!(
+                remaining
+                    .iter()
+                    .map(|item| item.path.as_str())
+                    .collect::<Vec<_>>(),
+                AOPS_226_TARGETS[index + 1..]
+            );
+            assert_eq!(
+                implementation_completion_status(&changes, &changed_paths, false, false),
+                if index + 1 == AOPS_226_TARGETS.len() {
+                    ImplementationCompletionStatus::ReadyForValidation
+                } else {
+                    ImplementationCompletionStatus::InProgress
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn aops_226_applies_all_five_targets_within_the_shared_implementation_repair_budget() {
+        let mut ledger = PhaseLedger::new(60, ExecutionPhase::Discovery);
+        for _ in 0..4 {
+            ledger.begin_model_call().unwrap();
+        }
+        ledger.transition(ExecutionPhase::Planning);
+        for _ in 0..2 {
+            ledger.begin_model_call().unwrap();
+        }
+        assert_eq!(ledger.apply_ticket_complexity(AOPS_226_TARGETS.len()), 20);
+
+        let mut changes = vec![aops_226_change(&[
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+            IntendedChangeStatus::Planned,
+        ])];
+        let mut inspected_targets = BTreeSet::new();
+        let mut changed_paths = BTreeSet::new();
+        ledger.transition(ExecutionPhase::Implementation);
+
+        for (index, path) in AOPS_226_TARGETS.iter().enumerate() {
+            ledger.begin_model_call().unwrap();
+            inspected_targets.insert((*path).to_owned());
+
+            // Reading the current target is sufficient to write it; later targets do not have to
+            // be inspected before this mutation is applied.
+            assert!(
+                AOPS_226_TARGETS[index + 1..]
+                    .iter()
+                    .all(|later| !inspected_targets.contains(*later))
+            );
+
+            // Exercise the shared repair reserve deterministically: the fifth implementation
+            // call encounters a recoverable mutation failure, and one repair call applies it.
+            if index + 1 == AOPS_226_TARGETS.len() {
+                assert_eq!(derive_remaining_work(&changes).len(), 1);
+                ledger.transition(ExecutionPhase::Repair);
+                ledger.begin_model_call().unwrap();
+            }
+
+            changes[0].targets[index].status = IntendedChangeStatus::Applied;
+            changed_paths.insert((*path).to_owned());
+            assert_eq!(
+                derive_remaining_work(&changes)
+                    .into_iter()
+                    .map(|item| item.path)
+                    .collect::<Vec<_>>(),
+                AOPS_226_TARGETS[index + 1..]
+            );
+        }
+
+        assert_eq!(
+            changed_paths,
+            AOPS_226_TARGETS.into_iter().map(str::to_owned).collect()
+        );
+        assert!(derive_remaining_work(&changes).is_empty());
+        assert_eq!(
+            implementation_completion_status(&changes, &changed_paths, false, false),
+            ImplementationCompletionStatus::ReadyForValidation
+        );
+        assert_eq!(ledger.implementation_repair_calls(), 6);
+        assert!(ledger.implementation_repair_calls() <= 10);
+
+        ledger.transition(ExecutionPhase::DiffReview);
+        ledger.begin_model_call().unwrap();
+        ledger.transition(ExecutionPhase::CompletionEvaluation);
+        ledger.begin_model_call().unwrap();
+        assert!(ledger.budgeted_calls() <= 20);
     }
 
     #[test]
@@ -362,43 +854,73 @@ mod tests {
             first,
             validation_fingerprint("npm test", ".", "tree-b", "lock", "env")
         );
+        assert_ne!(
+            first,
+            validation_fingerprint("npm test", "packages/ui", "tree-a", "lock", "env")
+        );
+        assert_ne!(
+            first,
+            validation_fingerprint("npm test", ".", "tree-a", "lock-updated", "env")
+        );
+        assert_ne!(
+            first,
+            validation_fingerprint("npm test", ".", "tree-a", "lock", "CI=true")
+        );
     }
 
     #[test]
-    fn aops_226_four_target_fixture_completes_and_reuses_three_gates() {
-        let changes = vec![change(&[
+    fn aops_226_five_target_fixture_completes_and_reuses_three_tree_bound_gates() {
+        let changes = vec![aops_226_change(&[
+            IntendedChangeStatus::Applied,
             IntendedChangeStatus::Applied,
             IntendedChangeStatus::Applied,
             IntendedChangeStatus::Applied,
             IntendedChangeStatus::Applied,
         ])];
-        let paths = (0..4).map(|index| format!("src/{index}.tsx")).collect();
+        let paths = AOPS_226_TARGETS.into_iter().map(str::to_owned).collect();
         assert_eq!(
             implementation_completion_status(&changes, &paths, false, false),
             ImplementationCompletionStatus::ReadyForValidation
         );
         let mut ledger = Vec::new();
-        for (id, command) in [
-            ("focused", "npm test -- theme"),
-            ("test", "npm test"),
-            ("build", "npm run build"),
+        for (id, command, gate_type) in [
+            (
+                "focused",
+                "npm test -- theme",
+                ValidationGateType::FocusedTest,
+            ),
+            ("test", "npm test", ValidationGateType::TestSuite),
+            ("build", "npm run build", ValidationGateType::Build),
         ] {
-            let fingerprint = validation_fingerprint(command, ".", "tree", "lock", "env");
+            let fingerprint = validation_fingerprint(command, ".", "tree-aops-226", "lock", "env");
             let mut evidence = new_running_evidence(
                 id.into(),
                 id.into(),
-                ValidationGateType::TestSuite,
+                gate_type,
                 command.into(),
                 fingerprint.clone(),
-                "tree".into(),
+                "tree-aops-226".into(),
                 "lock".into(),
                 ValidationSource::WorkerRequired,
             );
             evidence.status = ValidationStatus::Passed;
             ledger.push(evidence);
             assert!(passed_evidence(&ledger, &fingerprint).is_some());
+            let changed_tree_fingerprint =
+                validation_fingerprint(command, ".", "tree-after-one-byte-change", "lock", "env");
+            assert!(passed_evidence(&ledger, &changed_tree_fingerprint).is_none());
         }
-        assert!(validate_lifecycle_invariants(&changes, &[], &ledger, "tree").is_ok());
+        assert_eq!(ledger.len(), 3);
+        assert!(validate_lifecycle_invariants(&changes, &[], &ledger, "tree-aops-226").is_ok());
+        assert_eq!(
+            supersede_stale_validation(&mut ledger, "tree-after-one-byte-change"),
+            3
+        );
+        assert!(
+            ledger
+                .iter()
+                .all(|evidence| evidence.status == ValidationStatus::Superseded)
+        );
     }
 
     #[test]
