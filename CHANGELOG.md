@@ -5,6 +5,37 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.17 - 2026-08-01
+
+### Changed
+
+- Drive hosted execution through a canonical, validated lifecycle from
+  implementation to worker-owned validation, deterministic diff review,
+  completion evaluation, and publication.
+- Derive remaining work from authoritative per-target state and persist
+  source-tree-bound validation evidence, required-gate status, and cancellation
+  provenance in the resumable worker notebook.
+- Size model-call budgets by ticket complexity, with separate implementation
+  and repair ceilings, four-call zero-progress detection, and phase-specific
+  compact model context.
+
+### Fixed
+
+- Transition immediately out of implementation when every planned target is
+  applied, without waiting for `repository_snapshot`, a model declaration, or
+  budget exhaustion.
+- Deduplicate focused tests, test suites, builds, and other required gates for
+  an unchanged source tree and dependency lock; supersede their evidence only
+  after a relevant mutation.
+- Bound final validation, focused commands, repair rounds, estimated model
+  cost, and wall-clock duration so a healthy implementation cannot enter a
+  costly validation loop.
+- Preserve useful work, validation evidence, the branch, and an exact resume
+  phase on cancellation, partial completion, or a guardrail stop, while keeping
+  handled domain outcomes successful at the GitHub Actions process layer.
+- Prevent illegal lifecycle transitions and require current required-gate
+  evidence before deterministic diff review.
+
 ## 1.4.16 - 2026-07-31
 
 ### Changed
