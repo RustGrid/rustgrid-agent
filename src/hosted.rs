@@ -1959,6 +1959,98 @@ struct PartialRunContext {
     remaining_work: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)] // Names are the explicit startup-path contract.
+enum StartupMode {
+    FreshRun,
+    ResumeRun,
+    RecoveryPublicationRun,
+}
+
+impl StartupMode {
+    const fn next_decision(self) -> &'static str {
+        match self {
+            Self::FreshRun => "initialize_execution_snapshot",
+            Self::ResumeRun => "resume_next_graph_node",
+            Self::RecoveryPublicationRun => "evaluate_recovery_publication",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StartupModeResolution {
+    mode: StartupMode,
+    persisted_graph_present: bool,
+    persisted_notebook_revision: Option<u64>,
+    recovery_marker_present: bool,
+}
+
+fn compatible_worker_notebook(manifest: &HostedManifest) -> Option<WorkerNotebook> {
+    manifest
+        .run
+        .metadata
+        .get("worker_notebook")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<WorkerNotebook>(value).ok())
+        .filter(|notebook| {
+            notebook.schema_version == 1
+                && notebook.repository_base_sha == manifest.github.base_sha
+                && notebook.branch == manifest.github.branch
+        })
+}
+
+fn resolve_startup_mode(
+    manifest: &HostedManifest,
+    resumed_branch: bool,
+    changed_paths: &[String],
+) -> StartupModeResolution {
+    use crate::execution_graph::{FailureCategory, PublicationStatus};
+
+    let persisted = compatible_worker_notebook(manifest);
+    let persisted_graph_present = persisted
+        .as_ref()
+        .is_some_and(|notebook| notebook.orchestration.graph.is_some());
+    let persisted_notebook_revision = persisted.as_ref().map(|notebook| notebook.revision);
+    let recoverable_orchestration_failure = persisted.as_ref().is_some_and(|notebook| {
+        notebook
+            .orchestration
+            .failures
+            .unresolved()
+            .any(|failure| failure.category == FailureCategory::OrchestrationInvariantViolation)
+    });
+    let interrupted_publication = persisted.as_ref().is_some_and(|notebook| {
+        notebook.orchestration.publication.recovery_requested
+            || matches!(
+                notebook.orchestration.publication.status,
+                PublicationStatus::InProgress
+                    | PublicationStatus::CommitCreated
+                    | PublicationStatus::BranchPushed
+                    | PublicationStatus::Failed
+            )
+    });
+    // A branch is recovery evidence only when checkout confirms a persisted
+    // remote branch and its base-to-head diff is non-empty. Branch existence
+    // by itself is normal for a freshly checked-out mission.
+    let persisted_branch_with_changes = resumed_branch && !changed_paths.is_empty();
+    let recovery_marker_present = recoverable_orchestration_failure
+        || interrupted_publication
+        || persisted_branch_with_changes;
+    let mode = if recovery_marker_present {
+        StartupMode::RecoveryPublicationRun
+    } else if persisted.is_some() {
+        StartupMode::ResumeRun
+    } else {
+        StartupMode::FreshRun
+    };
+    StartupModeResolution {
+        mode,
+        persisted_graph_present,
+        persisted_notebook_revision,
+        recovery_marker_present,
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct ToolUsage {
     reads: u32,
@@ -2609,6 +2701,26 @@ struct UnderlyingFailure {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     stack_reference: Option<String>,
+}
+
+#[derive(Debug)]
+struct HostedStartupFailure {
+    category: &'static str,
+    code: &'static str,
+    message: String,
+    underlying: anyhow::Error,
+}
+
+impl std::fmt::Display for HostedStartupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HostedStartupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.underlying.as_ref())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -5151,11 +5263,26 @@ fn run_hosted_execution(
     drop(recovery_github);
     drop(recovery_token);
 
+    let startup_changed_paths = completion_changed_paths(&repo, &manifest.github.base_sha)?;
+    let startup = resolve_startup_mode(manifest, resumed, &startup_changed_paths);
+    api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.startup_mode_resolved",
+            "startup_mode": startup.mode,
+            "persisted_graph_presence": startup.persisted_graph_present,
+            "persisted_notebook_revision": startup.persisted_notebook_revision,
+            "repository_diff_status": if startup_changed_paths.is_empty() { "clean" } else { "changed" },
+            "branch_state": if resumed { "existing" } else { "created" },
+            "recovery_marker_present": startup.recovery_marker_present,
+            "selected_next_decision": startup.mode.next_decision(),
+        }),
+    )?;
     let partial_run = detect_partial_run(
         existing_pr.as_ref(),
         resumed,
         manifest.execution.attempt_number,
-        completion_changed_paths(&repo, &manifest.github.base_sha)?,
+        startup_changed_paths,
     );
     let mut agent = GatewayAgent::new(
         api.clone(),
@@ -5166,7 +5293,18 @@ fn run_hosted_execution(
         stop_reason,
         &containment,
         partial_run,
-    )?;
+    )
+    .map_err(|underlying| {
+        anyhow!(HostedStartupFailure {
+            category: "execution_graph_initialization_failed",
+            code: "execution_graph_initialization_failed",
+            message: format!(
+                "The hosted execution graph could not be initialized: {}",
+                truncate_text(&underlying.to_string(), 2_000)
+            ),
+            underlying,
+        })
+    })?;
     let execution_result = (|| -> Result<HostedResult> {
         if let Some(partial_run) = &agent.partial_run {
             api.append_event(
@@ -5190,6 +5328,78 @@ fn run_hosted_execution(
             bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment);
         agent.ensure_active_or_checkpoint_cancellation()?;
         bootstrap_result?;
+        if startup.mode == StartupMode::FreshRun {
+            agent
+                .initialize_fresh_execution_snapshot(&startup, resumed)
+                .map_err(|underlying| {
+                    anyhow!(HostedStartupFailure {
+                        category: "execution_graph_initialization_failed",
+                        code: "execution_graph_initialization_failed",
+                        message: format!(
+                            "The fresh execution snapshot could not be persisted: {}",
+                            truncate_text(&underlying.to_string(), 2_000)
+                        ),
+                        underlying,
+                    })
+                })?;
+        }
+        if startup.mode == StartupMode::RecoveryPublicationRun {
+            let persisted_reason = agent
+                .notebook
+                .orchestration
+                .failures
+                .unresolved()
+                .find(|failure| {
+                    failure.category
+                        == crate::execution_graph::FailureCategory::OrchestrationInvariantViolation
+                })
+                .map(|failure| failure.message.clone())
+                .unwrap_or_else(|| {
+                    "persisted execution state requires recovery publication evaluation".into()
+                });
+            let recovery_cause = anyhow!(persisted_reason);
+            let recovery = attempt_safe_recovery_publication(
+                &mut agent,
+                RecoveryPublicationContext {
+                    api,
+                    manifest,
+                    repo: &repo,
+                    repo_config: &repo_config,
+                    trusted_git_config: &trusted_git_config,
+                    trusted_head: &trusted_head,
+                    baseline: &baseline,
+                    containment: &containment,
+                    running,
+                    startup_mode: startup.mode,
+                },
+                &recovery_cause,
+            );
+            match recovery.result {
+                RecoveryPublicationResult::PublishedDraft => {
+                    return Ok(recovery
+                        .published
+                        .expect("published recovery result includes hosted output"));
+                }
+                RecoveryPublicationResult::NotApplicable
+                | RecoveryPublicationResult::SkippedNoDiff => {}
+                RecoveryPublicationResult::FailedInfrastructure => {
+                    let recovery_error = recovery
+                        .error
+                        .expect("failed recovery result includes its infrastructure error");
+                    return Err(agent.categorized_execution_failure(
+                        "recovery_publication_failed",
+                        "recovery_publication_failed",
+                        format!(
+                            "Recovery publication failed: {}",
+                            truncate_text(&recovery_error.to_string(), 2_000)
+                        ),
+                        Some(&recovery_error),
+                        true,
+                        "Resume the interrupted recovery publication from its persisted checkpoint.",
+                    ));
+                }
+            }
+        }
         // Refresh validation gate fingerprints against the live dependency and
         // environment state before deciding whether persisted finalization can
         // be reused.
@@ -5241,9 +5451,7 @@ fn run_hosted_execution(
                     }),
                 )?;
             }
-            agent
-                .implement()
-                .context("the RustGrid AI gateway implementation session failed")?
+            agent.implement()?
         } else {
             agent.reconstruct_implementation_outcome()?
         };
@@ -5729,7 +5937,10 @@ fn run_hosted_execution(
     })();
     match execution_result {
         Ok(result) => Ok(result),
-        Err(error) if is_hosted_orchestration_invariant_error(&error) => {
+        Err(error)
+            if is_hosted_orchestration_invariant_error(&error)
+                && startup.mode == StartupMode::RecoveryPublicationRun =>
+        {
             let recovery = attempt_safe_recovery_publication(
                 &mut agent,
                 RecoveryPublicationContext {
@@ -5742,12 +5953,16 @@ fn run_hosted_execution(
                     baseline: &baseline,
                     containment: &containment,
                     running,
+                    startup_mode: startup.mode,
                 },
                 &error,
             );
-            match recovery {
-                Ok(Some(result)) => Ok(result),
-                Ok(None) => {
+            match recovery.result {
+                RecoveryPublicationResult::PublishedDraft => Ok(recovery
+                    .published
+                    .expect("published recovery result includes hosted output")),
+                RecoveryPublicationResult::NotApplicable
+                | RecoveryPublicationResult::SkippedNoDiff => {
                     if error
                         .downcast_ref::<HostedAgentExecutionFailure>()
                         .is_some()
@@ -5755,7 +5970,8 @@ fn run_hosted_execution(
                         Err(error)
                     } else {
                         let (code, message) = safe_failure(&error, false);
-                        Err(agent.execution_failure(
+                        Err(agent.categorized_execution_failure(
+                            "execution_graph_initialization_failed",
                             &code,
                             message,
                             Some(&error),
@@ -5764,7 +5980,10 @@ fn run_hosted_execution(
                         ))
                     }
                 }
-                Err(recovery_error) => {
+                RecoveryPublicationResult::FailedInfrastructure => {
+                    let recovery_error = recovery
+                        .error
+                        .expect("failed recovery result includes its infrastructure error");
                     agent.append_event_recoverable(
                         "progress",
                         json!({
@@ -5780,11 +5999,14 @@ fn run_hosted_execution(
                     {
                         Err(error)
                     } else {
-                        let (code, message) = safe_failure(&error, false);
-                        Err(agent.execution_failure(
-                            &code,
-                            message,
-                            Some(&error),
+                        Err(agent.categorized_execution_failure(
+                            "recovery_publication_failed",
+                            "recovery_publication_failed",
+                            format!(
+                                "Recovery publication failed: {}",
+                                truncate_text(&recovery_error.to_string(), 2_000)
+                            ),
+                            Some(&recovery_error),
                             true,
                             "Resume from the persisted notebook; the validated draft-recovery publication attempt was preserved for an idempotent retry.",
                         ))
@@ -5799,9 +6021,12 @@ fn run_hosted_execution(
         {
             Err(error)
         }
+        Err(error) if error.downcast_ref::<HostedStartupFailure>().is_some() => Err(error),
         Err(error) => {
             let (code, message) = safe_failure(&error, false);
-            Err(agent.execution_failure(
+            let category = hosted_failure_category(&error);
+            Err(agent.categorized_execution_failure(
+                category,
                 &code,
                 message,
                 Some(&error),
@@ -5969,6 +6194,22 @@ fn is_hosted_orchestration_invariant_error(error: &anyhow::Error) -> bool {
     })
 }
 
+fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
+    if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
+        return failure.category;
+    }
+    if error
+        .downcast_ref::<HostedHttpError>()
+        .is_some_and(|failure| failure.provider_contacted() == Some(true))
+    {
+        "ai_gateway_failed"
+    } else if is_hosted_orchestration_invariant_error(error) {
+        "execution_graph_initialization_failed"
+    } else {
+        "orchestration_initialization_failed"
+    }
+}
+
 fn recovery_execution_is_active(running: &Arc<AtomicBool>) -> bool {
     running.load(Ordering::SeqCst) && !shutdown::requested()
 }
@@ -6044,18 +6285,47 @@ struct RecoveryPublicationContext<'a> {
     baseline: &'a BTreeSet<String>,
     containment: &'a command::HostedProcessContainment,
     running: &'a Arc<AtomicBool>,
+    startup_mode: StartupMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RecoveryPublicationResult {
+    NotApplicable,
+    SkippedNoDiff,
+    PublishedDraft,
+    FailedInfrastructure,
+}
+
+fn recovery_publication_no_op(
+    startup_mode: StartupMode,
+    snapshot: &crate::execution_graph::ExecutionSnapshot,
+) -> Option<RecoveryPublicationResult> {
+    if startup_mode != StartupMode::RecoveryPublicationRun {
+        Some(RecoveryPublicationResult::NotApplicable)
+    } else if !snapshot.current_repository.has_changes() {
+        Some(RecoveryPublicationResult::SkippedNoDiff)
+    } else {
+        None
+    }
+}
+
+struct RecoveryPublicationOutcome {
+    result: RecoveryPublicationResult,
+    published: Option<HostedResult>,
+    error: Option<anyhow::Error>,
 }
 
 fn attempt_safe_recovery_publication(
     agent: &mut GatewayAgent<'_>,
     context: RecoveryPublicationContext<'_>,
     original_error: &anyhow::Error,
-) -> Result<Option<HostedResult>> {
+) -> RecoveryPublicationOutcome {
     let api = context.api;
     let manifest = context.manifest;
     let repo = context.repo;
     let repo_config = context.repo_config;
-    attempt_safe_recovery_publication_with(
+    match attempt_safe_recovery_publication_with(
         agent,
         context,
         original_error,
@@ -6092,7 +6362,35 @@ fn attempt_safe_recovery_publication(
                 true,
             )
         },
-    )
+    ) {
+        Ok((result, published)) => RecoveryPublicationOutcome {
+            result,
+            published,
+            error: None,
+        },
+        Err(error) => {
+            agent.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.recovery_publication_evaluated",
+                    "startup_mode": StartupMode::RecoveryPublicationRun,
+                    "persisted_graph_presence": agent.notebook.orchestration.graph.is_some(),
+                    "persisted_notebook_revision": agent.notebook.revision,
+                    "repository_diff_status": "changed",
+                    "branch_state": "persisted",
+                    "selected_next_decision": "retry_recovery_publication",
+                    "result": RecoveryPublicationResult::FailedInfrastructure,
+                    "error": truncate_text(&error.to_string(), 2_000),
+                }),
+                "recovery publication result",
+            );
+            RecoveryPublicationOutcome {
+                result: RecoveryPublicationResult::FailedInfrastructure,
+                published: None,
+                error: Some(error),
+            }
+        }
+    }
 }
 
 fn attempt_safe_recovery_publication_with(
@@ -6104,7 +6402,7 @@ fn attempt_safe_recovery_publication_with(
         &[ValidationResult],
         &CompletionEvaluation,
     ) -> Result<crate::github::PullRequest>,
-) -> Result<Option<HostedResult>> {
+) -> Result<(RecoveryPublicationResult, Option<HostedResult>)> {
     use crate::execution_graph::{ExecutionDomainEvent, MissionOutcome, PublicationStatus};
 
     let RecoveryPublicationContext {
@@ -6117,11 +6415,58 @@ fn attempt_safe_recovery_publication_with(
         baseline,
         containment,
         running,
+        startup_mode,
     } = context;
+    if startup_mode != StartupMode::RecoveryPublicationRun {
+        agent.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.recovery_publication_evaluated",
+                "startup_mode": startup_mode,
+                "persisted_graph_presence": agent.notebook.orchestration.graph.is_some(),
+                "persisted_notebook_revision": agent.notebook.revision,
+                "repository_diff_status": "not_evaluated",
+                "branch_state": "not_recovery_mode",
+                "selected_next_decision": "continue_mission",
+                "result": RecoveryPublicationResult::NotApplicable,
+            }),
+            "recovery publication evaluation",
+        );
+        return Ok((RecoveryPublicationResult::NotApplicable, None));
+    }
     if !recovery_execution_is_active(running) {
-        return Ok(None);
+        return Ok((RecoveryPublicationResult::NotApplicable, None));
     }
     let snapshot = agent.build_execution_snapshot()?;
+    if recovery_publication_no_op(startup_mode, &snapshot)
+        == Some(RecoveryPublicationResult::SkippedNoDiff)
+    {
+        agent.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.recovery_publication_skipped",
+                "result": RecoveryPublicationResult::SkippedNoDiff,
+                "reason": "repository diff is empty",
+                "mission_outcome": "continuing",
+            }),
+            "recovery publication no-diff skip",
+        );
+        agent.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.recovery_publication_evaluated",
+                "startup_mode": startup_mode,
+                "persisted_graph_presence": agent.notebook.orchestration.graph.is_some(),
+                "persisted_notebook_revision": agent.notebook.revision,
+                "repository_diff_status": "clean",
+                "branch_state": "persisted",
+                "selected_next_decision": "continue_mission",
+                "result": RecoveryPublicationResult::SkippedNoDiff,
+            }),
+            "recovery publication evaluation",
+        );
+        return Ok((RecoveryPublicationResult::SkippedNoDiff, None));
+    }
     let authorization = match authorize_recovery_publication(&snapshot, manifest) {
         Ok(authorization) => authorization,
         Err(error) => {
@@ -6133,9 +6478,38 @@ fn attempt_safe_recovery_publication_with(
                 }),
                 "recovery publication eligibility",
             );
-            return Ok(None);
+            agent.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.recovery_publication_evaluated",
+                    "startup_mode": startup_mode,
+                    "persisted_graph_presence": agent.notebook.orchestration.graph.is_some(),
+                    "persisted_notebook_revision": agent.notebook.revision,
+                    "repository_diff_status": "changed",
+                    "branch_state": "persisted",
+                    "selected_next_decision": "continue_mission",
+                    "result": RecoveryPublicationResult::NotApplicable,
+                    "reason": error.to_string(),
+                }),
+                "recovery publication evaluation",
+            );
+            return Ok((RecoveryPublicationResult::NotApplicable, None));
         }
     };
+    agent.append_event_recoverable(
+        "progress",
+        json!({
+            "event_type": "worker.recovery_publication_evaluated",
+            "startup_mode": startup_mode,
+            "persisted_graph_presence": agent.notebook.orchestration.graph.is_some(),
+            "persisted_notebook_revision": agent.notebook.revision,
+            "repository_diff_status": "changed",
+            "branch_state": "persisted",
+            "selected_next_decision": "publish_recovery_draft",
+            "result": "applicable",
+        }),
+        "recovery publication evaluation",
+    );
     let validation = agent.restored_validation_results()?;
     let mut implementation = agent.reconstruct_implementation_outcome()?;
     implementation.budget_exhausted = true;
@@ -6273,18 +6647,35 @@ fn attempt_safe_recovery_publication_with(
         validation_evidence: agent.notebook.validation_evidence.clone(),
         notebook_revision: agent.notebook.revision,
     };
-    Ok(Some(HostedResult {
-        summary: completeness.summary.clone(),
-        branch: manifest.github.branch.clone(),
-        commit,
-        pull_request: PullRequestResult {
-            number: created.number,
-            url: created.html_url,
-        },
-        validation,
-        completeness,
-        terminal_telemetry,
-    }))
+    agent.append_event_recoverable(
+        "progress",
+        json!({
+            "event_type": "worker.recovery_publication_evaluated",
+            "startup_mode": startup_mode,
+            "persisted_graph_presence": true,
+            "persisted_notebook_revision": agent.notebook.revision,
+            "repository_diff_status": "changed",
+            "branch_state": "persisted",
+            "selected_next_decision": "finish_recovery_action",
+            "result": RecoveryPublicationResult::PublishedDraft,
+        }),
+        "recovery publication result",
+    );
+    Ok((
+        RecoveryPublicationResult::PublishedDraft,
+        Some(HostedResult {
+            summary: completeness.summary.clone(),
+            branch: manifest.github.branch.clone(),
+            commit,
+            pull_request: PullRequestResult {
+                number: created.number,
+                url: created.html_url,
+            },
+            validation,
+            completeness,
+            terminal_telemetry,
+        }),
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7548,17 +7939,7 @@ impl<'a> GatewayAgent<'a> {
             .min(MAX_MODEL_CALLS_HARD_LIMIT);
         let repository_fingerprint =
             repository_state_fingerprint(repo, &manifest.github.base_sha).unwrap_or_default();
-        let restored = manifest
-            .run
-            .metadata
-            .get("worker_notebook")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<WorkerNotebook>(value).ok())
-            .filter(|notebook| {
-                notebook.schema_version == 1
-                    && notebook.repository_base_sha == manifest.github.base_sha
-                    && notebook.branch == manifest.github.branch
-            });
+        let restored = compatible_worker_notebook(manifest);
         let mut notebook = restored.unwrap_or_else(|| {
             new_worker_notebook(
                 manifest,
@@ -8787,6 +9168,78 @@ impl<'a> GatewayAgent<'a> {
             .map_or(1, |event| event.sequence().saturating_add(1))
     }
 
+    fn initialize_fresh_execution_snapshot(
+        &mut self,
+        startup: &StartupModeResolution,
+        resumed_branch: bool,
+    ) -> Result<()> {
+        let graph = self
+            .notebook
+            .orchestration
+            .graph
+            .clone()
+            .context("fresh execution did not initialize an execution graph")?;
+        if self
+            .notebook
+            .orchestration
+            .domain_events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    crate::execution_graph::ExecutionDomainEvent::GraphCreated { .. }
+                )
+            })
+        {
+            bail!("fresh execution unexpectedly contained a persisted GraphCreated event");
+        }
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::GraphCreated {
+                sequence: self.next_domain_event_sequence(),
+                graph_id: graph.graph_id.clone(),
+                revision: graph.revision,
+                graph: Some(graph.clone()),
+                preserved_node_ids: Vec::new(),
+            },
+        )?;
+        self.persist_orchestration_checkpoint("fresh_execution_initialized", false)?;
+        let repository_diff_status =
+            if completion_changed_paths(self.repo, &self.manifest.github.base_sha)?.is_empty() {
+                "clean"
+            } else {
+                "changed"
+            };
+        self.api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.execution_snapshot_initialized",
+                "startup_mode": StartupMode::FreshRun,
+                "persisted_graph_presence": startup.persisted_graph_present,
+                "persisted_notebook_revision": startup.persisted_notebook_revision,
+                "repository_diff_status": repository_diff_status,
+                "branch_state": if resumed_branch { "existing" } else { "created" },
+                "graph_id": graph.graph_id,
+                "graph_revision": graph.revision,
+                "notebook_revision": self.notebook.revision,
+                "selected_next_decision": "begin_discovery",
+            }),
+        )?;
+        self.api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.execution_graph_created",
+                "startup_mode": StartupMode::FreshRun,
+                "persisted_graph_presence": startup.persisted_graph_present,
+                "persisted_notebook_revision": startup.persisted_notebook_revision,
+                "repository_diff_status": repository_diff_status,
+                "branch_state": if resumed_branch { "existing" } else { "created" },
+                "graph_id": graph.graph_id,
+                "graph_revision": graph.revision,
+                "selected_next_decision": "dispatch_discovery_model_call",
+            }),
+        )
+    }
+
     fn checkpoint_notebook(&mut self, repository_changed: bool) -> Result<()> {
         self.notebook.revision = self.notebook.revision.saturating_add(1);
         self.notebook.phase = if self.notebook.finalization_revalidation.is_some() {
@@ -9805,6 +10258,29 @@ impl<'a> GatewayAgent<'a> {
         recoverable: bool,
         recommended_action: &str,
     ) -> anyhow::Error {
+        let category = underlying.map_or(
+            "orchestration_initialization_failed",
+            hosted_failure_category,
+        );
+        self.categorized_execution_failure(
+            category,
+            code,
+            message,
+            underlying,
+            recoverable,
+            recommended_action,
+        )
+    }
+
+    fn categorized_execution_failure(
+        &self,
+        category: &'static str,
+        code: &str,
+        message: impl Into<String>,
+        underlying: Option<&anyhow::Error>,
+        recoverable: bool,
+        recommended_action: &str,
+    ) -> anyhow::Error {
         let phase = self.phases.active();
         let http = underlying.and_then(|error| error.downcast_ref::<HostedHttpError>());
         let (underlying_type, underlying_message, stack_reference) = if let Some(http) = http {
@@ -9824,7 +10300,7 @@ impl<'a> GatewayAgent<'a> {
         };
         anyhow!(HostedAgentExecutionFailure {
             status: "failed",
-            category: "hosted_agent_execution_failed",
+            category,
             process_health: "failed",
             mission_outcome: "failed",
             blocker: None,
@@ -14814,6 +15290,9 @@ fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, String) {
     if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
+    if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
+        return (failure.code.into(), failure.message.clone());
+    }
     if let Some(failure) = error.downcast_ref::<HostedProviderContractFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
@@ -14841,8 +15320,11 @@ fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, String) {
         )
     } else {
         (
-            "hosted_agent_execution_failed".into(),
-            "The ephemeral RustGrid agent failed before completing the mission.".into(),
+            "orchestration_initialization_failed".into(),
+            format!(
+                "Hosted orchestration failed: {}",
+                truncate_text(&error.to_string(), 2_000)
+            ),
         )
     }
 }
@@ -14852,17 +15334,36 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
         return serde_json::to_value(failure).unwrap_or_else(|_| {
             json!({
                 "status": "failed",
-                "category": "hosted_agent_execution_failed",
+                "category": failure.category,
                 "code": failure.code,
                 "phase": failure.phase,
                 "message": failure.message,
             })
         });
     }
+    if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
+        return json!({
+            "status": "failed",
+            "category": failure.category,
+            "code": failure.code,
+            "phase": "startup",
+            "message": failure.message,
+            "underlying_error": {
+                "type": "worker_error",
+                "message": truncate_text(&format!("{:#}", failure.underlying), 2_000),
+                "stack_reference": null,
+            },
+            "provider_contacted": false,
+            "model_calls_used": 0,
+            "recoverable": true,
+            "resume_phase": "startup",
+            "recommended_action": "Retry from the persisted startup state after resolving the exact initialization error.",
+        });
+    }
     if let Some(failure) = error.downcast_ref::<HostedProviderContractFailure>() {
         return json!({
             "status": "failed",
-            "category": "hosted_agent_execution_failed",
+            "category": "orchestration_initialization_failed",
             "code": failure.code,
             "phase": "request_validation",
             "message": failure.message,
@@ -14892,7 +15393,7 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
     if let Some(mismatch) = error.downcast_ref::<ExecutionBudgetMismatch>() {
         return json!({
             "status": "failed",
-            "category": "hosted_agent_execution_failed",
+            "category": "orchestration_initialization_failed",
             "code": "execution_budget_mismatch",
             "phase": "manifest_validation",
             "message":
@@ -14918,11 +15419,15 @@ fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {
                 http.request_id.clone(),
             )
         } else {
-            ("worker_error", message.clone(), None)
+            (
+                "worker_error",
+                truncate_text(&format!("{error:#}"), 2_000),
+                None,
+            )
         };
     json!({
         "status": if cancelled { "cancelled" } else { "failed" },
-        "category": "hosted_agent_execution_failed",
+        "category": hosted_failure_category(error),
         "code": code,
         "phase": ExecutionPhase::Implementation,
         "message": message,
@@ -17733,6 +18238,155 @@ mod tests {
     };
 
     #[test]
+    fn fresh_clean_branch_does_not_enter_recovery_publication() {
+        let manifest = test_manifest(Uuid::from_u128(0x2201));
+        let startup = resolve_startup_mode(&manifest, true, &[]);
+        assert_eq!(startup.mode, StartupMode::FreshRun);
+        assert!(!startup.persisted_graph_present);
+        assert!(!startup.recovery_marker_present);
+        let changed = resolve_startup_mode(&manifest, true, &["src/lib.rs".into()]);
+        assert_eq!(changed.mode, StartupMode::RecoveryPublicationRun);
+        assert!(changed.recovery_marker_present);
+    }
+
+    #[test]
+    fn fresh_clean_branch_begins_discovery() {
+        let manifest = test_manifest(Uuid::from_u128(0x2202));
+        let notebook = new_worker_notebook(&manifest, "clean-tree".into(), None);
+        let graph = notebook.orchestration.graph.as_ref().unwrap().clone();
+        let mut snapshot = notebook.orchestration.snapshot(
+            "fresh-run",
+            crate::execution_graph::RepositorySnapshot {
+                fingerprint: "clean-tree".into(),
+                source_tree_hash: "clean-tree".into(),
+                ..crate::execution_graph::RepositorySnapshot::default()
+            },
+        );
+        snapshot
+            .append_event(crate::execution_graph::ExecutionDomainEvent::GraphCreated {
+                sequence: 1,
+                graph_id: graph.graph_id.clone(),
+                revision: graph.revision,
+                graph: Some(graph),
+                preserved_node_ids: Vec::new(),
+            })
+            .expect("fresh graph creation is a valid first durable event");
+        let next = notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.next_runnable_node())
+            .expect("fresh graph has a runnable discovery node");
+        assert_eq!(
+            next.kind,
+            crate::execution_graph::ExecutionNodeKind::Discovery
+        );
+        assert_eq!(notebook.phase, ExecutionPhase::Discovery);
+    }
+
+    #[test]
+    fn recovery_publication_with_no_diff_is_a_successful_no_op() {
+        let snapshot = crate::execution_graph::ExecutionSnapshot::default();
+        assert_eq!(
+            recovery_publication_no_op(StartupMode::RecoveryPublicationRun, &snapshot),
+            Some(RecoveryPublicationResult::SkippedNoDiff)
+        );
+        assert_eq!(
+            recovery_publication_no_op(StartupMode::FreshRun, &snapshot),
+            Some(RecoveryPublicationResult::NotApplicable)
+        );
+    }
+
+    #[test]
+    fn resumed_run_with_persisted_graph_resumes_next_node() {
+        let mut manifest = test_manifest(Uuid::from_u128(0x2203));
+        let mut notebook = new_worker_notebook(&manifest, "persisted-tree".into(), None);
+        let graph = notebook.orchestration.graph.as_mut().unwrap();
+        graph
+            .node_mut(&crate::execution_graph::ExecutionNodeId::new("discovery"))
+            .unwrap()
+            .status = crate::execution_graph::ExecutionNodeStatus::Completed;
+        graph.refresh_readiness();
+        notebook.revision = 17;
+        manifest.run.metadata["worker_notebook"] = serde_json::to_value(&notebook).unwrap();
+
+        let startup = resolve_startup_mode(&manifest, true, &[]);
+        assert_eq!(startup.mode, StartupMode::ResumeRun);
+        assert_eq!(startup.persisted_notebook_revision, Some(17));
+        let restored = compatible_worker_notebook(&manifest).unwrap();
+        let next = restored
+            .orchestration
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.next_runnable_node())
+            .unwrap();
+        assert_eq!(
+            next.kind,
+            crate::execution_graph::ExecutionNodeKind::Planning
+        );
+    }
+
+    #[test]
+    fn interrupted_run_with_changes_selects_recovery_publication() {
+        let mut manifest = test_manifest(Uuid::from_u128(0x2204));
+        let mut notebook = new_worker_notebook(&manifest, "changed-tree".into(), None);
+        notebook.orchestration.publication.status =
+            crate::execution_graph::PublicationStatus::CommitCreated;
+        manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
+
+        let startup = resolve_startup_mode(&manifest, true, &["src/lib.rs".into()]);
+        assert_eq!(startup.mode, StartupMode::RecoveryPublicationRun);
+        let snapshot = crate::execution_graph::ExecutionSnapshot {
+            current_repository: crate::execution_graph::RepositorySnapshot {
+                changed_paths: BTreeSet::from(["src/lib.rs".into()]),
+                ..crate::execution_graph::RepositorySnapshot::default()
+            },
+            ..crate::execution_graph::ExecutionSnapshot::default()
+        };
+        assert_eq!(
+            recovery_publication_no_op(startup.mode, &snapshot),
+            None,
+            "a changed interrupted run may proceed to recovery authorization"
+        );
+    }
+
+    #[test]
+    fn provider_not_contacted_is_never_reported_as_ai_gateway_failure() {
+        let error = anyhow::Error::new(test_hosted_http_error(
+            StatusCode::BAD_REQUEST,
+            "request_rejected_before_dispatch",
+            None,
+            Some(false),
+        ));
+        assert_eq!(
+            hosted_failure_category(&error),
+            "orchestration_initialization_failed"
+        );
+    }
+
+    #[test]
+    fn startup_failure_telemetry_preserves_the_real_error() {
+        let error = anyhow!(HostedStartupFailure {
+            category: "execution_graph_initialization_failed",
+            code: "execution_graph_initialization_failed",
+            message: "The fresh execution snapshot could not be persisted".into(),
+            underlying: anyhow!("graph reducer rejected persisted revision 17"),
+        });
+        let diagnostics = failure_diagnostics(&error, false);
+        assert_eq!(
+            diagnostics["category"],
+            "execution_graph_initialization_failed"
+        );
+        assert_eq!(diagnostics["provider_contacted"], false);
+        assert!(
+            diagnostics["underlying_error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("graph reducer rejected persisted revision 17")
+        );
+    }
+
+    #[test]
     fn only_execution_decision_adapter_may_transition_hosted_lifecycle() {
         let source = include_str!("hosted.rs");
         let obsolete_transition = ["transition", "_phase("].concat();
@@ -18252,8 +18906,8 @@ mod tests {
             production
                 .matches("attempt_safe_recovery_publication(")
                 .count(),
-            2,
-            "the recovery helper must have one definition and one call site"
+            3,
+            "the recovery helper must have one definition and only the explicit startup and invariant-recovery call sites"
         );
         let recovery_start = production
             .find("fn attempt_safe_recovery_publication")
@@ -18480,6 +19134,7 @@ mod tests {
             baseline: &BTreeSet::new(),
             containment: &containment,
             running: &running,
+            startup_mode: StartupMode::RecoveryPublicationRun,
         };
         let mut draft_requested = false;
         let result = attempt_safe_recovery_publication_with(
@@ -18523,8 +19178,9 @@ mod tests {
                 })
             },
         )
-        .unwrap()
-        .expect("validated recovery should publish");
+        .unwrap();
+        assert_eq!(result.0, RecoveryPublicationResult::PublishedDraft);
+        let result = result.1.expect("validated recovery should publish");
         assert!(draft_requested);
         assert_eq!(result.completeness.status, CompletionStatus::Partial);
         assert_eq!(result.pull_request.number, 226);
