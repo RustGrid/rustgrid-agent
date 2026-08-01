@@ -18,6 +18,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::execution_graph::{
+    ExecutionNodeKind, ExecutionSnapshot as HostedExecutionSnapshot, NodeBudget,
+};
 use crate::{api::RustGridClient, mission::BudgetUsage, token_consumption::TokenConsumption};
 
 pub const TELEMETRY_VERSION: &str = "1.0";
@@ -27,6 +30,81 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_RAW_USAGE_BYTES: usize = 4 * 1024;
 const MAX_OUTBOX_BYTES: u64 = 64 * 1024 * 1024;
 const TELEMETRY_NAMESPACE: Uuid = Uuid::from_u128(0x9dd66585_d9bd_461e_a47a_671b061a3ef8);
+
+/// Deterministic cost/progress projection for the graph-backed hosted worker.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HostedOrchestrationTelemetry {
+    pub complexity_class: String,
+    pub complexity_score: Option<u32>,
+    pub mission_budget: crate::execution_graph::MissionBudget,
+    pub active_node_budget: Option<NodeBudget>,
+    pub active_node_cost_micros: Option<u64>,
+    pub model_calls: u32,
+    pub mission_cost_micros: u64,
+    pub progress_score: u64,
+    pub applied_targets: usize,
+    pub passed_gates: usize,
+    pub cost_per_applied_target_micros: Option<u64>,
+    pub cost_per_passed_gate_micros: Option<u64>,
+    pub cost_to_pull_request_micros: Option<u64>,
+}
+
+impl HostedOrchestrationTelemetry {
+    pub fn from_snapshot(snapshot: &HostedExecutionSnapshot) -> Self {
+        let active_node = snapshot
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.status == crate::execution_graph::ExecutionNodeStatus::Running)
+            .or_else(|| snapshot.graph.next_runnable_node());
+        let applied_targets = snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind.is_mutation() && node.status.is_success())
+            .count();
+        let passed_gates = snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    ExecutionNodeKind::ValidationFocused
+                        | ExecutionNodeKind::ValidationSuite
+                        | ExecutionNodeKind::ValidationBuild
+                        | ExecutionNodeKind::ValidationLint
+                ) && node.status.is_success()
+            })
+            .count();
+        let cost = snapshot.budget.total_cost_micros;
+        let complexity_score = snapshot.events.iter().rev().find_map(|event| match event {
+            crate::execution_graph::ExecutionDomainEvent::ComplexityClassified {
+                assessment,
+                ..
+            } => Some(assessment.score),
+            _ => None,
+        });
+        Self {
+            complexity_class: snapshot.graph.complexity.as_str().into(),
+            complexity_score,
+            mission_budget: snapshot.budget.mission.clone(),
+            active_node_budget: active_node.map(|node| node.budget.clone()),
+            active_node_cost_micros: active_node
+                .map(|node| snapshot.budget.usage_for(&node.id).cost_micros),
+            model_calls: snapshot.budget.total_model_calls,
+            mission_cost_micros: cost,
+            progress_score: snapshot.budget.progress_score,
+            applied_targets,
+            passed_gates,
+            cost_per_applied_target_micros: (applied_targets > 0)
+                .then(|| cost / u64::try_from(applied_targets).unwrap_or(u64::MAX).max(1)),
+            cost_per_passed_gate_micros: (passed_gates > 0)
+                .then(|| cost / u64::try_from(passed_gates).unwrap_or(u64::MAX).max(1)),
+            cost_to_pull_request_micros: snapshot.publication.is_published().then_some(cost),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TelemetryBatch {
@@ -1384,6 +1462,31 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_orchestration_telemetry_projects_the_classification_score() {
+        let mut snapshot = crate::execution_graph::ExecutionSnapshot::default();
+        snapshot.graph.complexity = crate::execution_graph::MissionComplexity::Small;
+        let assessment = crate::execution_graph::ComplexityAssessment::classify(
+            &crate::execution_graph::ComplexityInput {
+                planned_target_count: 4,
+                test_surface: 3,
+                cross_module_impact: 2,
+                ..crate::execution_graph::ComplexityInput::default()
+            },
+        );
+        let expected_score = assessment.score;
+        snapshot.events.push(
+            crate::execution_graph::ExecutionDomainEvent::ComplexityClassified {
+                sequence: 1,
+                assessment,
+            },
+        );
+
+        let telemetry = HostedOrchestrationTelemetry::from_snapshot(&snapshot);
+        assert_eq!(telemetry.complexity_class, "small");
+        assert_eq!(telemetry.complexity_score, Some(expected_score));
+    }
 
     #[test]
     fn resolves_model_identity_from_codex_flags_and_config_overrides() {

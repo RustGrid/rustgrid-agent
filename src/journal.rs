@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    lifecycle::RunPhase, optimization::DependencyState, token_consumption::TokenConsumption,
+    execution_graph::ExecutionSnapshot, lifecycle::RunPhase, optimization::DependencyState,
+    token_consumption::TokenConsumption,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +56,11 @@ pub struct RunJournal {
     pub token_consumption: TokenConsumption,
     #[serde(default)]
     pub dependency_state: Option<DependencyState>,
+    /// Optional graph-backed hosted checkpoint. Older journals deserialize
+    /// without it and hosted GitHub Actions runs may persist the same payload in
+    /// their remote worker notebook instead.
+    #[serde(default)]
+    pub hosted_execution: Option<ExecutionSnapshot>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -114,6 +120,7 @@ impl RunJournal {
             recovery_source_run_id: None,
             token_consumption: TokenConsumption::default(),
             dependency_state: None,
+            hosted_execution: None,
             path,
         };
         journal.persist()?;
@@ -123,6 +130,14 @@ impl RunJournal {
     pub fn checkpoint(&mut self, phase: RunPhase, sequence: u64) -> Result<()> {
         self.phase = phase;
         self.last_sequence = sequence;
+        self.persist()
+    }
+
+    pub fn checkpoint_hosted_execution(&mut self, snapshot: ExecutionSnapshot) -> Result<()> {
+        snapshot
+            .validate_invariants()
+            .context("cannot persist an invalid hosted execution snapshot")?;
+        self.hosted_execution = Some(snapshot);
         self.persist()
     }
 

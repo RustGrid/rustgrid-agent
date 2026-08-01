@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::HostedExecutionStage;
+
 pub(super) const DEFAULT_HOSTED_MODEL_CALLS: usize = 40;
 pub(super) const MINIMUM_HOSTED_MODEL_CALLS: usize = 10;
 
@@ -46,6 +48,17 @@ impl ExecutionPhase {
                 | Self::DiffReview
                 | Self::CompletionEvaluation
         )
+    }
+
+    pub(super) const fn stage(self) -> HostedExecutionStage {
+        match self {
+            Self::Discovery | Self::ArtifactRepair => HostedExecutionStage::Discovery,
+            Self::Planning => HostedExecutionStage::Planning,
+            Self::Implementation | Self::Repair => HostedExecutionStage::Implementation,
+            Self::Validation => HostedExecutionStage::Validation,
+            Self::DiffReview | Self::CompletionEvaluation => HostedExecutionStage::Review,
+            Self::Publication => HostedExecutionStage::Publication,
+        }
     }
 }
 
@@ -93,8 +106,7 @@ pub(super) fn phase_budget_allocation(total: usize) -> PhaseBudgetAllocation {
         .saturating_sub(discovery)
         .saturating_sub(planning)
         .saturating_sub(diff_review)
-        .saturating_sub(completion_evaluation)
-        .min(18);
+        .saturating_sub(completion_evaluation);
     PhaseBudgetAllocation {
         discovery_maximum: discovery,
         planning_maximum: planning,
@@ -156,13 +168,18 @@ impl PhaseLedger {
         self.total_limit
     }
 
+    #[cfg(test)]
     pub(super) fn apply_ticket_complexity(&mut self, target_count: usize) -> usize {
         let complexity_limit = match target_count {
-            0 | 1 => 12,
-            2..=8 => 20,
-            9..=12 => 35,
-            _ => 60,
+            0 | 1 => 14,
+            2..=8 => 25,
+            9..=12 => 45,
+            _ => 80,
         };
+        self.apply_complexity_limit(complexity_limit)
+    }
+
+    pub(super) fn apply_complexity_limit(&mut self, complexity_limit: usize) -> usize {
         self.total_limit = self
             .total_limit
             .min(complexity_limit)
@@ -217,8 +234,17 @@ impl PhaseLedger {
             .saturating_sub(self.reallocated_completion_evaluation_calls);
         if self.total_limit <= 20 {
             capacity.min(self.allocation.implementation_repair_reserved)
-        } else {
+        } else if self.total_limit <= 25 {
+            // Preserve the established small-mission shape: unused discovery
+            // and planning calls may roll into implementation, while review
+            // and completion remain protected.
             capacity.min(18)
+        } else {
+            // Medium and large graph-classified missions must be able to use
+            // their class-specific implementation allocation. A legacy global
+            // 18-call ceiling would silently defeat their 45/80-call mission
+            // budgets, while this cap still protects the other node pools.
+            capacity.min(self.allocation.implementation_repair_reserved)
         }
     }
 
@@ -290,6 +316,7 @@ impl PhaseLedger {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn begin_model_call(&mut self) -> Result<usize> {
         if !self.active.permits_model_call() {
             bail!(
@@ -319,6 +346,34 @@ impl PhaseLedger {
                 used,
                 self.phase_limit(self.active)
             );
+        }
+        let consumed = match self.active {
+            ExecutionPhase::Discovery => &mut self.discovery_calls,
+            ExecutionPhase::ArtifactRepair => &mut self.artifact_repair_calls,
+            ExecutionPhase::Planning => &mut self.planning_calls,
+            ExecutionPhase::Implementation => &mut self.implementation_calls,
+            ExecutionPhase::Repair => &mut self.repair_calls,
+            ExecutionPhase::DiffReview => &mut self.diff_review_calls,
+            ExecutionPhase::CompletionEvaluation => &mut self.completion_evaluation_calls,
+            ExecutionPhase::Validation | ExecutionPhase::Publication => unreachable!(),
+        };
+        *consumed = consumed.saturating_add(1);
+        Ok(self.total_calls())
+    }
+
+    /// Records a model call after the authoritative execution graph has
+    /// admitted it. Legacy phase allocations remain telemetry/compatibility
+    /// data and must not veto a call already authorized by node and mission
+    /// budgets.
+    pub(super) fn begin_graph_model_call(&mut self) -> Result<usize> {
+        if !self.active.permits_model_call() {
+            bail!(
+                "phase `{}` does not permit model calls",
+                self.active.as_str()
+            );
+        }
+        if self.total_calls() >= self.total_limit {
+            bail!("execution AI model-call budget was exhausted");
         }
         let consumed = match self.active {
             ExecutionPhase::Discovery => &mut self.discovery_calls,
@@ -483,10 +538,10 @@ mod tests {
         let allocation = phase_budget_allocation(DEFAULT_HOSTED_MODEL_CALLS);
         assert_eq!(allocation.discovery_maximum, 5);
         assert_eq!(allocation.planning_maximum, 3);
-        assert_eq!(allocation.implementation_repair_reserved, 18);
+        assert_eq!(allocation.implementation_repair_reserved, 26);
         assert_eq!(allocation.diff_review_reserved, 3);
         assert_eq!(allocation.completion_evaluation_reserved, 3);
-        assert_eq!(allocation.total(), 32);
+        assert_eq!(allocation.total(), 40);
         let ledger = PhaseLedger::new(40, ExecutionPhase::Discovery);
         assert_eq!(ledger.diff_review_start_call(), 35);
     }
@@ -498,7 +553,7 @@ mod tests {
             assert!(allocation.total() <= total);
             assert!(allocation.discovery_maximum <= 5);
             assert!(allocation.planning_maximum <= 3);
-            assert!(allocation.implementation_repair_reserved <= 18);
+            assert!(allocation.implementation_repair_reserved <= total);
             assert!(allocation.diff_review_reserved <= 3);
             assert!(allocation.completion_evaluation_reserved <= 3);
         }
@@ -515,10 +570,10 @@ mod tests {
         let allocation = phase_budget_allocation(60);
         assert_eq!(allocation.discovery_maximum, 5);
         assert_eq!(allocation.planning_maximum, 3);
-        assert_eq!(allocation.implementation_repair_reserved, 18);
+        assert_eq!(allocation.implementation_repair_reserved, 46);
         assert_eq!(allocation.diff_review_reserved, 3);
         assert_eq!(allocation.completion_evaluation_reserved, 3);
-        assert_eq!(allocation.total(), 32);
+        assert_eq!(allocation.total(), 60);
 
         let ledger = PhaseLedger::new(60, ExecutionPhase::Discovery);
         assert_eq!(ledger.diff_review_start_call(), 55);
@@ -533,10 +588,10 @@ mod tests {
         let reallocated = ledger.release_unused_implementation_capacity();
 
         assert_eq!(reallocated.diff_review_calls, 4);
-        assert_eq!(reallocated.completion_evaluation_calls, 6);
-        assert_eq!(ledger.implementation_repair_capacity(), 18);
+        assert_eq!(reallocated.completion_evaluation_calls, 34);
+        assert_eq!(ledger.implementation_repair_capacity(), 8);
         assert_eq!(ledger.phase_limit(ExecutionPhase::DiffReview), 7);
-        assert_eq!(ledger.phase_limit(ExecutionPhase::CompletionEvaluation), 9);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::CompletionEvaluation), 37);
         assert_eq!(ledger.total_limit, 60);
     }
 
@@ -549,7 +604,7 @@ mod tests {
 
         assert_eq!(ledger.phase_limit(ExecutionPhase::DiffReview), 4);
         assert_eq!(ledger.phase_limit(ExecutionPhase::CompletionEvaluation), 3);
-        assert_eq!(ledger.implementation_repair_capacity(), 18);
+        assert_eq!(ledger.implementation_repair_capacity(), 25);
     }
 
     #[test]
@@ -564,7 +619,7 @@ mod tests {
             ledger.begin_model_call().unwrap();
         }
         assert!(ledger.begin_model_call().is_err());
-        assert_eq!(ledger.allocation.implementation_repair_reserved, 18);
+        assert_eq!(ledger.allocation.implementation_repair_reserved, 26);
     }
 
     #[test]
@@ -591,6 +646,18 @@ mod tests {
     }
 
     #[test]
+    fn graph_admitted_call_is_not_vetoed_by_legacy_phase_allocation() {
+        let mut ledger = PhaseLedger::new(25, ExecutionPhase::Implementation);
+        let legacy_capacity = ledger.implementation_repair_capacity();
+        for _ in 0..legacy_capacity {
+            ledger.begin_model_call().unwrap();
+        }
+        assert!(ledger.begin_model_call().is_err());
+        assert!(ledger.begin_graph_model_call().is_ok());
+        assert_eq!(ledger.implementation_repair_calls(), legacy_capacity + 1);
+    }
+
+    #[test]
     fn early_implementation_failure_leaves_the_full_shared_pool_for_repair() {
         let mut ledger = PhaseLedger::new(60, ExecutionPhase::Discovery);
         for _ in 0..4 {
@@ -600,24 +667,24 @@ mod tests {
         for _ in 0..2 {
             ledger.begin_model_call().unwrap();
         }
-        assert_eq!(ledger.apply_ticket_complexity(5), 20);
-        assert_eq!(ledger.implementation_repair_capacity(), 10);
+        assert_eq!(ledger.apply_ticket_complexity(5), 25);
+        assert_eq!(ledger.implementation_repair_capacity(), 13);
 
         ledger.transition(ExecutionPhase::Implementation);
         ledger.begin_model_call().unwrap();
         assert_eq!(ledger.implementation_repair_calls(), 1);
 
         ledger.transition(ExecutionPhase::Repair);
-        assert_eq!(ledger.phase_limit(ExecutionPhase::Repair), 9);
-        for _ in 0..9 {
+        assert_eq!(ledger.phase_limit(ExecutionPhase::Repair), 12);
+        for _ in 0..12 {
             ledger.begin_model_call().unwrap();
         }
 
-        assert_eq!(ledger.implementation_repair_calls(), 10);
+        assert_eq!(ledger.implementation_repair_calls(), 13);
         assert!(ledger.begin_model_call().is_err());
         ledger.transition(ExecutionPhase::Implementation);
         assert!(ledger.begin_model_call().is_err());
-        assert_eq!(ledger.implementation_repair_calls(), 10);
+        assert_eq!(ledger.implementation_repair_calls(), 13);
     }
 
     #[test]
@@ -631,7 +698,7 @@ mod tests {
             ledger.begin_model_call().unwrap();
         }
         ledger.transition(ExecutionPhase::Implementation);
-        assert_eq!(ledger.implementation_repair_capacity(), 18);
+        assert_eq!(ledger.implementation_repair_capacity(), 26);
         let limit = ledger.phase_limit(ExecutionPhase::Implementation);
         for _ in 0..limit {
             ledger.begin_model_call().unwrap();
@@ -722,17 +789,17 @@ mod tests {
     }
 
     #[test]
-    fn five_target_ticket_is_capped_at_twenty_calls_with_ten_for_implementation() {
+    fn five_target_ticket_uses_the_small_mission_twenty_five_call_envelope() {
         let mut ledger = PhaseLedger::new(60, ExecutionPhase::Planning);
-        assert_eq!(ledger.apply_ticket_complexity(5), 20);
-        assert_eq!(ledger.total_limit(), 20);
-        assert_eq!(ledger.implementation_repair_capacity(), 10);
-        assert_eq!(ledger.phase_limit(ExecutionPhase::Implementation), 10);
-        assert_eq!(ledger.phase_limit(ExecutionPhase::Repair), 10);
+        assert_eq!(ledger.apply_ticket_complexity(5), 25);
+        assert_eq!(ledger.total_limit(), 25);
+        assert_eq!(ledger.implementation_repair_capacity(), 18);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::Implementation), 18);
+        assert_eq!(ledger.phase_limit(ExecutionPhase::Repair), 18);
     }
 
     #[test]
-    fn aops_226_call_shape_stays_below_twenty_with_four_discovery_and_two_planning_calls() {
+    fn aops_226_call_shape_stays_in_the_small_mission_envelope() {
         let mut ledger = PhaseLedger::new(60, ExecutionPhase::Discovery);
         for _ in 0..4 {
             ledger.begin_model_call().unwrap();
@@ -741,8 +808,8 @@ mod tests {
         for _ in 0..2 {
             ledger.begin_model_call().unwrap();
         }
-        assert_eq!(ledger.apply_ticket_complexity(5), 20);
-        assert_eq!(ledger.implementation_repair_capacity(), 10);
+        assert_eq!(ledger.apply_ticket_complexity(5), 25);
+        assert_eq!(ledger.implementation_repair_capacity(), 13);
 
         ledger.transition(ExecutionPhase::Implementation);
         for _ in 0..ledger.phase_limit(ExecutionPhase::Implementation) {
@@ -752,14 +819,14 @@ mod tests {
         for _ in 0..ledger.phase_limit(ExecutionPhase::Repair) {
             ledger.begin_model_call().unwrap();
         }
-        assert_eq!(ledger.implementation_repair_calls(), 10);
+        assert_eq!(ledger.implementation_repair_calls(), 13);
 
         ledger.transition(ExecutionPhase::DiffReview);
         ledger.begin_model_call().unwrap();
         ledger.transition(ExecutionPhase::CompletionEvaluation);
         ledger.begin_model_call().unwrap();
-        assert_eq!(ledger.budgeted_calls(), 18);
-        assert!(ledger.budgeted_calls() <= 20);
+        assert_eq!(ledger.budgeted_calls(), 21);
+        assert!(ledger.budgeted_calls() <= 25);
     }
 
     #[test]

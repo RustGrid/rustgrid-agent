@@ -80,39 +80,22 @@ pub(super) enum ToolProgressClass {
 pub(super) enum ImplementationProgressAction {
     Continue,
     FirstWriteDelayed,
-    BlockedBeforeFirstWrite,
-    BlockedAfterWrite,
 }
 
-pub(super) const MAX_PREPARATION_MODEL_CALLS: usize = 8;
 pub(super) const FIRST_WRITE_DELAY_CALL: usize = 6;
 pub(super) const MAX_CONSECUTIVE_PREPARATION_READS: usize = 6;
-pub(super) const MAX_RECOVERABLE_READ_FAILURES: usize = 3;
-pub(super) const MAX_POST_WRITE_STAGNANT_CALLS: usize = 4;
 
 pub(super) fn implementation_progress_action(
     implementation_calls: usize,
     successful_writes: u32,
     consecutive_preparation_reads: usize,
-    recoverable_read_failures: usize,
+    _recoverable_read_failures: usize,
     repeated_identical_read_failures: usize,
     guided_recovery_issued: bool,
-    calls_since_repository_progress: usize,
+    _calls_since_repository_progress: usize,
 ) -> ImplementationProgressAction {
     if successful_writes > 0 {
-        return if calls_since_repository_progress >= MAX_POST_WRITE_STAGNANT_CALLS {
-            ImplementationProgressAction::BlockedAfterWrite
-        } else {
-            ImplementationProgressAction::Continue
-        };
-    }
-
-    if guided_recovery_issued
-        && (implementation_calls >= MAX_PREPARATION_MODEL_CALLS
-            || recoverable_read_failures > MAX_RECOVERABLE_READ_FAILURES
-            || repeated_identical_read_failures >= 3)
-    {
-        return ImplementationProgressAction::BlockedBeforeFirstWrite;
+        return ImplementationProgressAction::Continue;
     }
 
     if !guided_recovery_issued
@@ -522,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_gets_six_productive_calls_then_one_guided_recovery_turn() {
+    fn preparation_guidance_never_becomes_an_independent_stop_authority() {
         for implementation_calls in 1..FIRST_WRITE_DELAY_CALL {
             assert_eq!(
                 implementation_progress_action(
@@ -554,8 +537,9 @@ mod tests {
             ImplementationProgressAction::Continue
         );
         assert_eq!(
-            implementation_progress_action(MAX_PREPARATION_MODEL_CALLS, 0, 0, 0, 0, true, 8),
-            ImplementationProgressAction::BlockedBeforeFirstWrite
+            implementation_progress_action(99, 0, 0, 99, 99, true, 99),
+            ImplementationProgressAction::Continue,
+            "only the canonical graph budget and progress window may stop the node"
         );
     }
 
@@ -570,19 +554,19 @@ mod tests {
         assert!(partial_batch.contains(&ToolProgressClass::Productive));
         assert!(partial_batch.contains(&ToolProgressClass::RecoverableFailure));
         assert_eq!(
-            implementation_progress_action(3, 0, 1, MAX_RECOVERABLE_READ_FAILURES, 1, false, 3),
+            implementation_progress_action(3, 0, 1, 3, 1, false, 3),
             ImplementationProgressAction::Continue
         );
 
-        // The second identical range/path failure requests recovery but does not terminate the
-        // implementation. Only a third identical failure after that recovery turn blocks it.
+        // Repeated range/path failures may request guided recovery, but never
+        // terminate independently of the graph budget.
         assert_eq!(
             implementation_progress_action(2, 0, 0, 2, 2, false, 2),
             ImplementationProgressAction::FirstWriteDelayed
         );
         assert_eq!(
             implementation_progress_action(3, 0, 0, 3, 3, true, 3),
-            ImplementationProgressAction::BlockedBeforeFirstWrite
+            ImplementationProgressAction::Continue
         );
 
         // A successful individual fallback is productive and therefore provides the caller a
@@ -595,14 +579,14 @@ mod tests {
     }
 
     #[test]
-    fn post_write_stagnation_requires_four_consecutive_calls_and_resets_on_progress() {
+    fn post_write_stagnation_is_observational_until_the_graph_budget_stops_it() {
         assert_eq!(
             implementation_progress_action(8, 1, 0, 0, 0, false, 3),
             ImplementationProgressAction::Continue
         );
         assert_eq!(
-            implementation_progress_action(9, 1, 0, 0, 0, false, MAX_POST_WRITE_STAGNANT_CALLS,),
-            ImplementationProgressAction::BlockedAfterWrite
+            implementation_progress_action(99, 1, 0, 0, 0, false, 99),
+            ImplementationProgressAction::Continue
         );
         assert_eq!(
             implementation_progress_action(10, 2, 0, 0, 0, false, 0),
@@ -763,7 +747,7 @@ mod tests {
         for _ in 0..2 {
             ledger.begin_model_call().unwrap();
         }
-        assert_eq!(ledger.apply_ticket_complexity(AOPS_226_TARGETS.len()), 20);
+        assert_eq!(ledger.apply_ticket_complexity(AOPS_226_TARGETS.len()), 25);
 
         let mut changes = vec![aops_226_change(&[
             IntendedChangeStatus::Planned,
@@ -823,7 +807,7 @@ mod tests {
         ledger.begin_model_call().unwrap();
         ledger.transition(ExecutionPhase::CompletionEvaluation);
         ledger.begin_model_call().unwrap();
-        assert!(ledger.budgeted_calls() <= 20);
+        assert!(ledger.budgeted_calls() <= 25);
     }
 
     #[test]

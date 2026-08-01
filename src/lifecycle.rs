@@ -79,6 +79,92 @@ pub enum RunPhase {
     TimedOut,
 }
 
+/// The coarse hosted-worker stage exposed at the lifecycle boundary.
+///
+/// Fine-grained progress remains owned by the hosted execution graph. In
+/// particular, this type cannot identify an individual graph node or target.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedExecutionStage {
+    Discovery,
+    Planning,
+    Implementation,
+    Validation,
+    Review,
+    Publication,
+    Terminal,
+}
+
+impl HostedExecutionStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Planning => "planning",
+            Self::Implementation => "implementation",
+            Self::Validation => "validation",
+            Self::Review => "review",
+            Self::Publication => "publication",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+
+    /// Returns whether the hosted orchestrator may move between two coarse
+    /// stages. Node-level readiness must still be decided by the execution
+    /// graph; this table is only the lifecycle boundary.
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        if matches!(
+            (self, next),
+            (Self::Discovery, Self::Discovery)
+                | (Self::Planning, Self::Planning)
+                | (Self::Implementation, Self::Implementation)
+                | (Self::Validation, Self::Validation)
+                | (Self::Review, Self::Review)
+                | (Self::Publication, Self::Publication)
+                | (Self::Terminal, Self::Terminal)
+        ) {
+            return true;
+        }
+        if self.is_terminal() {
+            return false;
+        }
+        matches!(
+            (self, next),
+            (Self::Discovery, Self::Planning)
+                | (Self::Planning, Self::Implementation)
+                | (Self::Implementation, Self::Validation)
+                | (Self::Validation, Self::Implementation)
+                | (Self::Validation, Self::Review)
+                | (Self::Review, Self::Publication)
+                // A remote branch may move after graph-selected publication
+                // begins. Reconciliation must invalidate stale proof and
+                // re-enter the full validation -> review -> publication route.
+                | (Self::Publication, Self::Validation)
+                | (Self::Publication, Self::Terminal)
+        )
+    }
+}
+
+/// Maps the hosted stage into the intentionally coarser public/API lifecycle.
+/// Discovery and planning are both preparing; validation and internal review
+/// are both verifying. Terminal selects the successful public terminal phase;
+/// callers with a concrete terminal outcome must use the corresponding
+/// `RunPhase` instead.
+impl From<HostedExecutionStage> for RunPhase {
+    fn from(stage: HostedExecutionStage) -> Self {
+        match stage {
+            HostedExecutionStage::Discovery | HostedExecutionStage::Planning => Self::Preparing,
+            HostedExecutionStage::Implementation => Self::Executing,
+            HostedExecutionStage::Validation | HostedExecutionStage::Review => Self::Verifying,
+            HostedExecutionStage::Publication => Self::Publishing,
+            HostedExecutionStage::Terminal => Self::Succeeded,
+        }
+    }
+}
+
 impl RunPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -101,6 +187,22 @@ impl RunPhase {
             self,
             Self::Succeeded | Self::Blocked | Self::Failed | Self::Cancelled | Self::TimedOut
         )
+    }
+
+    /// Recovers a hosted stage only when this public phase identifies one
+    /// unambiguously. `Preparing` aggregates discovery and planning, while
+    /// `Verifying` aggregates validation and internal diff review, so those
+    /// phases deliberately return `None`. Graph state, not `RunPhase`, must be
+    /// consulted to recover the finer progression.
+    pub const fn hosted_execution_stage(self) -> Option<HostedExecutionStage> {
+        match self {
+            Self::Executing => Some(HostedExecutionStage::Implementation),
+            Self::Publishing => Some(HostedExecutionStage::Publication),
+            Self::Succeeded | Self::Blocked | Self::Failed | Self::Cancelled | Self::TimedOut => {
+                Some(HostedExecutionStage::Terminal)
+            }
+            Self::Claimed | Self::Preparing | Self::Verifying | Self::AwaitingReview => None,
+        }
     }
 
     pub const fn can_transition_to(self, next: Self) -> bool {
@@ -197,5 +299,82 @@ mod tests {
         assert_eq!(TicketStatus::AwaitingReview.as_str(), "awaiting_review");
         assert_eq!(AgentRunStatus::Cancelled.as_str(), "cancelled");
         assert_eq!(WorkerStatus::Busy.as_str(), "busy");
+    }
+
+    #[test]
+    fn hosted_stage_serializes_and_maps_to_public_phases() {
+        assert_eq!(
+            serde_json::to_string(&HostedExecutionStage::Review).expect("serialize hosted stage"),
+            "\"review\""
+        );
+        assert_eq!(HostedExecutionStage::Planning.as_str(), "planning");
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Discovery),
+            RunPhase::Preparing
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Planning),
+            RunPhase::Preparing
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Implementation),
+            RunPhase::Executing
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Validation),
+            RunPhase::Verifying
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Review),
+            RunPhase::Verifying
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Publication),
+            RunPhase::Publishing
+        );
+        assert_eq!(
+            RunPhase::from(HostedExecutionStage::Terminal),
+            RunPhase::Succeeded
+        );
+    }
+
+    #[test]
+    fn hosted_stage_transition_table_enforces_the_authoritative_route() {
+        use HostedExecutionStage as Stage;
+
+        assert!(Stage::Discovery.can_transition_to(Stage::Discovery));
+        assert!(Stage::Discovery.can_transition_to(Stage::Planning));
+        assert!(Stage::Planning.can_transition_to(Stage::Implementation));
+        assert!(Stage::Implementation.can_transition_to(Stage::Validation));
+        assert!(Stage::Validation.can_transition_to(Stage::Implementation));
+        assert!(Stage::Validation.can_transition_to(Stage::Review));
+        assert!(Stage::Review.can_transition_to(Stage::Publication));
+        assert!(Stage::Publication.can_transition_to(Stage::Validation));
+        assert!(Stage::Publication.can_transition_to(Stage::Terminal));
+        assert!(Stage::Terminal.can_transition_to(Stage::Terminal));
+
+        assert!(!Stage::Discovery.can_transition_to(Stage::Implementation));
+        assert!(!Stage::Implementation.can_transition_to(Stage::Review));
+        assert!(!Stage::Review.can_transition_to(Stage::Terminal));
+        assert!(!Stage::Terminal.can_transition_to(Stage::Publication));
+    }
+
+    #[test]
+    fn public_phase_cannot_infer_aggregated_hosted_progress() {
+        assert_eq!(RunPhase::Preparing.hosted_execution_stage(), None);
+        assert_eq!(RunPhase::Verifying.hosted_execution_stage(), None);
+        assert_eq!(RunPhase::AwaitingReview.hosted_execution_stage(), None);
+        assert_eq!(
+            RunPhase::Executing.hosted_execution_stage(),
+            Some(HostedExecutionStage::Implementation)
+        );
+        assert_eq!(
+            RunPhase::Publishing.hosted_execution_stage(),
+            Some(HostedExecutionStage::Publication)
+        );
+        assert_eq!(
+            RunPhase::Failed.hosted_execution_stage(),
+            Some(HostedExecutionStage::Terminal)
+        );
     }
 }
