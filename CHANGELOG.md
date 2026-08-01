@@ -5,6 +5,25 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.19 - 2026-08-01
+
+### Changed
+
+- Represent implementation-plan acceptance-criterion references canonically as
+  stable `ac-N` IDs while retaining legacy text input for notebook migration.
+- Evaluate required criterion coverage across the complete plan and require
+  each independently editable change to reference only its relevant criteria.
+
+### Fixed
+
+- Accept plans whose changes collectively cover every required criterion
+  without requiring every change to duplicate every criterion.
+- Deterministically attach missing criterion coverage to the uniquely most
+  relevant existing change using impact-map paths and semantic evidence, then
+  revalidate locally without consuming another provider call.
+- Replace the original plan candidate with its repaired form before validation,
+  persistence, telemetry, and transition into implementation.
+
 ## 1.4.18 - 2026-08-01
 
 ### Changed
