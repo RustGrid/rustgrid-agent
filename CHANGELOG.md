@@ -5,6 +5,28 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.22 - 2026-08-01
+
+### Changed
+
+- Resolve every hosted startup into an explicit fresh-run, graph-resume, or
+  recovery-publication mode from compatible persisted state and the checked-out
+  repository diff.
+- Emit startup and recovery-publication decisions with notebook, graph, branch,
+  and selected-next-action evidence for operational diagnosis.
+
+### Fixed
+
+- Start discovery normally on a clean fresh checkout instead of treating the
+  manifest branch name alone as evidence of an interrupted publication.
+- Resume the next graph node when a compatible execution graph is persisted,
+  while reserving recovery publication for an explicit recoverable failure or
+  interrupted publication with repository changes.
+- Treat recovery publication with no remaining diff as a successful no-op and
+  preserve startup and graph-initialization errors under their real failure
+  categories instead of misreporting an AI gateway failure before any provider
+  request was made.
+
 ## 1.4.21 - 2026-08-01
 
 ### Changed
