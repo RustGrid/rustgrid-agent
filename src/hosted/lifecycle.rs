@@ -344,7 +344,6 @@ pub(super) fn validation_entry_decision(
             status,
             ImplementationCompletionStatus::ReadyForValidation
                 | ImplementationCompletionStatus::PartialReadyForValidation
-                | ImplementationCompletionStatus::InProgress
         )
     {
         return ValidationEntryDecision::ResumedImplementation;
@@ -656,7 +655,7 @@ mod tests {
         assert_eq!(restored_status, ImplementationCompletionStatus::InProgress);
         assert_eq!(
             validation_entry_decision(restored_status, restored_paths.len(), true, false),
-            ValidationEntryDecision::ResumedImplementation
+            ValidationEntryDecision::ForbiddenIncompletePreparation
         );
 
         let complete = vec![change(&[
@@ -700,7 +699,7 @@ mod tests {
         );
         assert_eq!(
             validation_entry_decision(ImplementationCompletionStatus::InProgress, 2, true, true,),
-            ValidationEntryDecision::ResumedImplementation
+            ValidationEntryDecision::UsefulPartialImplementation
         );
         assert_eq!(
             validation_entry_decision(

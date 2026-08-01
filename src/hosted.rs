@@ -2911,6 +2911,70 @@ fn reconcile_failed_write_attempts(
     }
 }
 
+fn supersede_failures_satisfied_by_repository_state(
+    failures: &mut [ToolFailureRecord],
+    intended_changes: &[IntendedChangeRecord],
+    write_attempts: &[WriteAttemptRecord],
+    changed_paths: &BTreeSet<String>,
+) -> usize {
+    let mut superseded = 0;
+    for failure in failures.iter_mut().filter(|failure| {
+        !failure.recovered && failure.reconciliation == FailureReconciliation::StillUnresolved
+    }) {
+        let Some(target) = failure.target.as_deref() else {
+            continue;
+        };
+        let target_applied = intended_changes.iter().any(|change| {
+            change.targets.iter().any(|candidate| {
+                candidate.path == target
+                    && matches!(
+                        candidate.status,
+                        IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+                    )
+            })
+        });
+        let later_success = write_attempts.iter().find(|attempt| {
+            attempt.attempt_index > failure.attempt_index
+                && attempt.target == target
+                && attempt.status == WriteAttemptStatus::Applied
+                && attempt_modified_target(attempt)
+        });
+        let final_diff_satisfies_target = changed_paths.contains(target);
+        if !(target_applied || later_success.is_some() || final_diff_satisfies_target) {
+            continue;
+        }
+
+        let (method, evidence) = if let Some(attempt) = later_success {
+            (
+                "later_successful_target_write",
+                format!(
+                    "A later successful {} mutation satisfies {target}.",
+                    attempt.tool
+                ),
+            )
+        } else if target_applied {
+            (
+                "target_already_applied",
+                format!("The authoritative target ledger marks {target} as applied."),
+            )
+        } else {
+            (
+                "final_diff_contains_target",
+                format!("The final repository diff contains the intended target {target}."),
+            )
+        };
+        failure.recovered = true;
+        failure.reconciliation = FailureReconciliation::Superseded;
+        failure.recovery = Some(IntendedChangeRecovery {
+            recovered: true,
+            method: method.into(),
+            evidence: vec![evidence],
+        });
+        superseded += 1;
+    }
+    superseded
+}
+
 fn attempt_modified_target(attempt: &WriteAttemptRecord) -> bool {
     attempt.before_sha256 != attempt.after_sha256
 }
@@ -2989,6 +3053,64 @@ fn deterministic_complete_declaration(
             .collect(),
         remaining_work: Vec::new(),
         known_risks: Vec::new(),
+        changed_paths: changed_paths.to_vec(),
+        criteria_evidence,
+    })
+}
+
+fn deterministic_partial_declaration(
+    planned_changes: &[PlannedChange],
+    changed_paths: &[String],
+    remaining_work: &[RemainingWorkItem],
+) -> Option<ImplementationDeclaration> {
+    if changed_paths.is_empty() || remaining_work.is_empty() {
+        return None;
+    }
+    let changed = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let completed_work = planned_changes
+        .iter()
+        .filter(|change| {
+            change
+                .targets
+                .iter()
+                .any(|target| changed.contains(target.path.as_str()))
+        })
+        .map(|change| change.change.clone())
+        .collect::<Vec<_>>();
+    let criteria_evidence = planned_changes
+        .iter()
+        .flat_map(|change| {
+            let paths = change
+                .targets
+                .iter()
+                .filter(|target| changed.contains(target.path.as_str()))
+                .map(|target| target.path.clone())
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                Vec::new()
+            } else {
+                change
+                    .acceptance_criteria
+                    .iter()
+                    .map(|criterion| ImplementationCriterionEvidence {
+                        criterion: criterion.clone(),
+                        paths: paths.clone(),
+                        evidence:
+                            "The preserved partial diff passed every worker-owned validation gate."
+                                .into(),
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+    Some(ImplementationDeclaration {
+        implementation_status: "partial".into(),
+        completed_work,
+        remaining_work: legacy_remaining_work(remaining_work),
+        known_risks: vec!["Explicit planned targets remain for a continuation run.".into()],
         changed_paths: changed_paths.to_vec(),
         criteria_evidence,
     })
@@ -4766,6 +4888,9 @@ fn run_hosted_execution(
         ensure_hosted_execution_deadline(agent.execution_started_at)?;
 
         let implementation_status = agent.reconcile_authoritative_target_state()?;
+        agent.reconcile_active_phase(
+            "implementation session ended; authoritative target state reconciled",
+        )?;
         let implementation_changed_paths =
             completion_changed_paths(&repo, &manifest.github.base_sha)?;
         let validation_entry = validation_entry_decision(
@@ -4859,10 +4984,17 @@ fn run_hosted_execution(
                 implementation.budget_exhausted = true;
                 break;
             }
-            agent.transition_phase(
-                ExecutionPhase::Validation,
+            agent.reconcile_authoritative_target_state()?;
+            let repair_decision = agent.reconcile_active_phase(
                 "validation repair ended; rerunning required quality gates",
             )?;
+            if !matches!(
+                repair_decision,
+                PhaseDecision::Transition(ExecutionPhase::Validation)
+            ) && agent.phases.active() != ExecutionPhase::Validation
+            {
+                bail!("validation repair left required implementation targets unresolved");
+            }
             validation_round = validation_round.saturating_add(1);
             validation = run_quality_gates(
                 api,
@@ -4911,6 +5043,29 @@ fn run_hosted_execution(
             agent.declaration = Some(declaration.clone());
             implementation.explicit_declaration = Some(declaration);
         }
+        if validation_passed
+            && implementation.budget_exhausted
+            && implementation.explicit_declaration.is_none()
+            && let Some(declaration) = deterministic_partial_declaration(
+                &agent.notebook.planned_changes,
+                &review_paths,
+                &agent.notebook.remaining_work_v2,
+            )
+        {
+            agent.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.partial_implementation_reconciled",
+                    "implementation_status": "partial",
+                    "changed_paths": declaration.changed_paths,
+                    "remaining_work": declaration.remaining_work,
+                    "publication_mode": "draft_pull_request",
+                }),
+                "deterministic partial implementation declaration",
+            );
+            agent.declaration = Some(declaration.clone());
+            implementation.explicit_declaration = Some(declaration);
+        }
         let completeness =
             agent.evaluate_completion(&implementation, &validation, &review_paths)?;
         api.append_event(
@@ -4929,10 +5084,15 @@ fn run_hosted_execution(
             }),
         )?;
 
-        agent.transition_phase(
-            ExecutionPhase::Publication,
-            "completion evaluation finished; publishing preserved work",
-        )?;
+        let publication_decision = agent
+            .reconcile_active_phase("completion evaluation finished; publishing preserved work")?;
+        if !matches!(
+            publication_decision,
+            PhaseDecision::Transition(ExecutionPhase::Publication)
+        ) && agent.phases.active() != ExecutionPhase::Publication
+        {
+            bail!("lifecycle invariant violated: publication requires completion evaluation");
+        }
         if repo.hosted_local_config()? != trusted_git_config {
             bail!("repository-controlled execution modified the protected local Git configuration");
         }
@@ -5538,6 +5698,38 @@ fn validate_current_target_scope(
         );
     }
     Ok(())
+}
+
+fn target_already_applied_error(
+    targets: &[ImplementationTarget],
+    attempted_path: &str,
+) -> Option<MutationPreflightError> {
+    let applied = targets.iter().find(|target| {
+        target.path == attempted_path
+            && matches!(
+                target.status,
+                IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+            )
+    })?;
+    let next_target = targets
+        .iter()
+        .find(|target| {
+            !matches!(
+                target.status,
+                IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+            )
+        })
+        .map(|target| target.path.as_str())
+        .unwrap_or("worker-owned validation");
+    Some(MutationPreflightError {
+        code: "target_already_applied",
+        change_id: applied.change_id.clone(),
+        target: applied.path.clone(),
+        message: format!(
+            "target_already_applied: this target is already present in the authoritative repository state; continue with `{next_target}`"
+        ),
+        repair_strategy: "continue_next_target",
+    })
 }
 
 fn mark_post_write_stagnation(write_blocker: &mut Option<String>, successful_writes: u32) -> bool {
@@ -6297,6 +6489,24 @@ impl<'a> GatewayAgent<'a> {
             repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         supersede_stale_validation(&mut self.notebook.validation_evidence, &current_tree_hash);
         reconcile_changed_target_statuses(&mut self.notebook.intended_changes, &changed_paths);
+        let superseded_failures = supersede_failures_satisfied_by_repository_state(
+            &mut self.tool_failures,
+            &self.notebook.intended_changes,
+            &self.notebook.write_attempts,
+            &changed_paths,
+        );
+        if superseded_failures > 0 {
+            self.notebook.failed_changes = self.tool_failures.clone();
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.mutation_failures_reconciled",
+                    "superseded_count": superseded_failures,
+                    "changed_paths": changed_paths,
+                }),
+                "authoritative mutation failure reconciliation",
+            );
+        }
         if let Some(plan) = self.implementation_plan.as_mut() {
             for planned in &mut plan.planned_changes {
                 if let Some(intended) = self
@@ -6375,6 +6585,40 @@ impl<'a> GatewayAgent<'a> {
             "implementation completion reconciliation",
         );
         Ok(status)
+    }
+
+    fn reconcile_active_phase(&mut self, reason: &str) -> Result<PhaseDecision> {
+        let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+        let target_statuses = self
+            .notebook
+            .intended_changes
+            .iter()
+            .flat_map(|change| change.targets.iter())
+            .map(|target| TargetPhaseStatus {
+                path: target.path.clone(),
+                status: target.status,
+            })
+            .collect::<Vec<_>>();
+        let unresolved_failures = self
+            .tool_failures
+            .iter()
+            .filter(|failure| {
+                !failure.recovered
+                    && failure.reconciliation == FailureReconciliation::StillUnresolved
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let decision = reconcile_next_phase(
+            self.phases.active(),
+            &target_statuses,
+            &unresolved_failures,
+            &changed_paths,
+            &self.notebook.required_gates,
+        );
+        if let PhaseDecision::Transition(phase) = decision {
+            self.transition_phase(phase, reason)?;
+        }
+        Ok(decision)
     }
 
     fn invalidate_validation_after_mutation(&mut self) -> Result<()> {
@@ -6950,7 +7194,12 @@ impl<'a> GatewayAgent<'a> {
         attempt: usize,
     ) -> Result<ImplementationOutcome> {
         record_validation_repair_start(&mut self.notebook, failures);
-        self.transition_phase(ExecutionPhase::Repair, "required validation failed")?;
+        let decision = self.reconcile_active_phase("required validation failed")?;
+        if !matches!(decision, PhaseDecision::Transition(ExecutionPhase::Repair))
+            && self.phases.active() != ExecutionPhase::Repair
+        {
+            bail!("lifecycle invariant violated: failed validation must enter repair");
+        }
         let diagnostics = failures
             .iter()
             .map(|failure| {
@@ -7519,6 +7768,9 @@ impl<'a> GatewayAgent<'a> {
                                 self.invalidate_validation_after_mutation()?;
                             }
                             self.reconcile_authoritative_target_state()?;
+                            self.reconcile_active_phase(
+                                "successful mutation reconciled against remaining planned targets",
+                            )?;
                         } else if matches!(
                             name.as_str(),
                             "read_file" | "read_files" | "related_tests"
@@ -7719,46 +7971,73 @@ impl<'a> GatewayAgent<'a> {
                         } else if let Some(preflight) =
                             error.downcast_ref::<MutationPreflightError>()
                         {
-                            let decision = record_mutation_preflight_rejection(
-                                &mut self.notebook,
-                                &mut self.tool_usage,
-                                preflight,
-                            );
-                            self.append_event_recoverable(
-                                "progress",
+                            if preflight.code == "target_already_applied" {
+                                let next_target = self
+                                    .current_implementation_target()
+                                    .map(|target| target.path);
+                                self.append_event_recoverable(
+                                    "progress",
+                                    json!({
+                                        "event_type": "worker.target_already_applied",
+                                        "change_id": preflight.change_id,
+                                        "target": preflight.target,
+                                        "next_target": next_target.clone(),
+                                        "mutation_attempted": false,
+                                        "unresolved_failure_recorded": false,
+                                    }),
+                                    "already-applied target reconciliation",
+                                );
                                 json!({
-                                    "event_type": "worker.mutation_preflight_rejected",
-                                    "change_id": preflight.change_id,
-                                    "target": preflight.target,
-                                    "failure_code": preflight.code,
-                                    "plan_revision": self.notebook.revision,
+                                    "ok": false,
+                                    "error": preflight.message,
+                                    "error_code": preflight.code,
+                                    "repair_strategy": preflight.repair_strategy,
+                                    "mutation_attempted": false,
+                                    "unresolved_failure_recorded": false,
+                                    "next_target": next_target,
+                                })
+                            } else {
+                                let decision = record_mutation_preflight_rejection(
+                                    &mut self.notebook,
+                                    &mut self.tool_usage,
+                                    preflight,
+                                );
+                                self.append_event_recoverable(
+                                    "progress",
+                                    json!({
+                                        "event_type": "worker.mutation_preflight_rejected",
+                                        "change_id": preflight.change_id,
+                                        "target": preflight.target,
+                                        "failure_code": preflight.code,
+                                        "plan_revision": self.notebook.revision,
+                                        "retryable_with_same_plan": false,
+                                        "repair_strategy": preflight.repair_strategy,
+                                        "mutation_attempted": false,
+                                        "mutation_preflight_failed": true,
+                                        "circuit_breaker_open": decision.repeated,
+                                        "orchestration_halted": decision.halt_orchestration,
+                                    }),
+                                    "mutation preflight rejection",
+                                );
+                                mark_mutation_preflight_blocker(
+                                    &mut self.write_blocker,
+                                    &preflight.target,
+                                );
+                                mutation_preflight_halt = Some(format!(
+                                    "Implementation paused after non-retryable mutation preflight rejection `{}` for `{}`. Repair the persisted plan metadata and resume without repeating discovery or planning.",
+                                    preflight.code, preflight.target
+                                ));
+                                json!({
+                                    "ok": false,
+                                    "error": preflight.message,
+                                    "error_code": preflight.code,
                                     "retryable_with_same_plan": false,
                                     "repair_strategy": preflight.repair_strategy,
                                     "mutation_attempted": false,
                                     "mutation_preflight_failed": true,
                                     "circuit_breaker_open": decision.repeated,
-                                    "orchestration_halted": decision.halt_orchestration,
-                                }),
-                                "mutation preflight rejection",
-                            );
-                            mark_mutation_preflight_blocker(
-                                &mut self.write_blocker,
-                                &preflight.target,
-                            );
-                            mutation_preflight_halt = Some(format!(
-                                "Implementation paused after non-retryable mutation preflight rejection `{}` for `{}`. Repair the persisted plan metadata and resume without repeating discovery or planning.",
-                                preflight.code, preflight.target
-                            ));
-                            json!({
-                                "ok": false,
-                                "error": preflight.message,
-                                "error_code": preflight.code,
-                                "retryable_with_same_plan": false,
-                                "repair_strategy": preflight.repair_strategy,
-                                "mutation_attempted": false,
-                                "mutation_preflight_failed": true,
-                                "circuit_breaker_open": decision.repeated,
-                            })
+                                })
+                            }
                         } else {
                             let error = truncate_text(&format!("{error:#}"), 4_000);
                             if is_source_mutation_tool(&name) {
@@ -7803,9 +8082,9 @@ impl<'a> GatewayAgent<'a> {
                                     intended_change_sha256: intended_change_sha256.clone(),
                                 });
                                 self.notebook.failed_changes = self.tool_failures.clone();
-                                self.transition_phase(
-                                    ExecutionPhase::Repair,
-                                    "source-changing tool failed and requires recovery",
+                                self.reconcile_authoritative_target_state()?;
+                                self.reconcile_active_phase(
+                                    "source-changing tool failure reconciled against repository state",
                                 )?;
                             }
                             json!({"ok": false, "error": error})
@@ -7838,8 +8117,18 @@ impl<'a> GatewayAgent<'a> {
                             "focused implementation validation failed and requires source repair",
                         )?;
                     } else if is_source_mutation_tool(&name) {
-                        progress_class = ToolProgressClass::RecoverableFailure;
-                        self.notebook.implementation_substate = ImplementationSubstate::Repairing;
+                        if result["error_code"] == "target_already_applied" {
+                            progress_class = ToolProgressClass::Duplicate;
+                            progress_detail =
+                                "target already applied; continue with next remaining target"
+                                    .into();
+                            self.notebook.implementation_substate =
+                                ImplementationSubstate::Mutating;
+                        } else {
+                            progress_class = ToolProgressClass::RecoverableFailure;
+                            self.notebook.implementation_substate =
+                                ImplementationSubstate::Repairing;
+                        }
                     } else {
                         progress_class = ToolProgressClass::BlockingFailure;
                     }
@@ -7912,14 +8201,16 @@ impl<'a> GatewayAgent<'a> {
             if let Some(summary) = self.implementation_progress_halt_summary()? {
                 mutation_preflight_halt.get_or_insert(summary);
             }
-            if self.reconcile_authoritative_target_state()?
-                == ImplementationCompletionStatus::ReadyForValidation
+            self.reconcile_authoritative_target_state()?;
+            let phase_decision = self.reconcile_active_phase(
+                "implementation turn reconciled against authoritative target state",
+            )?;
+            if matches!(
+                phase_decision,
+                PhaseDecision::Transition(ExecutionPhase::Validation)
+            ) || self.phases.active() == ExecutionPhase::Validation
             {
                 self.phases.release_unused_implementation_capacity();
-                self.transition_phase(
-                    ExecutionPhase::Validation,
-                    "all required planned targets are applied in the repository; worker-owned validation starts deterministically",
-                )?;
                 return Ok(ImplementationOutcome {
                     summary: format!(
                         "Applied all {} planned target(s); continuing with worker-owned validation.",
@@ -8076,10 +8367,18 @@ impl<'a> GatewayAgent<'a> {
             validation,
             project_verification_policy(self.manifest),
         );
-        self.transition_phase(
-            ExecutionPhase::CompletionEvaluation,
-            "technical validation finished; independent completion evaluation started",
+        let decision = self.reconcile_active_phase(
+            "diff review finished; independent completion evaluation started",
         )?;
+        if !matches!(
+            decision,
+            PhaseDecision::Transition(ExecutionPhase::CompletionEvaluation)
+        ) && self.phases.active() != ExecutionPhase::CompletionEvaluation
+        {
+            bail!(
+                "lifecycle invariant violated: completion evaluation requires completed diff review"
+            );
+        }
         if changed_paths.is_empty() {
             return Ok(fallback);
         }
@@ -8275,10 +8574,16 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             .collect::<BTreeSet<_>>();
         let unplanned = changed.difference(&planned).cloned().collect::<Vec<_>>();
         let planned_but_unchanged = planned.difference(&changed).cloned().collect::<Vec<_>>();
-        self.transition_phase(
-            ExecutionPhase::DiffReview,
+        let decision = self.reconcile_active_phase(
             "required validation gates passed; orchestrator is reviewing the final repository diff",
         )?;
+        if !matches!(
+            decision,
+            PhaseDecision::Transition(ExecutionPhase::DiffReview)
+        ) && self.phases.active() != ExecutionPhase::DiffReview
+        {
+            bail!("lifecycle invariant violated: diff review requires the validation phase");
+        }
         self.append_event_recoverable(
             "progress",
             json!({
@@ -8983,10 +9288,6 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         }
                     }
                 }
-                self.transition_phase(
-                    ExecutionPhase::DiffReview,
-                    "implementation requested complete repository diff review",
-                )?;
                 self.tool_usage.reads = self.tool_usage.reads.saturating_add(1);
                 let paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
                 let diff = completion_review_diff(
@@ -9255,10 +9556,6 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     );
                 }
                 self.declaration = Some(declaration);
-                self.transition_phase(
-                    ExecutionPhase::CompletionEvaluation,
-                    "complete diff reviewed and implementation declared",
-                )?;
                 Ok("recorded implementation declaration".into())
             }
             _ => bail!("unsupported hosted model tool `{name}`"),
@@ -9352,6 +9649,13 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 bail!(
                     "implementation and repair reads must target a planned edit, mapped criterion, or failed write"
                 );
+            }
+            if is_source_mutation_tool(name)
+                && let Some(path) = paths.first()
+                && let Some(error) =
+                    target_already_applied_error(&self.ordered_implementation_targets(), path)
+            {
+                return Err(error.into());
             }
             let current_target = self.current_implementation_target();
             validate_current_target_scope(
@@ -9454,6 +9758,82 @@ fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetPhaseStatus {
+    path: String,
+    status: IntendedChangeStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhaseDecision {
+    Stay,
+    Transition(ExecutionPhase),
+}
+
+fn reconcile_next_phase(
+    current_phase: ExecutionPhase,
+    target_statuses: &[TargetPhaseStatus],
+    unresolved_failures: &[ToolFailureRecord],
+    changed_paths: &[String],
+    required_gates: &[RequiredGate],
+) -> PhaseDecision {
+    let changed = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let all_targets_applied = !target_statuses.is_empty()
+        && target_statuses.iter().all(|target| {
+            matches!(
+                target.status,
+                IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+            ) && changed.contains(target.path.as_str())
+        });
+    let has_unresolved_failure = unresolved_failures.iter().any(|failure| {
+        !failure.recovered && failure.reconciliation == FailureReconciliation::StillUnresolved
+    });
+    let required = required_gates
+        .iter()
+        .filter(|gate| gate.required)
+        .collect::<Vec<_>>();
+    let required_failed = required.iter().any(|gate| {
+        matches!(
+            gate.status,
+            ValidationStatus::Failed | ValidationStatus::TimedOut | ValidationStatus::Cancelled
+        )
+    });
+    let required_passed = !required.is_empty()
+        && required
+            .iter()
+            .all(|gate| gate.status == ValidationStatus::Passed);
+
+    match current_phase {
+        ExecutionPhase::Implementation if has_unresolved_failure => {
+            PhaseDecision::Transition(ExecutionPhase::Repair)
+        }
+        ExecutionPhase::Implementation if all_targets_applied => {
+            PhaseDecision::Transition(ExecutionPhase::Validation)
+        }
+        ExecutionPhase::Repair if has_unresolved_failure => PhaseDecision::Stay,
+        ExecutionPhase::Repair if all_targets_applied => {
+            PhaseDecision::Transition(ExecutionPhase::Validation)
+        }
+        ExecutionPhase::Repair => PhaseDecision::Transition(ExecutionPhase::Implementation),
+        ExecutionPhase::Validation if required_failed => {
+            PhaseDecision::Transition(ExecutionPhase::Repair)
+        }
+        ExecutionPhase::Validation if required_passed => {
+            PhaseDecision::Transition(ExecutionPhase::DiffReview)
+        }
+        ExecutionPhase::DiffReview if required_passed && !changed_paths.is_empty() => {
+            PhaseDecision::Transition(ExecutionPhase::CompletionEvaluation)
+        }
+        ExecutionPhase::CompletionEvaluation => {
+            PhaseDecision::Transition(ExecutionPhase::Publication)
+        }
+        _ => PhaseDecision::Stay,
+    }
+}
+
 fn legal_phase_transition(from: ExecutionPhase, to: ExecutionPhase) -> bool {
     matches!(
         (from, to),
@@ -9463,13 +9843,10 @@ fn legal_phase_transition(from: ExecutionPhase, to: ExecutionPhase) -> bool {
             | (ExecutionPhase::Planning, ExecutionPhase::Implementation)
             | (ExecutionPhase::Implementation, ExecutionPhase::Repair)
             | (ExecutionPhase::Implementation, ExecutionPhase::Validation)
+            | (ExecutionPhase::Repair, ExecutionPhase::Implementation)
             | (ExecutionPhase::Repair, ExecutionPhase::Validation)
             | (ExecutionPhase::Validation, ExecutionPhase::Repair)
             | (ExecutionPhase::Validation, ExecutionPhase::DiffReview)
-            | (
-                ExecutionPhase::Validation,
-                ExecutionPhase::CompletionEvaluation
-            )
             | (
                 ExecutionPhase::DiffReview,
                 ExecutionPhase::CompletionEvaluation
@@ -15663,7 +16040,7 @@ mod tests {
             "src/components/theme/ThemeToggle.tsx",
             "src/styles/globals.css",
             "tests/theme-provider.test.tsx",
-            "tests/theme-tokens.test.ts",
+            "tests/theme-palette.test.ts",
         ];
         let mut notebook = test_discovery_notebook(ExecutionPhase::Implementation);
         notebook.planned_changes = paths
@@ -16915,9 +17292,33 @@ it("defines every semantic token for light-blue without conflating primary and i
 "#,
             ),
         ];
-        for (path, content) in implemented_files {
+        let mut target_sequence = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ImplementationTarget {
+                change_id: format!("aops-226-target-{}", index + 1),
+                path: (*path).into(),
+                role: "required AOPS-226 target".into(),
+                new_file: false,
+                intent: "Implement light-blue theme behavior.".into(),
+                acceptance_criteria: vec!["ac-1".into()],
+                status: IntendedChangeStatus::Planned,
+            })
+            .collect::<Vec<_>>();
+        for (index, (path, content)) in implemented_files.into_iter().enumerate() {
+            let active = target_sequence
+                .iter()
+                .find(|target| target.status == IntendedChangeStatus::Planned)
+                .unwrap();
+            assert_eq!(active.path, path);
             performance.begin_model_call().unwrap();
             fs::write(work.path().join(path), content).unwrap();
+            target_sequence[index].status = IntendedChangeStatus::Applied;
+            if index == 0 {
+                let duplicate = target_already_applied_error(&target_sequence, path).unwrap();
+                assert_eq!(duplicate.code, "target_already_applied");
+                assert!(duplicate.message.contains(paths[1]));
+            }
             first_successful_write_call
                 .get_or_insert(performance.phase_calls(ExecutionPhase::Implementation));
         }
@@ -16931,6 +17332,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         let changed_paths = completion_changed_paths(&repo, &base_sha).unwrap();
         assert_eq!(changed_paths, expected_paths);
         let reviewed_diff = completion_review_diff(work.path(), &changed_paths, &base_sha).unwrap();
+        performance.transition(ExecutionPhase::Validation);
         performance.transition(ExecutionPhase::DiffReview);
         performance.begin_model_call().unwrap();
         for path in paths {
@@ -17014,6 +17416,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         ));
         performance.transition(ExecutionPhase::CompletionEvaluation);
         performance.begin_model_call().unwrap();
+        performance.transition(ExecutionPhase::Publication);
         let estimated_cost_micros = 360_000;
         assert!(first_successful_write_call.is_some_and(|call| call <= 6));
         assert!(performance.implementation_repair_calls() <= 10);
@@ -17825,6 +18228,246 @@ it("defines every semantic token for light-blue without conflating primary and i
             ExecutionPhase::Validation,
             ExecutionPhase::Publication
         ));
+        assert!(legal_phase_transition(
+            ExecutionPhase::Repair,
+            ExecutionPhase::Implementation
+        ));
+        assert!(legal_phase_transition(
+            ExecutionPhase::Repair,
+            ExecutionPhase::Validation
+        ));
+        assert!(!legal_phase_transition(
+            ExecutionPhase::Repair,
+            ExecutionPhase::CompletionEvaluation
+        ));
+        assert!(!legal_phase_transition(
+            ExecutionPhase::Validation,
+            ExecutionPhase::CompletionEvaluation
+        ));
+        assert!(legal_phase_transition(
+            ExecutionPhase::Validation,
+            ExecutionPhase::DiffReview
+        ));
+    }
+
+    #[test]
+    fn attempt_20_duplicate_advances_to_remaining_targets_and_full_lifecycle() {
+        let paths = [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "src/styles/globals.css",
+            "tests/theme-provider.test.tsx",
+            "tests/theme-palette.test.ts",
+        ];
+        let mut targets = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| ImplementationTarget {
+                change_id: format!("theme-{}", index + 1),
+                path: (*path).into(),
+                role: "required attempt-20 target".into(),
+                new_file: false,
+                intent: "implement light-blue theme".into(),
+                acceptance_criteria: vec!["ac-1".into()],
+                status: if index == 0 {
+                    IntendedChangeStatus::Applied
+                } else {
+                    IntendedChangeStatus::Planned
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let duplicate = target_already_applied_error(&targets, paths[0]).unwrap();
+        assert_eq!(duplicate.code, "target_already_applied");
+        assert_eq!(duplicate.repair_strategy, "continue_next_target");
+        assert!(duplicate.message.contains(paths[1]));
+        assert_eq!(
+            targets
+                .iter()
+                .find(|target| target.status == IntendedChangeStatus::Planned)
+                .map(|target| target.path.as_str()),
+            Some(paths[1])
+        );
+
+        for path in &paths[1..] {
+            let active = targets
+                .iter_mut()
+                .find(|target| target.status == IntendedChangeStatus::Planned)
+                .unwrap();
+            assert_eq!(active.path, *path);
+            active.status = IntendedChangeStatus::Applied;
+        }
+        let phase_targets = targets
+            .iter()
+            .map(|target| TargetPhaseStatus {
+                path: target.path.clone(),
+                status: target.status,
+            })
+            .collect::<Vec<_>>();
+        let changed_paths = paths.iter().map(|path| (*path).into()).collect::<Vec<_>>();
+        assert_eq!(
+            reconcile_next_phase(
+                ExecutionPhase::Implementation,
+                &phase_targets,
+                &[],
+                &changed_paths,
+                &[],
+            ),
+            PhaseDecision::Transition(ExecutionPhase::Validation)
+        );
+        let gates = vec![RequiredGate {
+            gate_id: "npm-test-and-build".into(),
+            gate_type: ValidationGateType::Build,
+            required: true,
+            command: "npm test && npm run build".into(),
+            status: ValidationStatus::Passed,
+            evidence_id: Some("attempt-20-validation".into()),
+        }];
+        assert_eq!(
+            reconcile_next_phase(
+                ExecutionPhase::Validation,
+                &phase_targets,
+                &[],
+                &changed_paths,
+                &gates,
+            ),
+            PhaseDecision::Transition(ExecutionPhase::DiffReview)
+        );
+        assert_eq!(
+            reconcile_next_phase(
+                ExecutionPhase::DiffReview,
+                &phase_targets,
+                &[],
+                &changed_paths,
+                &gates,
+            ),
+            PhaseDecision::Transition(ExecutionPhase::CompletionEvaluation)
+        );
+        assert_eq!(
+            reconcile_next_phase(
+                ExecutionPhase::CompletionEvaluation,
+                &phase_targets,
+                &[],
+                &changed_paths,
+                &gates,
+            ),
+            PhaseDecision::Transition(ExecutionPhase::Publication)
+        );
+    }
+
+    #[test]
+    fn repair_with_repository_superseded_failure_returns_to_implementation() {
+        let mut intended = intended_changes_from_plan(&[test_planned_change()]);
+        intended[0].targets[0].status = IntendedChangeStatus::InProgress;
+        intended[0].status = IntendedChangeStatus::InProgress;
+        let target = intended[0].targets[0].path.clone();
+        let mut failures = vec![test_write_failure("theme-tests", &target, "failed-hash")];
+        let changed = BTreeSet::from([target.clone()]);
+        assert_eq!(
+            supersede_failures_satisfied_by_repository_state(
+                &mut failures,
+                &intended,
+                &[],
+                &changed,
+            ),
+            1
+        );
+        assert!(failures[0].recovered);
+        assert_eq!(
+            failures[0].reconciliation,
+            FailureReconciliation::Superseded
+        );
+        let targets = vec![TargetPhaseStatus {
+            path: target.clone(),
+            status: IntendedChangeStatus::InProgress,
+        }];
+        assert_eq!(
+            reconcile_next_phase(ExecutionPhase::Repair, &targets, &[], &[target], &[],),
+            PhaseDecision::Transition(ExecutionPhase::Implementation)
+        );
+    }
+
+    #[test]
+    fn validated_useful_partial_is_publishable_as_a_draft() {
+        let mut planned = test_planned_change();
+        planned.targets.push(PlannedTarget {
+            path: "tests/theme-palette.test.ts".into(),
+            role: "remaining palette coverage".into(),
+            new_file: false,
+            status: IntendedChangeStatus::Planned,
+        });
+        let changed_paths = vec![planned.targets[0].path.clone()];
+        let remaining = vec![RemainingWorkItem {
+            change_id: planned.change_id.clone(),
+            path: planned.targets[1].path.clone(),
+            role: planned.targets[1].role.clone(),
+            status: IntendedChangeStatus::Planned,
+            reason: "planned target has not been applied".into(),
+        }];
+        let declaration =
+            deterministic_partial_declaration(&[planned.clone()], &changed_paths, &remaining)
+                .unwrap();
+        let implementation = ImplementationOutcome {
+            summary: "Preserved a validated useful partial implementation.".into(),
+            budget_exhausted: true,
+            explicit_declaration: Some(declaration),
+        };
+        let plan = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes: vec![planned],
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        let completion = completion_fallback(
+            &implementation,
+            None,
+            Some(&plan),
+            &[],
+            &changed_paths,
+            &[],
+            &[test_passed_validation("npm test && npm run build")],
+            ProjectVerificationPolicy::default(),
+        );
+        assert_eq!(completion.status, CompletionStatus::Partial);
+        assert!(requires_implementation_continuation(completion.status));
+        let manifest = test_manifest(Uuid::from_u128(226));
+        assert!(hosted_pull_request_title(&manifest, true).starts_with("[INCOMPLETE]"));
+        let Some((github_base, requests, server)) = request_sequence_server(vec![
+            ("200 OK", json!([])),
+            (
+                "201 Created",
+                json!({
+                    "number": 227,
+                    "html_url": "https://github.example/RustGrid/example/pull/227",
+                    "node_id": "PR_AOPS_226_PARTIAL",
+                    "draft": true
+                }),
+            ),
+        ]) else {
+            return;
+        };
+        let github = GitHubClient::new("fixture-token", github_base.as_str()).unwrap();
+        let pull = find_or_create_hosted_pull_request(
+            &github,
+            &RepoConfig {
+                owner: "RustGrid".into(),
+                name: "example".into(),
+            },
+            &manifest,
+            &[test_passed_validation("npm test && npm run build")],
+            &completion,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pull.number, 227);
+        let _lookup = requests.recv().unwrap();
+        let creation = requests.recv().unwrap();
+        server.join().unwrap();
+        let creation_body: Value =
+            serde_json::from_str(creation.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(creation_body["draft"], true);
     }
 
     #[test]
