@@ -195,6 +195,18 @@ pub fn reconcile_execution(
         return Ok(ExecutionDecision::Finish { outcome });
     }
 
+    if snapshot.publication.recovery_requested && snapshot.publication.is_published() {
+        if snapshot.has_partial_reviewable_guardrail() {
+            return Ok(ExecutionDecision::Finish {
+                outcome: MissionOutcome::PartialReviewable,
+            });
+        }
+        return Ok(ExecutionDecision::StopForGuardrail {
+            outcome: MissionOutcome::PartialReviewable,
+            reason: GuardrailReason::OrchestrationInvariantViolation,
+        });
+    }
+
     let running = snapshot
         .graph
         .nodes
@@ -1057,6 +1069,94 @@ mod tests {
             reconcile_execution(&state).unwrap(),
             ExecutionDecision::Finish {
                 outcome: MissionOutcome::FailedInfrastructure,
+            }
+        );
+    }
+
+    #[test]
+    fn published_recovery_finishes_the_authorized_partial_outcome() {
+        let mut state = snapshot(&[target("one", "src/one.rs")]);
+        state
+            .current_repository
+            .changed_paths
+            .insert("src/one.rs".into());
+        complete_node(&mut state, ExecutionNodeKind::Discovery);
+        complete_node(&mut state, ExecutionNodeKind::Planning);
+        complete_node(&mut state, ExecutionNodeKind::SourceMutation);
+        complete_node(&mut state, ExecutionNodeKind::ValidationSuite);
+        let validation = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_validation())
+            .unwrap()
+            .clone();
+        let gate = validation.validation.as_ref().unwrap();
+        let evidence_id = "recovery-validation".to_owned();
+        state.evidence.record_validation(ValidationEvidenceRecord {
+            evidence_id: evidence_id.clone(),
+            node_id: validation.id,
+            gate_id: gate.gate_id.clone(),
+            fingerprint: gate.fingerprint("tree-1"),
+            repository_fingerprint: "tree-1".into(),
+            command: gate.command.clone(),
+            working_directory: gate.working_directory.clone(),
+            status: ValidationEvidenceStatus::Passed,
+            ..ValidationEvidenceRecord::default()
+        });
+        let publication = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::Publication)
+            .unwrap()
+            .id
+            .clone();
+        for event in [
+            ExecutionDomainEvent::RecoveryPublicationRequested {
+                sequence: 1,
+                node_id: publication.clone(),
+                repository_fingerprint: "tree-1".into(),
+                validation_evidence_ids: vec![evidence_id],
+            },
+            ExecutionDomainEvent::CommitCreated {
+                sequence: 2,
+                node_id: publication.clone(),
+                commit_sha: "recovery-commit".into(),
+            },
+            ExecutionDomainEvent::BranchPushed {
+                sequence: 3,
+                node_id: publication.clone(),
+                branch: "rustgrid/recovery".into(),
+            },
+            ExecutionDomainEvent::PullRequestCreated {
+                sequence: 4,
+                node_id: publication,
+                url: "https://example.test/pull/1".into(),
+                number: Some(1),
+                draft: true,
+            },
+        ] {
+            state.append_event(event).unwrap();
+        }
+
+        let stop = ExecutionDecision::StopForGuardrail {
+            outcome: MissionOutcome::PartialReviewable,
+            reason: GuardrailReason::OrchestrationInvariantViolation,
+        };
+        assert_eq!(reconcile_execution(&state).unwrap(), stop);
+        state
+            .append_event(ExecutionDomainEvent::GuardrailTriggered {
+                sequence: 5,
+                reason: GuardrailReason::OrchestrationInvariantViolation,
+                outcome: MissionOutcome::PartialReviewable,
+                detail: "authorized recovery publication".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::Finish {
+                outcome: MissionOutcome::PartialReviewable,
             }
         );
     }
