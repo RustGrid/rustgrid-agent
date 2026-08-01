@@ -5081,6 +5081,27 @@ mod tests {
     }
 
     #[test]
+    fn passed_validation_has_a_typed_completed_validation_identity() {
+        let mut graph = graph();
+        let validation_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_validation())
+            .expect("validation node")
+            .id
+            .clone();
+        graph
+            .node_mut(&validation_id)
+            .expect("validation node")
+            .status = ExecutionNodeStatus::Passed;
+
+        assert_eq!(
+            graph.derived_collections().completed_validation_nodes,
+            BTreeSet::from([ValidationNodeId::new(validation_id.as_str())])
+        );
+    }
+
+    #[test]
     fn mutation_overlap_diagnostic_names_invariant_and_typed_state() {
         let mut graph = graph();
         let mutation_index = graph

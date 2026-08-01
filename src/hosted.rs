@@ -3150,6 +3150,9 @@ fn reconcile_notebook_orchestration(
         orchestration =
             HostedOrchestrationCheckpoint::bootstrap(manifest, &notebook.repository_fingerprint);
     }
+    if implementation_plan.is_none() {
+        orchestration.normalize_pre_plan_classification(manifest);
+    }
     if orchestration.legacy_import_pending() {
         if let Some(plan) = implementation_plan {
             orchestration.ensure_graph_from_plan(manifest, plan, &notebook.repository_fingerprint);
@@ -18299,6 +18302,99 @@ mod tests {
             "graph initialization must leave the first discovery model call dispatchable"
         );
         assert_eq!(notebook.phase, ExecutionPhase::Discovery);
+    }
+
+    #[test]
+    fn fresh_graph_initialization_dispatches_the_first_discovery_request() {
+        let work = tempfile::tempdir().expect("temporary repository");
+        command::checked("git", ["init", "-q"], work.path()).unwrap();
+        command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "user.email", "test@example.com"],
+            work.path(),
+        )
+        .unwrap();
+        fs::write(work.path().join("base.txt"), "base\n").unwrap();
+        command::checked("git", ["add", "base.txt"], work.path()).unwrap();
+        command::checked(
+            "git",
+            ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+            work.path(),
+        )
+        .unwrap();
+        let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+        let repo = Repo {
+            root: work.path().to_path_buf(),
+        };
+        let execution_id = Uuid::from_u128(0x2205);
+        let mut manifest = test_manifest(execution_id);
+        manifest.github.base_sha = base_sha;
+        manifest.github.branch = "main".into();
+        let Some(StoppableOkServer {
+            api_root,
+            requests,
+            stop,
+            handle,
+        }) = stoppable_ok_server()
+        else {
+            return;
+        };
+        let api = test_api_client(api_root, execution_id);
+        let running = Arc::new(AtomicBool::new(true));
+        let stop_reason = Arc::new(Mutex::new(None));
+        let Ok(containment) = command::HostedProcessContainment::new() else {
+            let _ = stop.send(());
+            handle.join().unwrap();
+            return;
+        };
+        let trusted_git_config = repo.hosted_local_config().unwrap();
+        let mut agent = GatewayAgent::new(
+            api,
+            &manifest,
+            &repo,
+            &trusted_git_config,
+            &running,
+            &stop_reason,
+            &containment,
+            None,
+        )
+        .unwrap();
+        let startup = StartupModeResolution {
+            mode: StartupMode::FreshRun,
+            persisted_graph_present: false,
+            persisted_notebook_revision: None,
+            recovery_marker_present: false,
+        };
+
+        agent
+            .initialize_fresh_execution_snapshot(&startup, false)
+            .expect("fresh graph initialization");
+        let result = agent.implement();
+        assert!(
+            result.is_err(),
+            "the empty fixture response should end the session after dispatch"
+        );
+
+        let _ = stop.send(());
+        handle.join().unwrap();
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let graph_checkpoint_index = requests
+            .iter()
+            .position(|request| request.contains("\"event_type\":\"graph_created\""))
+            .expect("GraphCreated must be persisted before provider dispatch");
+        let discovery_request_index = requests
+            .iter()
+            .position(|request| {
+                request.starts_with(&format!(
+                    "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
+                ))
+            })
+            .expect("discovery request reached the AI gateway");
+        assert!(graph_checkpoint_index < discovery_request_index);
+        let discovery_request = &requests[discovery_request_index];
+        assert!(discovery_request.contains("\"phase\":\"discovery\""));
+        assert!(discovery_request.contains("x-rustgrid-call-phase: discovery"));
     }
 
     #[test]

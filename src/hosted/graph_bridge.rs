@@ -429,6 +429,34 @@ impl HostedOrchestrationCheckpoint {
         }
     }
 
+    /// Older checkpoints predate the explicit classification-stage field. If
+    /// their topology still contains only bootstrap work, restore the semantic
+    /// stage rather than accepting serde's authoritative compatibility default.
+    pub(super) fn normalize_pre_plan_classification(&mut self, manifest: &HostedManifest) {
+        let is_bootstrap_topology = self.graph.as_ref().is_some_and(|graph| {
+            !graph.nodes.is_empty()
+                && graph.nodes.iter().all(|node| {
+                    matches!(
+                        node.kind,
+                        ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning
+                    )
+                })
+        });
+        if !is_bootstrap_topology {
+            return;
+        }
+        if let Some(graph) = self.graph.as_mut() {
+            graph.complexity_classification_stage = ComplexityClassificationStage::Provisional;
+        }
+        if let Some(assessment) = self.complexity.as_mut() {
+            assessment.stage = ComplexityClassificationStage::Provisional;
+        } else {
+            let mut assessment = provisional_complexity_assessment(manifest);
+            assessment.budget = self.budget.mission.clone();
+            self.complexity = Some(assessment);
+        }
+    }
+
     /// Reconstructs the canonical graph from the accepted plan. Target order is
     /// stable: plan order, then target order within each planned change. The
     /// graph builder keeps production targets ahead of test targets while
@@ -2261,6 +2289,47 @@ mod tests {
                 .expect("accepted-plan graph")
                 .complexity_classification_stage,
             ComplexityClassificationStage::Authoritative
+        );
+    }
+
+    #[test]
+    fn legacy_bootstrap_checkpoint_without_stage_is_normalized_to_provisional() {
+        let manifest = hosted_manifest();
+        let checkpoint = HostedOrchestrationCheckpoint::bootstrap(&manifest, "tree-clean");
+        let mut serialized = serde_json::to_value(checkpoint).expect("serialize checkpoint");
+        serialized["graph"]
+            .as_object_mut()
+            .expect("serialized graph")
+            .remove("complexity_classification_stage");
+        serialized["complexity"]
+            .as_object_mut()
+            .expect("serialized assessment")
+            .remove("stage");
+
+        let mut restored: HostedOrchestrationCheckpoint =
+            serde_json::from_value(serialized).expect("restore legacy checkpoint");
+        assert_eq!(
+            restored
+                .graph
+                .as_ref()
+                .expect("legacy graph")
+                .complexity_classification_stage,
+            ComplexityClassificationStage::Authoritative,
+            "the serde default alone cannot identify a pre-plan checkpoint"
+        );
+
+        restored.normalize_pre_plan_classification(&manifest);
+        assert_eq!(
+            restored
+                .graph
+                .as_ref()
+                .expect("normalized graph")
+                .complexity_classification_stage,
+            ComplexityClassificationStage::Provisional
+        );
+        assert_eq!(
+            restored.complexity.as_ref().map(|value| value.stage),
+            Some(ComplexityClassificationStage::Provisional)
         );
     }
 
