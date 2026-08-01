@@ -651,8 +651,14 @@ pub struct NodeBudget {
 impl NodeBudget {
     pub fn remaining(&self, usage: &NodeBudgetUsage) -> NodeBudgetRemaining {
         NodeBudgetRemaining {
-            model_calls: self.max_model_calls.saturating_sub(usage.model_calls),
-            cost_micros: self.max_cost_micros.saturating_sub(usage.cost_micros),
+            model_calls_remaining: self.max_model_calls.saturating_sub(
+                usage
+                    .model_calls_consumed
+                    .saturating_add(usage.model_calls_reserved),
+            ),
+            cost_micros: self
+                .max_cost_micros
+                .saturating_sub(usage.cost_micros.saturating_add(usage.cost_micros_reserved)),
             duration: self.max_duration.saturating_sub(usage.duration),
             repair_attempts: self
                 .max_repair_attempts
@@ -663,7 +669,8 @@ impl NodeBudget {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NodeBudgetRemaining {
-    pub model_calls: u32,
+    #[serde(default, alias = "model_calls")]
+    pub model_calls_remaining: u32,
     pub cost_micros: u64,
     #[serde(with = "duration_millis")]
     pub duration: Duration,
@@ -672,7 +679,7 @@ pub struct NodeBudgetRemaining {
 
 impl NodeBudgetRemaining {
     pub fn exhausted(&self) -> bool {
-        self.model_calls == 0 || self.cost_micros == 0 || self.duration.is_zero()
+        self.model_calls_remaining == 0 || self.cost_micros == 0 || self.duration.is_zero()
     }
 }
 
@@ -809,7 +816,7 @@ impl ExecutionGraph {
                 ..ExecutionNode::default()
             },
         ];
-        assign_node_budgets(&mut graph.nodes, mission_budget);
+        assign_bootstrap_node_budgets(&mut graph.nodes, mission_budget);
         graph
     }
 
@@ -1614,6 +1621,42 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
     }
 }
 
+fn assign_bootstrap_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
+    let discovery_calls = mission.max_model_calls.min(3);
+    let planning_calls = mission
+        .max_model_calls
+        .saturating_sub(discovery_calls)
+        .min(2);
+    let discovery_cost = mission.max_cost_micros.min(350_000);
+    let planning_cost = mission
+        .max_cost_micros
+        .saturating_sub(discovery_cost)
+        .min(300_000);
+    let discovery_duration = mission.max_duration.min(Duration::from_millis(120_000));
+    let planning_duration = mission
+        .max_duration
+        .saturating_sub(discovery_duration)
+        .min(Duration::from_millis(90_000));
+
+    for node in nodes {
+        node.budget = match node.kind {
+            ExecutionNodeKind::Discovery => NodeBudget {
+                max_model_calls: discovery_calls,
+                max_cost_micros: discovery_cost,
+                max_duration: discovery_duration,
+                max_repair_attempts: 0,
+            },
+            ExecutionNodeKind::Planning => NodeBudget {
+                max_model_calls: planning_calls,
+                max_cost_micros: planning_cost,
+                max_duration: planning_duration,
+                max_repair_attempts: 0,
+            },
+            _ => NodeBudget::default(),
+        };
+    }
+}
+
 #[derive(Clone, Copy, Debug, Ord, PartialEq, Eq, PartialOrd)]
 enum BudgetGroup {
     Discovery,
@@ -2322,8 +2365,13 @@ impl FailureStore {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NodeBudgetUsage {
-    pub model_calls: u32,
+    #[serde(default)]
+    pub model_calls_reserved: u32,
+    #[serde(default, alias = "model_calls")]
+    pub model_calls_consumed: u32,
     pub cost_micros: u64,
+    #[serde(default)]
+    pub cost_micros_reserved: u64,
     #[serde(with = "duration_millis")]
     pub duration: Duration,
     pub repair_attempts: u32,
@@ -2388,10 +2436,35 @@ pub struct ProgressEvent {
     pub elapsed_at_event: Duration,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCallAdmission {
+    pub node_id: ExecutionNodeId,
+    pub max_model_calls: u32,
+    pub consumed_calls: u32,
+    pub reserved_calls: u32,
+    pub requested_calls: u32,
+    pub admitted: bool,
+    pub rejection_reason: Option<&'static str>,
+    pub node_cost_used: u64,
+    pub node_cost_reserved: u64,
+    pub mission_cost_used: u64,
+    pub mission_calls_used: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCallReservation {
+    pub node_id: ExecutionNodeId,
+    pub estimated_cost_micros: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BudgetState {
     pub mission: MissionBudget,
+    #[serde(default)]
+    pub total_model_calls_reserved: u32,
     pub total_model_calls: u32,
+    #[serde(default)]
+    pub total_cost_micros_reserved: u64,
     pub total_cost_micros: u64,
     #[serde(with = "duration_millis")]
     pub elapsed: Duration,
@@ -2413,7 +2486,9 @@ impl BudgetState {
     pub fn new(mission: MissionBudget) -> Self {
         Self {
             mission,
+            total_model_calls_reserved: 0,
             total_model_calls: 0,
+            total_cost_micros_reserved: 0,
             total_cost_micros: 0,
             elapsed: Duration::ZERO,
             node_usage: BTreeMap::new(),
@@ -2454,15 +2529,139 @@ impl BudgetState {
         estimated_cost_micros: u64,
         estimated_duration: Duration,
     ) -> bool {
+        self.evaluate_model_call_admission(
+            node_id,
+            node_budget,
+            1,
+            estimated_cost_micros,
+            estimated_duration,
+        )
+        .admitted
+    }
+
+    pub fn evaluate_model_call_admission(
+        &self,
+        node_id: &ExecutionNodeId,
+        node_budget: &NodeBudget,
+        requested_calls: u32,
+        estimated_cost_micros: u64,
+        estimated_duration: Duration,
+    ) -> ModelCallAdmission {
         let usage = self.usage_for(node_id);
-        self.total_model_calls < self.mission.max_model_calls
-            && self.total_cost_micros.saturating_add(estimated_cost_micros)
-                <= self.mission.max_cost_micros
-            && self.elapsed.saturating_add(estimated_duration) <= self.mission.max_duration
-            && usage.model_calls < node_budget.max_model_calls
-            && usage.cost_micros.saturating_add(estimated_cost_micros)
-                <= node_budget.max_cost_micros
-            && usage.duration.saturating_add(estimated_duration) <= node_budget.max_duration
+        let node_calls_after = usage
+            .model_calls_consumed
+            .saturating_add(usage.model_calls_reserved)
+            .saturating_add(requested_calls);
+        let mission_calls_after = self
+            .total_model_calls
+            .saturating_add(self.total_model_calls_reserved)
+            .saturating_add(requested_calls);
+        let node_cost_after = usage
+            .cost_micros
+            .saturating_add(usage.cost_micros_reserved)
+            .saturating_add(estimated_cost_micros);
+        let mission_cost_after = self
+            .total_cost_micros
+            .saturating_add(self.total_cost_micros_reserved)
+            .saturating_add(estimated_cost_micros);
+
+        let rejection_reason = if requested_calls == 0 {
+            Some("invalid_requested_calls")
+        } else if node_calls_after > node_budget.max_model_calls {
+            Some("node_model_call_budget_exhausted")
+        } else if mission_calls_after > self.mission.max_model_calls {
+            Some("mission_model_call_budget_exhausted")
+        } else if node_cost_after > node_budget.max_cost_micros {
+            Some("node_cost_budget_exhausted")
+        } else if mission_cost_after > self.mission.max_cost_micros {
+            Some("mission_cost_budget_exhausted")
+        } else if usage.duration.saturating_add(estimated_duration) > node_budget.max_duration {
+            Some("node_duration_budget_exhausted")
+        } else if self.elapsed.saturating_add(estimated_duration) > self.mission.max_duration {
+            Some("mission_duration_budget_exhausted")
+        } else {
+            None
+        };
+
+        debug_assert!(
+            !(node_budget.max_model_calls > 0
+                && usage.model_calls_consumed == 0
+                && usage.model_calls_reserved == 0
+                && requested_calls == 1
+                && rejection_reason == Some("node_model_call_budget_exhausted")),
+            "a fresh node with a positive call budget must admit its first single-call request"
+        );
+
+        ModelCallAdmission {
+            node_id: node_id.clone(),
+            max_model_calls: node_budget.max_model_calls,
+            consumed_calls: usage.model_calls_consumed,
+            reserved_calls: usage.model_calls_reserved,
+            requested_calls,
+            admitted: rejection_reason.is_none(),
+            rejection_reason,
+            node_cost_used: usage.cost_micros,
+            node_cost_reserved: usage.cost_micros_reserved,
+            mission_cost_used: self.total_cost_micros,
+            mission_calls_used: self.total_model_calls,
+        }
+    }
+
+    pub fn reserve_model_call(
+        &mut self,
+        node_id: &ExecutionNodeId,
+        node_budget: &NodeBudget,
+        estimated_cost_micros: u64,
+        estimated_duration: Duration,
+    ) -> Result<ModelCallReservation, ModelCallAdmission> {
+        let admission = self.evaluate_model_call_admission(
+            node_id,
+            node_budget,
+            1,
+            estimated_cost_micros,
+            estimated_duration,
+        );
+        if !admission.admitted {
+            return Err(admission);
+        }
+        self.total_model_calls_reserved = self.total_model_calls_reserved.saturating_add(1);
+        self.total_cost_micros_reserved = self
+            .total_cost_micros_reserved
+            .saturating_add(estimated_cost_micros);
+        let usage = self.node_usage.entry(node_id.clone()).or_default();
+        usage.model_calls_reserved = usage.model_calls_reserved.saturating_add(1);
+        usage.cost_micros_reserved = usage
+            .cost_micros_reserved
+            .saturating_add(estimated_cost_micros);
+        Ok(ModelCallReservation {
+            node_id: node_id.clone(),
+            estimated_cost_micros,
+        })
+    }
+
+    pub fn release_model_call_reservation(&mut self, reservation: &ModelCallReservation) {
+        self.total_model_calls_reserved = self.total_model_calls_reserved.saturating_sub(1);
+        self.total_cost_micros_reserved = self
+            .total_cost_micros_reserved
+            .saturating_sub(reservation.estimated_cost_micros);
+        let usage = self
+            .node_usage
+            .entry(reservation.node_id.clone())
+            .or_default();
+        usage.model_calls_reserved = usage.model_calls_reserved.saturating_sub(1);
+        usage.cost_micros_reserved = usage
+            .cost_micros_reserved
+            .saturating_sub(reservation.estimated_cost_micros);
+    }
+
+    pub fn consume_model_call_reservation(
+        &mut self,
+        reservation: &ModelCallReservation,
+        actual_cost_micros: u64,
+        duration: Duration,
+    ) {
+        self.release_model_call_reservation(reservation);
+        self.record_model_call(reservation.node_id.clone(), actual_cost_micros, duration);
     }
 
     pub fn record_model_call(
@@ -2475,7 +2674,7 @@ impl BudgetState {
         self.total_cost_micros = self.total_cost_micros.saturating_add(cost_micros);
         self.elapsed = self.elapsed.saturating_add(duration);
         let usage = self.node_usage.entry(node_id).or_default();
-        usage.model_calls = usage.model_calls.saturating_add(1);
+        usage.model_calls_consumed = usage.model_calls_consumed.saturating_add(1);
         usage.cost_micros = usage.cost_micros.saturating_add(cost_micros);
         usage.duration = usage.duration.saturating_add(duration);
     }
@@ -2531,7 +2730,10 @@ impl BudgetState {
     pub fn should_stop_node(&self, node_id: &ExecutionNodeId, node_budget: &NodeBudget) -> bool {
         let usage = self.usage_for(node_id);
         let hard_exceeded = (node_budget.max_model_calls > 0
-            && usage.model_calls >= node_budget.max_model_calls)
+            && usage
+                .model_calls_consumed
+                .saturating_add(usage.model_calls_reserved)
+                >= node_budget.max_model_calls)
             || (node_budget.max_cost_micros > 0
                 && usage.cost_micros >= node_budget.max_cost_micros)
             || (!node_budget.max_duration.is_zero() && usage.duration >= node_budget.max_duration)
@@ -2543,8 +2745,13 @@ impl BudgetState {
             return true;
         }
 
-        let soft_exceeded = ratio_at_least(usage.model_calls, node_budget.max_model_calls, 80)
-            || ratio_at_least(usage.cost_micros, node_budget.max_cost_micros, 80)
+        let soft_exceeded = ratio_at_least(
+            usage
+                .model_calls_consumed
+                .saturating_add(usage.model_calls_reserved),
+            node_budget.max_model_calls,
+            80,
+        ) || ratio_at_least(usage.cost_micros, node_budget.max_cost_micros, 80)
             || duration_ratio_at_least(usage.duration, node_budget.max_duration, 80);
         if !soft_exceeded {
             return false;
@@ -4825,6 +5032,132 @@ mod tests {
         }
     }
 
+    fn one_call_budget() -> (BudgetState, ExecutionNodeId, NodeBudget) {
+        (
+            BudgetState::new(MissionBudget {
+                max_model_calls: 1,
+                max_cost_micros: 1_000,
+                max_duration: Duration::from_secs(10),
+                max_target_repair_rounds: 0,
+            }),
+            ExecutionNodeId::new("discovery"),
+            NodeBudget {
+                max_model_calls: 1,
+                max_cost_micros: 1_000,
+                max_duration: Duration::from_secs(10),
+                max_repair_attempts: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn first_call_is_admitted_when_maximum_is_one_and_usage_is_zero() {
+        let (state, node_id, node_budget) = one_call_budget();
+        let admission =
+            state.evaluate_model_call_admission(&node_id, &node_budget, 1, 100, Duration::ZERO);
+        assert!(admission.admitted);
+        assert_eq!(admission.consumed_calls, 0);
+        assert_eq!(admission.reserved_calls, 0);
+    }
+
+    #[test]
+    fn second_call_is_rejected_after_the_only_call_is_consumed() {
+        let (mut state, node_id, node_budget) = one_call_budget();
+        let reservation = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect("first call reservation");
+        state.consume_model_call_reservation(&reservation, 75, Duration::from_millis(5));
+        let rejected = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect_err("second call must exceed the maximum");
+        assert_eq!(
+            rejected.rejection_reason,
+            Some("node_model_call_budget_exhausted")
+        );
+        assert_eq!(rejected.consumed_calls, 1);
+        assert_eq!(rejected.reserved_calls, 0);
+    }
+
+    #[test]
+    fn active_reservation_prevents_a_duplicate_concurrent_call() {
+        let (mut state, node_id, node_budget) = one_call_budget();
+        let _reservation = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect("first active reservation");
+        let rejected = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect_err("active reservation must occupy the remaining call slot");
+        assert_eq!(rejected.consumed_calls, 0);
+        assert_eq!(rejected.reserved_calls, 1);
+    }
+
+    #[test]
+    fn failed_provider_contact_releases_without_consuming_the_reservation() {
+        let (mut state, node_id, node_budget) = one_call_budget();
+        let reservation = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect("provider call reservation");
+        state.release_model_call_reservation(&reservation);
+        let usage = state.usage_for(&node_id);
+        assert_eq!(usage.model_calls_reserved, 0);
+        assert_eq!(usage.model_calls_consumed, 0);
+        assert_eq!(state.total_model_calls_reserved, 0);
+        assert_eq!(state.total_model_calls, 0);
+        assert!(state.can_spend_model_call(&node_id, &node_budget, 100, Duration::ZERO));
+    }
+
+    #[test]
+    fn reservation_reconciliation_does_not_double_count_the_call_budget() {
+        let (mut state, node_id, node_budget) = one_call_budget();
+        let reservation = state
+            .reserve_model_call(&node_id, &node_budget, 100, Duration::ZERO)
+            .expect("provider call reservation");
+        assert_eq!(state.total_model_calls, 0);
+        assert_eq!(state.total_model_calls_reserved, 1);
+        state.consume_model_call_reservation(&reservation, 80, Duration::from_millis(5));
+        assert_eq!(state.total_model_calls, 1);
+        assert_eq!(state.total_model_calls_reserved, 0);
+        let usage = state.usage_for(&node_id);
+        assert_eq!(usage.model_calls_consumed, 1);
+        assert_eq!(usage.model_calls_reserved, 0);
+    }
+
+    #[test]
+    fn legacy_model_call_usage_restores_as_consumed_without_an_active_reservation() {
+        let usage: NodeBudgetUsage = serde_json::from_value(serde_json::json!({
+            "model_calls": 2,
+            "cost_micros": 125,
+            "duration": 5,
+            "repair_attempts": 0
+        }))
+        .expect("legacy node usage");
+        assert_eq!(usage.model_calls_consumed, 2);
+        assert_eq!(usage.model_calls_reserved, 0);
+        assert_eq!(usage.cost_micros_reserved, 0);
+    }
+
+    #[test]
+    fn bootstrap_graph_assigns_only_the_bounded_discovery_and_planning_budgets() {
+        let mission = MissionBudget::for_complexity(MissionComplexity::Tiny);
+        let graph =
+            ExecutionGraph::bootstrap("bootstrap", "tree", MissionComplexity::Tiny, &mission);
+        let discovery = graph.node(&ExecutionNodeId::new("discovery")).unwrap();
+        let planning = graph.node(&ExecutionNodeId::new("planning")).unwrap();
+        assert_eq!(discovery.budget.max_model_calls, 3);
+        assert_eq!(discovery.budget.max_cost_micros, 350_000);
+        assert_eq!(
+            discovery.budget.max_duration,
+            Duration::from_millis(120_000)
+        );
+        assert_eq!(planning.budget.max_model_calls, 2);
+        assert_eq!(planning.budget.max_cost_micros, 300_000);
+        assert_eq!(planning.budget.max_duration, Duration::from_millis(90_000));
+        assert!(graph.nodes.iter().all(|node| matches!(
+            node.kind,
+            ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning
+        )));
+    }
+
     #[test]
     fn policy_overrides_do_not_change_the_classification() {
         let input = ComplexityInput {
@@ -5511,7 +5844,10 @@ mod tests {
             "a stable validation node invalidated by changed dependencies must lose stale evidence"
         );
         assert_eq!(
-            persisted.budget.usage_for(&validation_node.id).model_calls,
+            persisted
+                .budget
+                .usage_for(&validation_node.id)
+                .model_calls_consumed,
             0
         );
         assert!(

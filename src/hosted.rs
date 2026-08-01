@@ -2855,6 +2855,39 @@ fn blocked_result_event_payload(
     })
 }
 
+fn blocked_completion_evaluation(failure: &HostedAgentExecutionFailure) -> CompletionEvaluation {
+    CompletionEvaluation {
+        status: CompletionStatus::Blocked,
+        implementation_completeness: ImplementationCompleteness::Incomplete,
+        verification_readiness: VerificationReadiness::Blocked,
+        evaluation_source: EvaluationSource::OrchestratorFallback,
+        confidence: 1.0,
+        criteria: Vec::new(),
+        remaining_implementation_work: failure
+            .remaining_work
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}: {} ({})",
+                    item.path,
+                    item.reason,
+                    format!("{:?}", item.status).to_ascii_lowercase()
+                )
+            })
+            .collect(),
+        remaining_automated_verification: Vec::new(),
+        pending_external_review: Vec::new(),
+        optional_follow_up: Vec::new(),
+        review_checklist: Vec::new(),
+        unrecovered_tool_failures: failure
+            .failed_tool_operations
+            .iter()
+            .map(|operation| operation.detail.clone())
+            .collect(),
+        summary: failure.message.clone(),
+    }
+}
+
 fn acceptance_criteria_from_ticket(ticket: &str) -> Vec<String> {
     let mut criteria = Vec::new();
     let mut in_acceptance_criteria = false;
@@ -4881,11 +4914,12 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
             );
             let diagnostics = failure_diagnostics(&error, false);
             api.append_event("result", blocked_result_event_payload(failure, diagnostics))?;
+            let completion_evaluation = blocked_completion_evaluation(failure);
             api.complete(&CompletionRequest {
                 status: "blocked".into(),
                 mission_outcome: Some(CompletionStatus::Blocked),
                 process_health: Some("healthy".into()),
-                completion_evaluation: None,
+                completion_evaluation: Some(completion_evaluation),
                 output_summary: Some(failure.message.clone()),
                 failure_code: Some(failure.code.clone()),
                 failure_message: Some(failure.message.clone()),
@@ -8715,8 +8749,11 @@ impl<'a> GatewayAgent<'a> {
         self.last_tool_order_sha256 = Some(tool_order_sha256);
     }
 
-    fn graph_allows_model_dispatch(&self, request: &Value) -> bool {
-        let Some(node_id) = self
+    fn reserve_graph_model_call(
+        &mut self,
+        request: &Value,
+    ) -> Option<crate::execution_graph::ModelCallReservation> {
+        let node_id = self
             .current_decision
             .as_ref()
             .and_then(ExecutionDecision::node_id)
@@ -8736,19 +8773,14 @@ impl<'a> GatewayAgent<'a> {
                             .or_else(|| graph.next_runnable_node())
                     })
                     .map(|node| node.id.clone())
-            })
-        else {
-            return false;
-        };
-        let Some(node) = self
+            })?;
+        let node_budget = self
             .notebook
             .orchestration
             .graph
             .as_ref()
             .and_then(|graph| graph.node(&node_id))
-        else {
-            return false;
-        };
+            .map(|node| node.budget.clone())?;
         let serialized_bytes = serde_json::to_vec(request).map_or(0, |bytes| bytes.len());
         let estimated_input_tokens =
             u64::try_from(serialized_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX);
@@ -8759,22 +8791,76 @@ impl<'a> GatewayAgent<'a> {
         let estimated_cost_micros = estimated_input_tokens
             .saturating_mul(5)
             .saturating_add(estimated_output_tokens.saturating_mul(15));
-        self.notebook.orchestration.budget.can_spend_model_call(
-            &node_id,
-            &node.budget,
-            estimated_cost_micros,
-            Duration::ZERO,
-        )
+        let admission = self
+            .notebook
+            .orchestration
+            .budget
+            .evaluate_model_call_admission(
+                &node_id,
+                &node_budget,
+                1,
+                estimated_cost_micros,
+                Duration::ZERO,
+            );
+        let reservation = if admission.admitted {
+            self.notebook
+                .orchestration
+                .budget
+                .reserve_model_call(
+                    &node_id,
+                    &node_budget,
+                    estimated_cost_micros,
+                    Duration::ZERO,
+                )
+                .ok()
+        } else {
+            None
+        };
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.model_call_admission_evaluated",
+                "node_id": admission.node_id,
+                "max_model_calls": admission.max_model_calls,
+                "consumed_calls": admission.consumed_calls,
+                "reserved_calls": admission.reserved_calls,
+                "requested_calls": admission.requested_calls,
+                "admitted": admission.admitted,
+                "rejection_reason": admission.rejection_reason,
+                "node_cost_used": admission.node_cost_used,
+                "node_cost_reserved": admission.node_cost_reserved,
+                "mission_cost_used": admission.mission_cost_used,
+                "mission_calls_used": admission.mission_calls_used,
+                "model_calls_remaining": admission.max_model_calls.saturating_sub(
+                    admission
+                        .consumed_calls
+                        .saturating_add(admission.reserved_calls)
+                        .saturating_add(admission.requested_calls)
+                ),
+            }),
+            "model-call admission telemetry",
+        );
+        if !admission.admitted {
+            return None;
+        }
+        reservation
     }
 
     fn observe_model_cost(
         &mut self,
+        reservation: &crate::execution_graph::ModelCallReservation,
         request: &Value,
         response: &Value,
         duration: Duration,
     ) -> Result<()> {
         let (input_tokens, output_tokens, estimated) =
-            model_usage_for_accounting(request, response)?;
+            match model_usage_for_accounting(request, response) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    self.observe_failed_model_cost(reservation, request, None, duration);
+                    return Err(error);
+                }
+            };
         self.cost_guard.call_count = self.cost_guard.call_count.saturating_add(1);
         self.cost_guard.input_tokens = self.cost_guard.input_tokens.saturating_add(input_tokens);
         self.cost_guard.output_tokens = self.cost_guard.output_tokens.saturating_add(output_tokens);
@@ -8790,34 +8876,10 @@ impl<'a> GatewayAgent<'a> {
             .cost_guard
             .estimated_cost_micros
             .saturating_add(call_cost_micros);
-        let budget_node = self
-            .current_decision
-            .as_ref()
-            .and_then(ExecutionDecision::node_id)
-            .cloned()
-            .or_else(|| {
-                self.notebook
-                    .orchestration
-                    .graph
-                    .as_ref()
-                    .and_then(|graph| {
-                        graph
-                            .nodes
-                            .iter()
-                            .find(|node| {
-                                node.status == crate::execution_graph::ExecutionNodeStatus::Running
-                            })
-                            .or_else(|| graph.next_runnable_node())
-                    })
-                    .map(|node| node.id.clone())
-            });
-        if let Some(node_id) = budget_node {
-            self.notebook.orchestration.budget.record_model_call(
-                node_id,
-                call_cost_micros,
-                duration,
-            );
-        }
+        self.notebook
+            .orchestration
+            .budget
+            .consume_model_call_reservation(reservation, call_cost_micros, duration);
         if estimated {
             self.append_event_recoverable(
                 "progress",
@@ -8841,6 +8903,7 @@ impl<'a> GatewayAgent<'a> {
     /// transport failure cannot authorize paid retries beyond the graph budget.
     fn observe_failed_model_cost(
         &mut self,
+        reservation: &crate::execution_graph::ModelCallReservation,
         request: &Value,
         actual_cost_micros: Option<u64>,
         duration: Duration,
@@ -8862,34 +8925,10 @@ impl<'a> GatewayAgent<'a> {
                 self.cost_guard.usage_estimate_fallbacks.saturating_add(1);
         }
 
-        let budget_node = self
-            .current_decision
-            .as_ref()
-            .and_then(ExecutionDecision::node_id)
-            .cloned()
-            .or_else(|| {
-                self.notebook
-                    .orchestration
-                    .graph
-                    .as_ref()
-                    .and_then(|graph| {
-                        graph
-                            .nodes
-                            .iter()
-                            .find(|node| {
-                                node.status == crate::execution_graph::ExecutionNodeStatus::Running
-                            })
-                            .or_else(|| graph.next_runnable_node())
-                    })
-                    .map(|node| node.id.clone())
-            });
-        if let Some(node_id) = budget_node {
-            self.notebook.orchestration.budget.record_model_call(
-                node_id,
-                call_cost_micros,
-                duration,
-            );
-        }
+        self.notebook
+            .orchestration
+            .budget
+            .consume_model_call_reservation(reservation, call_cost_micros, duration);
         self.append_event_recoverable(
             "progress",
             json!({
@@ -10900,9 +10939,14 @@ impl<'a> GatewayAgent<'a> {
                 ),
             )?;
             validate_provider_request_envelope(&request)?;
-            if !constrain_request_to_cost_limit(&mut request, &self.cost_guard)?
-                || !self.graph_allows_model_dispatch(&request)
-            {
+            let cost_admitted = constrain_request_to_cost_limit(&mut request, &self.cost_guard)?;
+            if cost_admitted {
+                validate_provider_request_envelope(&request)?;
+            }
+            let reservation = cost_admitted
+                .then(|| self.reserve_graph_model_call(&request))
+                .flatten();
+            let Some(reservation) = reservation else {
                 let changed_paths =
                     completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
                 if allow_budget_handoff && !changed_paths.is_empty() {
@@ -10947,11 +10991,18 @@ impl<'a> GatewayAgent<'a> {
                     budget_exhausted: true,
                     explicit_declaration: self.declaration.clone(),
                 });
-            }
-            validate_provider_request_envelope(&request)?;
-
+            };
             let call_phase = self.phases.active();
-            let model_call = self.phases.begin_graph_model_call()?;
+            let model_call = match self.phases.begin_graph_model_call() {
+                Ok(model_call) => model_call,
+                Err(error) => {
+                    self.notebook
+                        .orchestration
+                        .budget
+                        .release_model_call_reservation(&reservation);
+                    return Err(error);
+                }
+            };
             let registration = ai_call_registration(
                 self.manifest.execution.execution_id,
                 self.api.execution_attempt,
@@ -10960,7 +11011,7 @@ impl<'a> GatewayAgent<'a> {
                 call_phase,
                 registration_attempt,
             );
-            self.api.append_event(
+            if let Err(error) = self.api.append_event(
                 "progress",
                 json!({
                     "step": "ai_gateway",
@@ -10971,11 +11022,28 @@ impl<'a> GatewayAgent<'a> {
                     "phase_call": self.phases.phase_calls(call_phase),
                     "budget": self.budget_telemetry(),
                 }),
-            )?;
-            let execution_deadline = hosted_execution_deadline(
+            ) {
+                self.phases.rollback_model_call(call_phase)?;
+                self.notebook
+                    .orchestration
+                    .budget
+                    .release_model_call_reservation(&reservation);
+                return Err(error);
+            }
+            let execution_deadline = match hosted_execution_deadline(
                 self.execution_started_at,
                 Duration::from_secs(self.cost_guard.max_duration_seconds),
-            )?;
+            ) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    self.phases.rollback_model_call(call_phase)?;
+                    self.notebook
+                        .orchestration
+                        .budget
+                        .release_model_call_reservation(&reservation);
+                    return Err(error);
+                }
+            };
             let model_call_started = Instant::now();
             let response = match self.api.ai_response_until(
                 request.clone(),
@@ -10993,6 +11061,10 @@ impl<'a> GatewayAgent<'a> {
                         .unwrap_or(AiBudgetDisposition::Unknown);
                     if budget_disposition == AiBudgetDisposition::Restore {
                         self.phases.rollback_model_call(call_phase)?;
+                        self.notebook
+                            .orchestration
+                            .budget
+                            .release_model_call_reservation(&reservation);
                         if http.is_some_and(|failure| {
                             failure.failure_class() == AiFailureClass::RegistrationConflict
                         }) {
@@ -11079,6 +11151,7 @@ impl<'a> GatewayAgent<'a> {
                         let actual_cost_micros =
                             http.and_then(|failure| failure.actual_cost_micros);
                         self.observe_failed_model_cost(
+                            &reservation,
                             &request,
                             actual_cost_micros,
                             model_call_started.elapsed(),
@@ -11134,7 +11207,12 @@ impl<'a> GatewayAgent<'a> {
                 }
             };
             self.record_cache_observability(&request, &response);
-            self.observe_model_cost(&request, &response, model_call_started.elapsed())?;
+            self.observe_model_cost(
+                &reservation,
+                &request,
+                &response,
+                model_call_started.elapsed(),
+            )?;
             let output = response
                 .get("output")
                 .and_then(Value::as_array)
@@ -11994,9 +12072,14 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     .phase_calls(ExecutionPhase::CompletionEvaluation),
             );
         for evaluator_attempt in 0..attempts_available {
-            if !constrain_request_to_cost_limit(&mut request, &self.cost_guard)?
-                || !self.graph_allows_model_dispatch(&request)
-            {
+            let cost_admitted = constrain_request_to_cost_limit(&mut request, &self.cost_guard)?;
+            if cost_admitted {
+                validate_provider_request_envelope(&request)?;
+            }
+            let reservation = cost_admitted
+                .then(|| self.reserve_graph_model_call(&request))
+                .flatten();
+            let Some(reservation) = reservation else {
                 self.append_event_recoverable(
                     "progress",
                     json!({
@@ -12011,10 +12094,18 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     "completion evaluation model cost preflight",
                 );
                 break;
-            }
-            validate_provider_request_envelope(&request)?;
-            let model_call = self.phases.begin_graph_model_call()?;
-            self.api.append_event(
+            };
+            let model_call = match self.phases.begin_graph_model_call() {
+                Ok(model_call) => model_call,
+                Err(error) => {
+                    self.notebook
+                        .orchestration
+                        .budget
+                        .release_model_call_reservation(&reservation);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.api.append_event(
                 "progress",
                 json!({
                     "step": "completion_evaluation",
@@ -12024,7 +12115,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     "model_call": model_call,
                     "budget": self.budget_telemetry(),
                 }),
-            )?;
+            ) {
+                self.phases
+                    .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
+                self.notebook
+                    .orchestration
+                    .budget
+                    .release_model_call_reservation(&reservation);
+                return Err(error);
+            }
             let registration = ai_call_registration(
                 self.manifest.execution.execution_id,
                 self.api.execution_attempt,
@@ -12033,10 +12132,21 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 ExecutionPhase::CompletionEvaluation,
                 0,
             );
-            let execution_deadline = hosted_execution_deadline(
+            let execution_deadline = match hosted_execution_deadline(
                 self.execution_started_at,
                 Duration::from_secs(self.cost_guard.max_duration_seconds),
-            )?;
+            ) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    self.phases
+                        .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
+                    self.notebook
+                        .orchestration
+                        .budget
+                        .release_model_call_reservation(&reservation);
+                    return Err(error);
+                }
+            };
             let model_call_started = Instant::now();
             let evaluated_response = match self.api.ai_response_until(
                 request.clone(),
@@ -12045,7 +12155,12 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             ) {
                 Ok(response) => {
                     self.record_cache_observability(&request, &response);
-                    self.observe_model_cost(&request, &response, model_call_started.elapsed())?;
+                    self.observe_model_cost(
+                        &reservation,
+                        &request,
+                        &response,
+                        model_call_started.elapsed(),
+                    )?;
                     Some(response)
                 }
                 Err(error) => {
@@ -12056,6 +12171,10 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     if budget_disposition == AiBudgetDisposition::Restore {
                         self.phases
                             .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
+                        self.notebook
+                            .orchestration
+                            .budget
+                            .release_model_call_reservation(&reservation);
                         if let Some(failure) = http.filter(|failure| {
                             failure.failure_class() == AiFailureClass::ProviderValidation
                         }) {
@@ -12078,6 +12197,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         let actual_cost_micros =
                             http.and_then(|failure| failure.actual_cost_micros);
                         self.observe_failed_model_cost(
+                            &reservation,
                             &request,
                             actual_cost_micros,
                             model_call_started.elapsed(),
@@ -18391,7 +18511,20 @@ mod tests {
                 ))
             })
             .expect("discovery request reached the AI gateway");
+        let admission_index = requests
+            .iter()
+            .position(|request| {
+                request.contains("\"event_type\":\"worker.model_call_admission_evaluated\"")
+                    && request.contains("\"node_id\":\"discovery\"")
+                    && request.contains("\"max_model_calls\":3")
+                    && request.contains("\"consumed_calls\":0")
+                    && request.contains("\"reserved_calls\":0")
+                    && request.contains("\"requested_calls\":1")
+                    && request.contains("\"admitted\":true")
+            })
+            .expect("first discovery admission was diagnosed as admitted");
         assert!(graph_checkpoint_index < discovery_request_index);
+        assert!(admission_index < discovery_request_index);
         let discovery_request = &requests[discovery_request_index];
         assert!(discovery_request.contains("\"phase\":\"discovery\""));
         assert!(discovery_request.contains("x-rustgrid-call-phase: discovery"));
@@ -18700,8 +18833,8 @@ mod tests {
             production
                 .matches("self.observe_failed_model_cost(")
                 .count(),
-            2,
-            "implementation and completion provider failures must both charge canonical budget usage"
+            3,
+            "implementation failure, completion failure, and invalid successful-response usage must all reconcile canonical budget usage"
         );
     }
 
@@ -23615,6 +23748,7 @@ it("defines every semantic token for light-blue without conflating primary and i
             .downcast_ref::<HostedAgentExecutionFailure>()
             .expect("the classified failure must remain structured");
         let event = blocked_result_event_payload(failure, diagnostics.clone());
+        let completion = blocked_completion_evaluation(failure);
 
         assert_eq!(code, "implementation_preparation_failed");
         assert_ne!(code, "hosted_agent_execution_failed");
@@ -23677,6 +23811,19 @@ it("defines every semantic token for light-blue without conflating primary and i
         assert_eq!(event["resume_phase"], "implementation");
         assert_eq!(event["changed_paths"], json!([]));
         assert_eq!(event["remaining_work"], json!(remaining_work));
+        assert_eq!(completion.status, CompletionStatus::Blocked);
+        assert_eq!(
+            completion.verification_readiness,
+            VerificationReadiness::Blocked
+        );
+        assert_eq!(
+            completion.evaluation_source,
+            EvaluationSource::OrchestratorFallback
+        );
+        assert_eq!(completion.remaining_implementation_work.len(), 1);
+        assert!(
+            completion.remaining_implementation_work[0].contains("tests/theme-provider.test.tsx")
+        );
         assert_eq!(event["terminal_telemetry"]["model_calls_used"], 8);
         assert_eq!(event["terminal_telemetry"]["input_tokens"], 12_345);
         assert_eq!(event["terminal_telemetry"]["output_tokens"], 2_345);

@@ -1231,7 +1231,11 @@ impl SimulationHarness {
                         .graph
                         .node(&node_id)
                         .map_or(1, |node| node.budget.max_model_calls.max(1));
-                    let used = self.snapshot.budget.usage_for(&node_id).model_calls;
+                    let used = self
+                        .snapshot
+                        .budget
+                        .usage_for(&node_id)
+                        .model_calls_consumed;
                     for _ in used..max_calls {
                         self.snapshot
                             .budget

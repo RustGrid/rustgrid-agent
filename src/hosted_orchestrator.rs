@@ -629,7 +629,11 @@ fn guardrail_outcome(snapshot: &ExecutionSnapshot) -> MissionOutcome {
 
 fn hard_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> bool {
     let usage = snapshot.budget.usage_for(&node.id);
-    (node.budget.max_model_calls > 0 && usage.model_calls >= node.budget.max_model_calls)
+    (node.budget.max_model_calls > 0
+        && usage
+            .model_calls_consumed
+            .saturating_add(usage.model_calls_reserved)
+            >= node.budget.max_model_calls)
         || (node.budget.max_cost_micros > 0 && usage.cost_micros >= node.budget.max_cost_micros)
         || (!node.budget.max_duration.is_zero() && usage.duration >= node.budget.max_duration)
         || usage.repair_attempts > node.budget.max_repair_attempts

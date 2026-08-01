@@ -2256,6 +2256,46 @@ mod tests {
                 ))
         );
 
+        let graph = checkpoint.graph.as_ref().expect("bootstrap graph");
+        let discovery = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::Discovery)
+            .expect("discovery node");
+        let planning = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::Planning)
+            .expect("planning node");
+        assert_eq!(discovery.budget.max_model_calls, 3);
+        assert_eq!(planning.budget.max_model_calls, 2);
+
+        for _ in 0..3 {
+            let reservation = checkpoint
+                .budget
+                .reserve_model_call(&discovery.id, &discovery.budget, 1, Duration::ZERO)
+                .expect("discovery bootstrap allowance");
+            checkpoint
+                .budget
+                .consume_model_call_reservation(&reservation, 1, Duration::ZERO);
+        }
+        assert!(
+            checkpoint
+                .budget
+                .reserve_model_call(&discovery.id, &discovery.budget, 1, Duration::ZERO,)
+                .is_err(),
+            "discovery must stop after its three-call bootstrap allowance"
+        );
+        for _ in 0..2 {
+            let reservation = checkpoint
+                .budget
+                .reserve_model_call(&planning.id, &planning.budget, 1, Duration::ZERO)
+                .expect("planning bootstrap allowance");
+            checkpoint
+                .budget
+                .consume_model_call_reservation(&reservation, 1, Duration::ZERO);
+        }
+
         let authoritative = checkpoint
             .rebuild_from_plan(&manifest, &complex_accepted_plan(), "tree-clean")
             .clone();
@@ -2432,6 +2472,12 @@ mod tests {
             Some(planning_id.clone()),
         );
         let previous_budget = checkpoint.budget.clone();
+        let provisional_discovery_budget = checkpoint
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.node(&discovery_id))
+            .map(|node| node.budget.clone())
+            .expect("provisional discovery budget");
         assert_eq!(
             checkpoint.complexity.as_ref().map(|value| value.stage),
             Some(ComplexityClassificationStage::Provisional)
@@ -2479,19 +2525,23 @@ mod tests {
             checkpoint.budget.progress_score,
             previous_budget.progress_score
         );
-        assert_eq!(checkpoint.budget.usage_for(&discovery_id).model_calls, 1);
-        assert_eq!(checkpoint.budget.usage_for(&planning_id).model_calls, 1);
-        assert!(
-            !checkpoint
+        assert_eq!(
+            checkpoint
                 .budget
-                .can_start_model_call(&discovery_id, &discovery.budget),
-            "the discovery call spent before plan acceptance must still exhaust its node budget"
+                .usage_for(&discovery_id)
+                .model_calls_consumed,
+            1
         );
-        assert!(
-            !checkpoint
+        assert_eq!(
+            checkpoint
                 .budget
-                .can_start_model_call(&planning_id, &planning.budget),
-            "the planning call spent before plan acceptance must still exhaust its node budget"
+                .usage_for(&planning_id)
+                .model_calls_consumed,
+            1
+        );
+        assert_ne!(
+            discovery.budget, provisional_discovery_budget,
+            "accepted-plan classification must replace provisional node budgets"
         );
     }
 
@@ -3168,7 +3218,10 @@ mod tests {
             .budget
             .record_model_call(first_id.clone(), 125, Duration::from_millis(10));
         retain_checkpoint_progress_for_nodes(&mut checkpoint, &preserved, &replacement);
-        assert_eq!(checkpoint.budget.usage_for(&first_id).model_calls, 1);
+        assert_eq!(
+            checkpoint.budget.usage_for(&first_id).model_calls_consumed,
+            1
+        );
     }
 
     #[test]
