@@ -9416,7 +9416,6 @@ impl<'a> GatewayAgent<'a> {
         self.implementation_plan = implementation_plan_from_notebook(&self.notebook);
         validate_lifecycle_invariants(
             &self.notebook.intended_changes,
-            &self.notebook.remaining_work_v2,
             &self.notebook.validation_evidence,
             &snapshot.current_repository.fingerprint,
         )
@@ -18254,6 +18253,12 @@ mod tests {
         let manifest = test_manifest(Uuid::from_u128(0x2202));
         let notebook = new_worker_notebook(&manifest, "clean-tree".into(), None);
         let graph = notebook.orchestration.graph.as_ref().unwrap().clone();
+        graph
+            .validate_invariants()
+            .expect("fresh graph passes every graph invariant");
+        let initial_collections = graph.derived_collections();
+        assert!(initial_collections.remaining_mutation_targets.is_empty());
+        assert!(initial_collections.applied_mutation_targets.is_empty());
         let mut snapshot = notebook.orchestration.snapshot(
             "fresh-run",
             crate::execution_graph::RepositorySnapshot {
@@ -18271,6 +18276,14 @@ mod tests {
                 preserved_node_ids: Vec::new(),
             })
             .expect("fresh graph creation is a valid first durable event");
+        assert!(
+            snapshot
+                .graph
+                .derived_collections()
+                .applied_mutation_targets
+                .is_empty(),
+            "GraphCreated is orchestration history, not repository mutation evidence"
+        );
         let next = notebook
             .orchestration
             .graph
@@ -18280,6 +18293,10 @@ mod tests {
         assert_eq!(
             next.kind,
             crate::execution_graph::ExecutionNodeKind::Discovery
+        );
+        assert!(
+            notebook.orchestration.budget.can_start_model_call_for(next),
+            "graph initialization must leave the first discovery model call dispatchable"
         );
         assert_eq!(notebook.phase, ExecutionPhase::Discovery);
     }

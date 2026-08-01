@@ -359,13 +359,9 @@ pub(super) fn legacy_remaining_work(items: &[RemainingWorkItem]) -> Vec<String> 
 
 pub(super) fn validate_lifecycle_invariants(
     changes: &[IntendedChangeRecord],
-    remaining_work: &[RemainingWorkItem],
     ledger: &[ValidationEvidence],
     current_tree_hash: &str,
 ) -> Result<(), String> {
-    if derive_remaining_work(changes) != remaining_work {
-        return Err("applied target is still present in remaining work".into());
-    }
     let mut passed = BTreeSet::new();
     for evidence in ledger
         .iter()
@@ -894,7 +890,7 @@ mod tests {
             assert!(passed_evidence(&ledger, &changed_tree_fingerprint).is_none());
         }
         assert_eq!(ledger.len(), 3);
-        assert!(validate_lifecycle_invariants(&changes, &[], &ledger, "tree-aops-226").is_ok());
+        assert!(validate_lifecycle_invariants(&changes, &ledger, "tree-aops-226").is_ok());
         assert_eq!(
             supersede_stale_validation(&mut ledger, "tree-after-one-byte-change"),
             3
@@ -907,17 +903,8 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_remaining_work_and_duplicate_validation_fail_invariants() {
+    fn duplicate_validation_fails_invariants() {
         let changes = vec![change(&[IntendedChangeStatus::Applied])];
-        let stale_remaining = vec![RemainingWorkItem {
-            change_id: "theme".into(),
-            path: "src/0.tsx".into(),
-            role: "source".into(),
-            status: IntendedChangeStatus::Planned,
-            reason: "stale".into(),
-        }];
-        assert!(validate_lifecycle_invariants(&changes, &stale_remaining, &[], "tree").is_err());
-
         let fingerprint = validation_fingerprint("npm test", ".", "tree", "lock", "env");
         let mut evidence = new_running_evidence(
             "one".into(),
@@ -932,9 +919,7 @@ mod tests {
         evidence.status = ValidationStatus::Passed;
         let mut duplicate = evidence.clone();
         duplicate.evidence_id = "two".into();
-        assert!(
-            validate_lifecycle_invariants(&changes, &[], &[evidence, duplicate], "tree").is_err()
-        );
+        assert!(validate_lifecycle_invariants(&changes, &[evidence, duplicate], "tree").is_err());
     }
 
     #[test]

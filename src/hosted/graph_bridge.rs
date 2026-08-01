@@ -13,14 +13,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::execution_graph::{
-    BudgetState, CancellationState, ComplexityAssessment, ComplexityInput, EvidenceKind,
-    EvidenceStore, ExecutionDomainEvent, ExecutionGraph, ExecutionNodeId, ExecutionNodeKind,
-    ExecutionNodeStatus, ExecutionSnapshot, FailureCategory, FailureId, FailureRecord,
-    FailureStatus, FailureStore, GraphInvariantError, MissionBudgetOverride, MissionOutcome,
-    PlannedTarget as GraphPlannedTarget, PublicationState, PublicationStatus, RepositorySnapshot,
-    ValidationEvidenceRecord, ValidationEvidenceStatus,
-    ValidationGateSpec as GraphValidationGateSpec, ValidationGateType as GraphValidationGateType,
-    normalize_validation_gate_order,
+    BudgetState, CancellationState, ComplexityAssessment, ComplexityClassificationStage,
+    ComplexityInput, EvidenceKind, EvidenceStore, ExecutionDomainEvent, ExecutionGraph,
+    ExecutionNodeId, ExecutionNodeKind, ExecutionNodeStatus, ExecutionSnapshot, FailureCategory,
+    FailureId, FailureRecord, FailureStatus, FailureStore, GraphInvariantError, MissionBudget,
+    MissionBudgetOverride, MissionComplexity, MissionOutcome, PlannedTarget as GraphPlannedTarget,
+    PublicationState, PublicationStatus, RepositorySnapshot, ValidationEvidenceRecord,
+    ValidationEvidenceStatus, ValidationGateSpec as GraphValidationGateSpec,
+    ValidationGateType as GraphValidationGateType, normalize_validation_gate_order,
 };
 use crate::lifecycle::HostedExecutionStage;
 
@@ -407,14 +407,11 @@ pub(super) struct HostedReconciliationFacts {
 }
 
 impl HostedOrchestrationCheckpoint {
-    /// Creates the discovery/planning graph and applies only signed manifest
-    /// budget overrides. Complexity is reassessed after a plan is accepted.
+    /// Creates the discovery/planning graph with a bounded bootstrap envelope.
+    /// Tighter signed limits are respected; complexity is reassessed only after
+    /// a plan is accepted.
     pub(super) fn bootstrap(manifest: &HostedManifest, repository_fingerprint: &str) -> Self {
-        let input = ComplexityInput {
-            repository_count: 1,
-            ..ComplexityInput::default()
-        };
-        let assessment = complexity_assessment(manifest, &input);
+        let assessment = provisional_complexity_assessment(manifest);
         let graph_id = graph_id(manifest);
         let graph = ExecutionGraph::bootstrap(
             graph_id,
@@ -1491,6 +1488,31 @@ fn complexity_assessment(
     ComplexityAssessment::classify_with_policy(input, &policy)
 }
 
+fn provisional_complexity_assessment(manifest: &HostedManifest) -> ComplexityAssessment {
+    let input = ComplexityInput {
+        repository_count: 1,
+        ..ComplexityInput::default()
+    };
+    let default = ComplexityAssessment::classify(&input);
+    let policy = manifest_budget_override(manifest, &default);
+    let baseline = MissionBudget::for_complexity(MissionComplexity::Tiny);
+    let requested = baseline.applying_override(&policy);
+    ComplexityAssessment {
+        stage: ComplexityClassificationStage::Provisional,
+        class: MissionComplexity::Tiny,
+        score: default.score,
+        factors: default.factors,
+        budget: MissionBudget {
+            max_model_calls: requested.max_model_calls.min(baseline.max_model_calls),
+            max_cost_micros: requested.max_cost_micros.min(baseline.max_cost_micros),
+            max_duration: requested.max_duration.min(baseline.max_duration),
+            max_target_repair_rounds: requested
+                .max_target_repair_rounds
+                .min(baseline.max_target_repair_rounds),
+        },
+    }
+}
+
 fn manifest_budget_override(
     manifest: &HostedManifest,
     default: &ComplexityAssessment,
@@ -2138,6 +2160,110 @@ mod tests {
         }
     }
 
+    fn complex_accepted_plan() -> ImplementationPlan {
+        let mut plan = accepted_plan();
+        plan.planned_changes = [
+            ("dependency", "Cargo.toml", "production", false),
+            ("schema", "migrations/0099_scope.sql", "production", true),
+            (
+                "integration",
+                "src/github/auth_client.rs",
+                "production",
+                true,
+            ),
+            ("tests", "tests/integration_test.rs", "tests", true),
+        ]
+        .into_iter()
+        .map(|(change_id, path, role, new_file)| PlannedChange {
+            change_id: change_id.to_owned(),
+            parent_change_id: None,
+            path: String::new(),
+            targets: vec![PlannedTarget {
+                path: path.to_owned(),
+                role: role.to_owned(),
+                new_file,
+                status: IntendedChangeStatus::Planned,
+            }],
+            change: format!("Implement {change_id}"),
+            reason: "Exercise authoritative complexity inputs".to_owned(),
+            status: IntendedChangeStatus::Planned,
+            acceptance_criteria: vec!["ac-1".to_owned()],
+            test_coverage: Vec::new(),
+        })
+        .collect();
+        plan
+    }
+
+    #[test]
+    fn complexity_is_provisional_until_an_accepted_plan_reclassifies_it() {
+        let manifest = hosted_manifest();
+        let mut checkpoint = HostedOrchestrationCheckpoint::bootstrap(&manifest, "tree-clean");
+        let provisional = checkpoint
+            .complexity
+            .as_ref()
+            .expect("bootstrap assessment");
+        assert_eq!(
+            provisional.stage,
+            ComplexityClassificationStage::Provisional
+        );
+        assert_eq!(provisional.class, MissionComplexity::Tiny);
+        assert_eq!(
+            checkpoint
+                .graph
+                .as_ref()
+                .expect("bootstrap graph")
+                .complexity_classification_stage,
+            ComplexityClassificationStage::Provisional
+        );
+        assert!(
+            checkpoint
+                .graph
+                .as_ref()
+                .expect("bootstrap graph")
+                .nodes
+                .iter()
+                .all(|node| matches!(
+                    node.kind,
+                    ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning
+                ))
+        );
+
+        let authoritative = checkpoint
+            .rebuild_from_plan(&manifest, &complex_accepted_plan(), "tree-clean")
+            .clone();
+        assert_eq!(
+            authoritative.stage,
+            ComplexityClassificationStage::Authoritative
+        );
+        assert_ne!(authoritative.class, MissionComplexity::Tiny);
+        for factor in [
+            crate::execution_graph::ComplexityFactorKind::PlannedTargetCount,
+            crate::execution_graph::ComplexityFactorKind::NewFileCount,
+            crate::execution_graph::ComplexityFactorKind::DependencyChanges,
+            crate::execution_graph::ComplexityFactorKind::DatabaseSchemaChanges,
+            crate::execution_graph::ComplexityFactorKind::ExternalIntegrations,
+            crate::execution_graph::ComplexityFactorKind::TestSurface,
+            crate::execution_graph::ComplexityFactorKind::ExpectedValidationDuration,
+            crate::execution_graph::ComplexityFactorKind::CrossModuleImpact,
+        ] {
+            assert!(
+                authoritative
+                    .factors
+                    .iter()
+                    .any(|entry| entry.kind == factor && entry.value > 0),
+                "authoritative assessment omitted {factor:?}"
+            );
+        }
+        assert_eq!(
+            checkpoint
+                .graph
+                .as_ref()
+                .expect("accepted-plan graph")
+                .complexity_classification_stage,
+            ComplexityClassificationStage::Authoritative
+        );
+    }
+
     #[test]
     fn parses_signed_decimal_cost_without_floating_point_drift() {
         assert_eq!(parse_usd_micros("5"), Some(5_000_000));
@@ -2237,6 +2363,10 @@ mod tests {
             Some(planning_id.clone()),
         );
         let previous_budget = checkpoint.budget.clone();
+        assert_eq!(
+            checkpoint.complexity.as_ref().map(|value| value.stage),
+            Some(ComplexityClassificationStage::Provisional)
+        );
 
         let assessment = checkpoint
             .rebuild_from_plan(&manifest, &accepted_plan(), "tree-before-plan")
@@ -2265,6 +2395,10 @@ mod tests {
         );
 
         assert_eq!(checkpoint.budget.mission, assessment.budget);
+        assert_eq!(
+            assessment.stage,
+            ComplexityClassificationStage::Authoritative
+        );
         assert_eq!(checkpoint.budget.total_model_calls, 2);
         assert_eq!(checkpoint.budget.total_cost_micros, 300);
         assert_eq!(checkpoint.budget.elapsed, Duration::from_secs(5));
@@ -2982,6 +3116,16 @@ mod tests {
         checkpoint.materialize_legacy_notebook(&mut notebook);
 
         assert_eq!(notebook.last_successful_action, json!({}));
+        assert!(
+            checkpoint
+                .graph
+                .as_ref()
+                .expect("graph")
+                .derived_collections()
+                .applied_mutation_targets
+                .is_empty(),
+            "a legacy last_successful_action is not repository mutation evidence"
+        );
     }
 
     #[test]

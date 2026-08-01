@@ -85,7 +85,17 @@ macro_rules! string_id {
 }
 
 string_id!(ExecutionNodeId);
+string_id!(MutationTargetId);
+string_id!(ValidationNodeId);
 string_id!(FailureId);
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplexityClassificationStage {
+    Provisional,
+    #[default]
+    Authoritative,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +257,8 @@ pub struct ComplexityInput {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ComplexityAssessment {
+    #[serde(default)]
+    pub stage: ComplexityClassificationStage,
     pub class: MissionComplexity,
     pub score: u32,
     pub factors: Vec<ComplexityFactor>,
@@ -383,6 +395,7 @@ pub fn classify_complexity(
     });
 
     ComplexityAssessment {
+        stage: ComplexityClassificationStage::Authoritative,
         class,
         score,
         factors,
@@ -511,6 +524,10 @@ pub struct PlannedTarget {
 }
 
 impl PlannedTarget {
+    pub fn mutation_target_id(&self) -> MutationTargetId {
+        MutationTargetId::new(format!("{}:{}:{}", self.change_id, self.path, self.role))
+    }
+
     pub fn is_test_target(&self) -> bool {
         let path = self.path.to_ascii_lowercase();
         let role = self.role.to_ascii_lowercase();
@@ -726,6 +743,8 @@ pub struct ExecutionGraph {
     pub schema_version: u16,
     pub graph_id: String,
     pub complexity: MissionComplexity,
+    #[serde(default)]
+    pub complexity_classification_stage: ComplexityClassificationStage,
     pub nodes: Vec<ExecutionNode>,
     pub created_from_repository_fingerprint: String,
     /// Monotonically increases whenever authoritative graph state changes.
@@ -750,6 +769,7 @@ impl Default for ExecutionGraph {
             schema_version: EXECUTION_GRAPH_SCHEMA_VERSION,
             graph_id: String::new(),
             complexity: MissionComplexity::Tiny,
+            complexity_classification_stage: ComplexityClassificationStage::Authoritative,
             nodes: Vec::new(),
             created_from_repository_fingerprint: String::new(),
             revision: 0,
@@ -769,6 +789,7 @@ impl ExecutionGraph {
         let mut graph = Self {
             graph_id: graph_id.into(),
             complexity,
+            complexity_classification_stage: ComplexityClassificationStage::Provisional,
             created_from_repository_fingerprint: repository_fingerprint.into(),
             ..Self::default()
         };
@@ -889,6 +910,57 @@ impl ExecutionGraph {
             .iter()
             .filter(|node| node.required && !node.status.is_success())
             .collect()
+    }
+
+    pub fn derived_collections(&self) -> DerivedExecutionCollections {
+        let remaining_graph_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.required && !node.status.is_success())
+            .map(|node| node.id.clone())
+            .collect();
+        let remaining_mutation_targets = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind.is_mutation()
+                    && !matches!(
+                        node.status,
+                        ExecutionNodeStatus::Applied | ExecutionNodeStatus::Completed
+                    )
+            })
+            .filter_map(|node| node.target.as_ref().map(PlannedTarget::mutation_target_id))
+            .collect();
+        let applied_mutation_targets = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind.is_mutation()
+                    && matches!(
+                        node.status,
+                        ExecutionNodeStatus::Applied | ExecutionNodeStatus::Completed
+                    )
+            })
+            .filter_map(|node| node.target.as_ref().map(PlannedTarget::mutation_target_id))
+            .collect();
+        let completed_validation_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind.is_validation()
+                    && matches!(
+                        node.status,
+                        ExecutionNodeStatus::Passed | ExecutionNodeStatus::Completed
+                    )
+            })
+            .map(|node| ValidationNodeId::new(node.id.as_str()))
+            .collect();
+        DerivedExecutionCollections {
+            remaining_graph_nodes,
+            remaining_mutation_targets,
+            applied_mutation_targets,
+            completed_validation_nodes,
+        }
     }
 
     pub fn all_required_nodes_succeeded(&self) -> bool {
@@ -1031,6 +1103,36 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
+        }
+        let collections = self.derived_collections();
+        let overlapping_targets = collections
+            .remaining_mutation_targets
+            .intersection(&collections.applied_mutation_targets)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !overlapping_targets.is_empty() {
+            let offending_nodes = self
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.kind.is_mutation()
+                        && node.target.as_ref().is_some_and(|target| {
+                            overlapping_targets.contains(&target.mutation_target_id())
+                        })
+                })
+                .map(|node| {
+                    format!(
+                        "id={} kind={:?} status={:?}",
+                        node.id, node.kind, node.status
+                    )
+                })
+                .collect::<Vec<_>>();
+            return Err(GraphInvariantError::new(format!(
+                "invariant=applied_mutation_target_excluded_from_remaining; offending_nodes=[{}]; remaining_mutation_target_ids={:?}; applied_mutation_target_ids={:?}",
+                offending_nodes.join(", "),
+                collections.remaining_mutation_targets,
+                collections.applied_mutation_targets,
+            )));
         }
         for node in &self.nodes {
             let mut dependencies = BTreeSet::new();
@@ -1261,6 +1363,14 @@ pub struct GraphInvariantError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DerivedExecutionCollections {
+    pub remaining_graph_nodes: BTreeSet<ExecutionNodeId>,
+    pub remaining_mutation_targets: BTreeSet<MutationTargetId>,
+    pub applied_mutation_targets: BTreeSet<MutationTargetId>,
+    pub completed_validation_nodes: BTreeSet<ValidationNodeId>,
+}
+
 impl GraphInvariantError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -1395,6 +1505,7 @@ pub fn build_execution_graph(
         schema_version: EXECUTION_GRAPH_SCHEMA_VERSION,
         graph_id: graph_id.into(),
         complexity,
+        complexity_classification_stage: ComplexityClassificationStage::Authoritative,
         nodes,
         created_from_repository_fingerprint: repository_fingerprint.into(),
         revision: 1,
@@ -4905,6 +5016,127 @@ mod tests {
             remaining
                 .iter()
                 .all(|node| node.required && !node.status.is_success())
+        );
+    }
+
+    #[test]
+    fn fresh_bootstrap_graph_has_only_orchestration_remaining_work() {
+        let graph = ExecutionGraph::bootstrap(
+            "graph-bootstrap",
+            "tree-clean",
+            MissionComplexity::Tiny,
+            &MissionBudget::for_complexity(MissionComplexity::Tiny),
+        );
+
+        graph.validate_invariants().expect("valid fresh graph");
+        let collections = graph.derived_collections();
+        assert_eq!(
+            collections.remaining_graph_nodes,
+            BTreeSet::from([
+                ExecutionNodeId::new("discovery"),
+                ExecutionNodeId::new("planning"),
+            ])
+        );
+        assert!(collections.remaining_mutation_targets.is_empty());
+        assert!(collections.applied_mutation_targets.is_empty());
+        assert!(collections.completed_validation_nodes.is_empty());
+        assert_eq!(
+            graph.node_by_str("discovery").map(|node| node.status),
+            Some(ExecutionNodeStatus::Ready)
+        );
+        assert_eq!(
+            graph.node_by_str("planning").map(|node| node.status),
+            Some(ExecutionNodeStatus::Pending)
+        );
+        assert_eq!(
+            graph
+                .node_by_str("planning")
+                .map(|node| node.dependencies.clone()),
+            Some(vec![ExecutionNodeId::new("discovery")])
+        );
+    }
+
+    #[test]
+    fn applied_mutation_targets_are_excluded_from_remaining_mutation_targets() {
+        let mut graph = graph();
+        let mutation_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_mutation())
+            .expect("mutation node")
+            .id
+            .clone();
+        let target_id = graph
+            .node(&mutation_id)
+            .and_then(|node| node.target.as_ref())
+            .expect("mutation target")
+            .mutation_target_id();
+
+        graph
+            .set_node_status(&mutation_id, ExecutionNodeStatus::Applied)
+            .expect("apply mutation");
+        let collections = graph.derived_collections();
+        assert!(collections.applied_mutation_targets.contains(&target_id));
+        assert!(!collections.remaining_mutation_targets.contains(&target_id));
+    }
+
+    #[test]
+    fn mutation_overlap_diagnostic_names_invariant_and_typed_state() {
+        let mut graph = graph();
+        let mutation_index = graph
+            .nodes
+            .iter()
+            .position(|node| node.kind.is_mutation())
+            .expect("mutation node");
+        let mut duplicate = graph.nodes[mutation_index].clone();
+        duplicate.id = ExecutionNodeId::new("duplicate-mutation-target");
+        duplicate.status = ExecutionNodeStatus::Pending;
+        graph.nodes[mutation_index].status = ExecutionNodeStatus::Applied;
+        graph.nodes.push(duplicate);
+
+        let error = graph.validate_invariants().expect_err("overlap must fail");
+        assert!(
+            error
+                .message
+                .contains("invariant=applied_mutation_target_excluded_from_remaining")
+        );
+        assert!(error.message.contains("kind=SourceMutation"));
+        assert!(error.message.contains("status=Applied"));
+        assert!(error.message.contains("status=Pending"));
+        assert!(error.message.contains("remaining_mutation_target_ids="));
+        assert!(error.message.contains("applied_mutation_target_ids="));
+    }
+
+    #[test]
+    fn graph_created_event_does_not_create_an_applied_mutation_target() {
+        let graph = ExecutionGraph::bootstrap(
+            "graph-created-fixture",
+            "tree-clean",
+            MissionComplexity::Tiny,
+            &MissionBudget::for_complexity(MissionComplexity::Tiny),
+        );
+        let mut snapshot = ExecutionSnapshot {
+            run_id: "run-created-fixture".to_owned(),
+            graph: graph.clone(),
+            budget: BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Tiny)),
+            ..ExecutionSnapshot::default()
+        };
+        snapshot
+            .append_event(ExecutionDomainEvent::GraphCreated {
+                sequence: 1,
+                graph_id: graph.graph_id.clone(),
+                revision: graph.revision,
+                graph: Some(graph),
+                preserved_node_ids: Vec::new(),
+            })
+            .expect("graph-created event");
+
+        assert!(
+            snapshot
+                .graph
+                .derived_collections()
+                .applied_mutation_targets
+                .is_empty()
         );
     }
 
