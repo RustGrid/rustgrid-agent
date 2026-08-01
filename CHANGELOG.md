@@ -5,6 +5,26 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.20 - 2026-08-01
+
+### Changed
+
+- Centralize hosted lifecycle advancement around authoritative target status,
+  unresolved mutation failures, changed paths, and required validation gates.
+- Preserve deterministic target order after each successful mutation and
+  continue through every remaining planned target while call budget remains.
+
+### Fixed
+
+- Reconcile failed mutations as superseded when the target is already applied,
+  a later successful mutation satisfies it, or the final diff contains it.
+- Return `target_already_applied` for duplicate mutations without entering
+  repair or recording a new unresolved failure.
+- Add the legal recovery routes from repair to implementation or validation,
+  and require validation followed by diff review before completion evaluation.
+- Publish passing, useful partial implementations as draft pull requests when
+  budget expires with explicit remaining targets.
+
 ## 1.4.19 - 2026-08-01
 
 ### Changed
