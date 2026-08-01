@@ -5,6 +5,33 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.21 - 2026-08-01
+
+### Changed
+
+- Make a serializable execution graph and its domain-event reducer the
+  authoritative lifecycle state for hosted discovery, planning, mutation,
+  validation, diff review, completion, and publication.
+- Classify missions as tiny, small, medium, or large with deterministic
+  per-node and mission-wide model-call, repair, cost, and duration budgets.
+- Project graph state back into legacy worker notebooks for compatible resume,
+  telemetry, and API behavior without allowing legacy fields to advance work.
+
+### Fixed
+
+- Reconcile hosted decisions through a pure deterministic orchestrator so
+  validation, completion, publication, cancellation, and failure routes cannot
+  bypass graph dependencies or reuse stale repository evidence.
+- Preserve partial work and publish only authorized, validated draft-recovery
+  pull requests, then terminate them as successful partial outcomes without
+  re-entering the normal diff-review route.
+- Bind validation evidence to repository, dependency-lock, command, and
+  environment fingerprints and invalidate finalization after remote branch
+  reconciliation.
+- Add deterministic replay coverage for attempts 17 through 20 and ten mission
+  benchmarks, including collective acceptance coverage and multi-target
+  duplicate-write recovery.
+
 ## 1.4.20 - 2026-08-01
 
 ### Changed
