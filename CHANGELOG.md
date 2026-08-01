@@ -5,6 +5,29 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.23 - 2026-08-01
+
+### Changed
+
+- Separate unfinished orchestration nodes, remaining mutation targets, applied
+  mutation targets, and completed validation nodes into strongly typed graph
+  projections.
+- Use a bounded provisional discovery/planning budget, then classify mission
+  complexity authoritatively from the accepted plan and rebuild downstream
+  node budgets without resetting consumed calls, cost, or duration.
+
+### Fixed
+
+- Stop treating discovery and planning notebook entries as repository mutation
+  targets during lifecycle invariant validation.
+- Restrict the applied-target exclusion invariant to source and test mutation
+  nodes in applied or completed state, with node-specific invariant diagnostics.
+- Keep graph-creation events and compatibility `last_successful_action` values
+  from fabricating applied repository targets.
+- Normalize legacy discovery/planning-only checkpoints to provisional
+  complexity and dispatch the first discovery model request only after the
+  fresh graph checkpoint is persisted.
+
 ## 1.4.22 - 2026-08-01
 
 ### Changed
