@@ -3390,46 +3390,6 @@ impl ExecutionSnapshot {
         satisfied
     }
 
-    fn invalidate_validation_without_current_fingerprint(&mut self) {
-        let repository_fingerprint = self.current_repository.fingerprint.clone();
-        let invalidated = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|node| {
-                if node.status != ExecutionNodeStatus::Passed {
-                    return false;
-                }
-                let Some(gate) = node.validation.as_ref() else {
-                    return false;
-                };
-                let expected = gate.fingerprint(&repository_fingerprint);
-                !node.evidence_ids.iter().any(|evidence_id| {
-                    self.evidence
-                        .validations
-                        .get(evidence_id)
-                        .is_some_and(|evidence| {
-                            evidence.status == ValidationEvidenceStatus::Passed
-                                && evidence.repository_fingerprint == repository_fingerprint
-                                && evidence.fingerprint == expected
-                        })
-                })
-            })
-            .map(|node| node.id.clone())
-            .collect::<Vec<_>>();
-        if invalidated.is_empty() {
-            return;
-        }
-        for node_id in invalidated {
-            if let Some(node) = self.graph.node_mut(&node_id) {
-                node.status = ExecutionNodeStatus::Pending;
-                node.evidence_ids.clear();
-            }
-        }
-        self.graph.revision = self.graph.revision.saturating_add(1);
-        self.graph.refresh_readiness();
-    }
-
     pub fn has_partial_reviewable_guardrail(&self) -> bool {
         current_execution_epoch(&self.events)
             .iter()

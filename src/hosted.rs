@@ -37,8 +37,8 @@ use crate::{
     git::{RemoteBranchMoved, Repo, read_repo_instructions},
     github::{GitHubClient, PullRequest},
     hosted_orchestrator::{
-        ExecutionDecision, MissionOutcome as OrchestratedMissionOutcome,
-        classify_mutation_request, reconcile_execution,
+        ExecutionDecision, MissionOutcome as OrchestratedMissionOutcome, classify_mutation_request,
+        reconcile_execution,
     },
     shutdown,
     telemetry::{
@@ -5831,26 +5831,6 @@ fn validation_failure_category(status: &str) -> Option<crate::execution_graph::F
     }
 }
 
-fn github_publication_failure_record(
-    node_id: crate::execution_graph::ExecutionNodeId,
-    repository_fingerprint: &str,
-    operation: &str,
-) -> crate::execution_graph::FailureRecord {
-    crate::execution_graph::FailureRecord::new(
-        crate::execution_graph::FailureId::new(format!(
-            "github-infrastructure-{}",
-            sha256_text(&format!(
-                "{node_id}\0{repository_fingerprint}\0{operation}"
-            ))
-        )),
-        node_id,
-        crate::execution_graph::FailureCategory::InfrastructureFailure,
-        1,
-        repository_fingerprint,
-        format!("GitHub publication operation `{operation}` failed"),
-    )
-}
-
 fn validation_failure_target_hint(
     mutation_target_paths: &[String],
     diagnostics: &str,
@@ -9197,51 +9177,6 @@ impl<'a> GatewayAgent<'a> {
             }
         }
         bail!("hosted orchestrator did not finalize guardrail outcome `{expected:?}`")
-    }
-
-    fn github_publication_result<T>(&mut self, operation: &str, result: Result<T>) -> Result<T> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(_error) => {
-                let node_id = self
-                    .graph_node_id(crate::execution_graph::ExecutionNodeKind::Publication)?;
-                let repository_fingerprint =
-                    repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
-                let failure = github_publication_failure_record(
-                    node_id,
-                    &repository_fingerprint,
-                    operation,
-                );
-                self.append_execution_domain_event(
-                    crate::execution_graph::ExecutionDomainEvent::FailureRecorded {
-                        sequence: self.next_domain_event_sequence(),
-                        failure,
-                    },
-                )?;
-                self.finalize_guardrail_outcome(
-                    OrchestratedMissionOutcome::FailedInfrastructure,
-                )?;
-                self.persist_orchestration_checkpoint("github_infrastructure_failure", true)?;
-                Err(self.github_publication_failure(operation))
-            }
-        }
-    }
-
-    fn github_publication_failure(&self, operation: &str) -> anyhow::Error {
-        let error = self.execution_failure(
-            "github_publication_infrastructure_failure",
-            format!("GitHub publication operation `{operation}` failed."),
-            None,
-            true,
-            "Resume publication from the persisted graph after GitHub authentication or connectivity recovers.",
-        );
-        let mut failure = error
-            .downcast::<HostedAgentExecutionFailure>()
-            .expect("execution_failure always returns HostedAgentExecutionFailure");
-        failure.category = "hosted_infrastructure_failure";
-        failure.mission_outcome = "failed_infrastructure";
-        failure.blocker = Some("github_publication".into());
-        anyhow!(failure)
     }
 
     fn peek_execution_decision(&mut self) -> Result<ExecutionDecision> {
@@ -20488,9 +20423,7 @@ mod tests {
 
     #[test]
     fn legacy_progress_observation_cannot_stop_before_the_graph_soft_bound() {
-        use crate::execution_graph::{
-            BudgetState, ExecutionNodeId, MissionBudget, NodeBudget,
-        };
+        use crate::execution_graph::{BudgetState, ExecutionNodeId, MissionBudget, NodeBudget};
 
         assert_eq!(
             implementation_progress_action(4, 1, 0, 0, 0, false, 4),
@@ -23429,13 +23362,10 @@ it("defines every semantic token for light-blue without conflating primary and i
 
         // The production adapter receives only the attempted path here. It
         // must derive identity from the graph, never from model `change_id`.
-        let duplicate = classify_hosted_mutation_preflight(
-            &snapshot,
-            Some(&mutation_nodes[1]),
-            paths[0],
-        )
-        .unwrap()
-        .expect("the first canonical node is already applied");
+        let duplicate =
+            classify_hosted_mutation_preflight(&snapshot, Some(&mutation_nodes[1]), paths[0])
+                .unwrap()
+                .expect("the first canonical node is already applied");
         assert_eq!(duplicate.code, "target_already_applied");
         assert_eq!(duplicate.change_id, "theme-1");
         assert_eq!(duplicate.target, paths[0]);
