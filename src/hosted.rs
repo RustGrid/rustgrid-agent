@@ -19098,8 +19098,13 @@ mod tests {
         notebook.acceptance_criteria = vec!["The recovered change remains reviewable.".into()];
         manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
 
-        let responses = (0..10).map(|_| ("200 OK", json!({}))).collect::<Vec<_>>();
-        let Some((api_root, requests, server)) = request_sequence_server(responses) else {
+        let Some(StoppableOkServer {
+            api_root,
+            requests,
+            stop: stop_server,
+            handle: server,
+        }) = stoppable_ok_server()
+        else {
             return;
         };
         let api = test_api_client(api_root, execution_id);
@@ -19252,16 +19257,9 @@ mod tests {
         assert_eq!(remote_commit, result.commit);
         assert!(repo.new_agent_paths(&BTreeSet::new()).unwrap().is_empty());
 
+        stop_server.send(()).unwrap();
         server.join().unwrap();
         let delivered = requests.try_iter().collect::<Vec<_>>();
-        assert_eq!(delivered.len(), 10);
-        assert_eq!(
-            delivered
-                .iter()
-                .filter(|request| request.contains("/worker-events"))
-                .count(),
-            9
-        );
         assert_eq!(
             delivered
                 .iter()
@@ -19269,6 +19267,23 @@ mod tests {
                 .count(),
             1
         );
+        let mut cursor = 0;
+        for marker in [
+            "publish_recovery_draft",
+            "recovery_publication_requested",
+            "worker.recovery_publication_started",
+            "recovery_commit_created",
+            "recovery_branch_pushed",
+            "creating_pull_request",
+            "recovery_run_finished",
+            "finish_recovery_action",
+        ] {
+            let offset = delivered[cursor..]
+                .iter()
+                .position(|request| request.contains(marker))
+                .unwrap_or_else(|| panic!("missing ordered recovery request marker `{marker}`"));
+            cursor += offset + 1;
+        }
     }
 
     #[test]
@@ -19503,6 +19518,54 @@ mod tests {
             receiver,
             handle,
         ))
+    }
+
+    struct StoppableOkServer {
+        api_root: Url,
+        requests: Receiver<String>,
+        stop: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn stoppable_ok_server() -> Option<StoppableOkServer> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("test HTTP server should bind: {error}"),
+        };
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            loop {
+                match stop_receiver.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        let _ = request_sender.send(request);
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("test HTTP server should accept requests: {error}"),
+                }
+            }
+        });
+        Some(StoppableOkServer {
+            api_root: Url::parse(&format!("http://{address}/")).unwrap(),
+            requests: request_receiver,
+            stop: stop_sender,
+            handle,
+        })
     }
 
     fn exchange_response(execution_id: Uuid) -> ExchangeResponse {
