@@ -18444,7 +18444,7 @@ mod tests {
         notebook.acceptance_criteria = vec!["The recovered change remains reviewable.".into()];
         manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
 
-        let responses = (0..6).map(|_| ("200 OK", json!({}))).collect::<Vec<_>>();
+        let responses = (0..10).map(|_| ("200 OK", json!({}))).collect::<Vec<_>>();
         let Some((api_root, requests, server)) = request_sequence_server(responses) else {
             return;
         };
@@ -18598,13 +18598,13 @@ mod tests {
 
         server.join().unwrap();
         let delivered = requests.try_iter().collect::<Vec<_>>();
-        assert_eq!(delivered.len(), 6);
+        assert_eq!(delivered.len(), 10);
         assert_eq!(
             delivered
                 .iter()
                 .filter(|request| request.contains("/worker-events"))
                 .count(),
-            5
+            9
         );
         assert_eq!(
             delivered
