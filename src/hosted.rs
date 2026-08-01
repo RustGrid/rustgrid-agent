@@ -18341,6 +18341,12 @@ mod tests {
             root: work.path().to_path_buf(),
         };
         let repository_fingerprint = repository_state_fingerprint(&repo, &base_sha).unwrap();
+        let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_00d2);
+        let mut manifest = test_manifest(execution_id);
+        manifest.github.base_sha = base_sha.clone();
+        manifest.github.branch = branch.into();
+        manifest.github.web_base_url = "https://github.example".into();
+        manifest.github.clone_url = hosted_origin.into();
         let budget = MissionBudget::for_complexity(MissionComplexity::Small);
         let mut graph = build_execution_graph(
             "production-recovery-publication",
@@ -18360,7 +18366,11 @@ mod tests {
                 command: "cargo test".into(),
                 working_directory: work.path().to_string_lossy().into_owned(),
                 required: true,
-                ..ValidationGateSpec::default()
+                dependency_lock_hash: dependency_lock_fingerprint(work.path()).unwrap(),
+                relevant_environment_fingerprint: relevant_environment_fingerprint(
+                    &manifest.execution_policy,
+                )
+                .unwrap(),
             }],
             &budget,
         );
@@ -18416,12 +18426,6 @@ mod tests {
             ..ExecutionSnapshot::default()
         };
 
-        let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_00d2);
-        let mut manifest = test_manifest(execution_id);
-        manifest.github.base_sha = base_sha.clone();
-        manifest.github.branch = branch.into();
-        manifest.github.web_base_url = "https://github.example".into();
-        manifest.github.clone_url = hosted_origin.into();
         let mut notebook = new_worker_notebook(&manifest, repository_fingerprint.clone(), None);
         notebook.phase = ExecutionPhase::Repair;
         notebook.orchestration = HostedOrchestrationCheckpoint {
@@ -21768,6 +21772,7 @@ mod tests {
         let mut checkpoint = HostedOrchestrationCheckpoint {
             graph_revision: graph.revision,
             graph: Some(graph),
+            legacy_import_completed: true,
             ..HostedOrchestrationCheckpoint::default()
         };
         checkpoint
