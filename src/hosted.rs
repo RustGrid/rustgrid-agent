@@ -1619,7 +1619,11 @@ struct PlannedChange {
     reason: String,
     #[serde(default)]
     status: IntendedChangeStatus,
-    #[serde(default)]
+    #[serde(
+        default,
+        rename = "acceptance_criteria_ids",
+        alias = "acceptance_criteria"
+    )]
     acceptance_criteria: Vec<String>,
     #[serde(default)]
     test_coverage: Vec<String>,
@@ -3211,6 +3215,237 @@ fn merge_preserved_plan_fragments(
             planned_changes.push(preserved.clone());
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PlanCriterionAssignment {
+    acceptance_criterion_id: String,
+    change_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct ImplementationPlanAcceptance {
+    plan: ImplementationPlan,
+    criterion_assignments: Vec<PlanCriterionAssignment>,
+    model_call_consumed: bool,
+    next_phase: ExecutionPhase,
+}
+
+fn semantic_tokens(values: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "acceptance",
+        "change",
+        "changes",
+        "criterion",
+        "criteria",
+        "existing",
+        "file",
+        "files",
+        "implementation",
+        "required",
+        "should",
+        "that",
+        "the",
+        "this",
+        "update",
+        "with",
+    ];
+    values
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .filter(|token| token.len() >= 3 && !STOP_WORDS.contains(&token.as_str()))
+        .collect()
+}
+
+fn planned_change_criterion_relevance(
+    change: &PlannedChange,
+    criterion: &impact_map::AcceptanceCriterion,
+    impact_areas: &[ImpactArea],
+) -> usize {
+    let target_paths = change
+        .targets
+        .iter()
+        .map(|target| target.path.trim())
+        .filter(|path| !path.is_empty())
+        .collect::<BTreeSet<_>>();
+    let related_areas = impact_areas
+        .iter()
+        .filter(|area| area.acceptance_criteria_ids.contains(&criterion.id))
+        .collect::<Vec<_>>();
+    let exact_path_matches = related_areas
+        .iter()
+        .flat_map(|area| &area.candidate_paths)
+        .filter(|path| target_paths.contains(path.trim()))
+        .count();
+
+    let change_tokens = semantic_tokens(
+        [
+            change.change.clone(),
+            change.reason.clone(),
+            change.change_id.clone(),
+        ]
+        .into_iter()
+        .chain(
+            change
+                .targets
+                .iter()
+                .flat_map(|target| [target.path.clone(), target.role.clone()]),
+        ),
+    );
+    let criterion_tokens = semantic_tokens(std::iter::once(criterion.text.clone()).chain(
+        related_areas.iter().flat_map(|area| {
+            std::iter::once(area.name.clone())
+                .chain(std::iter::once(area.reason.clone()))
+                .chain(area.candidate_paths.iter().cloned())
+        }),
+    ));
+    exact_path_matches.saturating_mul(10_000)
+        + change_tokens.intersection(&criterion_tokens).count()
+}
+
+fn canonicalize_plan_criterion_ids(
+    changes: &mut [PlannedChange],
+    criteria: &[impact_map::AcceptanceCriterion],
+) -> Result<()> {
+    let valid_ids = criteria
+        .iter()
+        .map(|criterion| (criterion.id.as_str(), criterion))
+        .collect::<BTreeMap<_, _>>();
+    for (change_index, change) in changes.iter_mut().enumerate() {
+        let mut canonical = BTreeSet::new();
+        for reference in &change.acceptance_criteria {
+            let reference = reference.trim();
+            let id = if valid_ids.contains_key(reference) {
+                reference
+            } else if let Some(criterion) = criteria
+                .iter()
+                .find(|criterion| criterion.text.trim() == reference)
+            {
+                criterion.id.as_str()
+            } else {
+                bail!(
+                    "$.planned_changes[{change_index}].acceptance_criteria_ids: unknown acceptance criterion ID `{reference}`"
+                );
+            };
+            canonical.insert(id.to_owned());
+        }
+        change.acceptance_criteria = criteria
+            .iter()
+            .filter(|criterion| canonical.contains(&criterion.id))
+            .map(|criterion| criterion.id.clone())
+            .collect();
+    }
+    Ok(())
+}
+
+fn validate_plan_criterion_coverage(
+    plan: &ImplementationPlan,
+    criteria: &[impact_map::AcceptanceCriterion],
+    impact_areas: &[ImpactArea],
+) -> Result<()> {
+    let required = criteria
+        .iter()
+        .map(|criterion| criterion.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut covered = BTreeSet::new();
+    for (change_index, change) in plan.planned_changes.iter().enumerate() {
+        if change.acceptance_criteria.is_empty() {
+            bail!(
+                "$.planned_changes[{change_index}].acceptance_criteria_ids: at least one relevant acceptance criterion ID is required"
+            );
+        }
+        let mut has_relevant_reference = false;
+        for id in &change.acceptance_criteria {
+            let Some(criterion) = criteria.iter().find(|criterion| criterion.id == *id) else {
+                bail!(
+                    "$.planned_changes[{change_index}].acceptance_criteria_ids: unknown acceptance criterion ID `{id}`"
+                );
+            };
+            covered.insert(id.as_str());
+            has_relevant_reference |=
+                planned_change_criterion_relevance(change, criterion, impact_areas) > 0;
+        }
+        if !has_relevant_reference {
+            bail!(
+                "$.planned_changes[{change_index}].acceptance_criteria_ids: no referenced acceptance criterion is relevant to this planned change"
+            );
+        }
+    }
+    let missing = required.difference(&covered).copied().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "$.planned_changes[*].acceptance_criteria_ids: required acceptance criteria are not covered: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn validate_and_repair_plan_criteria(
+    mut candidate: ImplementationPlan,
+    criteria: &[impact_map::AcceptanceCriterion],
+    impact_areas: &[ImpactArea],
+) -> Result<ImplementationPlanAcceptance> {
+    canonicalize_plan_criterion_ids(&mut candidate.planned_changes, criteria)?;
+    let covered = candidate
+        .planned_changes
+        .iter()
+        .flat_map(|change| change.acceptance_criteria.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let missing = criteria
+        .iter()
+        .filter(|criterion| !covered.contains(&criterion.id))
+        .collect::<Vec<_>>();
+    let mut assignments = Vec::new();
+    for criterion in missing {
+        let scored = candidate
+            .planned_changes
+            .iter()
+            .enumerate()
+            .map(|(index, change)| {
+                (
+                    index,
+                    planned_change_criterion_relevance(change, criterion, impact_areas),
+                )
+            })
+            .collect::<Vec<_>>();
+        let best_score = scored.iter().map(|(_, score)| *score).max().unwrap_or(0);
+        let best = scored
+            .iter()
+            .filter(|(_, score)| *score == best_score)
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>();
+        if best_score == 0 || best.len() != 1 {
+            bail!(
+                "$.planned_changes[*].acceptance_criteria_ids: semantic placement of `{}` is ambiguous",
+                criterion.id
+            );
+        }
+        let change = &mut candidate.planned_changes[best[0]];
+        change.acceptance_criteria.push(criterion.id.clone());
+        assignments.push(PlanCriterionAssignment {
+            acceptance_criterion_id: criterion.id.clone(),
+            change_id: change.change_id.clone(),
+        });
+    }
+    canonicalize_plan_criterion_ids(&mut candidate.planned_changes, criteria)?;
+    validate_plan_criterion_coverage(&candidate, criteria, impact_areas)?;
+    let next_phase = if candidate.implementation_status == "ready" {
+        ExecutionPhase::Implementation
+    } else {
+        ExecutionPhase::Planning
+    };
+    Ok(ImplementationPlanAcceptance {
+        plan: candidate,
+        criterion_assignments: assignments,
+        model_call_consumed: false,
+        next_phase,
+    })
 }
 
 fn repair_implementation_plan(
@@ -8887,37 +9122,29 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         serde_json::to_string(&repair.invalid_fields)?
                     );
                 }
-                if plan.implementation_status == "ready"
-                    && self.impact_map.as_ref().is_some_and(|map| {
-                        let planned_criteria = plan
-                            .planned_changes
-                            .iter()
-                            .flat_map(|change| &change.acceptance_criteria)
-                            .map(|criterion| criterion.trim())
-                            .collect::<BTreeSet<_>>();
-                        map.areas
-                            .iter()
-                            .flat_map(|area| &area.acceptance_criteria_ids)
-                            .filter_map(|id| {
-                                id.strip_prefix("ac-")
-                                    .and_then(|n| n.parse::<usize>().ok())
-                                    .and_then(|n| {
-                                        self.notebook.acceptance_criteria.get(n.saturating_sub(1))
-                                    })
-                            })
-                            .any(|criterion| !planned_criteria.contains(criterion.trim()))
-                    })
-                {
-                    repair.invalid_fields.push(
-                        "$.planned_changes[*].acceptance_criteria: ready plan must map every impact-map criterion"
-                            .into(),
-                    );
-                    self.notebook.planning_repair = Some(repair.clone());
-                    bail!(
-                        "implementation_plan_repair_required: {}",
-                        serde_json::to_string(&repair.invalid_fields)?
-                    );
-                }
+                let criteria = self.notebook.acceptance_criteria_v2.clone();
+                let impact_areas = self
+                    .impact_map
+                    .as_ref()
+                    .map(|map| map.areas.as_slice())
+                    .unwrap_or(self.notebook.impact_map.as_slice());
+                let accepted =
+                    match validate_and_repair_plan_criteria(plan, &criteria, impact_areas) {
+                        Ok(validated) => validated,
+                        Err(error) => {
+                            repair
+                                .invalid_fields
+                                .push(truncate_text(&error.to_string(), 500));
+                            self.notebook.planning_repair = Some(repair.clone());
+                            bail!(
+                                "implementation_plan_repair_required: {}",
+                                serde_json::to_string(&repair.invalid_fields)?
+                            );
+                        }
+                    };
+                // Replace the provider candidate before any later validation or persistence.
+                // This prevents the original, coverage-incomplete payload from being reused.
+                plan = accepted.plan;
                 let target_count = plan
                     .planned_changes
                     .iter()
@@ -8934,6 +9161,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         "normalized_legacy_targets": normalized_legacy_targets,
                         "normalization_source": (normalized_legacy_targets > 0)
                             .then_some("legacy_semicolon_target"),
+                        "criterion_assignments": accepted.criterion_assignments,
+                        "criterion_repair_model_call_consumed": accepted.model_call_consumed,
                         "ticket_complexity_call_limit": complexity_call_limit,
                     }),
                 )?;
@@ -8947,7 +9176,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 self.notebook.remaining_work =
                     legacy_remaining_work(&self.notebook.remaining_work_v2);
                 self.notebook.blocking_unknowns = plan.blocking_unknowns.clone();
-                let ready = plan.implementation_status == "ready";
+                let ready = accepted.next_phase == ExecutionPhase::Implementation;
                 self.implementation_plan = Some(plan);
                 self.guided_first_write_recovery_issued = false;
                 self.last_repository_progress_call = 0;
@@ -9264,7 +9493,7 @@ fn hosted_tools() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "record_implementation_plan",
-            "description": "End planning with a machine-readable mapping from acceptance criteria to edits and tests.",
+            "description": "End planning with a machine-readable mapping from canonical acceptance-criterion IDs to the relevant edits and tests. Coverage is evaluated across the complete plan; each change needs only its relevant IDs.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -9294,10 +9523,10 @@ fn hosted_tools() -> Vec<Value> {
                                     }
                                 },
                                 "status": {"type": "string", "enum": ["planned", "in_progress", "applied", "verified", "partial", "unresolved"]},
-                                "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                                "acceptance_criteria_ids": {"type": "array", "items": {"type": "string"}},
                                 "test_coverage": {"type": "array", "items": {"type": "string"}}
                             },
-                            "required": ["change_id", "parent_change_id", "intent", "reason", "targets", "status", "acceptance_criteria", "test_coverage"],
+                            "required": ["change_id", "parent_change_id", "intent", "reason", "targets", "status", "acceptance_criteria_ids", "test_coverage"],
                             "additionalProperties": false
                         }
                     },
@@ -9692,7 +9921,9 @@ replacing a complete file. Every source-changing call must cite the stable chang
 Prefer one planned change per independently editable file; use parent_change_id only to group \
 related file changes. When one logical change genuinely has multiple targets, represent them as \
 structured target objects and mutate one concrete member path per tool call. Never encode multiple \
-paths in one string. A mutation authorization or plan-metadata rejection is not a content-edit \
+paths in one string. In the plan, use acceptance_criteria_ids with canonical ac-N values, cover every \
+required ID across the complete plan, and attach to each change only the IDs relevant to that change. \
+A mutation authorization or plan-metadata rejection is not a content-edit \
 failure: do not switch editing tools; allow the orchestrator to repair metadata deterministically. \
 run_focused_command starts one executable directly without a shell; never pass shell operators, \
 pipelines, redirects, heredocs, or chained commands to it, and never use it to mutate files. Never \
@@ -15235,6 +15466,182 @@ mod tests {
                 "valid-theme-tokens"
             ]
         );
+    }
+
+    #[test]
+    fn implementation_plan_accepts_collective_criterion_coverage() {
+        let criteria = impact_map::acceptance_criteria(
+            &(1..=9)
+                .map(|index| format!("Criterion {index} for its owned surface"))
+                .collect::<Vec<_>>(),
+        );
+        let specifications = [
+            ("provider", "src/provider.ts", vec!["ac-1", "ac-2"]),
+            ("toggle", "src/toggle.ts", vec!["ac-3", "ac-4"]),
+            ("storage", "src/storage.ts", vec!["ac-5", "ac-6"]),
+            ("palette", "src/palette.ts", vec!["ac-7", "ac-8", "ac-9"]),
+        ];
+        let planned_changes = specifications
+            .iter()
+            .map(|(name, path, ids)| PlannedChange {
+                change_id: (*name).into(),
+                parent_change_id: None,
+                path: String::new(),
+                targets: vec![PlannedTarget {
+                    path: (*path).into(),
+                    role: format!("{name} implementation"),
+                    new_file: false,
+                    status: IntendedChangeStatus::Planned,
+                }],
+                change: format!("Implement the {name} surface."),
+                reason: format!("Own the {name} criteria."),
+                status: IntendedChangeStatus::Planned,
+                acceptance_criteria: ids.iter().map(|id| (*id).into()).collect(),
+                test_coverage: vec![format!("test {name}")],
+            })
+            .collect::<Vec<_>>();
+        let areas = specifications
+            .iter()
+            .map(|(name, path, ids)| ImpactArea {
+                area_id: format!("area-{name}"),
+                name: format!("{name} surface"),
+                candidate_paths: vec![(*path).into()],
+                evidence: vec![impact_map::ImpactEvidence {
+                    evidence_type: impact_map::EvidenceType::Inference,
+                    path: Some((*path).into()),
+                    query: None,
+                    description: format!("{name} path"),
+                }],
+                acceptance_criteria_ids: ids.iter().map(|id| (*id).into()).collect(),
+                reason: format!("Maps {name} criteria."),
+            })
+            .collect::<Vec<_>>();
+        let candidate = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes,
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+
+        let accepted = validate_and_repair_plan_criteria(candidate, &criteria, &areas).unwrap();
+
+        assert!(accepted.criterion_assignments.is_empty());
+        assert_eq!(accepted.next_phase, ExecutionPhase::Implementation);
+        assert!(
+            accepted
+                .plan
+                .planned_changes
+                .iter()
+                .all(|change| change.acceptance_criteria.len() < 9)
+        );
+        let covered = accepted
+            .plan
+            .planned_changes
+            .iter()
+            .flat_map(|change| change.acceptance_criteria.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            covered,
+            (1..=9).map(|index| format!("ac-{index}")).collect()
+        );
+    }
+
+    #[test]
+    fn orchestrator_repairs_missing_palette_criterion_without_provider_call() {
+        let criteria = impact_map::acceptance_criteria(&[
+            "Provider registers the theme".into(),
+            "Toggle exposes the theme".into(),
+            "Selection persists".into(),
+            "Fallback remains safe".into(),
+            "Existing themes remain available".into(),
+            "Keyboard selection works".into(),
+            "Tests cover registration".into(),
+            "Tests cover persistence".into(),
+            "Palette uses the approved blue tokens".into(),
+        ]);
+        let mut provider = test_planned_change();
+        provider.change_id = "provider".into();
+        provider.targets[0].path = "src/provider.ts".into();
+        provider.acceptance_criteria = (1..=4).map(|index| format!("ac-{index}")).collect();
+        let mut tests = test_planned_change();
+        tests.change_id = "tests".into();
+        tests.targets[0].path = "tests/theme.test.ts".into();
+        tests.acceptance_criteria = (5..=8).map(|index| format!("ac-{index}")).collect();
+        let mut palette = test_planned_change();
+        palette.change_id = "palette".into();
+        palette.targets[0].path = "src/palette.ts".into();
+        palette.targets[0].role = "approved blue palette".into();
+        palette.change = "Apply the approved blue palette tokens.".into();
+        palette.reason = "The palette must use the approved blue tokens.".into();
+        palette.acceptance_criteria = vec!["ac-1".into()];
+        let areas = vec![
+            ImpactArea {
+                area_id: "area-provider".into(),
+                name: "Theme behavior".into(),
+                candidate_paths: vec!["src/provider.ts".into(), "tests/theme.test.ts".into()],
+                evidence: vec![impact_map::ImpactEvidence {
+                    evidence_type: impact_map::EvidenceType::Inference,
+                    path: Some("src/provider.ts".into()),
+                    query: None,
+                    description: "Theme behavior paths".into(),
+                }],
+                acceptance_criteria_ids: (1..=8).map(|index| format!("ac-{index}")).collect(),
+                reason: "Provider and tests cover behavioral criteria.".into(),
+            },
+            ImpactArea {
+                area_id: "area-palette".into(),
+                name: "Approved blue palette".into(),
+                candidate_paths: vec!["src/palette.ts".into()],
+                evidence: vec![impact_map::ImpactEvidence {
+                    evidence_type: impact_map::EvidenceType::Inference,
+                    path: Some("src/palette.ts".into()),
+                    query: None,
+                    description: "Palette path".into(),
+                }],
+                acceptance_criteria_ids: vec!["ac-9".into()],
+                reason: "Owns the approved palette tokens.".into(),
+            },
+        ];
+        let original_candidate = ImplementationPlan {
+            implementation_status: "ready".into(),
+            planned_changes: vec![provider, tests, palette],
+            planned_new_files: vec![],
+            planned_test_changes: vec![],
+            remaining_unknowns: vec![],
+            blocking_unknowns: vec![],
+        };
+        assert!(
+            !original_candidate
+                .planned_changes
+                .iter()
+                .any(|change| change.acceptance_criteria.contains(&"ac-9".into()))
+        );
+
+        let accepted =
+            validate_and_repair_plan_criteria(original_candidate, &criteria, &areas).unwrap();
+
+        assert_eq!(
+            accepted.criterion_assignments,
+            vec![PlanCriterionAssignment {
+                acceptance_criterion_id: "ac-9".into(),
+                change_id: "palette".into(),
+            }]
+        );
+        assert!(!accepted.model_call_consumed);
+        assert_eq!(accepted.next_phase, ExecutionPhase::Implementation);
+        assert!(
+            accepted
+                .plan
+                .planned_changes
+                .iter()
+                .find(|change| change.change_id == "palette")
+                .unwrap()
+                .acceptance_criteria
+                .contains(&"ac-9".into())
+        );
+        validate_plan_criterion_coverage(&accepted.plan, &criteria, &areas).unwrap();
     }
 
     #[test]
