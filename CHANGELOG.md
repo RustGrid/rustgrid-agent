@@ -5,6 +5,41 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.18 - 2026-08-01
+
+### Changed
+
+- Track hosted implementation preparation, mutation, repair, and validation
+  readiness as persisted substates with productive, neutral, recoverable,
+  blocking, and duplicate tool outcomes.
+- Drive multi-file work target by target with compact authoritative context,
+  bounded preparation, one guided first-write recovery turn, and a shared
+  implementation-and-repair budget.
+- Cap the five-target hosted fixture at 20 model calls, 10 implementation and
+  repair calls, ten minutes, and an estimated EUR 2 while preserving review and
+  completion capacity.
+
+### Fixed
+
+- Preserve successful batch-read results, prevalidate every requested path,
+  retry failed paths individually, and keep recoverable read failures from
+  consuming healthy implementation progress.
+- Forbid repository validation when every required target remains planned and
+  the source tree is unchanged; return a structured resumable blocked result
+  without running tests or replacing terminal telemetry.
+- Fingerprint repository identity, HEAD, tracked edits, untracked contents, and
+  dependency locks so one-byte changes invalidate tree-bound validation while
+  identical trees reuse required-gate evidence exactly once.
+- Preserve valid impact-map evidence and planning fragments, prevent
+  informational progress reports from faking writes, and keep mutation
+  authorization scoped to the current planned target.
+- Reconcile committed and dirty target changes together on resumed branches,
+  retain useful partial work, and admit matching restored implementation state
+  to validation without losing previously applied targets.
+- Bound AI requests and transport or registration retries by the execution
+  deadline, conservatively account missing provider usage, and preserve
+  accurate model-call, cost, token, and tool telemetry through publication.
+
 ## 1.4.17 - 2026-08-01
 
 ### Changed
