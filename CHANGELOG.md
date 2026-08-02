@@ -5,6 +5,33 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.27 - 2026-08-02
+
+### Changed
+
+- Give each validation gate a gate-specific execution, inactivity, startup,
+  scheduling, and retry policy instead of reusing the graph node deadline as
+  the process timeout.
+- Build the validation graph deterministically from accepted targets, placing
+  dependency bootstrap and focused changed-test gates before broad lint,
+  typecheck, suite, build, and browser validation.
+- Persist dependency-bootstrap and validation-process evidence, including
+  output activity, elapsed time, configured limits, retry count, and precise
+  pending, running, code-failure, infrastructure-failure, and timeout states.
+
+### Fixed
+
+- Keep stdout and stderr activity alive independently, enforce a hard absolute
+  timeout, and allow one model-free retry for transient validation
+  infrastructure failures when the remaining mission budget can fund it.
+- Publish useful applied changes as a clearly incomplete draft when validation
+  cannot finish because of worker infrastructure, without claiming a test
+  assertion failure or discarding authoritative partial-reviewable state.
+- Resume timed-out partial executions from validation while preserving applied
+  mutation nodes and preventing duplicate source changes.
+- Split target inspection from mutation so stale or missing evidence exposes
+  only repository read/search tools before a verified mutation action.
+
 ## 1.4.26 - 2026-08-02
 
 ### Changed
