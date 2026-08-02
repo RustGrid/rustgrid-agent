@@ -249,6 +249,10 @@ impl SimulationPhase {
         match decision {
             ExecutionDecision::ContinueDiscovery { .. } => Self::Discovery,
             ExecutionDecision::ContinuePlanning { .. } => Self::Planning,
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            } => Self::Repair,
             ExecutionDecision::ExecuteTarget { .. } => Self::Implementation,
             ExecutionDecision::RepairTarget { .. } => Self::Repair,
             ExecutionDecision::RunValidation { .. } => Self::Validation,
@@ -311,7 +315,22 @@ impl SimulationReport {
                         "resolve_evidence_gap"
                     }
                 },
-                ExecutionDecision::ExecuteTarget { .. } => "execute_target",
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                    ..
+                } => "prepare_target_context",
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::MutateTarget { .. },
+                    ..
+                } => "mutate_target",
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
+                    ..
+                } => "verify_target_state",
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                    ..
+                } => "repair_target",
                 ExecutionDecision::RepairTarget { .. } => "repair_target",
                 ExecutionDecision::RunValidation { .. } => "run_validation",
                 ExecutionDecision::ReviewDiff { .. } => "review_diff",
@@ -484,9 +503,15 @@ impl SimulationHarness {
                 Ok(None)
             }
             ExecutionDecision::ExecuteTarget {
-                node_id, target, ..
+                node_id,
+                action,
+                target,
             } => {
-                self.simulate_target(node_id, target.target, false)?;
+                let repair = matches!(
+                    action,
+                    crate::hosted_orchestrator::MutationAction::RepairTarget { .. }
+                );
+                self.simulate_target(node_id, target.target, repair)?;
                 Ok(None)
             }
             ExecutionDecision::RepairTarget {
@@ -1582,7 +1607,10 @@ mod tests {
         ));
         assert!(matches!(
             apply_next_decision(&mut harness),
-            ExecutionDecision::RepairTarget { .. }
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            }
         ));
         let persisted = harness.snapshot.clone();
         let suffix = persisted.events[checkpoint.events.len()..].to_vec();

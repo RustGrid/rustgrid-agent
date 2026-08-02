@@ -87,6 +87,7 @@ macro_rules! string_id {
 string_id!(ExecutionNodeId);
 string_id!(MutationTargetId);
 string_id!(ValidationNodeId);
+string_id!(RepositoryFingerprint);
 string_id!(FailureId);
 string_id!(EvidenceId);
 string_id!(ArtifactId);
@@ -524,6 +525,9 @@ pub struct PlannedTarget {
     #[serde(default)]
     pub new_file: bool,
 }
+
+/// A repository mutation target is plan-owned data, not a generic graph id.
+pub type MutationTarget = PlannedTarget;
 
 impl PlannedTarget {
     pub fn mutation_target_id(&self) -> MutationTargetId {
@@ -1730,17 +1734,20 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
         let count = indices.len();
         for (position, index) in indices.iter().copied().enumerate() {
             let node = &mut nodes[index];
+            let distributed_calls = distribute_u32(call_total, count, position);
             node.budget = NodeBudget {
-                max_model_calls: distribute_u32(call_total, count, position),
+                max_model_calls: if node.kind.is_mutation() {
+                    distributed_calls.clamp(1, 2)
+                } else {
+                    distributed_calls
+                },
                 max_cost_micros: distribute_u64(cost_total, count, position),
                 max_duration: Duration::from_millis(distribute_u64(
                     duration_total,
                     count,
                     position,
                 )),
-                max_repair_attempts: if node.kind.is_mutation() {
-                    mission.max_target_repair_rounds
-                } else if node.kind.is_validation() {
+                max_repair_attempts: if node.kind.is_mutation() || node.kind.is_validation() {
                     mission.max_target_repair_rounds.min(1)
                 } else {
                     0
@@ -3071,6 +3078,23 @@ pub enum ExecutionDomainEvent {
         started_at: String,
         repository_fingerprint: String,
     },
+    TargetContextPrepared {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+        target_path: String,
+        repository_fingerprint: RepositoryFingerprint,
+        #[serde(default)]
+        evidence_ids: Vec<String>,
+    },
+    TargetMutationProduced {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+        target_path: String,
+        expected_repository_fingerprint: RepositoryFingerprint,
+        repository_fingerprint: RepositoryFingerprint,
+        before_content_hash: Option<String>,
+        after_content_hash: Option<String>,
+    },
     MutationApplied {
         sequence: u64,
         node_id: ExecutionNodeId,
@@ -3227,6 +3251,8 @@ impl ExecutionDomainEvent {
             Self::PlanRepaired { .. } => "plan_repaired",
             Self::GraphCreated { .. } => "graph_created",
             Self::NodeStarted { .. } => "node_started",
+            Self::TargetContextPrepared { .. } => "target_context_prepared",
+            Self::TargetMutationProduced { .. } => "target_mutation_produced",
             Self::MutationApplied { .. } => "mutation_applied",
             Self::MutationRejected { .. } => "mutation_rejected",
             Self::MutationSuperseded { .. } => "mutation_superseded",
@@ -3264,6 +3290,8 @@ impl ExecutionDomainEvent {
             | Self::PlanRepaired { sequence, .. }
             | Self::GraphCreated { sequence, .. }
             | Self::NodeStarted { sequence, .. }
+            | Self::TargetContextPrepared { sequence, .. }
+            | Self::TargetMutationProduced { sequence, .. }
             | Self::MutationApplied { sequence, .. }
             | Self::MutationRejected { sequence, .. }
             | Self::MutationSuperseded { sequence, .. }
@@ -3294,6 +3322,8 @@ impl ExecutionDomainEvent {
     pub fn node_id(&self) -> Option<&ExecutionNodeId> {
         match self {
             Self::NodeStarted { node_id, .. }
+            | Self::TargetContextPrepared { node_id, .. }
+            | Self::TargetMutationProduced { node_id, .. }
             | Self::MutationApplied { node_id, .. }
             | Self::MutationRejected { node_id, .. }
             | Self::MutationSuperseded { node_id, .. }
@@ -3359,6 +3389,8 @@ impl ExecutionGraph {
         let satisfied = self.dependency_satisfaction_ids(additionally_satisfied);
         let guarded_node = match event {
             ExecutionDomainEvent::NodeStarted { node_id, .. }
+            | ExecutionDomainEvent::TargetContextPrepared { node_id, .. }
+            | ExecutionDomainEvent::TargetMutationProduced { node_id, .. }
             | ExecutionDomainEvent::MutationApplied { node_id, .. }
             | ExecutionDomainEvent::MutationSuperseded { node_id, .. }
             | ExecutionDomainEvent::FailureSuperseded { node_id, .. }
@@ -3406,6 +3438,13 @@ impl ExecutionGraph {
                         ..NodeAttempt::default()
                     });
                 }
+                self.revision = self.revision.saturating_add(1);
+            }
+            ExecutionDomainEvent::TargetContextPrepared { .. }
+            | ExecutionDomainEvent::TargetMutationProduced { .. } => {
+                // These events advance the action state while the same node
+                // attempt remains Running. The orchestrator derives the next
+                // action from the append-only event stream.
                 self.revision = self.revision.saturating_add(1);
             }
             ExecutionDomainEvent::MutationApplied {
@@ -7499,7 +7538,7 @@ mod tests {
         };
         snapshot.failures.record(failure);
 
-        for attempt in 1..=2 {
+        for attempt in 1..=1 {
             snapshot
                 .graph
                 .set_node_status(&node_id, ExecutionNodeStatus::FailedRecoverable)
@@ -7514,22 +7553,22 @@ mod tests {
                 })
                 .expect("bounded repair start");
         }
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 2);
+        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 1);
         snapshot
             .graph
             .set_node_status(&node_id, ExecutionNodeStatus::FailedRecoverable)
             .expect("third repair request");
         let error = snapshot
             .append_event(ExecutionDomainEvent::NodeStarted {
-                sequence: 3,
+                sequence: 2,
                 node_id: node_id.clone(),
-                attempt: 3,
-                started_at: "attempt-3".to_owned(),
+                attempt: 2,
+                started_at: "attempt-2".to_owned(),
                 repository_fingerprint: "tree-1".to_owned(),
             })
             .expect_err("repair budget must be hard bounded");
         assert!(error.message.contains("cannot start repair beyond"));
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 2);
+        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 1);
     }
 
     #[test]

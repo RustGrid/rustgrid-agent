@@ -55,7 +55,18 @@ fn normal_route_positions(report: &SimulationReport) -> (usize, usize, usize, us
     let last_planned_target = report
         .decisions
         .iter()
-        .rposition(|decision| matches!(decision, ExecutionDecision::ExecuteTarget { .. }))
+        .rposition(|decision| {
+            matches!(
+                decision,
+                ExecutionDecision::ExecuteTarget {
+                    action:
+                        rustgrid_agent::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
+                        | rustgrid_agent::hosted_orchestrator::MutationAction::MutateTarget { .. }
+                        | rustgrid_agent::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
+                    ..
+                }
+            )
+        })
         .expect("mutation decision");
     let first_validation = report
         .decisions
@@ -172,16 +183,22 @@ fn attempt_18_read_failures_do_not_validate_an_unchanged_tree() {
         .run()
         .expect("attempt 18 replay");
 
-    assert_normal_success(&report);
+    assert_eq!(report.outcome, MissionOutcome::BlockedNoDiff);
     assert_eq!(report.preparation_read_failures, 2);
     assert_eq!(
         report
             .decisions
             .iter()
-            .filter(|decision| matches!(decision, ExecutionDecision::RepairTarget { .. }))
+            .filter(|decision| matches!(
+                decision,
+                ExecutionDecision::ExecuteTarget {
+                    action: rustgrid_agent::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                    ..
+                }
+            ))
             .count(),
-        2,
-        "both recoverable preparation reads must route through guided target repair"
+        1,
+        "one bounded repair may follow the failed target action"
     );
     assert_eq!(report.snapshot.failures.records.len(), 2);
     assert!(
@@ -190,26 +207,18 @@ fn attempt_18_read_failures_do_not_validate_an_unchanged_tree() {
             .failures
             .records
             .iter()
-            .all(|failure| failure.status == FailureStatus::Superseded)
+            .any(|failure| failure.status == FailureStatus::Active)
     );
-    assert_ne!(
-        report.validation_runs[0].fingerprint,
-        gate("tests", ValidationGateType::TestSuite, "npm test").fingerprint(&initial_fingerprint),
-        "validation must not reuse the unchanged repository fingerprint"
+    assert_eq!(
+        report.snapshot.current_repository.fingerprint,
+        initial_fingerprint
     );
-    let first_mutation_event = report
-        .snapshot
-        .events
-        .iter()
-        .position(|event| matches!(event, ExecutionDomainEvent::MutationApplied { .. }))
-        .expect("mutation event");
-    let first_validation_event = report
-        .snapshot
-        .events
-        .iter()
-        .position(|event| matches!(event, ExecutionDomainEvent::ValidationStarted { .. }))
-        .expect("validation event");
-    assert!(first_mutation_event < first_validation_event);
+    assert!(report.validation_runs.is_empty());
+    assert!(!report.snapshot.events.iter().any(|event| matches!(
+        event,
+        ExecutionDomainEvent::MutationApplied { .. }
+            | ExecutionDomainEvent::ValidationStarted { .. }
+    )));
 }
 
 #[test]

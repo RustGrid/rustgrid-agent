@@ -2257,6 +2257,7 @@ struct ImplementationStartContext {
     #[serde(skip_serializing)]
     target_order: Vec<ImplementationTarget>,
     acceptance_criteria_ids: Vec<String>,
+    assigned_acceptance_criteria: Vec<impact_map::AcceptanceCriterion>,
     exact_files_already_read: Vec<String>,
     missing_file_contents: Vec<String>,
     source_tree_hash: String,
@@ -2266,6 +2267,9 @@ struct ImplementationStartContext {
     cached_nearby_context: Vec<crate::execution_graph::FileExcerpt>,
     graph_node_id: Option<crate::execution_graph::ExecutionNodeId>,
     dependency_evidence: Vec<crate::execution_graph::EvidenceSummary>,
+    relevant_impact_areas: Vec<ImpactArea>,
+    related_test_evidence: Vec<crate::execution_graph::FileExcerpt>,
+    constraints: Vec<String>,
     allowed_tools: Vec<crate::execution_graph::ToolKind>,
     remaining_node_budget: Option<crate::execution_graph::NodeBudgetRemaining>,
     guided_recovery: bool,
@@ -8183,6 +8187,7 @@ fn implementation_start_context_from_notebook(
             .iter()
             .map(|criterion| criterion.id.clone())
             .collect(),
+        assigned_acceptance_criteria: Vec::new(),
         exact_files_already_read,
         missing_file_contents,
         source_tree_hash,
@@ -8192,6 +8197,13 @@ fn implementation_start_context_from_notebook(
         cached_nearby_context: Vec::new(),
         graph_node_id: None,
         dependency_evidence: Vec::new(),
+        relevant_impact_areas: Vec::new(),
+        related_test_evidence: Vec::new(),
+        constraints: vec![
+            "Preserve existing defaults and fallback behavior unless the accepted change intent explicitly replaces them.".into(),
+            "Preserve public APIs, persisted keys, and behavior outside the assigned acceptance criteria.".into(),
+            "Do not inspect or mutate another planned target during this node action.".into(),
+        ],
         allowed_tools: Vec::new(),
         remaining_node_budget: None,
         guided_recovery,
@@ -9290,6 +9302,10 @@ impl<'a> GatewayAgent<'a> {
             } => Some(ExecutionPhase::ArtifactRepair),
             ExecutionDecision::ContinueDiscovery { .. } => Some(ExecutionPhase::Discovery),
             ExecutionDecision::ContinuePlanning { .. } => Some(ExecutionPhase::Planning),
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            } => Some(ExecutionPhase::Repair),
             ExecutionDecision::ExecuteTarget { .. } => Some(ExecutionPhase::Implementation),
             ExecutionDecision::RepairTarget { .. } => Some(ExecutionPhase::Repair),
             ExecutionDecision::RunValidation { .. } => Some(ExecutionPhase::Validation),
@@ -9751,14 +9767,44 @@ impl<'a> GatewayAgent<'a> {
             context.cached_nearby_context = target.nearby_context.clone();
             context.graph_node_id = Some(target.node_id.clone());
             context.dependency_evidence = target.dependency_evidence.clone();
+            context.relevant_impact_areas = self
+                .notebook
+                .impact_map
+                .iter()
+                .filter(|area| area.candidate_paths.contains(&target.target.path))
+                .cloned()
+                .collect();
+            context.related_test_evidence = self
+                .notebook
+                .orchestration
+                .evidence
+                .files
+                .values()
+                .filter(|evidence| {
+                    evidence.repository_fingerprint == self.notebook.repository_fingerprint && {
+                        let path = evidence.path.to_ascii_lowercase();
+                        path.contains("test") || path.contains("spec")
+                    }
+                })
+                .map(crate::execution_graph::FileExcerpt::from)
+                .take(4)
+                .collect();
             context.allowed_tools = target.allowed_tools.clone();
             context.remaining_node_budget = Some(target.remaining_node_budget.clone());
             context.acceptance_criteria_ids = target.acceptance_criteria_ids.clone();
+            context.assigned_acceptance_criteria = self
+                .notebook
+                .acceptance_criteria_v2
+                .iter()
+                .filter(|criterion| target.acceptance_criteria_ids.contains(&criterion.id))
+                .cloned()
+                .collect();
             if target.current_file_content.is_some() {
                 context
                     .missing_file_contents
                     .retain(|path| path != &target.target.path);
             }
+            context.instruction = "Mutate only current_target using the persisted evidence bundle. Do not rediscover the repository. Return exactly one target-bound mutation, or a concrete typed blocker; verification is deterministic and model-free.".into();
         }
         Ok(context)
     }
@@ -10404,6 +10450,14 @@ impl<'a> GatewayAgent<'a> {
 
     fn record_active_target_applied(&mut self, target_path: &str) -> Result<()> {
         let validation_recovery = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                Some((failure.id.clone(), failure.node_id.clone()))
+            }
             Some(ExecutionDecision::RepairTarget {
                 failure_id,
                 context,
@@ -10414,7 +10468,18 @@ impl<'a> GatewayAgent<'a> {
                 Some((failure_id.clone(), context.failure.node_id.clone()))
             }
             _ => None,
-        };
+        }
+        .or_else(|| {
+            self.notebook
+                .orchestration
+                .failures
+                .unresolved()
+                .find(|failure| {
+                    failure.category == crate::execution_graph::FailureCategory::ValidationFailure
+                        && failure.target_path.as_deref() == Some(target_path)
+                })
+                .map(|failure| (failure.id.clone(), failure.node_id.clone()))
+        });
         let node_id = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget { node_id, .. })
             | Some(ExecutionDecision::RepairTarget { node_id, .. }) => node_id.clone(),
@@ -10451,6 +10516,142 @@ impl<'a> GatewayAgent<'a> {
             )?;
         }
         Ok(())
+    }
+
+    fn prepare_active_target_context(&mut self) -> Result<()> {
+        let (node_id, target_path) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id,
+                action:
+                    crate::hosted_orchestrator::MutationAction::PrepareTargetContext { target, .. },
+                ..
+            }) => (node_id.clone(), target.path.clone()),
+            _ => return Ok(()),
+        };
+        let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        let evidence = self
+            .notebook
+            .orchestration
+            .evidence
+            .reusable_file(&target_path, &fingerprint, None)
+            .cloned();
+        let evidence_ids = evidence
+            .as_ref()
+            .map(|evidence| vec![evidence.evidence_id.clone()])
+            .unwrap_or_default();
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
+                sequence: self.next_domain_event_sequence(),
+                node_id,
+                target_path: target_path.clone(),
+                repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                    fingerprint.clone(),
+                ),
+                evidence_ids,
+            },
+        )?;
+        if let Some(evidence) = evidence {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.evidence_cache_hit",
+                    "target": target_path,
+                    "content_hash": evidence.content_hash,
+                    "evidence_id": evidence.evidence_id,
+                    "repository_fingerprint": fingerprint,
+                    "model_call_consumed": false,
+                    "tool_operation_consumed": false,
+                    "progress_window_consumed": false,
+                }),
+                "target evidence cache hit",
+            );
+        }
+        self.persist_orchestration_checkpoint("target_context_prepared", false)
+    }
+
+    fn record_active_target_mutation_produced(
+        &mut self,
+        target_path: &str,
+        before_content_hash: Option<String>,
+        after_content_hash: Option<String>,
+    ) -> Result<()> {
+        let (node_id, expected) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id,
+                action:
+                    crate::hosted_orchestrator::MutationAction::MutateTarget {
+                        expected_repository_fingerprint,
+                        ..
+                    },
+                ..
+            }) => (node_id.clone(), expected_repository_fingerprint.clone()),
+            Some(ExecutionDecision::ExecuteTarget { node_id, .. }) => (
+                node_id.clone(),
+                crate::execution_graph::RepositoryFingerprint::new(
+                    self.notebook.repository_fingerprint.clone(),
+                ),
+            ),
+            _ => return Ok(()),
+        };
+        let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::TargetMutationProduced {
+                sequence: self.next_domain_event_sequence(),
+                node_id,
+                target_path: target_path.to_owned(),
+                expected_repository_fingerprint: expected,
+                repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                    fingerprint,
+                ),
+                before_content_hash,
+                after_content_hash,
+            },
+        )
+    }
+
+    fn verify_active_target_state(&mut self) -> Result<()> {
+        let (node_id, target_path) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id,
+                action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { target, .. },
+                ..
+            }) => (node_id.clone(), target.path.clone()),
+            _ => return Ok(()),
+        };
+        let produced = self
+            .notebook
+            .orchestration
+            .domain_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::execution_graph::ExecutionDomainEvent::TargetMutationProduced {
+                    node_id: produced_node,
+                    target_path,
+                    before_content_hash,
+                    after_content_hash,
+                    ..
+                } if produced_node == &node_id => Some((
+                    target_path.clone(),
+                    before_content_hash.clone(),
+                    after_content_hash.clone(),
+                )),
+                _ => None,
+            })
+            .context("target verification requires a produced mutation event")?;
+        let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+        if produced.0 != target_path
+            || produced.1 == produced.2
+            || !changed_paths.contains(&target_path)
+        {
+            self.record_active_target_failure(
+                crate::execution_graph::FailureCategory::MutationConflict,
+                "MutationNotProduced: deterministic verification found no attributable target change",
+            )?;
+            return Ok(());
+        }
+        self.record_active_target_applied(&target_path)?;
+        self.persist_orchestration_checkpoint("target_state_verified", true)
     }
 
     fn reconcile_active_phase(&mut self, _reason: &str) -> Result<PhaseDecision> {
@@ -11023,6 +11224,73 @@ impl<'a> GatewayAgent<'a> {
         })
     }
 
+    fn emit_mutation_no_progress_diagnostics(&mut self) -> Result<()> {
+        let active = self
+            .notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .and_then(crate::execution_graph::ExecutionGraph::active_node)
+            .or_else(|| {
+                self.notebook
+                    .orchestration
+                    .graph
+                    .as_ref()
+                    .and_then(crate::execution_graph::ExecutionGraph::next_runnable_node)
+            });
+        let node_id = active.map(|node| node.id.clone());
+        let target = active.and_then(|node| node.target.as_ref().map(|target| target.path.clone()));
+        let calls = node_id.as_ref().map_or(0, |node_id| {
+            self.notebook
+                .orchestration
+                .budget
+                .usage_for(node_id)
+                .model_calls_consumed
+        });
+        let read_paths = self
+            .notebook
+            .tool_progress
+            .iter()
+            .filter(|progress| {
+                matches!(
+                    progress.phase,
+                    ExecutionPhase::Implementation | ExecutionPhase::Repair
+                ) && matches!(
+                    progress.tool.as_str(),
+                    "read_file" | "read_files" | "search_text" | "related_tests"
+                )
+            })
+            .filter_map(|progress| progress.target.clone())
+            .collect::<Vec<_>>();
+        let duplicate_target_reads = target.as_ref().map_or(0, |target| {
+            read_paths
+                .iter()
+                .filter(|path| *path == target)
+                .count()
+                .saturating_sub(1)
+        });
+        let cross_target_reads = target.as_ref().map_or(0, |target| {
+            read_paths.iter().filter(|path| *path != target).count()
+        });
+        self.api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.mutation_no_progress_diagnostics",
+                "active_node_id": node_id,
+                "active_target": target,
+                "expected_action": "MutateTarget",
+                "calls_consumed_by_action_kind": {"mutate_or_repair": calls},
+                "read_paths_requested": read_paths,
+                "repository_reads_requested": read_paths.len(),
+                "cross_target_reads_requested": cross_target_reads,
+                "duplicate_cache_eligible_reads": duplicate_target_reads,
+                "mutation_tools_offered": ["apply_patch", "replace_file"],
+                "mutation_tools_invoked": self.notebook.write_attempts.len(),
+                "reason_no_mutation_was_produced": "no attributable target mutation or typed blocker was recorded before the no-progress boundary",
+            }),
+        )
+    }
+
     fn prepare_next_model_call(
         &mut self,
         allow_budget_handoff: bool,
@@ -11030,7 +11298,24 @@ impl<'a> GatewayAgent<'a> {
         loop {
             let graph_decision = self.reconcile_execution_and_apply()?;
             match graph_decision.decision {
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                    ..
+                } => {
+                    self.prepare_active_target_context()?;
+                    continue;
+                }
+                ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
+                    ..
+                } => {
+                    self.verify_active_target_state()?;
+                    continue;
+                }
                 ExecutionDecision::StopForGuardrail { outcome, reason } => {
+                    if reason == crate::execution_graph::GuardrailReason::NoProgress {
+                        self.emit_mutation_no_progress_diagnostics()?;
+                    }
                     let changed_paths =
                         completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
                     if outcome == OrchestratedMissionOutcome::PartialReviewable
@@ -11455,7 +11740,10 @@ impl<'a> GatewayAgent<'a> {
             let mut request = json!({
                 "model": self.manifest.ai_gateway.model,
                 "input": input,
-                "instructions": hosted_agent_instructions(active_phase),
+                "instructions": hosted_agent_instructions_for_decision(
+                    active_phase,
+                    self.current_decision.as_ref(),
+                ),
                 "max_output_tokens": action_profile.max_output_tokens,
                 "reasoning": {"effort": action_profile.reasoning_effort},
                 "tools": hosted_tools_for_action(active_phase, self.current_decision.as_ref()),
@@ -11877,7 +12165,7 @@ impl<'a> GatewayAgent<'a> {
                         Some("record the required machine-readable implementation plan")
                     }
                     ExecutionPhase::Implementation | ExecutionPhase::Repair => {
-                        Some("inspect the complete repository diff")
+                        Some("produce the required target-bound mutation")
                     }
                     ExecutionPhase::DiffReview if self.declaration.is_none() => {
                         Some("record the required implementation declaration")
@@ -11902,6 +12190,12 @@ impl<'a> GatewayAgent<'a> {
                         self.phases.active(),
                         ExecutionPhase::Implementation | ExecutionPhase::Repair
                     ) {
+                        self.record_active_target_failure(
+                            crate::execution_graph::FailureCategory::ToolRecoverable,
+                            "MutationNotProduced: the target-bound model response contained no mutation tool call",
+                        )?;
+                        self.reconcile_authoritative_target_state()?;
+                        self.reconcile_execution_and_apply()?;
                         self.observe_implementation_progress()?;
                     }
                     turns.push_back(turn);
@@ -11986,6 +12280,8 @@ impl<'a> GatewayAgent<'a> {
                             if !target_was_modified {
                                 attempt.status = WriteAttemptStatus::NoChange;
                             }
+                            let mutation_before_hash = attempt.before_sha256.clone();
+                            let mutation_after_hash = attempt.after_sha256.clone();
                             self.notebook.write_attempts.push(attempt);
                             if target_was_modified {
                                 self.tool_usage.successful_writes =
@@ -12000,6 +12296,10 @@ impl<'a> GatewayAgent<'a> {
                                 progress_detail =
                                     "mutation tool returned successfully but repository content did not change"
                                         .into();
+                                self.record_active_target_failure(
+                                    crate::execution_graph::FailureCategory::ToolRecoverable,
+                                    "MutationNotProduced: mutation tool completed without an attributable target change",
+                                )?;
                             }
                             self.diff_reviewed = false;
                             self.diff_review_cursor = 0;
@@ -12031,7 +12331,11 @@ impl<'a> GatewayAgent<'a> {
                                 }
                             }
                             if target_was_modified && let Some(target_path) = target.as_deref() {
-                                self.record_active_target_applied(target_path)?;
+                                self.record_active_target_mutation_produced(
+                                    target_path,
+                                    mutation_before_hash,
+                                    mutation_after_hash,
+                                )?;
                             }
                             self.reconcile_authoritative_target_state()?;
                             self.reconcile_active_phase(
@@ -13023,6 +13327,7 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
         {
             // Reconciliation is authoritative for selecting the next node. The
             // duplicate itself records no failure and consumes no repair work.
+            self.record_active_target_applied(path)?;
             self.reconcile_execution_and_apply()?;
             return Err(already_applied.into());
         }
@@ -13597,11 +13902,17 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                     name == "insert_after_symbol",
                 )
             }
-            "apply_unified_diff" => {
+            "apply_patch" | "apply_unified_diff" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let patch = required_tool_string(object, "patch", MAX_MODEL_FILE_BYTES)?;
                 apply_repo_unified_diff(&self.repo.root, path, patch)
+            }
+            "replace_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
+                write_repo_file(&self.repo.root, path, content, false)
             }
             "rewrite_small_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
@@ -14190,6 +14501,8 @@ fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "replace_range"
                 | "insert_after_symbol"
                 | "insert_before_symbol"
+                | "apply_patch"
+                | "replace_file"
                 | "apply_unified_diff"
                 | "rewrite_small_file"
                 | "delete_file"
@@ -14235,7 +14548,22 @@ const fn execution_decision_name(decision: &ExecutionDecision) -> &'static str {
         ExecutionDecision::ContinuePlanning {
             action: crate::hosted_orchestrator::PlanningAction::ResolveEvidenceGap { .. },
         } => "resolve_evidence_gap",
-        ExecutionDecision::ExecuteTarget { .. } => "execute_target",
+        ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+            ..
+        } => "prepare_target_context",
+        ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::MutateTarget { .. },
+            ..
+        } => "mutate_target",
+        ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
+            ..
+        } => "verify_target_state",
+        ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+            ..
+        } => "repair_target",
         ExecutionDecision::RepairTarget { .. } => "repair_target",
         ExecutionDecision::RunValidation { .. } => "run_validation",
         ExecutionDecision::ReviewDiff { .. } => "review_diff",
@@ -14251,7 +14579,11 @@ const fn execution_decision_requires_model_work(decision: &ExecutionDecision) ->
         decision,
         ExecutionDecision::ContinueDiscovery { .. }
             | ExecutionDecision::ContinuePlanning { .. }
-            | ExecutionDecision::ExecuteTarget { .. }
+            | ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
+                    | crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            }
             | ExecutionDecision::RepairTarget { .. }
             | ExecutionDecision::StopForGuardrail { .. }
     )
@@ -14527,7 +14859,7 @@ fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "apply_unified_diff",
+            "name": "apply_patch",
             "description": "Apply one bounded unified diff that modifies only the declared repository path.",
             "parameters": {
                 "type": "object",
@@ -14543,8 +14875,8 @@ fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "rewrite_small_file",
-            "description": "Deterministically replace the complete contents of an existing UTF-8 file no larger than 64 KiB. Prefer this for small test files after repeated ambiguous edits.",
+            "name": "replace_file",
+            "description": "Deterministically replace the complete contents of the exact active UTF-8 target, creating it when the accepted plan marks it as new.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -14671,19 +15003,23 @@ impl ModelActionProfile {
     ) -> Self {
         match decision {
             Some(ExecutionDecision::ExecuteTarget {
-                action: crate::hosted_orchestrator::MutationAction::InspectTarget,
+                action:
+                    crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
+                    | crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
                 ..
             }) => Self {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "low",
                 forced_tool: None,
-                require_tool: true,
+                require_tool: false,
             },
             Some(ExecutionDecision::ExecuteTarget {
-                action: crate::hosted_orchestrator::MutationAction::MutateTarget,
+                action:
+                    crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
+                    | crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
                 ..
             }) => Self {
-                max_output_tokens: configured_max_output_tokens.min(8_192),
+                max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
                 forced_tool: None,
                 require_tool: true,
@@ -14766,6 +15102,15 @@ fn hosted_tools_for_action(
     phase: ExecutionPhase,
     decision: Option<&ExecutionDecision>,
 ) -> Vec<Value> {
+    let active_mutation_target = match decision {
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::MutateTarget { target, .. }
+                | crate::hosted_orchestrator::MutationAction::RepairTarget { target, .. },
+            ..
+        }) => Some(target.path.as_str()),
+        _ => None,
+    };
     let allowed = match decision {
         Some(ExecutionDecision::ContinueDiscovery {
             action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
@@ -14792,28 +15137,21 @@ fn hosted_tools_for_action(
             action: crate::hosted_orchestrator::PlanningAction::ResolveEvidenceGap { .. },
         }) => Some(&["read_file", "read_files", "search_text", "related_tests"][..]),
         Some(ExecutionDecision::ExecuteTarget {
-            action: crate::hosted_orchestrator::MutationAction::InspectTarget,
+            action:
+                crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
+                | crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
             ..
-        }) => Some(&["read_file", "read_files", "search_text"][..]),
+        }) => Some(&[][..]),
         Some(ExecutionDecision::ExecuteTarget {
-            action: crate::hosted_orchestrator::MutationAction::MutateTarget,
+            action:
+                crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
+                | crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
             ..
-        }) => Some(
-            &[
-                "write_file",
-                "replace_text",
-                "replace_range",
-                "insert_after_symbol",
-                "insert_before_symbol",
-                "apply_unified_diff",
-                "rewrite_small_file",
-                "delete_file",
-            ][..],
-        ),
+        }) => Some(&["apply_patch", "replace_file"][..]),
         _ => None,
     };
     let tools = hosted_tools_for_phase(phase);
-    allowed.map_or(tools.clone(), |allowed| {
+    let mut selected = allowed.map_or(tools.clone(), |allowed| {
         tools
             .into_iter()
             .filter(|tool| {
@@ -14822,7 +15160,22 @@ fn hosted_tools_for_action(
                     .is_some_and(|name| allowed.contains(&name))
             })
             .collect()
-    })
+    });
+    if let Some(path) = active_mutation_target {
+        for tool in &mut selected {
+            if let Some(path_schema) = tool
+                .get_mut("parameters")
+                .and_then(Value::as_object_mut)
+                .and_then(|parameters| parameters.get_mut("properties"))
+                .and_then(Value::as_object_mut)
+                .and_then(|properties| properties.get_mut("path"))
+                .and_then(Value::as_object_mut)
+            {
+                path_schema.insert("enum".into(), json!([path]));
+            }
+        }
+    }
+    selected
 }
 
 fn discovery_action_permits_tool(decision: Option<&ExecutionDecision>, name: &str) -> bool {
@@ -15050,6 +15403,24 @@ fn accepted_artifact_normalization_metadata(
                 .map(|error| truncate_text(&format!("{error:#}"), 2_000)),
         })
     })
+}
+
+fn hosted_agent_instructions_for_decision(
+    phase: ExecutionPhase,
+    decision: Option<&ExecutionDecision>,
+) -> String {
+    match decision {
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::MutateTarget { target, .. }
+                | crate::hosted_orchestrator::MutationAction::RepairTarget { target, .. },
+            ..
+        }) => format!(
+            "You are executing exactly one repository mutation target: `{}`. The accepted intent, assigned acceptance criteria, current cached content, impact evidence, related-test excerpts, and preservation constraints are in the authoritative input context. Do not rediscover the repository and do not request or modify another path. Invoke exactly one admitted mutation tool for this exact target. A free-form response or read request is MutationNotProduced. Preserve unrelated behavior and do not run validation; deterministic verification follows the tool operation.",
+            target.path
+        ),
+        _ => hosted_agent_instructions(phase),
+    }
 }
 
 fn hosted_agent_instructions(phase: ExecutionPhase) -> String {
@@ -17889,6 +18260,8 @@ fn is_source_mutation_tool(name: &str) -> bool {
             | "replace_range"
             | "insert_after_symbol"
             | "insert_before_symbol"
+            | "apply_patch"
+            | "replace_file"
             | "apply_unified_diff"
             | "rewrite_small_file"
             | "delete_file"
@@ -19821,6 +20194,65 @@ mod tests {
         assert!(!successful_tool_updates_last_action("read_file", 4, 4));
         assert!(!successful_tool_updates_last_action("read_files", 4, 4));
         assert!(successful_tool_updates_last_action("read_file", 4, 5));
+    }
+
+    #[test]
+    fn mutation_action_forces_two_exact_path_mutation_tools() {
+        let node_id = crate::execution_graph::ExecutionNodeId::new("source-000");
+        let target = crate::execution_graph::PlannedTarget {
+            change_id: "theme-change".into(),
+            path: "src/components/theme/ThemeProvider.tsx".into(),
+            role: "production".into(),
+            intent: "extend the persisted theme state".into(),
+            acceptance_criteria_ids: vec!["ac-1".into()],
+            new_file: false,
+        };
+        let decision = ExecutionDecision::ExecuteTarget {
+            node_id: node_id.clone(),
+            action: crate::hosted_orchestrator::MutationAction::MutateTarget {
+                node_id: node_id.clone(),
+                target: target.clone(),
+                expected_repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                    "tree-1",
+                ),
+            },
+            target: crate::execution_graph::TargetExecutionContext {
+                node_id,
+                change_id: target.change_id.clone(),
+                target,
+                intent: "extend the persisted theme state".into(),
+                acceptance_criteria_ids: vec!["ac-1".into()],
+                dependency_evidence: Vec::new(),
+                current_file_content: Some("export type Theme = 'dark';".into()),
+                nearby_context: Vec::new(),
+                allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
+                remaining_node_budget: Default::default(),
+            },
+        };
+
+        let profile = ModelActionProfile::for_decision(
+            ExecutionPhase::Implementation,
+            Some(&decision),
+            16_384,
+        );
+        assert_eq!(profile.max_output_tokens, 4_096);
+        assert_eq!(profile.reasoning_effort, "medium");
+        assert_eq!(profile.tool_choice(), json!("required"));
+
+        let tools = hosted_tools_for_action(ExecutionPhase::Implementation, Some(&decision));
+        assert_eq!(
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["apply_patch", "replace_file"]
+        );
+        for tool in tools {
+            assert_eq!(
+                tool["parameters"]["properties"]["path"]["enum"],
+                json!(["src/components/theme/ThemeProvider.tsx"])
+            );
+        }
     }
 
     #[test]
@@ -26298,15 +26730,11 @@ it("defines every semantic token for light-blue without conflating primary and i
             } => {
                 assert_eq!(node_id, mutation_nodes[1]);
                 assert_eq!(target.target.path, paths[1]);
-                assert_eq!(
+                assert!(matches!(
                     action,
-                    crate::hosted_orchestrator::MutationAction::InspectTarget
-                );
-                assert!(target.allowed_tools.iter().all(|tool| matches!(
-                    tool,
-                    crate::execution_graph::ToolKind::ReadFile
-                        | crate::execution_graph::ToolKind::SearchRepository
-                )));
+                    crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
+                ));
+                assert!(target.allowed_tools.is_empty());
             }
             decision => panic!(
                 "already-applied production preflight must advance to target two, got {decision:?}"

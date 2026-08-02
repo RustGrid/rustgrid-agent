@@ -82,12 +82,27 @@ pub struct TargetRepairContext {
     pub next_repair_attempt: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum MutationAction {
-    #[default]
-    InspectTarget,
-    MutateTarget,
+    PrepareTargetContext {
+        node_id: ExecutionNodeId,
+        target: MutationTarget,
+    },
+    MutateTarget {
+        node_id: ExecutionNodeId,
+        target: MutationTarget,
+        expected_repository_fingerprint: RepositoryFingerprint,
+    },
+    VerifyTargetState {
+        node_id: ExecutionNodeId,
+        target: MutationTarget,
+    },
+    RepairTarget {
+        node_id: ExecutionNodeId,
+        target: MutationTarget,
+        failure: FailureRecord,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -101,10 +116,11 @@ pub enum ExecutionDecision {
     },
     ExecuteTarget {
         node_id: ExecutionNodeId,
-        #[serde(default)]
         action: MutationAction,
         target: TargetExecutionContext,
     },
+    /// Legacy checkpoint shape. New reconciliation emits
+    /// `ExecuteTarget { action: MutationAction::RepairTarget, .. }`.
     RepairTarget {
         node_id: ExecutionNodeId,
         failure_id: FailureId,
@@ -478,33 +494,57 @@ fn decision_for_node(
                 let failure = unresolved_failure_for_node(snapshot, &node.id)?;
                 repair_target_decision(snapshot, node, failure)
             } else {
-                let mut target = snapshot.target_execution_context(
-                    &node.id,
-                    vec![
-                        ToolKind::ReadFile,
-                        ToolKind::SearchRepository,
-                        ToolKind::ApplyPatch,
-                        ToolKind::CreateFile,
-                        ToolKind::DeleteFile,
-                        ToolKind::RunFocusedCommand,
-                    ],
-                )?;
-                let action = if !target.target.new_file && target.current_file_content.is_none() {
-                    target.allowed_tools.retain(|tool| {
-                        matches!(tool, ToolKind::ReadFile | ToolKind::SearchRepository)
-                    });
-                    MutationAction::InspectTarget
+                let mut target =
+                    snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+                let prepared = snapshot.events.iter().rev().any(|event| {
+                    matches!(
+                        event,
+                        ExecutionDomainEvent::TargetContextPrepared {
+                            node_id,
+                            repository_fingerprint,
+                            ..
+                        } if node_id == &node.id
+                            && repository_fingerprint.as_str()
+                                == snapshot.current_repository.fingerprint
+                    )
+                });
+                let mutation_produced =
+                    snapshot.events.iter().rev().find_map(|event| match event {
+                        ExecutionDomainEvent::TargetMutationProduced { node_id, .. }
+                            if node_id == &node.id =>
+                        {
+                            Some(true)
+                        }
+                        ExecutionDomainEvent::TargetContextPrepared { node_id, .. }
+                        | ExecutionDomainEvent::MutationApplied { node_id, .. }
+                        | ExecutionDomainEvent::MutationRejected { node_id, .. }
+                        | ExecutionDomainEvent::MutationSuperseded { node_id, .. }
+                            if node_id == &node.id =>
+                        {
+                            Some(false)
+                        }
+                        _ => None,
+                    }) == Some(true);
+                let planned_target = target.target.clone();
+                let action = if mutation_produced {
+                    MutationAction::VerifyTargetState {
+                        node_id: node.id.clone(),
+                        target: planned_target,
+                    }
+                } else if prepared {
+                    MutationAction::MutateTarget {
+                        node_id: node.id.clone(),
+                        target: planned_target,
+                        expected_repository_fingerprint: RepositoryFingerprint::new(
+                            snapshot.current_repository.fingerprint.clone(),
+                        ),
+                    }
                 } else {
-                    target.allowed_tools.retain(|tool| {
-                        matches!(
-                            tool,
-                            ToolKind::ApplyPatch
-                                | ToolKind::CreateFile
-                                | ToolKind::DeleteFile
-                                | ToolKind::RunFocusedCommand
-                        )
-                    });
-                    MutationAction::MutateTarget
+                    target.allowed_tools.clear();
+                    MutationAction::PrepareTargetContext {
+                        node_id: node.id.clone(),
+                        target: planned_target,
+                    }
                 };
                 Ok(ExecutionDecision::ExecuteTarget {
                     node_id: node.id.clone(),
@@ -724,25 +764,15 @@ fn repair_target_decision(
             "target repair was requested after its node repair budget was exhausted",
         ));
     }
-    let target = snapshot.target_execution_context(
-        &node.id,
-        vec![
-            ToolKind::ReadFile,
-            ToolKind::SearchRepository,
-            ToolKind::ApplyPatch,
-            ToolKind::CreateFile,
-            ToolKind::RunFocusedCommand,
-        ],
-    )?;
-    let usage = snapshot.budget.usage_for(&node.id);
-    Ok(ExecutionDecision::RepairTarget {
+    let target = snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+    Ok(ExecutionDecision::ExecuteTarget {
         node_id: node.id.clone(),
-        failure_id: failure.id.clone(),
-        context: TargetRepairContext {
+        action: MutationAction::RepairTarget {
+            node_id: node.id.clone(),
+            target: target.target.clone(),
             failure: failure.clone(),
-            target,
-            next_repair_attempt: usage.repair_attempts.saturating_add(1),
         },
+        target,
     })
 }
 
@@ -1017,6 +1047,69 @@ mod tests {
             budget: BudgetState::new(budget),
             ..ExecutionSnapshot::default()
         }
+    }
+
+    #[test]
+    fn mutation_actions_advance_prepare_mutate_verify_without_repository_exploration() {
+        let mut state = snapshot(&[target("theme", "src/theme.ts")]);
+        let node = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_mutation())
+            .expect("mutation node")
+            .clone();
+
+        let prepared = reconcile_execution(&state).expect("prepare decision");
+        assert!(matches!(
+            prepared,
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::PrepareTargetContext { .. },
+                ref target,
+                ..
+            } if target.allowed_tools.is_empty()
+        ));
+
+        state
+            .events
+            .push(ExecutionDomainEvent::TargetContextPrepared {
+                sequence: 1,
+                node_id: node.id.clone(),
+                target_path: "src/theme.ts".into(),
+                repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+                evidence_ids: vec!["file-current".into()],
+            });
+        assert!(matches!(
+            reconcile_execution(&state).expect("mutate decision"),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::MutateTarget {
+                    expected_repository_fingerprint,
+                    ..
+                },
+                ref target,
+                ..
+            } if expected_repository_fingerprint.as_str() == "tree-1"
+                && target.allowed_tools == vec![ToolKind::ApplyPatch]
+        ));
+
+        state
+            .events
+            .push(ExecutionDomainEvent::TargetMutationProduced {
+                sequence: 2,
+                node_id: node.id,
+                target_path: "src/theme.ts".into(),
+                expected_repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+                repository_fingerprint: RepositoryFingerprint::new("tree-2"),
+                before_content_hash: Some("before".into()),
+                after_content_hash: Some("after".into()),
+            });
+        assert!(matches!(
+            reconcile_execution(&state).expect("verify decision"),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::VerifyTargetState { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1693,10 +1786,10 @@ mod tests {
                 ),
                 FailureCategory::ValidationFailure => assert!(matches!(
                     reconcile_execution(&state).expect("repair decision"),
-                    ExecutionDecision::RepairTarget {
-                        failure_id: decision_failure_id,
+                    ExecutionDecision::ExecuteTarget {
+                        action: MutationAction::RepairTarget { failure, .. },
                         ..
-                    } if decision_failure_id == failure_id
+                    } if failure.id == failure_id
                 )),
                 _ => unreachable!("fixture only covers validation failure categories"),
             }
