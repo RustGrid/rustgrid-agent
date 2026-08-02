@@ -5,6 +5,35 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.26 - 2026-08-02
+
+### Changed
+
+- Split planning into explicit plan construction, plan repair, and concrete
+  evidence-gap actions selected from the accepted impact map and persisted
+  repository evidence.
+- Give plan construction and repair bounded 4,096-token profiles that expose
+  and force only `record_implementation_plan`; repository reads are available
+  only to an explicit evidence-gap action.
+- Build planning context from current-fingerprint discovery excerpts, related
+  tests, architecture findings, acceptance criteria, and validation commands
+  derived from `package.json`.
+
+### Fixed
+
+- Fund one plan-construction call plus one compact plan-repair call within the
+  provisional planning node, and make the repair attempt reachable through a
+  typed recoverable planning failure.
+- Reuse unchanged single and batch file evidence without rereading repository
+  content or allowing duplicate reads to become the planning node's last
+  successful action.
+- Construct a conservative normally validated implementation plan from the
+  accepted impact map when the bounded model calls cannot persist a valid
+  plan, then continue through authoritative complexity classification and the
+  first ready mutation node.
+- Record successful impact-map normalization as non-blocking metadata with no
+  artifact failure layer.
+
 ## 1.4.25 - 2026-08-02
 
 ### Changed
