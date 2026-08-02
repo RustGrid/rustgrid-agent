@@ -627,6 +627,22 @@ fn capture_cancellable_with_containment(
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
+    // Reader threads can observe the final stdout/stderr bytes after the
+    // process exits and after the polling loop emitted its last throttled
+    // update. Always publish that post-drain snapshot when it advances the
+    // byte count so completion telemetry cannot omit trailing output.
+    let final_bytes = bytes_emitted.load(Ordering::Relaxed);
+    if final_bytes != observed_bytes {
+        let last_output_age = last_output_at
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default();
+        on_activity(CommandActivity {
+            elapsed: started.elapsed(),
+            last_output_age,
+            bytes_emitted: final_bytes,
+        });
+    }
     if stdout.truncated || stderr.truncated {
         return Err(CommandFailure::OutputLimit {
             detail: format!("command output exceeded {max_output_bytes} bytes"),

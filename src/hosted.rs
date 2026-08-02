@@ -6465,7 +6465,12 @@ fn recovery_completion_evaluation(
     );
     evaluation.status = CompletionStatus::Partial;
     evaluation.implementation_completeness = ImplementationCompleteness::Partial;
-    evaluation.verification_readiness = VerificationReadiness::AutomatedVerified;
+    evaluation.verification_readiness = if validation.iter().all(|result| result.status == "passed")
+    {
+        VerificationReadiness::AutomatedVerified
+    } else {
+        VerificationReadiness::PendingManualReview
+    };
     evaluation.evaluation_source = EvaluationSource::OrchestratorFallback;
     evaluation.confidence = 1.0;
     push_unique(
@@ -7711,7 +7716,15 @@ fn validate_reconciled_finalization_route(
 fn restored_validation_results_from_snapshot(
     snapshot: &crate::execution_graph::ExecutionSnapshot,
 ) -> Result<Vec<ValidationResult>> {
+    use crate::execution_graph::{FailureCategory, ValidationEvidenceStatus};
+
     let satisfied = snapshot.dependency_satisfaction_ids();
+    let infrastructure_partial = snapshot.has_partial_reviewable_guardrail()
+        && snapshot.failures.unresolved().next().is_some()
+        && snapshot
+            .failures
+            .unresolved()
+            .all(|failure| failure.category == FailureCategory::InfrastructureFailure);
     let mut results = Vec::new();
     for node in snapshot
         .graph
@@ -7719,7 +7732,7 @@ fn restored_validation_results_from_snapshot(
         .iter()
         .filter(|node| node.required && node.kind.is_validation())
     {
-        if !satisfied.contains(&node.id) {
+        if !infrastructure_partial && !satisfied.contains(&node.id) {
             bail!(
                 "required validation node `{}` has no effective current pass",
                 node.id
@@ -7737,20 +7750,41 @@ fn restored_validation_results_from_snapshot(
             .rev()
             .find(|evidence| {
                 evidence.node_id == node.id
-                    && evidence.status == crate::execution_graph::ValidationEvidenceStatus::Passed
+                    && (evidence.status == ValidationEvidenceStatus::Passed
+                        || infrastructure_partial
+                            && matches!(
+                                evidence.status,
+                                ValidationEvidenceStatus::Failed
+                                    | ValidationEvidenceStatus::TimedOut
+                                    | ValidationEvidenceStatus::Cancelled
+                            ))
                     && evidence.fingerprint == fingerprint
                     && evidence.repository_fingerprint == snapshot.current_repository.fingerprint
             })
             .with_context(|| {
                 format!(
-                    "effective validation node `{}` has no current passed evidence",
-                    node.id
+                    "effective validation node `{}` has no current {} evidence",
+                    node.id,
+                    if infrastructure_partial {
+                        "process observation"
+                    } else {
+                        "passed"
+                    }
                 )
             })?;
         results.push(ValidationResult {
             id: evidence.gate_id.clone(),
             command: evidence.command.clone(),
-            status: "passed".into(),
+            status: match evidence.status {
+                ValidationEvidenceStatus::Passed => "passed",
+                ValidationEvidenceStatus::Failed => "failed",
+                ValidationEvidenceStatus::TimedOut => "timed_out",
+                ValidationEvidenceStatus::Cancelled => "cancelled",
+                ValidationEvidenceStatus::Running | ValidationEvidenceStatus::Superseded => {
+                    unreachable!("restored validation evidence must be terminal")
+                }
+            }
+            .into(),
             output: evidence.output_summary.clone(),
         });
     }
@@ -21161,6 +21195,10 @@ mod tests {
                 outcome: MissionOutcome::PartialReviewable,
                 detail: "validation process timed out after its model-free retry".into(),
             });
+        let restored = restored_validation_results_from_snapshot(&snapshot)
+            .expect("partial infrastructure recovery restores the timeout observation");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].status, "timed_out");
 
         let mut notebook = new_worker_notebook(&manifest, repository_fingerprint.clone(), None);
         notebook.phase = ExecutionPhase::Repair;
@@ -21264,6 +21302,10 @@ mod tests {
         let result = result.1.expect("validated recovery should publish");
         assert!(draft_requested);
         assert_eq!(result.completeness.status, CompletionStatus::Partial);
+        assert_eq!(
+            result.completeness.verification_readiness,
+            VerificationReadiness::PendingManualReview
+        );
         assert_eq!(result.pull_request.number, 226);
         assert!(
             agent
