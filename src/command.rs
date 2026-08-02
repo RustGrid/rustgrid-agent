@@ -587,6 +587,14 @@ fn capture_cancellable_with_containment(
             .lock()
             .map(|last| last.elapsed())
             .unwrap_or_default();
+        // A short-lived command may complete between polling ticks, especially
+        // on a loaded macOS runner. Observe terminal state before classifying
+        // the same tick as idle so completed work is never reported as an
+        // inactivity timeout merely because the polling interval crossed the
+        // configured boundary.
+        if let Some(status) = child.try_wait().context("failed while checking command")? {
+            break status;
+        }
         if inactivity_timeout
             .is_some_and(|limit| started.elapsed() >= limit && last_output_age >= limit)
         {
@@ -610,9 +618,6 @@ fn capture_cancellable_with_containment(
                 last_output_age,
                 bytes_emitted: current_bytes,
             });
-        }
-        if let Some(status) = child.try_wait().context("failed while checking command")? {
-            break status;
         }
         thread::sleep(Duration::from_millis(250));
     };

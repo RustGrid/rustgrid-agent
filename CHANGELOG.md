@@ -37,6 +37,9 @@ Semantic Versioning.
 - Report action-aware no-progress diagnostics including the active target,
   calls, read paths, cache-eligible duplicates, and mutation tools offered and
   invoked.
+- Observe a repository command's completed process state before applying its
+  inactivity deadline so a short-lived command cannot be misclassified as idle
+  when a slower runner crosses the polling boundary.
 
 ## 1.4.27 - 2026-08-02
 
