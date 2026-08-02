@@ -139,11 +139,16 @@ pub(super) enum ValidationGateType {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ValidationStatus {
+    Pending,
+    Ready,
     Running,
     Passed,
-    Failed,
+    #[serde(alias = "failed")]
+    FailedCode,
+    FailedInfrastructure,
     TimedOut,
     Cancelled,
+    Skipped,
     Superseded,
 }
 

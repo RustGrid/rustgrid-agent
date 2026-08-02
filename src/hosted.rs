@@ -2303,6 +2303,21 @@ struct PersistedCompletionArtifact {
     evaluation: CompletionEvaluation,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DependencyBootstrapStatus {
+    Passed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct DependencyBootstrapEvidence {
+    command: String,
+    lock_hash: String,
+    repository_fingerprint: String,
+    completed_at: String,
+    status: DependencyBootstrapStatus,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct WorkerNotebook {
     schema_version: u32,
@@ -2367,6 +2382,8 @@ struct WorkerNotebook {
     validation_evidence: Vec<ValidationEvidence>,
     #[serde(default)]
     required_gates: Vec<RequiredGate>,
+    #[serde(default)]
+    dependency_bootstrap_evidence: Option<DependencyBootstrapEvidence>,
     #[serde(default)]
     phase_budget: Value,
     #[serde(default)]
@@ -3048,6 +3065,7 @@ fn new_worker_notebook(
         validation_failures: Vec::new(),
         validation_evidence: Vec::new(),
         required_gates: Vec::new(),
+        dependency_bootstrap_evidence: None,
         phase_budget: Value::Null,
         last_successful_action: json!({}),
         last_orchestration_decision_key: None,
@@ -5482,10 +5500,21 @@ fn run_hosted_execution(
             )?;
         }
         agent.ensure_active_or_checkpoint_cancellation()?;
-        let bootstrap_result =
-            bootstrap_hosted_dependencies(api, manifest, &repo, running, &containment);
+        let bootstrap_result = bootstrap_hosted_dependencies(
+            api,
+            manifest,
+            &repo,
+            running,
+            &containment,
+            agent.notebook.dependency_bootstrap_evidence.as_ref(),
+        );
         agent.ensure_active_or_checkpoint_cancellation()?;
-        bootstrap_result?;
+        let bootstrap_evidence = bootstrap_result?;
+        if let Some(evidence) = bootstrap_evidence {
+            agent.notebook.dependency_bootstrap_evidence = Some(evidence);
+            agent.notebook.orchestration.dependency_bootstrap_completed = true;
+            agent.persist_orchestration_checkpoint("dependency_bootstrap_completed", false)?;
+        }
         if startup.mode == StartupMode::FreshRun {
             agent
                 .initialize_fresh_execution_snapshot(&startup, resumed)
@@ -6096,8 +6125,27 @@ fn run_hosted_execution(
     match execution_result {
         Ok(result) => Ok(result),
         Err(error)
-            if is_hosted_orchestration_invariant_error(&error)
-                && startup.mode == StartupMode::RecoveryPublicationRun =>
+            if (is_hosted_orchestration_invariant_error(&error)
+                && startup.mode == StartupMode::RecoveryPublicationRun)
+                || agent
+                    .notebook
+                    .orchestration
+                    .snapshot(
+                        manifest.execution.execution_id.to_string(),
+                        crate::execution_graph::RepositorySnapshot {
+                            fingerprint: agent.notebook.repository_fingerprint.clone(),
+                            source_tree_hash: agent.notebook.repository_fingerprint.clone(),
+                            changed_paths: completion_changed_paths(
+                                &repo,
+                                &manifest.github.base_sha,
+                            )
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                            ..crate::execution_graph::RepositorySnapshot::default()
+                        },
+                    )
+                    .has_partial_reviewable_guardrail() =>
         {
             let recovery = attempt_safe_recovery_publication(
                 &mut agent,
@@ -6206,8 +6254,8 @@ const fn validation_entry_allows_gates(decision: ValidationEntryDecision) -> boo
 
 fn validation_failure_category(status: &str) -> Option<crate::execution_graph::FailureCategory> {
     match status {
-        "cancelled" => None,
-        "infrastructure_failed" => {
+        "cancelled" | "pending" | "ready" | "skipped" | "superseded" => None,
+        "infrastructure_failed" | "timed_out" => {
             Some(crate::execution_graph::FailureCategory::InfrastructureFailure)
         }
         _ => Some(crate::execution_graph::FailureCategory::ValidationFailure),
@@ -6264,7 +6312,18 @@ fn authorize_recovery_publication(
     if snapshot.cancellation.is_some() {
         bail!("recovery publication is forbidden after cancellation was requested");
     }
-    if snapshot
+    let partial_infrastructure = snapshot.has_partial_reviewable_guardrail()
+        && snapshot
+            .failures
+            .unresolved()
+            .all(|failure| failure.category == FailureCategory::InfrastructureFailure)
+        && snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_mutation())
+            .all(|node| node.status.satisfies_dependency());
+    if (snapshot
         .failures
         .unresolved()
         .any(|failure| failure.category == FailureCategory::InfrastructureFailure)
@@ -6276,7 +6335,8 @@ fn authorize_recovery_publication(
                     ..
                 }
             )
-        })
+        }))
+        && !partial_infrastructure
     {
         bail!("recovery publication is forbidden after an infrastructure failure");
     }
@@ -6306,11 +6366,11 @@ fn authorize_recovery_publication(
         .filter(|node| node.required && node.kind.is_validation())
         .filter_map(|node| node.validation.as_ref().map(|gate| gate.gate_id.clone()))
         .collect::<BTreeSet<_>>();
-    if graph_gate_ids != required_gate_ids {
-        bail!("recovery publication validation graph does not exactly match required hosted gates");
+    if !required_gate_ids.is_subset(&graph_gate_ids) {
+        bail!("recovery publication validation graph omits a required hosted gate");
     }
     let validation_evidence_ids = snapshot
-        .current_required_validation_evidence_ids()
+        .recovery_publication_validation_evidence_ids()
         .map_err(|error| {
             anyhow!("recovery publication validation proof is not current: {error}")
         })?;
@@ -6459,7 +6519,9 @@ fn recovery_publication_no_op(
     startup_mode: StartupMode,
     snapshot: &crate::execution_graph::ExecutionSnapshot,
 ) -> Option<RecoveryPublicationResult> {
-    if startup_mode != StartupMode::RecoveryPublicationRun {
+    if startup_mode != StartupMode::RecoveryPublicationRun
+        && !snapshot.has_partial_reviewable_guardrail()
+    {
         Some(RecoveryPublicationResult::NotApplicable)
     } else if !snapshot.current_repository.has_changes() {
         Some(RecoveryPublicationResult::SkippedNoDiff)
@@ -6575,7 +6637,10 @@ fn attempt_safe_recovery_publication_with(
         running,
         startup_mode,
     } = context;
-    if startup_mode != StartupMode::RecoveryPublicationRun {
+    let snapshot = agent.build_execution_snapshot()?;
+    if startup_mode != StartupMode::RecoveryPublicationRun
+        && !snapshot.has_partial_reviewable_guardrail()
+    {
         agent.append_event_recoverable(
             "progress",
             json!({
@@ -6595,7 +6660,6 @@ fn attempt_safe_recovery_publication_with(
     if !recovery_execution_is_active(running) {
         return Ok((RecoveryPublicationResult::NotApplicable, None));
     }
-    let snapshot = agent.build_execution_snapshot()?;
     if recovery_publication_no_op(startup_mode, &snapshot)
         == Some(RecoveryPublicationResult::SkippedNoDiff)
     {
@@ -6909,12 +6973,16 @@ fn canonical_validation_evidence_status(
     status: ValidationStatus,
 ) -> crate::execution_graph::ValidationEvidenceStatus {
     match status {
-        ValidationStatus::Running => crate::execution_graph::ValidationEvidenceStatus::Running,
+        ValidationStatus::Pending | ValidationStatus::Ready | ValidationStatus::Running => {
+            crate::execution_graph::ValidationEvidenceStatus::Running
+        }
         ValidationStatus::Passed => crate::execution_graph::ValidationEvidenceStatus::Passed,
-        ValidationStatus::Failed => crate::execution_graph::ValidationEvidenceStatus::Failed,
-        ValidationStatus::TimedOut => crate::execution_graph::ValidationEvidenceStatus::TimedOut,
+        ValidationStatus::FailedCode => crate::execution_graph::ValidationEvidenceStatus::Failed,
+        ValidationStatus::FailedInfrastructure | ValidationStatus::TimedOut => {
+            crate::execution_graph::ValidationEvidenceStatus::TimedOut
+        }
         ValidationStatus::Cancelled => crate::execution_graph::ValidationEvidenceStatus::Cancelled,
-        ValidationStatus::Superseded => {
+        ValidationStatus::Skipped | ValidationStatus::Superseded => {
             crate::execution_graph::ValidationEvidenceStatus::Superseded
         }
     }
@@ -6993,10 +7061,19 @@ fn run_graph_validation_sequence(
     validation_round: u32,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::<ValidationResult>::new();
-    let maximum_steps = manifest
-        .execution_policy
-        .quality_gates
-        .len()
+    let maximum_steps = agent
+        .notebook
+        .orchestration
+        .graph
+        .as_ref()
+        .map(|graph| {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.required && node.kind.is_validation())
+                .count()
+        })
+        .unwrap_or_else(|| manifest.execution_policy.quality_gates.len())
         .saturating_add(1);
     for _ in 0..maximum_steps {
         let reconciled = agent.reconcile_execution_and_apply()?;
@@ -7017,7 +7094,23 @@ fn run_graph_validation_sequence(
         policy
             .quality_gates
             .retain(|candidate| candidate.id == gate.gate_id);
-        if policy.quality_gates.len() != 1 {
+        if policy.quality_gates.is_empty()
+            && gate.gate_type == crate::execution_graph::ValidationGateType::FocusedTest
+        {
+            policy.quality_gates.push(HostedQualityGate {
+                id: gate.gate_id.clone(),
+                command: gate.command.clone(),
+                timeout_seconds: i64::try_from(
+                    crate::execution_graph::ValidationTimeoutPolicy::for_gate(
+                        crate::execution_graph::ValidationGateType::FocusedTest,
+                    )
+                    .absolute_timeout
+                    .as_secs(),
+                )
+                .unwrap_or(120),
+                required: true,
+            });
+        } else if policy.quality_gates.len() != 1 {
             bail!(
                 "execution graph selected unknown validation gate `{}`",
                 gate.gate_id
@@ -7182,6 +7275,35 @@ fn run_graph_validation_sequence(
         agent.checkpoint_validation_ledger()?;
         agent.ensure_active_or_checkpoint_cancellation()?;
         if results.iter().any(|result| result.status != "passed") {
+            if let Some(graph) = agent.notebook.orchestration.graph.as_ref() {
+                for pending in graph
+                    .nodes
+                    .iter()
+                    .filter(|node| node.required && node.kind.is_validation())
+                {
+                    let Some(pending_gate) = pending.validation.as_ref() else {
+                        continue;
+                    };
+                    if results
+                        .iter()
+                        .any(|result| result.id == pending_gate.gate_id)
+                    {
+                        continue;
+                    }
+                    results.push(ValidationResult {
+                        id: pending_gate.gate_id.clone(),
+                        command: pending_gate.command.clone(),
+                        status: match pending.status {
+                            crate::execution_graph::ExecutionNodeStatus::Ready => "ready",
+                            crate::execution_graph::ExecutionNodeStatus::Skipped => "skipped",
+                            crate::execution_graph::ExecutionNodeStatus::Superseded => "superseded",
+                            _ => "pending",
+                        }
+                        .into(),
+                        output: "Validation gate has not started.".into(),
+                    });
+                }
+            }
             return Ok(results);
         }
     }
@@ -10124,9 +10246,9 @@ impl<'a> GatewayAgent<'a> {
         detail: &str,
     ) -> Result<()> {
         let (node_id, target_path) = match self.current_decision.as_ref() {
-            Some(ExecutionDecision::ExecuteTarget { node_id, target }) => {
-                (node_id.clone(), Some(target.target.path.clone()))
-            }
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id, target, ..
+            }) => (node_id.clone(), Some(target.target.path.clone())),
             Some(ExecutionDecision::RepairTarget {
                 node_id, context, ..
             }) => (node_id.clone(), Some(context.target.target.path.clone())),
@@ -11143,14 +11265,56 @@ impl<'a> GatewayAgent<'a> {
         attempt: usize,
     ) -> Result<ImplementationOutcome> {
         self.record_validation_failures(failures, attempt)?;
-        if failures
-            .iter()
-            .any(|failure| failure.status == "infrastructure_failed")
-        {
+        if failures.iter().any(|failure| {
+            matches!(
+                failure.status.as_str(),
+                "infrastructure_failed" | "timed_out"
+            )
+        }) {
+            let changed_paths =
+                completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+            let all_mutations_applied =
+                self.notebook
+                    .orchestration
+                    .graph
+                    .as_ref()
+                    .is_some_and(|graph| {
+                        graph
+                            .nodes
+                            .iter()
+                            .filter(|node| node.required && node.kind.is_mutation())
+                            .all(|node| node.status.satisfies_dependency())
+                    });
+            if !changed_paths.is_empty() && all_mutations_applied {
+                self.record_partial_reviewable_handoff(
+                    crate::execution_graph::GuardrailReason::InfrastructureFailure,
+                    "required validation remained incomplete after one model-free infrastructure retry; preserve the applied diff for draft review",
+                )?;
+                self.persist_orchestration_checkpoint(
+                    "validation_infrastructure_partial_reviewable",
+                    true,
+                )?;
+                let timed_out = failures.iter().any(|failure| failure.status == "timed_out");
+                return Err(self.execution_failure(
+                    if timed_out {
+                        "validation_process_timeout"
+                    } else {
+                        "validation_infrastructure_failure"
+                    },
+                    "Worker-owned validation did not produce a code assertion result after its infrastructure retry.",
+                    None,
+                    true,
+                    "Resume at the incomplete validation node; the applied repository diff is preserved in a draft pull request.",
+                ));
+            }
             self.finalize_guardrail_outcome(OrchestratedMissionOutcome::FailedInfrastructure)?;
             self.persist_orchestration_checkpoint("validation_infrastructure_failure", true)?;
             return Err(self.execution_failure(
-                "validation_infrastructure_failure",
+                if failures.iter().any(|failure| failure.status == "timed_out") {
+                    "validation_process_timeout"
+                } else {
+                    "validation_infrastructure_failure"
+                },
                 "Worker-owned validation could not complete because its process or duration infrastructure failed.",
                 None,
                 true,
@@ -14462,6 +14626,7 @@ struct ModelActionProfile {
     max_output_tokens: u64,
     reasoning_effort: &'static str,
     forced_tool: Option<&'static str>,
+    require_tool: bool,
 }
 
 impl ModelActionProfile {
@@ -14471,12 +14636,31 @@ impl ModelActionProfile {
         configured_max_output_tokens: u64,
     ) -> Self {
         match decision {
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::InspectTarget,
+                ..
+            }) => Self {
+                max_output_tokens: configured_max_output_tokens.min(4_096),
+                reasoning_effort: "low",
+                forced_tool: None,
+                require_tool: true,
+            },
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::MutateTarget,
+                ..
+            }) => Self {
+                max_output_tokens: configured_max_output_tokens.min(8_192),
+                reasoning_effort: "medium",
+                forced_tool: None,
+                require_tool: true,
+            },
             Some(ExecutionDecision::ContinueDiscovery {
                 action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
             }) => Self {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
                 forced_tool: None,
+                require_tool: false,
             },
             Some(ExecutionDecision::ContinueDiscovery {
                 action:
@@ -14486,6 +14670,7 @@ impl ModelActionProfile {
                 max_output_tokens: configured_max_output_tokens.min(2_048),
                 reasoning_effort: "low",
                 forced_tool: Some("record_impact_map"),
+                require_tool: true,
             },
             Some(ExecutionDecision::ContinuePlanning {
                 action: crate::hosted_orchestrator::PlanningAction::BuildPlan { .. },
@@ -14493,6 +14678,7 @@ impl ModelActionProfile {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
                 forced_tool: Some("record_implementation_plan"),
+                require_tool: true,
             },
             Some(ExecutionDecision::ContinuePlanning {
                 action: crate::hosted_orchestrator::PlanningAction::RepairPlan { .. },
@@ -14500,6 +14686,7 @@ impl ModelActionProfile {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "low",
                 forced_tool: Some("record_implementation_plan"),
+                require_tool: true,
             },
             Some(ExecutionDecision::ContinuePlanning {
                 action: crate::hosted_orchestrator::PlanningAction::ResolveEvidenceGap { .. },
@@ -14507,6 +14694,7 @@ impl ModelActionProfile {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
                 forced_tool: None,
+                require_tool: false,
             },
             _ => Self {
                 max_output_tokens: configured_max_output_tokens.min(match phase {
@@ -14521,13 +14709,20 @@ impl ModelActionProfile {
                 },
                 forced_tool: (phase == ExecutionPhase::ArtifactRepair)
                     .then_some("record_impact_map"),
+                require_tool: phase == ExecutionPhase::ArtifactRepair,
             },
         }
     }
 
     fn tool_choice(self) -> Value {
         self.forced_tool.map_or_else(
-            || json!("auto"),
+            || {
+                if self.require_tool {
+                    json!("required")
+                } else {
+                    json!("auto")
+                }
+            },
             |name| json!({"type": "function", "name": name}),
         )
     }
@@ -14562,6 +14757,25 @@ fn hosted_tools_for_action(
         Some(ExecutionDecision::ContinuePlanning {
             action: crate::hosted_orchestrator::PlanningAction::ResolveEvidenceGap { .. },
         }) => Some(&["read_file", "read_files", "search_text", "related_tests"][..]),
+        Some(ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::InspectTarget,
+            ..
+        }) => Some(&["read_file", "read_files", "search_text"][..]),
+        Some(ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::MutateTarget,
+            ..
+        }) => Some(
+            &[
+                "write_file",
+                "replace_text",
+                "replace_range",
+                "insert_after_symbol",
+                "insert_before_symbol",
+                "apply_unified_diff",
+                "rewrite_small_file",
+                "delete_file",
+            ][..],
+        ),
         _ => None,
     };
     let tools = hosted_tools_for_phase(phase);
@@ -14946,10 +15160,32 @@ fn bootstrap_hosted_dependencies(
     repo: &Repo,
     running: &Arc<AtomicBool>,
     containment: &command::HostedProcessContainment,
-) -> Result<()> {
+    existing: Option<&DependencyBootstrapEvidence>,
+) -> Result<Option<DependencyBootstrapEvidence>> {
     let Some((manager, command_text)) = hosted_dependency_bootstrap(&repo.root) else {
-        return Ok(());
+        return Ok(None);
     };
+    let lock_hash = dependency_lock_fingerprint(&repo.root)?;
+    let repository_fingerprint = repository_state_fingerprint(repo, &manifest.github.base_sha)?;
+    if existing.is_some_and(|evidence| {
+        evidence.command == command_text
+            && evidence.lock_hash == lock_hash
+            && evidence.repository_fingerprint == repository_fingerprint
+            && evidence.status == DependencyBootstrapStatus::Passed
+    }) {
+        api.append_event(
+            "progress",
+            json!({
+                "step": "dependency_bootstrap",
+                "status": "reused",
+                "manager": manager,
+                "command": command_text,
+                "lock_hash": lock_hash,
+                "repository_fingerprint": repository_fingerprint,
+            }),
+        )?;
+        return Ok(existing.cloned());
+    }
     api.append_event(
         "progress",
         json!({
@@ -14964,11 +15200,7 @@ fn bootstrap_hosted_dependencies(
         command_text,
         &repo.root,
         running,
-        Duration::from_secs(
-            u64::try_from(manifest.execution_policy.timeout_seconds)
-                .unwrap_or(1)
-                .min(1_800),
-        ),
+        crate::execution_graph::ValidationTimeoutPolicy::dependency_install().absolute_timeout,
         2 * 1024 * 1024,
         Some(&allowlist),
         None,
@@ -14988,7 +15220,13 @@ fn bootstrap_hosted_dependencies(
             "manager": manager
         }),
     )?;
-    Ok(())
+    Ok(Some(DependencyBootstrapEvidence {
+        command: command_text.into(),
+        lock_hash,
+        repository_fingerprint,
+        completed_at: now_rfc3339(),
+        status: DependencyBootstrapStatus::Passed,
+    }))
 }
 
 fn hosted_dependency_bootstrap(root: &Path) -> Option<(&'static str, &'static str)> {
@@ -15050,15 +15288,53 @@ fn run_quality_gates(
         execution_started_at,
         execution_limit,
         |command_text, cwd, running, timeout, max_output_bytes, environment_allowlist, limits| {
-            command::capture_hosted_cancellable_with_environment(
+            let gate_type = policy
+                .quality_gates
+                .iter()
+                .find(|gate| gate.command == command_text)
+                .map_or(ValidationGateType::Custom, |gate| {
+                    classify_validation_gate(&gate.id, &gate.command)
+                });
+            let timeout_policy =
+                validation_timeout_policy(gate_type, command_text).clamped_to(timeout);
+            let node_id = policy
+                .quality_gates
+                .iter()
+                .find(|gate| gate.command == command_text)
+                .map(|gate| gate.id.as_str())
+                .unwrap_or("unknown-validation-node");
+            let mut activity = |observation: command::CommandActivity| {
+                record_validation_observability(
+                    "validation process activity event",
+                    api.append_event(
+                        "validation",
+                        json!({
+                            "event_type": "worker.validation_process_activity",
+                            "node_id": node_id,
+                            "command": command_text,
+                            "gate_type": gate_type,
+                            "current_elapsed_ms": observation.elapsed.as_millis(),
+                            "last_output_age_ms": observation.last_output_age.as_millis(),
+                            "last_output_at_elapsed_ms": observation.elapsed.saturating_sub(observation.last_output_age).as_millis(),
+                            "bytes_emitted": observation.bytes_emitted,
+                            "configured_execution_timeout_ms": timeout_policy.execution_timeout.as_millis(),
+                            "configured_inactivity_timeout_ms": timeout_policy.inactivity_timeout.map(|value| value.as_millis()),
+                            "configured_absolute_timeout_ms": timeout_policy.absolute_timeout.as_millis(),
+                        }),
+                    ),
+                );
+            };
+            command::capture_hosted_cancellable_observed_with_environment(
                 command_text,
                 cwd,
                 running,
-                timeout,
+                timeout_policy.absolute_timeout,
+                timeout_policy.inactivity_timeout,
                 max_output_bytes,
                 environment_allowlist,
                 limits,
                 containment,
+                &mut activity,
             )
         },
     )
@@ -15115,24 +15391,17 @@ where
         .iter()
         .filter(|gate| gate.required)
         .collect::<Vec<_>>();
-    ordered_gates.sort_by_key(|gate| {
-        usize::from(
-            classify_validation_gate(&gate.id, &gate.command) != ValidationGateType::FocusedTest,
-        )
-    });
+    ordered_gates.sort_by_cached_key(|gate| validation_gate_order_key(&gate.id, &gate.command));
     for gate in ordered_gates {
         ensure_running(running)?;
-        let validation_remaining = validation_duration_limit
+        let scheduling_remaining = validation_duration_limit
             .checked_sub(validation_started_at.elapsed())
             .filter(|remaining| !remaining.is_zero());
         let execution_remaining = execution_limit
             .min(MAX_HOSTED_EXECUTION_DURATION)
             .checked_sub(execution_started_at.elapsed())
             .filter(|remaining| !remaining.is_zero());
-        let Some(validation_remaining) = validation_remaining
-            .zip(execution_remaining)
-            .map(|(validation, execution)| validation.min(execution))
-        else {
+        let Some(execution_remaining) = execution_remaining else {
             record_validation_observability(
                 "validation wall-clock event",
                 api.append_event(
@@ -15169,6 +15438,16 @@ where
             &environment_fingerprint,
         );
         let gate_type = classify_validation_gate(&gate.id, &gate.command);
+        if scheduling_remaining.is_none() {
+            results.push(ValidationResult {
+                id: gate.id.clone(),
+                command: gate.command.clone(),
+                status: "timed_out".into(),
+                output: "Validation node scheduling deadline elapsed before the process started."
+                    .into(),
+            });
+            break;
+        }
         if let Some(evidence) = passed_evidence(ledger, &fingerprint).cloned() {
             usage.deduplicated_validations = usage.deduplicated_validations.saturating_add(1);
             record_validation_observability(
@@ -15211,7 +15490,7 @@ where
             .rev()
             .find(|evidence| {
                 evidence.command_fingerprint == fingerprint
-                    && evidence.status == ValidationStatus::Failed
+                    && evidence.status == ValidationStatus::FailedCode
             })
             .cloned()
         {
@@ -15244,7 +15523,8 @@ where
                 id: gate.id.clone(),
                 command: gate.command.clone(),
                 status: match evidence.status {
-                    ValidationStatus::TimedOut => "infrastructure_failed".into(),
+                    ValidationStatus::TimedOut => "timed_out".into(),
+                    ValidationStatus::FailedInfrastructure => "infrastructure_failed".into(),
                     ValidationStatus::Cancelled => "cancelled".into(),
                     _ => "failed".into(),
                 },
@@ -15280,9 +15560,16 @@ where
             api.append_event(
                 "validation",
                 json!({
+                    "event_type": "worker.validation_process_started",
+                    "node_id": gate.id,
                     "gate_id": gate.id,
                     "command": gate.command,
-                    "status": "running"
+                    "gate_type": gate_type,
+                    "status": "running",
+                    "process_started_at": phase_started_at,
+                    "repository_fingerprint": source_tree_hash,
+                    "configured_timeouts": validation_timeout_policy(gate_type, &gate.command),
+                    "retry_count": 0,
                 }),
             ),
         );
@@ -15303,16 +15590,47 @@ where
             dependency_lock_hash,
             ValidationSource::WorkerRequired,
         ));
-        let output = capture(
-            &gate.command,
-            &repo.root,
-            running,
-            Duration::from_secs(u64::try_from(gate.timeout_seconds).unwrap_or(1))
-                .min(validation_remaining),
-            2 * 1024 * 1024,
-            Some(&allowlist),
-            None,
-        );
+        let timeout_policy =
+            validation_timeout_policy(gate_type, &gate.command).clamped_to(execution_remaining);
+        let mut retry_count = 0_u32;
+        let output = loop {
+            let output = capture(
+                &gate.command,
+                &repo.root,
+                running,
+                timeout_policy.absolute_timeout,
+                2 * 1024 * 1024,
+                Some(&allowlist),
+                None,
+            );
+            if output.is_ok() || retry_count > 0 || !running.load(Ordering::SeqCst) {
+                break output;
+            }
+            let remaining_after_failure = execution_limit
+                .min(MAX_HOSTED_EXECUTION_DURATION)
+                .saturating_sub(execution_started_at.elapsed());
+            if remaining_after_failure < timeout_policy.absolute_timeout {
+                break output;
+            }
+            retry_count = 1;
+            record_validation_observability(
+                "validation retry event",
+                api.append_event(
+                    "validation",
+                    json!({
+                        "event_type": "worker.validation_retry_scheduled",
+                        "node_id": gate.id,
+                        "gate_id": gate.id,
+                        "command": gate.command,
+                        "gate_type": gate_type,
+                        "repository_fingerprint": source_tree_hash,
+                        "retry_count": retry_count,
+                        "model_call_required": false,
+                        "configured_timeouts": timeout_policy,
+                    }),
+                ),
+            );
+        };
         let (result, evidence_status, exit_code, stdout, stderr) = match output {
             Ok(output) => {
                 let combined = format!("{}\n{}", output.stdout, output.stderr);
@@ -15331,7 +15649,7 @@ where
                     if passed {
                         ValidationStatus::Passed
                     } else {
-                        ValidationStatus::Failed
+                        ValidationStatus::FailedCode
                     },
                     output.status.code(),
                     output.stdout,
@@ -15339,14 +15657,37 @@ where
                 )
             }
             Err(error) => {
-                let message = truncate_text(&format!("{error:#}"), 16_000);
+                let raw_message = truncate_text(&format!("{error:#}"), 12_000);
                 let cancelled = !running.load(Ordering::SeqCst) || shutdown::requested();
+                let timed_out = command::is_timeout(&error);
+                let message = truncate_text(
+                    &format!(
+                        "{raw_message}\ncode={}\ngate_id={}\ngate_type={gate_type:?}\nconfigured_execution_timeout_ms={}\nconfigured_inactivity_timeout_ms={:?}\nconfigured_absolute_timeout_ms={}\nelapsed_ms={}\nrepository_fingerprint={}\nretry_count={}\nretry_eligible=false",
+                        if timed_out {
+                            "validation_process_timeout"
+                        } else {
+                            "validation_process_infrastructure_failure"
+                        },
+                        gate.id,
+                        timeout_policy.execution_timeout.as_millis(),
+                        timeout_policy
+                            .inactivity_timeout
+                            .map(|value| value.as_millis()),
+                        timeout_policy.absolute_timeout.as_millis(),
+                        started.elapsed().as_millis(),
+                        source_tree_hash,
+                        retry_count,
+                    ),
+                    16_000,
+                );
                 (
                     ValidationResult {
                         id: gate.id.clone(),
                         command: gate.command.clone(),
                         status: if cancelled {
                             "cancelled".into()
+                        } else if timed_out {
+                            "timed_out".into()
                         } else {
                             "infrastructure_failed".into()
                         },
@@ -15354,11 +15695,10 @@ where
                     },
                     if cancelled {
                         ValidationStatus::Cancelled
-                    } else {
-                        // The legacy ledger's timed-out state is its
-                        // non-domain-failure bucket. The structured failure
-                        // taxonomy separately records InfrastructureFailure.
+                    } else if timed_out {
                         ValidationStatus::TimedOut
+                    } else {
+                        ValidationStatus::FailedInfrastructure
                     },
                     None,
                     String::new(),
@@ -15416,10 +15756,22 @@ where
                     "status": result.status,
                     "output": result.output,
                     "execution_id": manifest.execution.execution_id
-                    ,"event_type": "worker.validation_completed"
+                    ,"event_type": if result.status == "timed_out" {
+                        "worker.validation_process_timed_out"
+                    } else {
+                        "worker.validation_process_completed"
+                    }
                     ,"evidence_id": evidence_id
+                    ,"node_id": gate.id
                     ,"command_fingerprint": fingerprint
                     ,"source_tree_hash": source_tree_hash
+                    ,"gate_type": gate_type
+                    ,"elapsed_ms": started.elapsed().as_millis()
+                    ,"process_started_at": phase_started_at
+                    ,"process_completed_at": phase_completed_at
+                    ,"exit_code": exit_code
+                    ,"retry_count": retry_count
+                    ,"configured_timeouts": timeout_policy
                 }),
             ),
         );
@@ -15453,6 +15805,75 @@ fn classify_validation_gate(id: &str, command: &str) -> ValidationGateType {
     } else {
         ValidationGateType::Custom
     }
+}
+
+fn validation_timeout_policy(
+    gate_type: ValidationGateType,
+    command: &str,
+) -> crate::execution_graph::ValidationTimeoutPolicy {
+    if is_dependency_install_command(command) {
+        crate::execution_graph::ValidationTimeoutPolicy::dependency_install()
+    } else {
+        let graph_type = match gate_type {
+            ValidationGateType::FocusedTest => {
+                crate::execution_graph::ValidationGateType::FocusedTest
+            }
+            ValidationGateType::TestSuite => crate::execution_graph::ValidationGateType::TestSuite,
+            ValidationGateType::Build => crate::execution_graph::ValidationGateType::Build,
+            ValidationGateType::Lint => crate::execution_graph::ValidationGateType::Lint,
+            ValidationGateType::Typecheck => crate::execution_graph::ValidationGateType::Typecheck,
+            ValidationGateType::Custom => crate::execution_graph::ValidationGateType::Custom,
+        };
+        crate::execution_graph::ValidationTimeoutPolicy::for_gate(graph_type)
+    }
+}
+
+fn is_dependency_install_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    [
+        "npm ci",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "bun install",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn validation_gate_order_key(id: &str, command: &str) -> (u8, String, String) {
+    let gate_type = classify_validation_gate(id, command);
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let browser_e2e = ["playwright", "cypress", "browser", " e2e"]
+        .iter()
+        .any(|needle| normalized.contains(needle));
+    let class = if is_dependency_install_command(command) {
+        0
+    } else if gate_type == ValidationGateType::FocusedTest {
+        1
+    } else if matches!(
+        gate_type,
+        ValidationGateType::Lint | ValidationGateType::Typecheck
+    ) {
+        2
+    } else if gate_type == ValidationGateType::TestSuite && !browser_e2e {
+        3
+    } else if gate_type == ValidationGateType::Build {
+        4
+    } else if browser_e2e {
+        5
+    } else {
+        6
+    };
+    (class, id.to_owned(), normalized)
 }
 
 fn dependency_lock_fingerprint(root: &Path) -> Result<String> {
@@ -16413,18 +16834,41 @@ fn hosted_pull_request_body(
     let checks = validation
         .iter()
         .map(|result| {
-            format!(
-                "- {} `{}`",
-                if result.status == "passed" {
-                    "✅"
-                } else {
-                    "❌"
-                },
-                result.command
-            )
+            let icon = match result.status.as_str() {
+                "passed" => "✅",
+                "failed" | "failed_code" => "❌",
+                _ => "⏳",
+            };
+            format!("- {} `{}`", icon, result.command)
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let infrastructure_incomplete = validation
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.status.as_str(),
+                "timed_out" | "infrastructure_failed" | "pending" | "ready"
+            )
+        })
+        .map(|result| {
+            if result.status == "timed_out" {
+                format!("- {} timed out: {}", result.command, result.output)
+            } else if result.status == "infrastructure_failed" {
+                format!("- {} could not complete: {}", result.command, result.output)
+            } else {
+                format!("- {} not yet run", result.command)
+            }
+        })
+        .collect::<Vec<_>>();
+    let infrastructure_notice = if infrastructure_incomplete.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Validation incomplete due to worker infrastructure:\n{}\n\nNo test failure was observed because the incomplete command did not produce an assertion result.\n\n",
+            infrastructure_incomplete.join("\n")
+        )
+    };
     let completeness_heading = match completeness.status {
         CompletionStatus::Complete => "Implementation completeness: **complete**",
         CompletionStatus::CompletePendingExternalReview => {
@@ -16523,7 +16967,7 @@ Criterion evidence:\n{}\n\n\
 Remaining implementation work:\n{}\n\n\
 Remaining automated verification:\n{}\n\n\
 External review checklist:\n{}\n\n\
-Optional follow-up:\n{}\n\n{}Technical validation:\n{}\n\n\
+Optional follow-up:\n{}\n\n{}{}Technical validation:\n{}\n\n\
 _The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
         completeness_heading,
         external_review_notice,
@@ -16548,6 +16992,7 @@ _The OpenAI credential remained encrypted in RustGrid and was never sent to this
         review_checklist,
         render_items(&completeness.optional_follow_up),
         partial_summary,
+        infrastructure_notice,
         if checks.is_empty() {
             "- No required validation commands configured.".into()
         } else {
@@ -20102,6 +20547,10 @@ mod tests {
             Some(crate::execution_graph::FailureCategory::InfrastructureFailure)
         );
         assert_eq!(
+            validation_failure_category("timed_out"),
+            Some(crate::execution_graph::FailureCategory::InfrastructureFailure)
+        );
+        assert_eq!(
             validation_failure_category("failed"),
             Some(crate::execution_graph::FailureCategory::ValidationFailure)
         );
@@ -20113,6 +20562,90 @@ mod tests {
             .expect("validation duration guard result");
         let timeout_result = &source[timeout_message.saturating_sub(300)..timeout_message];
         assert!(timeout_result.contains("infrastructure_failed"));
+    }
+
+    #[test]
+    fn one_validation_infrastructure_retry_runs_without_a_model_call() {
+        let directory = tempfile::tempdir().unwrap();
+        command::checked("git", ["init", "-q"], directory.path()).unwrap();
+        command::checked("git", ["config", "user.name", "Test"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            ["config", "user.email", "test@example.com"],
+            directory.path(),
+        )
+        .unwrap();
+        fs::write(directory.path().join("fixture.txt"), "fixture\n").unwrap();
+        command::checked("git", ["add", "fixture.txt"], directory.path()).unwrap();
+        command::checked(
+            "git",
+            [
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+            directory.path(),
+        )
+        .unwrap();
+        let execution_id = Uuid::from_u128(0xa0228);
+        let mut manifest = test_manifest(execution_id);
+        manifest.github.base_sha =
+            command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+        let Some((api_root, requests, server)) = request_sequence_server(
+            std::iter::repeat_with(|| ("200 OK", json!({})))
+                .take(5)
+                .collect(),
+        ) else {
+            return;
+        };
+        let api = test_api_client(api_root, execution_id);
+        let repo = Repo {
+            root: directory.path().to_path_buf(),
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut ledger = Vec::new();
+        let mut required_gates = Vec::new();
+        let mut usage = ToolUsage::default();
+        let results = run_quality_gates_with_capture(
+            &api,
+            &manifest,
+            &repo,
+            &running,
+            &manifest.execution_policy,
+            1,
+            &mut ledger,
+            &mut required_gates,
+            &mut usage,
+            Instant::now(),
+            MAX_HOSTED_EXECUTION_DURATION,
+            Instant::now(),
+            MAX_HOSTED_EXECUTION_DURATION,
+            |_, _, _, _, _, _, _| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(anyhow!(command::CommandFailure::TimedOut { seconds: 1 }))
+                } else {
+                    Ok(command::CommandOutput {
+                        status: std::process::Command::new("true").status()?,
+                        stdout: "passed after refreshed process capacity".into(),
+                        stderr: String::new(),
+                    })
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(results[0].status, "passed");
+        assert_eq!(usage.validation_commands, 1);
+        server.join().unwrap();
+        let delivered = requests.try_iter().collect::<Vec<_>>();
+        assert!(delivered.iter().any(|request| {
+            request.contains("worker.validation_retry_scheduled")
+                && request.contains("model_call_required")
+        }));
     }
 
     #[test]
@@ -20236,7 +20769,7 @@ mod tests {
         let mut evidence = EvidenceStore::default();
         evidence.record_validation(ValidationEvidenceRecord {
             evidence_id: evidence_id.clone(),
-            node_id: validation_node.id,
+            node_id: validation_node.id.clone(),
             gate_id: gate.gate_id.clone(),
             fingerprint: gate.fingerprint(&repository_fingerprint),
             repository_fingerprint: repository_fingerprint.clone(),
@@ -20375,6 +20908,29 @@ mod tests {
         ));
         assert!(authorize_recovery_publication(&infrastructure, &manifest).is_err());
         infrastructure
+            .events
+            .push(ExecutionDomainEvent::GuardrailTriggered {
+                sequence: 1,
+                reason: crate::execution_graph::GuardrailReason::InfrastructureFailure,
+                outcome: MissionOutcome::PartialReviewable,
+                detail: "validation process timed out after its model-free retry".into(),
+            });
+        let partial_authorization = authorize_recovery_publication(&infrastructure, &manifest)
+            .expect(
+                "applied diffs with only validation infrastructure incomplete are draft-publishable",
+            );
+        assert!(
+            infrastructure
+                .append_event(ExecutionDomainEvent::RecoveryPublicationRequested {
+                    sequence: 2,
+                    node_id: partial_authorization.publication_node_id,
+                    repository_fingerprint: partial_authorization.repository_fingerprint,
+                    validation_evidence_ids: partial_authorization.validation_evidence_ids,
+                })
+                .is_ok(),
+            "applied diffs with only validation infrastructure incomplete are draft-publishable"
+        );
+        infrastructure
             .failures
             .mark_recovered(&infrastructure_failure_id, "recovered-tree");
         assert!(authorize_recovery_publication(&infrastructure, &manifest).is_ok());
@@ -20426,14 +20982,14 @@ mod tests {
     }
 
     #[test]
-    fn authorized_recovery_commits_pushes_draft_pr_and_finishes_partial() {
+    fn fresh_run_infrastructure_timeout_publishes_draft_and_finishes_partial() {
         use crate::execution_graph::{
             BudgetState, EvidenceStore, ExecutionDomainEvent, ExecutionNodeKind,
-            ExecutionNodeStatus, ExecutionSnapshot, MissionBudget, MissionComplexity,
-            MissionOutcome, PlannedTarget as GraphTarget, PublicationMode, PublicationStatus,
-            RepositorySnapshot, ValidationEvidenceRecord, ValidationEvidenceStatus,
-            ValidationGateSpec, ValidationGateType as GraphValidationGateType,
-            build_execution_graph,
+            ExecutionNodeStatus, ExecutionSnapshot, FailureCategory, FailureId, FailureRecord,
+            GuardrailReason, MissionBudget, MissionComplexity, MissionOutcome,
+            PlannedTarget as GraphTarget, PublicationMode, PublicationStatus, RepositorySnapshot,
+            ValidationEvidenceRecord, ValidationEvidenceStatus, ValidationGateSpec,
+            ValidationGateType as GraphValidationGateType, build_execution_graph,
         };
 
         let work = tempfile::tempdir().unwrap();
@@ -20543,7 +21099,7 @@ mod tests {
                     ExecutionNodeStatus::Completed
                 }
                 kind if kind.is_mutation() => ExecutionNodeStatus::Applied,
-                kind if kind.is_validation() => ExecutionNodeStatus::Passed,
+                kind if kind.is_validation() => ExecutionNodeStatus::FailedRecoverable,
                 _ => ExecutionNodeStatus::Pending,
             };
         }
@@ -20564,18 +21120,19 @@ mod tests {
         let mut evidence = EvidenceStore::default();
         evidence.record_validation(ValidationEvidenceRecord {
             evidence_id,
-            node_id: validation_node.id,
+            node_id: validation_node.id.clone(),
             gate_id: gate.gate_id.clone(),
             fingerprint: gate.fingerprint(&repository_fingerprint),
             repository_fingerprint: repository_fingerprint.clone(),
             command: gate.command.clone(),
             working_directory: gate.working_directory.clone(),
-            status: ValidationEvidenceStatus::Passed,
-            exit_code: Some(0),
-            output_summary: "all recovery validation passed".into(),
+            status: ValidationEvidenceStatus::TimedOut,
+            exit_code: None,
+            output_summary: "validation process timed out after its model-free retry".into(),
             duration: Duration::from_millis(1),
         });
-        let snapshot = ExecutionSnapshot {
+        let failure_id = FailureId::new("production-validation-timeout");
+        let mut snapshot = ExecutionSnapshot {
             run_id: "production-recovery-run".into(),
             current_repository: RepositorySnapshot {
                 fingerprint: repository_fingerprint.clone(),
@@ -20588,6 +21145,22 @@ mod tests {
             budget: BudgetState::new(budget),
             ..ExecutionSnapshot::default()
         };
+        snapshot.failures.records.push(FailureRecord::new(
+            failure_id,
+            validation_node.id,
+            FailureCategory::InfrastructureFailure,
+            1,
+            repository_fingerprint.clone(),
+            "validation process timed out after its model-free retry",
+        ));
+        snapshot
+            .events
+            .push(ExecutionDomainEvent::GuardrailTriggered {
+                sequence: 1,
+                reason: GuardrailReason::InfrastructureFailure,
+                outcome: MissionOutcome::PartialReviewable,
+                detail: "validation process timed out after its model-free retry".into(),
+            });
 
         let mut notebook = new_worker_notebook(&manifest, repository_fingerprint.clone(), None);
         notebook.phase = ExecutionPhase::Repair;
@@ -20642,7 +21215,7 @@ mod tests {
             baseline: &BTreeSet::new(),
             containment: &containment,
             running: &running,
-            startup_mode: StartupMode::RecoveryPublicationRun,
+            startup_mode: StartupMode::FreshRun,
         };
         let mut draft_requested = false;
         let result = attempt_safe_recovery_publication_with(
@@ -20669,7 +21242,7 @@ mod tests {
             },
             |validation, completeness| {
                 draft_requested = true;
-                assert!(validation.iter().all(|gate| gate.status == "passed"));
+                assert!(validation.iter().all(|gate| gate.status == "timed_out"));
                 assert_eq!(completeness.status, CompletionStatus::Partial);
                 assert!(
                     completeness
@@ -21974,8 +22547,7 @@ mod tests {
         assert_eq!(required_gates.len(), 1);
         assert_eq!(required_gates[0].gate_type, ValidationGateType::FocusedTest);
         let observed_timeout = observed_timeouts.lock().unwrap()[0];
-        assert!(observed_timeout <= Duration::from_secs(17));
-        assert!(observed_timeout > Duration::from_secs(16));
+        assert_eq!(observed_timeout, Duration::from_secs(120));
         server.join().unwrap();
         assert_eq!(requests.try_iter().count(), 4);
     }
@@ -25677,9 +26249,22 @@ it("defines every semantic token for light-blue without conflating primary and i
         assert!(!snapshot.failures.has_unresolved());
 
         match reconcile_execution(&snapshot).unwrap() {
-            ExecutionDecision::ExecuteTarget { node_id, target } => {
+            ExecutionDecision::ExecuteTarget {
+                node_id,
+                action,
+                target,
+            } => {
                 assert_eq!(node_id, mutation_nodes[1]);
                 assert_eq!(target.target.path, paths[1]);
+                assert_eq!(
+                    action,
+                    crate::hosted_orchestrator::MutationAction::InspectTarget
+                );
+                assert!(target.allowed_tools.iter().all(|tool| matches!(
+                    tool,
+                    crate::execution_graph::ToolKind::ReadFile
+                        | crate::execution_graph::ToolKind::SearchRepository
+                )));
             }
             decision => panic!(
                 "already-applied production preflight must advance to target two, got {decision:?}"
@@ -26195,6 +26780,7 @@ Implement theme support.\n\n\
             validation_failures: vec![],
             validation_evidence: vec![],
             required_gates: vec![],
+            dependency_bootstrap_evidence: None,
             phase_budget: json!({}),
             last_successful_action: json!({"tool": "read_file"}),
             last_orchestration_decision_key: None,
@@ -26873,6 +27459,7 @@ Implement theme support.\n\n\
             validation_failures: vec![],
             validation_evidence: vec![],
             required_gates: vec![],
+            dependency_bootstrap_evidence: None,
             phase_budget: json!({}),
             last_successful_action: json!({"tool": "read_files"}),
             last_orchestration_decision_key: None,

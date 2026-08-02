@@ -48,6 +48,10 @@ pub(super) struct HostedOrchestrationCheckpoint {
     /// false, allowing exactly one migration pass on resume.
     #[serde(default)]
     pub(super) legacy_import_completed: bool,
+    /// True only after the locked startup dependency installation completed
+    /// for the current repository/lock state.
+    #[serde(default)]
+    pub(super) dependency_bootstrap_completed: bool,
     pub(super) domain_events: Vec<ExecutionDomainEvent>,
     pub(super) evidence: EvidenceStore,
     pub(super) failures: FailureStore,
@@ -468,7 +472,11 @@ impl HostedOrchestrationCheckpoint {
         repository_fingerprint: &str,
     ) -> &ComplexityAssessment {
         let targets = canonical_plan_targets(plan);
-        let validation_gates = canonical_validation_gates(manifest);
+        let validation_gates = canonical_validation_gates_for_targets(
+            manifest,
+            &targets,
+            self.dependency_bootstrap_completed,
+        );
         let input = complexity_input(&targets, &validation_gates);
         let assessment = complexity_assessment(manifest, &input);
         let mut graph = ExecutionGraph::from_targets(
@@ -532,7 +540,13 @@ impl HostedOrchestrationCheckpoint {
         }
 
         let topology_changed = self.graph.as_ref().is_some_and(|graph| {
-            !graph_matches_plan_topology(graph, manifest, plan, repository_fingerprint)
+            !graph_matches_plan_topology(
+                graph,
+                manifest,
+                plan,
+                repository_fingerprint,
+                self.dependency_bootstrap_completed,
+            )
         });
         if stale_revision || topology_changed {
             self.reconcile_plan_topology(manifest, plan, repository_fingerprint);
@@ -551,7 +565,11 @@ impl HostedOrchestrationCheckpoint {
         repository_fingerprint: &str,
     ) -> &ComplexityAssessment {
         let targets = canonical_plan_targets(plan);
-        let validation_gates = canonical_validation_gates(manifest);
+        let validation_gates = canonical_validation_gates_for_targets(
+            manifest,
+            &targets,
+            self.dependency_bootstrap_completed,
+        );
         let input = complexity_input(&targets, &validation_gates);
         let assessment = complexity_assessment(manifest, &input);
         let mut replacement = ExecutionGraph::from_targets(
@@ -1164,9 +1182,11 @@ fn graph_matches_plan_topology(
     manifest: &HostedManifest,
     plan: &ImplementationPlan,
     repository_fingerprint: &str,
+    dependency_bootstrap_completed: bool,
 ) -> bool {
     let targets = canonical_plan_targets(plan);
-    let validation_gates = canonical_validation_gates(manifest);
+    let validation_gates =
+        canonical_validation_gates_for_targets(manifest, &targets, dependency_bootstrap_completed);
     let assessment =
         complexity_assessment(manifest, &complexity_input(&targets, &validation_gates));
     let expected = ExecutionGraph::from_targets(
@@ -1463,13 +1483,28 @@ pub(super) fn canonical_plan_targets(plan: &ImplementationPlan) -> Vec<GraphPlan
     targets
 }
 
+#[cfg(test)]
 pub(super) fn canonical_validation_gates(
     manifest: &HostedManifest,
 ) -> Vec<GraphValidationGateSpec> {
+    canonical_validation_gates_for_targets(manifest, &[], true)
+}
+
+fn canonical_validation_gates_for_targets(
+    manifest: &HostedManifest,
+    targets: &[GraphPlannedTarget],
+    dependency_bootstrap_completed: bool,
+) -> Vec<GraphValidationGateSpec> {
+    let dependency_changed = targets.iter().any(|target| dependency_path(&target.path));
     let mut gates = manifest
         .execution_policy
         .quality_gates
         .iter()
+        .filter(|gate| {
+            dependency_changed
+                || !dependency_bootstrap_completed
+                || !is_dependency_install_command(&gate.command)
+        })
         .map(|gate| GraphValidationGateSpec {
             gate_id: gate.id.clone(),
             gate_type: infer_validation_gate_type(&gate.id, &gate.command),
@@ -1480,8 +1515,79 @@ pub(super) fn canonical_validation_gates(
             relevant_environment_fingerprint: String::new(),
         })
         .collect::<Vec<_>>();
+    let has_vitest_suite = gates.iter().any(|gate| {
+        gate.gate_type == GraphValidationGateType::TestSuite
+            && (gate.command.to_ascii_lowercase().contains("vitest")
+                || gate.command.to_ascii_lowercase().starts_with("npm test"))
+    });
+    if has_vitest_suite {
+        for target in targets.iter().filter(|target| {
+            !target.new_file && target.is_test_target() && is_vitest_test_path(&target.path)
+        }) {
+            let gate_id = format!("focused-{}", focused_gate_label(&target.path));
+            if gates.iter().any(|gate| gate.gate_id == gate_id) {
+                continue;
+            }
+            gates.push(GraphValidationGateSpec {
+                gate_id,
+                gate_type: GraphValidationGateType::FocusedTest,
+                command: format!("npx vitest run {}", target.path),
+                working_directory: String::new(),
+                required: true,
+                dependency_lock_hash: String::new(),
+                relevant_environment_fingerprint: String::new(),
+            });
+        }
+    }
     normalize_validation_gate_order(&mut gates);
     gates
+}
+
+fn is_dependency_install_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    [
+        "npm ci",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "bun install",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+}
+
+fn is_vitest_test_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [
+        ".test.ts",
+        ".test.tsx",
+        ".spec.ts",
+        ".spec.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".spec.js",
+        ".spec.jsx",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+}
+
+fn focused_gate_label(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_ascii_lowercase()
 }
 
 pub(super) fn mission_outcome_from_completion(status: CompletionStatus) -> MissionOutcome {
@@ -1897,12 +2003,18 @@ fn stable_failure_id(failure: &ToolFailureRecord, node_id: &ExecutionNodeId) -> 
 
 const fn graph_validation_status(status: ValidationStatus) -> ValidationEvidenceStatus {
     match status {
-        ValidationStatus::Running => ValidationEvidenceStatus::Running,
         ValidationStatus::Passed => ValidationEvidenceStatus::Passed,
-        ValidationStatus::Failed => ValidationEvidenceStatus::Failed,
-        ValidationStatus::TimedOut => ValidationEvidenceStatus::TimedOut,
+        ValidationStatus::FailedCode => ValidationEvidenceStatus::Failed,
+        ValidationStatus::FailedInfrastructure | ValidationStatus::TimedOut => {
+            ValidationEvidenceStatus::TimedOut
+        }
         ValidationStatus::Cancelled => ValidationEvidenceStatus::Cancelled,
-        ValidationStatus::Superseded => ValidationEvidenceStatus::Superseded,
+        ValidationStatus::Skipped | ValidationStatus::Superseded => {
+            ValidationEvidenceStatus::Superseded
+        }
+        ValidationStatus::Pending | ValidationStatus::Ready | ValidationStatus::Running => {
+            ValidationEvidenceStatus::Running
+        }
     }
 }
 
@@ -1910,7 +2022,7 @@ const fn legacy_validation_status(status: ValidationEvidenceStatus) -> Validatio
     match status {
         ValidationEvidenceStatus::Running => ValidationStatus::Running,
         ValidationEvidenceStatus::Passed => ValidationStatus::Passed,
-        ValidationEvidenceStatus::Failed => ValidationStatus::Failed,
+        ValidationEvidenceStatus::Failed => ValidationStatus::FailedCode,
         ValidationEvidenceStatus::TimedOut => ValidationStatus::TimedOut,
         ValidationEvidenceStatus::Cancelled => ValidationStatus::Cancelled,
         ValidationEvidenceStatus::Superseded => ValidationStatus::Superseded,
@@ -1920,15 +2032,14 @@ const fn legacy_validation_status(status: ValidationEvidenceStatus) -> Validatio
 const fn legacy_validation_status_from_node(status: ExecutionNodeStatus) -> ValidationStatus {
     match status {
         ExecutionNodeStatus::Passed | ExecutionNodeStatus::Completed => ValidationStatus::Passed,
-        ExecutionNodeStatus::FailedRecoverable => ValidationStatus::Failed,
-        ExecutionNodeStatus::FailedBlocking => ValidationStatus::Cancelled,
-        ExecutionNodeStatus::Superseded | ExecutionNodeStatus::Skipped => {
-            ValidationStatus::Superseded
-        }
-        ExecutionNodeStatus::Pending
-        | ExecutionNodeStatus::Ready
-        | ExecutionNodeStatus::Running
-        | ExecutionNodeStatus::Applied => ValidationStatus::Running,
+        ExecutionNodeStatus::FailedRecoverable => ValidationStatus::FailedCode,
+        ExecutionNodeStatus::FailedBlocking => ValidationStatus::FailedInfrastructure,
+        ExecutionNodeStatus::Superseded => ValidationStatus::Superseded,
+        ExecutionNodeStatus::Skipped => ValidationStatus::Skipped,
+        ExecutionNodeStatus::Pending => ValidationStatus::Pending,
+        ExecutionNodeStatus::Ready => ValidationStatus::Ready,
+        ExecutionNodeStatus::Running => ValidationStatus::Running,
+        ExecutionNodeStatus::Applied => ValidationStatus::Passed,
     }
 }
 
@@ -2139,10 +2250,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "focused",
-                "suite",
-                "build",
                 "lint-z",
                 "typecheck-a",
+                "suite",
+                "build",
                 "custom",
             ]
         );
@@ -2153,12 +2264,102 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 GraphValidationGateType::FocusedTest,
-                GraphValidationGateType::TestSuite,
-                GraphValidationGateType::Build,
                 GraphValidationGateType::Lint,
                 GraphValidationGateType::Typecheck,
+                GraphValidationGateType::TestSuite,
+                GraphValidationGateType::Build,
                 GraphValidationGateType::Custom,
             ]
+        );
+    }
+
+    #[test]
+    fn existing_vitest_target_inserts_focused_gate_before_broad_validation() {
+        let mut manifest = hosted_manifest();
+        manifest.execution_policy.quality_gates[0].id = "test".into();
+        manifest.execution_policy.quality_gates[0].command = "npm test".into();
+        let targets = vec![GraphPlannedTarget {
+            change_id: "theme-test".into(),
+            path: "tests/theme-provider.test.tsx".into(),
+            role: "test".into(),
+            intent: "cover theme selection".into(),
+            acceptance_criteria_ids: vec!["ac-1".into()],
+            new_file: false,
+        }];
+        let gates = canonical_validation_gates_for_targets(&manifest, &targets, true);
+        assert_eq!(gates.len(), 2);
+        assert_eq!(gates[0].gate_type, GraphValidationGateType::FocusedTest);
+        assert_eq!(
+            gates[0].command,
+            "npx vitest run tests/theme-provider.test.tsx"
+        );
+        assert_eq!(gates[1].gate_type, GraphValidationGateType::TestSuite);
+    }
+
+    #[test]
+    fn startup_bootstrap_suppresses_redundant_install_unless_dependencies_change() {
+        let mut manifest = hosted_manifest();
+        let mut install = manifest.execution_policy.quality_gates[0].clone();
+        install.id = "install".into();
+        install.command = "npm ci --maxsockets=1".into();
+        manifest.execution_policy.quality_gates.push(install);
+        let source = GraphPlannedTarget {
+            change_id: "theme".into(),
+            path: "src/theme.tsx".into(),
+            role: "source".into(),
+            intent: "update theme".into(),
+            acceptance_criteria_ids: vec![],
+            new_file: false,
+        };
+        let gates =
+            canonical_validation_gates_for_targets(&manifest, std::slice::from_ref(&source), true);
+        assert!(!gates.iter().any(|gate| gate.gate_id == "install"));
+
+        let gates =
+            canonical_validation_gates_for_targets(&manifest, std::slice::from_ref(&source), false);
+        assert!(gates.iter().any(|gate| gate.gate_id == "install"));
+
+        let mut dependency = source;
+        dependency.path = "package-lock.json".into();
+        let gates = canonical_validation_gates_for_targets(&manifest, &[dependency], true);
+        assert_eq!(gates[0].gate_id, "install");
+    }
+
+    #[test]
+    fn unstarted_required_gates_materialize_as_ready_or_pending_never_running() {
+        let target = target("theme", "src/theme.tsx", "production");
+        let mut suite = gate();
+        suite.gate_id = "suite".into();
+        let mut build = gate();
+        build.gate_id = "build".into();
+        build.gate_type = GraphValidationGateType::Build;
+        build.command = "cargo build".into();
+        let mut graph = ExecutionGraph::from_targets(
+            "gate-statuses",
+            MissionComplexity::Small,
+            "tree-1",
+            std::slice::from_ref(&target),
+            &[suite, build],
+            &MissionBudget::for_complexity(MissionComplexity::Small),
+        );
+        let mutation_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_mutation())
+            .unwrap()
+            .id
+            .clone();
+        graph
+            .set_node_status(&mutation_id, ExecutionNodeStatus::Applied)
+            .unwrap();
+        graph.refresh_readiness();
+        let statuses = materialize_required_gates(&graph, &EvidenceStore::default())
+            .into_iter()
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [ValidationStatus::Ready, ValidationStatus::Pending]
         );
     }
 
@@ -2691,7 +2892,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: 42,
                 exit_code: Some(1),
-                status: ValidationStatus::Failed,
+                status: ValidationStatus::FailedCode,
                 stdout_summary: "one test failed".to_owned(),
                 stderr_summary: String::new(),
                 source: ValidationSource::ResumeReused,
@@ -2704,7 +2905,7 @@ mod tests {
                 gate_type: ValidationGateType::TestSuite,
                 required: true,
                 command: "cargo test".to_owned(),
-                status: ValidationStatus::Failed,
+                status: ValidationStatus::FailedCode,
                 evidence_id: Some("validation-tests".to_owned()),
             }]
         );
@@ -2820,7 +3021,7 @@ mod tests {
             ["canonical-validation-failure: canonical failure output"]
         );
         assert_eq!(canonical_evidence.len(), 1);
-        assert_eq!(canonical_evidence[0].status, ValidationStatus::Failed);
+        assert_eq!(canonical_evidence[0].status, ValidationStatus::FailedCode);
         assert_eq!(
             canonical_evidence[0].stdout_summary,
             "canonical failure output"

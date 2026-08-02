@@ -573,6 +573,79 @@ pub struct ValidationGateSpec {
     pub relevant_environment_fingerprint: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationTimeoutPolicy {
+    #[serde(with = "duration_millis")]
+    pub startup_grace: Duration,
+    #[serde(with = "duration_millis")]
+    pub execution_timeout: Duration,
+    #[serde(default, with = "optional_duration_millis")]
+    pub inactivity_timeout: Option<Duration>,
+    #[serde(with = "duration_millis")]
+    pub absolute_timeout: Duration,
+}
+
+impl ValidationTimeoutPolicy {
+    pub fn for_gate(gate_type: ValidationGateType) -> Self {
+        let (execution_seconds, absolute_seconds) = match gate_type {
+            ValidationGateType::FocusedTest => (90, 120),
+            ValidationGateType::TestSuite => (240, 300),
+            ValidationGateType::Build => (180, 240),
+            ValidationGateType::Lint | ValidationGateType::Typecheck => (120, 180),
+            ValidationGateType::Custom => (120, 180),
+        };
+        Self {
+            startup_grace: Duration::from_secs(15),
+            execution_timeout: Duration::from_secs(execution_seconds),
+            inactivity_timeout: Some(Duration::from_secs(execution_seconds)),
+            absolute_timeout: Duration::from_secs(absolute_seconds),
+        }
+    }
+
+    pub fn dependency_install() -> Self {
+        Self {
+            startup_grace: Duration::from_secs(30),
+            execution_timeout: Duration::from_secs(300),
+            inactivity_timeout: Some(Duration::from_secs(300)),
+            absolute_timeout: Duration::from_secs(360),
+        }
+    }
+
+    pub fn clamped_to(&self, remaining: Duration) -> Self {
+        Self {
+            startup_grace: self.startup_grace.min(remaining),
+            execution_timeout: self.execution_timeout.min(remaining),
+            inactivity_timeout: self.inactivity_timeout.map(|value| value.min(remaining)),
+            absolute_timeout: self.absolute_timeout.min(remaining),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRetryPolicy {
+    Never,
+    TransientInfrastructureOnce,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationNodeBudget {
+    #[serde(with = "duration_millis")]
+    pub scheduling_deadline: Duration,
+    pub process_timeout: ValidationTimeoutPolicy,
+    pub retry_policy: ValidationRetryPolicy,
+}
+
+impl ValidationNodeBudget {
+    pub fn for_gate(gate_type: ValidationGateType, scheduling_deadline: Duration) -> Self {
+        Self {
+            scheduling_deadline,
+            process_timeout: ValidationTimeoutPolicy::for_gate(gate_type),
+            retry_policy: ValidationRetryPolicy::TransientInfrastructureOnce,
+        }
+    }
+}
+
 impl ValidationGateSpec {
     pub fn fingerprint(&self, repository_fingerprint: &str) -> String {
         validation_fingerprint(
@@ -601,12 +674,36 @@ impl ValidationGateSpec {
 /// order in which an otherwise equivalent manifest supplied its gates.
 pub fn normalize_validation_gate_order(gates: &mut [ValidationGateSpec]) {
     gates.sort_by_cached_key(|gate| {
-        let class = match gate.gate_type {
-            ValidationGateType::FocusedTest => 0_u8,
-            ValidationGateType::TestSuite => 1,
-            ValidationGateType::Build => 2,
-            ValidationGateType::Lint | ValidationGateType::Typecheck => 3,
-            ValidationGateType::Custom => 4,
+        let normalized = normalize_command(&gate.command).to_ascii_lowercase();
+        let dependency_install = [
+            "npm ci",
+            "npm install",
+            "pnpm install",
+            "yarn install",
+            "bun install",
+        ]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix));
+        let browser_e2e = ["playwright", "cypress", "browser", " e2e"]
+            .iter()
+            .any(|needle| normalized.contains(needle));
+        let class = if dependency_install {
+            0_u8
+        } else if gate.gate_type == ValidationGateType::FocusedTest {
+            1
+        } else if matches!(
+            gate.gate_type,
+            ValidationGateType::Lint | ValidationGateType::Typecheck
+        ) {
+            2
+        } else if gate.gate_type == ValidationGateType::TestSuite && !browser_e2e {
+            3
+        } else if gate.gate_type == ValidationGateType::Build {
+            4
+        } else if browser_e2e {
+            5
+        } else {
+            6
         };
         (
             class,
@@ -3823,6 +3920,61 @@ impl ExecutionSnapshot {
         Ok(evidence_ids.into_iter().collect())
     }
 
+    /// Returns either complete validation proof or, for the explicit
+    /// partial-reviewable infrastructure route, the current observations that
+    /// explain why validation is incomplete. Unstarted gates intentionally
+    /// contribute no fabricated evidence.
+    pub fn recovery_publication_validation_evidence_ids(
+        &self,
+    ) -> Result<Vec<String>, GraphInvariantError> {
+        let infrastructure_partial = self.has_partial_reviewable_guardrail()
+            && self.failures.unresolved().next().is_some()
+            && self
+                .failures
+                .unresolved()
+                .all(|failure| failure.category == FailureCategory::InfrastructureFailure)
+            && self
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.required && node.kind.is_mutation())
+                .all(|node| node.status.satisfies_dependency());
+        if !infrastructure_partial {
+            return self.current_required_validation_evidence_ids();
+        }
+
+        let graph_gate_ids = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_validation())
+            .filter_map(|node| node.validation.as_ref().map(|gate| gate.gate_id.clone()))
+            .collect::<BTreeSet<_>>();
+        let evidence_ids = self
+            .evidence
+            .validations
+            .iter()
+            .filter(|(_, evidence)| {
+                evidence.repository_fingerprint == self.current_repository.fingerprint
+                    && graph_gate_ids.contains(&evidence.gate_id)
+                    && matches!(
+                        evidence.status,
+                        ValidationEvidenceStatus::Passed
+                            | ValidationEvidenceStatus::Failed
+                            | ValidationEvidenceStatus::TimedOut
+                            | ValidationEvidenceStatus::Cancelled
+                    )
+            })
+            .map(|(evidence_id, _)| evidence_id.clone())
+            .collect::<Vec<_>>();
+        if evidence_ids.is_empty() {
+            return Err(GraphInvariantError::new(
+                "partial recovery publication requires a current validation process observation",
+            ));
+        }
+        Ok(evidence_ids)
+    }
+
     /// Returns the canonical complete set of validation proof invalidated when
     /// finalization is rebound to a new repository observation.
     pub fn finalization_validation_evidence_ids(&self) -> Vec<String> {
@@ -4233,6 +4385,20 @@ impl ExecutionSnapshot {
             } => {
                 self.cancellation = None;
                 if *previous_outcome == Some(MissionOutcome::PartialReviewable) {
+                    let infrastructure_failure_ids = self
+                        .failures
+                        .unresolved()
+                        .filter(|failure| {
+                            failure.category == FailureCategory::InfrastructureFailure
+                        })
+                        .map(|failure| failure.id.clone())
+                        .collect::<Vec<_>>();
+                    for failure_id in infrastructure_failure_ids {
+                        self.failures.mark_recovered(
+                            &failure_id,
+                            self.current_repository.fingerprint.clone(),
+                        );
+                    }
                     self.publication.status = PublicationStatus::NotStarted;
                     self.publication.mode = None;
                     self.publication.commit_sha = None;
@@ -4368,7 +4534,7 @@ impl ExecutionSnapshot {
                         "recovery publication cannot replace completed publication",
                     ));
                 }
-                let expected = self.current_required_validation_evidence_ids()?;
+                let expected = self.recovery_publication_validation_evidence_ids()?;
                 if validation_evidence_ids != &expected {
                     return Err(GraphInvariantError::new(format!(
                         "recovery publication validation evidence ids must exactly match {:?}",
@@ -5345,11 +5511,11 @@ mod tests {
             vec![
                 "focused-a",
                 "focused-z",
+                "lint-z",
+                "typecheck-a",
                 "suite-a",
                 "suite-z",
                 "build",
-                "lint-z",
-                "typecheck-a",
                 "custom",
             ]
         );
@@ -5379,6 +5545,32 @@ mod tests {
             canonical_projection(&reversed_graph),
             "equivalent gate sets must not produce manifest-order-dependent topology"
         );
+    }
+
+    #[test]
+    fn validation_process_budgets_are_independent_from_node_scheduling_budgets() {
+        let suite =
+            ValidationNodeBudget::for_gate(ValidationGateType::TestSuite, Duration::from_secs(74));
+        assert_eq!(suite.scheduling_deadline, Duration::from_secs(74));
+        assert_eq!(
+            suite.process_timeout.execution_timeout,
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            suite.process_timeout.absolute_timeout,
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            suite.retry_policy,
+            ValidationRetryPolicy::TransientInfrastructureOnce
+        );
+
+        let focused = ValidationTimeoutPolicy::for_gate(ValidationGateType::FocusedTest);
+        assert_eq!(focused.execution_timeout, Duration::from_secs(90));
+        assert_eq!(focused.absolute_timeout, Duration::from_secs(120));
+        let install = ValidationTimeoutPolicy::dependency_install();
+        assert_eq!(install.execution_timeout, Duration::from_secs(300));
+        assert_eq!(install.absolute_timeout, Duration::from_secs(360));
     }
 
     #[test]

@@ -82,6 +82,14 @@ pub struct TargetRepairContext {
     pub next_repair_attempt: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationAction {
+    #[default]
+    InspectTarget,
+    MutateTarget,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum ExecutionDecision {
@@ -93,6 +101,8 @@ pub enum ExecutionDecision {
     },
     ExecuteTarget {
         node_id: ExecutionNodeId,
+        #[serde(default)]
+        action: MutationAction,
         target: TargetExecutionContext,
     },
     RepairTarget {
@@ -468,7 +478,7 @@ fn decision_for_node(
                 let failure = unresolved_failure_for_node(snapshot, &node.id)?;
                 repair_target_decision(snapshot, node, failure)
             } else {
-                let target = snapshot.target_execution_context(
+                let mut target = snapshot.target_execution_context(
                     &node.id,
                     vec![
                         ToolKind::ReadFile,
@@ -479,8 +489,26 @@ fn decision_for_node(
                         ToolKind::RunFocusedCommand,
                     ],
                 )?;
+                let action = if !target.target.new_file && target.current_file_content.is_none() {
+                    target.allowed_tools.retain(|tool| {
+                        matches!(tool, ToolKind::ReadFile | ToolKind::SearchRepository)
+                    });
+                    MutationAction::InspectTarget
+                } else {
+                    target.allowed_tools.retain(|tool| {
+                        matches!(
+                            tool,
+                            ToolKind::ApplyPatch
+                                | ToolKind::CreateFile
+                                | ToolKind::DeleteFile
+                                | ToolKind::RunFocusedCommand
+                        )
+                    });
+                    MutationAction::MutateTarget
+                };
                 Ok(ExecutionDecision::ExecuteTarget {
                     node_id: node.id.clone(),
+                    action,
                     target,
                 })
             }

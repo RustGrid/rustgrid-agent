@@ -4,8 +4,8 @@ use std::{
     path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
     thread,
@@ -26,6 +26,13 @@ pub struct CommandOutput {
     pub status: ExitStatus,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CommandActivity {
+    pub elapsed: Duration,
+    pub last_output_age: Duration,
+    pub bytes_emitted: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -429,6 +436,8 @@ pub fn capture_cancellable_with_environment(
         environment_allowlist,
         limits,
         None,
+        None,
+        &mut |_| {},
     )
 }
 
@@ -452,6 +461,35 @@ pub fn capture_hosted_cancellable_with_environment(
         environment_allowlist,
         limits,
         Some(containment),
+        None,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn capture_hosted_cancellable_observed_with_environment(
+    command: &str,
+    cwd: &Path,
+    running: &AtomicBool,
+    absolute_timeout: Duration,
+    inactivity_timeout: Option<Duration>,
+    max_output_bytes: usize,
+    environment_allowlist: Option<&[String]>,
+    limits: Option<ChildLimits>,
+    containment: &HostedProcessContainment,
+    on_activity: &mut dyn FnMut(CommandActivity),
+) -> Result<CommandOutput> {
+    capture_cancellable_with_containment(
+        command,
+        cwd,
+        running,
+        absolute_timeout,
+        max_output_bytes,
+        environment_allowlist,
+        limits,
+        Some(containment),
+        inactivity_timeout,
+        on_activity,
     )
 }
 
@@ -465,6 +503,8 @@ fn capture_cancellable_with_containment(
     environment_allowlist: Option<&[String]>,
     limits: Option<ChildLimits>,
     containment: Option<&HostedProcessContainment>,
+    inactivity_timeout: Option<Duration>,
+    on_activity: &mut dyn FnMut(CommandActivity),
 ) -> Result<CommandOutput> {
     if containment.is_some() && environment_allowlist.is_none() {
         bail!("hosted repository commands require an explicit environment allowlist");
@@ -500,9 +540,31 @@ fn capture_cancellable_with_containment(
         .take()
         .context("failed to capture command stderr")?;
     let stream_limit = max_output_bytes / 2;
-    let stdout_reader = thread::spawn(move || read_bounded(&mut stdout, stream_limit));
-    let stderr_reader = thread::spawn(move || read_bounded(&mut stderr, stream_limit));
+    let bytes_emitted = Arc::new(AtomicU64::new(0));
+    let last_output_at = Arc::new(Mutex::new(std::time::Instant::now()));
+    let stdout_bytes = Arc::clone(&bytes_emitted);
+    let stdout_last_output = Arc::clone(&last_output_at);
+    let stderr_bytes = Arc::clone(&bytes_emitted);
+    let stderr_last_output = Arc::clone(&last_output_at);
+    let stdout_reader = thread::spawn(move || {
+        read_bounded_observed(
+            &mut stdout,
+            stream_limit,
+            &stdout_bytes,
+            &stdout_last_output,
+        )
+    });
+    let stderr_reader = thread::spawn(move || {
+        read_bounded_observed(
+            &mut stderr,
+            stream_limit,
+            &stderr_bytes,
+            &stderr_last_output,
+        )
+    });
     let started = std::time::Instant::now();
+    let mut observed_bytes = 0;
+    let mut last_activity_report = None::<std::time::Instant>;
     let status = loop {
         if !running.load(Ordering::SeqCst) || shutdown::requested() {
             terminate_command(&mut child, containment)?;
@@ -520,6 +582,34 @@ fn capture_cancellable_with_containment(
                 seconds: timeout.as_secs(),
             }
             .into());
+        }
+        let last_output_age = last_output_at
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default();
+        if inactivity_timeout
+            .is_some_and(|limit| started.elapsed() >= limit && last_output_age >= limit)
+        {
+            terminate_command(&mut child, containment)?;
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(CommandFailure::IdleTimedOut {
+                seconds: inactivity_timeout.unwrap_or_default().as_secs(),
+            }
+            .into());
+        }
+        let current_bytes = bytes_emitted.load(Ordering::Relaxed);
+        if current_bytes != observed_bytes
+            && last_activity_report.is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            observed_bytes = current_bytes;
+            last_activity_report = Some(std::time::Instant::now());
+            on_activity(CommandActivity {
+                elapsed: started.elapsed(),
+                last_output_age,
+                bytes_emitted: current_bytes,
+            });
         }
         if let Some(status) = child.try_wait().context("failed while checking command")? {
             break status;
@@ -1237,6 +1327,39 @@ fn read_bounded(reader: &mut impl Read, limit: usize) -> std::io::Result<Bounded
     })
 }
 
+fn read_bounded_observed(
+    reader: &mut impl Read,
+    limit: usize,
+    bytes_emitted: &AtomicU64,
+    last_output_at: &Mutex<std::time::Instant>,
+) -> std::io::Result<BoundedBytes> {
+    let mut output = Vec::with_capacity(limit.min(64 * 1024));
+    let mut buffer = [0u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes_emitted.fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if let Ok(mut last) = last_output_at.lock() {
+            *last = std::time::Instant::now();
+        }
+        let remaining = limit.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        truncated |= read > remaining;
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[output truncated by rustgrid-agent]\n");
+    }
+    Ok(BoundedBytes {
+        bytes: output,
+        truncated,
+    })
+}
+
 #[cfg(not(unix))]
 fn terminate_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
@@ -1514,5 +1637,34 @@ while not os.path.exists(pid_file):
             }
         }
         reader.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incremental_stdout_and_stderr_refresh_process_activity() {
+        let running = AtomicBool::new(true);
+        let directory = tempfile::tempdir().unwrap();
+        let mut activity = Vec::new();
+        let output = capture_cancellable_with_containment(
+            "sh -c 'printf first; sleep 0.1; printf second >&2; sleep 0.1; printf third'",
+            directory.path(),
+            &running,
+            Duration::from_secs(2),
+            64 * 1024,
+            None,
+            None,
+            None,
+            Some(Duration::from_millis(350)),
+            &mut |observation| activity.push(observation),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            activity
+                .iter()
+                .any(|observation| observation.bytes_emitted >= 5)
+        );
+        assert!(activity.last().unwrap().bytes_emitted >= 16);
+        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(350));
     }
 }
