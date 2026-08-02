@@ -1667,7 +1667,7 @@ while not os.path.exists(pid_file):
         let directory = tempfile::tempdir().unwrap();
         let mut activity = Vec::new();
         let output = capture_cancellable_with_containment(
-            "sh -c 'printf first; sleep 0.1; printf second >&2; sleep 0.1; printf third'",
+            "sh -c 'printf \"first\\n\"; sleep 0.1; printf \"second\\n\" >&2; sleep 0.1; printf \"third\\n\"'",
             directory.path(),
             &running,
             Duration::from_secs(2),
@@ -1675,7 +1675,7 @@ while not os.path.exists(pid_file):
             None,
             None,
             None,
-            Some(Duration::from_millis(350)),
+            Some(Duration::from_millis(1_500)),
             &mut |observation| activity.push(observation),
         )
         .unwrap();
@@ -1685,7 +1685,7 @@ while not os.path.exists(pid_file):
                 .iter()
                 .any(|observation| observation.bytes_emitted >= 5)
         );
-        assert!(activity.last().unwrap().bytes_emitted >= 16);
-        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(350));
+        assert!(activity.last().unwrap().bytes_emitted >= 19);
+        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(1_500));
     }
 }
