@@ -394,6 +394,29 @@ pub fn fallback(
     ))
 }
 
+pub fn fallback_from_persisted_evidence(
+    inspected_files: &[String],
+    completed_searches: &[String],
+    criteria: &[String],
+    unresolved: &[String],
+    architecture_findings: &[String],
+) -> Option<(ImpactMap, f64)> {
+    let (mut map, mut confidence) =
+        fallback(inspected_files, completed_searches, criteria, unresolved)?;
+    if let Some(area) = map.areas.first_mut()
+        && !architecture_findings.is_empty()
+    {
+        area.reason = format!(
+            "The orchestrator derived this conservative map from {} persisted file observation(s), {} search result(s), and {} architecture finding(s).",
+            inspected_files.len(),
+            completed_searches.len(),
+            architecture_findings.len(),
+        );
+        confidence = 0.9;
+    }
+    Some((map, confidence))
+}
+
 fn required(path: &str) -> ValidationError {
     ValidationError {
         path: path.into(),
@@ -670,6 +693,28 @@ mod tests {
         let (map, confidence) = fallback(&f, &s, &c, &[]).unwrap();
         assert!(confidence >= 0.8);
         assert!(validate(&map, c.len()).is_empty());
+    }
+    #[test]
+    fn persisted_evidence_fallback_is_conservative_and_covers_attempt_25_paths() {
+        let paths = vec![
+            "src/components/theme/ThemeProvider.tsx".into(),
+            "src/components/theme/ThemeToggle.tsx".into(),
+            "src/styles/globals.css".into(),
+            "tests/theme-provider.test.tsx".into(),
+        ];
+        let criteria = vec!["Theme selection persists and remains covered by tests".into()];
+        let (map, confidence) = fallback_from_persisted_evidence(
+            &paths,
+            &["ThemeProvider".into()],
+            &criteria,
+            &[],
+            &["Theme state is centralized in the provider".into()],
+        )
+        .unwrap();
+        assert!(confidence >= 0.8);
+        assert!(validate(&map, criteria.len()).is_empty());
+        assert_eq!(map.areas[0].candidate_paths, paths);
+        assert_eq!(map.inspected_files, paths);
     }
     #[test]
     fn genuinely_empty_discovery_blocks_fallback() {

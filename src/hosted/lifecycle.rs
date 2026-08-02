@@ -71,9 +71,16 @@ pub(super) enum ImplementationSubstate {
 pub(super) enum ToolProgressClass {
     Productive,
     Neutral,
+    ActionRedirected,
     RecoverableFailure,
     BlockingFailure,
     Duplicate,
+}
+
+impl ToolProgressClass {
+    pub(super) const fn is_failure(self) -> bool {
+        matches!(self, Self::RecoverableFailure | Self::BlockingFailure)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

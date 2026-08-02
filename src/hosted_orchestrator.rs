@@ -14,9 +14,30 @@ pub use crate::execution_graph::*;
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DiscoveryAction {
-    InspectRepository { missing_evidence: Vec<String> },
-    ReuseEvidence { evidence_ids: Vec<String> },
-    RepairArtifact { failure_id: FailureId },
+    InspectRepository {
+        inspection_scope: InspectionScope,
+    },
+    FinalizeImpactMap {
+        evidence_ids: Vec<EvidenceId>,
+    },
+    RepairImpactMap {
+        validation_errors: Vec<ArtifactValidationError>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct InspectionScope {
+    #[serde(default)]
+    pub missing_evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopened_for: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ArtifactValidationError {
+    pub path: String,
+    pub keyword: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -42,7 +63,6 @@ pub enum ExecutionDecision {
     ContinueDiscovery {
         action: DiscoveryAction,
     },
-    FinalizeDiscovery,
     BuildPlan,
     RepairPlan {
         repair: PlanRepair,
@@ -81,9 +101,7 @@ pub enum ExecutionDecision {
 impl ExecutionDecision {
     pub const fn stage(&self) -> HostedExecutionStage {
         match self {
-            Self::ContinueDiscovery { .. } | Self::FinalizeDiscovery => {
-                HostedExecutionStage::Discovery
-            }
+            Self::ContinueDiscovery { .. } => HostedExecutionStage::Discovery,
             Self::BuildPlan | Self::RepairPlan { .. } => HostedExecutionStage::Planning,
             Self::ExecuteTarget { .. } | Self::RepairTarget { .. } => {
                 HostedExecutionStage::Implementation
@@ -357,36 +375,31 @@ fn decision_for_node(
 ) -> Result<ExecutionDecision, OrchestrationInvariantError> {
     match node.kind {
         ExecutionNodeKind::Discovery => match node.status {
-            ExecutionNodeStatus::Applied => Ok(ExecutionDecision::FinalizeDiscovery),
+            ExecutionNodeStatus::Applied => Ok(ExecutionDecision::ContinueDiscovery {
+                action: DiscoveryAction::FinalizeImpactMap {
+                    evidence_ids: current_repository_evidence_ids(snapshot),
+                },
+            }),
             ExecutionNodeStatus::FailedRecoverable => {
                 let failure = unresolved_failure_for_node(snapshot, &node.id)?;
                 Ok(ExecutionDecision::ContinueDiscovery {
-                    action: DiscoveryAction::RepairArtifact {
-                        failure_id: failure.id.clone(),
+                    action: DiscoveryAction::RepairImpactMap {
+                        validation_errors: artifact_validation_errors(&failure.message),
                     },
                 })
             }
             _ => {
-                let evidence_ids = snapshot
-                    .evidence
-                    .files
-                    .values()
-                    .filter(|evidence| {
-                        evidence.repository_fingerprint == snapshot.current_repository.fingerprint
-                    })
-                    .map(|evidence| evidence.evidence_id.clone())
-                    .collect::<Vec<_>>();
+                let evidence_ids = current_repository_evidence_ids(snapshot);
                 Ok(ExecutionDecision::ContinueDiscovery {
-                    action: if evidence_ids.is_empty() {
-                        DiscoveryAction::InspectRepository {
-                            missing_evidence: vec![
-                                "implementation targets".into(),
-                                "related tests".into(),
-                                "validation commands".into(),
-                            ],
-                        }
+                    action: if discovery_evidence_is_sufficient(snapshot) {
+                        DiscoveryAction::FinalizeImpactMap { evidence_ids }
                     } else {
-                        DiscoveryAction::ReuseEvidence { evidence_ids }
+                        DiscoveryAction::InspectRepository {
+                            inspection_scope: InspectionScope {
+                                missing_evidence: missing_discovery_evidence(snapshot),
+                                reopened_for: None,
+                            },
+                        }
                     },
                 })
             }
@@ -471,6 +484,93 @@ fn decision_for_node(
             }
         }
     }
+}
+
+fn current_repository_evidence_ids(snapshot: &ExecutionSnapshot) -> Vec<EvidenceId> {
+    snapshot
+        .evidence
+        .files
+        .values()
+        .filter(|evidence| {
+            evidence.repository_fingerprint == snapshot.current_repository.fingerprint
+        })
+        .map(|evidence| EvidenceId::new(evidence.evidence_id.clone()))
+        .collect()
+}
+
+fn current_repository_evidence_paths(snapshot: &ExecutionSnapshot) -> BTreeSet<String> {
+    snapshot
+        .evidence
+        .files
+        .values()
+        .filter(|evidence| {
+            evidence.repository_fingerprint == snapshot.current_repository.fingerprint
+        })
+        .map(|evidence| evidence.path.to_ascii_lowercase())
+        .collect()
+}
+
+fn discovery_evidence_is_sufficient(snapshot: &ExecutionSnapshot) -> bool {
+    let paths = current_repository_evidence_paths(snapshot);
+    let has_source = paths.iter().any(|path| {
+        path.starts_with("src/") || path.starts_with("app/") || path.starts_with("crates/")
+    });
+    let has_test = paths
+        .iter()
+        .any(|path| path.contains("test") || path.contains("spec"));
+    let has_validation_contract = paths.iter().any(|path| {
+        matches!(
+            path.as_str(),
+            "package.json" | "cargo.toml" | "pyproject.toml" | "go.mod" | "makefile"
+        )
+    });
+    paths.len() >= 4 && has_source && has_test && has_validation_contract
+}
+
+fn missing_discovery_evidence(snapshot: &ExecutionSnapshot) -> Vec<String> {
+    let paths = current_repository_evidence_paths(snapshot);
+    let mut missing = Vec::new();
+    if !paths.iter().any(|path| {
+        path.starts_with("src/") || path.starts_with("app/") || path.starts_with("crates/")
+    }) {
+        missing.push("implementation targets".into());
+    }
+    if !paths
+        .iter()
+        .any(|path| path.contains("test") || path.contains("spec"))
+    {
+        missing.push("related tests".into());
+    }
+    if !paths.iter().any(|path| {
+        matches!(
+            path.as_str(),
+            "package.json" | "cargo.toml" | "pyproject.toml" | "go.mod" | "makefile"
+        )
+    }) {
+        missing.push("validation commands".into());
+    }
+    missing
+}
+
+fn artifact_validation_errors(message: &str) -> Vec<ArtifactValidationError> {
+    serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|error| {
+            Some(ArtifactValidationError {
+                path: error.get("path")?.as_str()?.to_owned(),
+                keyword: error.get("keyword")?.as_str()?.to_owned(),
+                message: error.get("message")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
 }
 
 fn repair_target_decision(
@@ -758,6 +858,75 @@ mod tests {
             budget: BudgetState::new(budget),
             ..ExecutionSnapshot::default()
         }
+    }
+
+    fn discovery_snapshot() -> ExecutionSnapshot {
+        let budget = MissionBudget::for_complexity(MissionComplexity::Small);
+        ExecutionSnapshot {
+            run_id: "discovery-run".into(),
+            current_repository: RepositorySnapshot {
+                fingerprint: "tree-1".into(),
+                source_tree_hash: "tree-1".into(),
+                ..RepositorySnapshot::default()
+            },
+            graph: ExecutionGraph::bootstrap(
+                "discovery-graph",
+                "tree-1",
+                MissionComplexity::Small,
+                &budget,
+            ),
+            budget: BudgetState::new(budget),
+            ..ExecutionSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn localized_discovery_inspects_once_then_finalizes_and_advances_to_planning() {
+        let mut state = discovery_snapshot();
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ContinueDiscovery {
+                action: DiscoveryAction::InspectRepository { .. }
+            }
+        ));
+
+        for path in [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "tests/theme-provider.test.tsx",
+            "package.json",
+        ] {
+            state.evidence.capture_file(
+                path,
+                "tree-1",
+                None,
+                format!("evidence for {path}"),
+                false,
+            );
+        }
+
+        let evidence_ids = match reconcile_execution(&state).unwrap() {
+            ExecutionDecision::ContinueDiscovery {
+                action: DiscoveryAction::FinalizeImpactMap { evidence_ids },
+            } => evidence_ids,
+            decision => panic!("expected impact-map finalization, got {decision:?}"),
+        };
+        assert_eq!(evidence_ids.len(), 4);
+
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryCompleted {
+                sequence: 1,
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::BuildPlan
+        ));
+        assert_eq!(
+            state.graph.next_runnable_node().map(|node| node.kind),
+            Some(ExecutionNodeKind::Planning)
+        );
     }
 
     fn complete_node(snapshot: &mut ExecutionSnapshot, kind: ExecutionNodeKind) {

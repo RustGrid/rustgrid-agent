@@ -2144,6 +2144,7 @@ fn implementation_read_progress(
                 record.class,
                 ToolProgressClass::Productive
                     | ToolProgressClass::Neutral
+                    | ToolProgressClass::ActionRedirected
                     | ToolProgressClass::Duplicate
             )
         })
@@ -2205,7 +2206,9 @@ fn unresolved_preparation_blockers(
             ToolProgressClass::Productive => {
                 unresolved.remove(&key);
             }
-            ToolProgressClass::Neutral | ToolProgressClass::Duplicate => {}
+            ToolProgressClass::Neutral
+            | ToolProgressClass::ActionRedirected
+            | ToolProgressClass::Duplicate => {}
         }
     }
     let mut unresolved = unresolved.into_values().collect::<Vec<_>>();
@@ -2365,6 +2368,8 @@ struct WorkerNotebook {
     phase_budget: Value,
     #[serde(default)]
     last_successful_action: Value,
+    #[serde(default)]
+    last_orchestration_decision_key: Option<String>,
     #[serde(default)]
     finalization_revalidation: Option<FinalizationRevalidation>,
     #[serde(default)]
@@ -3042,6 +3047,7 @@ fn new_worker_notebook(
         required_gates: Vec::new(),
         phase_budget: Value::Null,
         last_successful_action: json!({}),
+        last_orchestration_decision_key: None,
         finalization_revalidation: None,
         completion_artifact: None,
         orchestration: HostedOrchestrationCheckpoint::bootstrap(manifest, &repository_fingerprint),
@@ -7566,6 +7572,77 @@ struct CostGuard {
     max_duration_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestCostEstimate {
+    input_tokens_estimated: u64,
+    max_output_tokens: u64,
+    reasoning_effort: String,
+    estimated_request_cost: u64,
+    cost_estimation_method: &'static str,
+}
+
+fn estimate_model_call_request_cost(request: &Value) -> RequestCostEstimate {
+    let serialized_bytes = serde_json::to_vec(request).map_or(0, |bytes| bytes.len());
+    let input_tokens_estimated =
+        u64::try_from(serialized_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX);
+    let max_output_tokens = request
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let reasoning_effort = request
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .to_owned();
+    // Provider-independent upper bound. The output cap includes reasoning
+    // tokens, so effort is reported and bounded by the same exact cap rather
+    // than charged a second time.
+    let estimated_request_cost = input_tokens_estimated
+        .saturating_mul(5)
+        .saturating_add(max_output_tokens.saturating_mul(15));
+    RequestCostEstimate {
+        input_tokens_estimated,
+        max_output_tokens,
+        reasoning_effort,
+        estimated_request_cost,
+        cost_estimation_method: "serialized_request_bytes_div_4_plus_action_output_cap_v1",
+    }
+}
+
+fn model_call_admission_telemetry(
+    admission: &crate::execution_graph::ModelCallAdmission,
+    estimate: &RequestCostEstimate,
+) -> Value {
+    json!({
+        "event_type": "worker.model_call_admission_evaluated",
+        "node_id": admission.node_id,
+        "max_model_calls": admission.max_model_calls,
+        "consumed_calls": admission.consumed_calls,
+        "reserved_calls": admission.reserved_calls,
+        "requested_calls": admission.requested_calls,
+        "admitted": admission.admitted,
+        "rejection_reason": admission.rejection_reason,
+        "node_cost_used": admission.node_cost_used,
+        "node_cost_limit": admission.node_cost_limit,
+        "node_cost_consumed": admission.node_cost_used,
+        "node_cost_reserved": admission.node_cost_reserved,
+        "estimated_request_cost": admission.estimated_request_cost,
+        "projected_node_cost": admission.projected_node_cost,
+        "input_tokens_estimated": estimate.input_tokens_estimated,
+        "max_output_tokens": estimate.max_output_tokens,
+        "reasoning_effort": estimate.reasoning_effort,
+        "cost_estimation_method": estimate.cost_estimation_method,
+        "mission_cost_used": admission.mission_cost_used,
+        "mission_calls_used": admission.mission_calls_used,
+        "model_calls_remaining": admission.max_model_calls.saturating_sub(
+            admission
+                .consumed_calls
+                .saturating_add(admission.reserved_calls)
+                .saturating_add(admission.requested_calls)
+        ),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostedWallClockBoundary {
     BeforeValidation,
@@ -8781,16 +8858,8 @@ impl<'a> GatewayAgent<'a> {
             .as_ref()
             .and_then(|graph| graph.node(&node_id))
             .map(|node| node.budget.clone())?;
-        let serialized_bytes = serde_json::to_vec(request).map_or(0, |bytes| bytes.len());
-        let estimated_input_tokens =
-            u64::try_from(serialized_bytes.saturating_add(3) / 4).unwrap_or(u64::MAX);
-        let estimated_output_tokens = request
-            .get("max_output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        let estimated_cost_micros = estimated_input_tokens
-            .saturating_mul(5)
-            .saturating_add(estimated_output_tokens.saturating_mul(15));
+        let estimate = estimate_model_call_request_cost(request);
+        let estimated_cost_micros = estimate.estimated_request_cost;
         let admission = self
             .notebook
             .orchestration
@@ -8818,26 +8887,7 @@ impl<'a> GatewayAgent<'a> {
         };
         self.append_event_recoverable(
             "progress",
-            json!({
-                "event_type": "worker.model_call_admission_evaluated",
-                "node_id": admission.node_id,
-                "max_model_calls": admission.max_model_calls,
-                "consumed_calls": admission.consumed_calls,
-                "reserved_calls": admission.reserved_calls,
-                "requested_calls": admission.requested_calls,
-                "admitted": admission.admitted,
-                "rejection_reason": admission.rejection_reason,
-                "node_cost_used": admission.node_cost_used,
-                "node_cost_reserved": admission.node_cost_reserved,
-                "mission_cost_used": admission.mission_cost_used,
-                "mission_calls_used": admission.mission_calls_used,
-                "model_calls_remaining": admission.max_model_calls.saturating_sub(
-                    admission
-                        .consumed_calls
-                        .saturating_add(admission.reserved_calls)
-                        .saturating_add(admission.requested_calls)
-                ),
-            }),
+            model_call_admission_telemetry(&admission, &estimate),
             "model-call admission telemetry",
         );
         if !admission.admitted {
@@ -8963,11 +9013,9 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<DecisionExecutionResult> {
         let phase = match &decision {
             ExecutionDecision::ContinueDiscovery {
-                action: crate::hosted_orchestrator::DiscoveryAction::RepairArtifact { .. },
+                action: crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
             } => Some(ExecutionPhase::ArtifactRepair),
-            ExecutionDecision::ContinueDiscovery { .. } | ExecutionDecision::FinalizeDiscovery => {
-                Some(ExecutionPhase::Discovery)
-            }
+            ExecutionDecision::ContinueDiscovery { .. } => Some(ExecutionPhase::Discovery),
             ExecutionDecision::BuildPlan | ExecutionDecision::RepairPlan { .. } => {
                 Some(ExecutionPhase::Planning)
             }
@@ -9194,7 +9242,6 @@ impl<'a> GatewayAgent<'a> {
                     outcome: *outcome,
                 })
             }
-            ExecutionDecision::FinalizeDiscovery => None,
         };
         if let Some(event) = event {
             self.append_execution_domain_event(event)?;
@@ -9631,7 +9678,29 @@ impl<'a> GatewayAgent<'a> {
         let snapshot = self.build_execution_snapshot()?;
         let decision = reconcile_execution(&snapshot)
             .map_err(|error| anyhow!("hosted orchestration invariant failed: {error}"))?;
-        let result = self.apply_execution_decision(decision)?;
+        let decision_key = execution_decision_idempotency_key(&snapshot, &decision);
+        if !orchestration_decision_is_new(
+            self.notebook.last_orchestration_decision_key.as_deref(),
+            &decision_key,
+        ) {
+            self.current_decision = Some(decision.clone());
+            return Ok(DecisionExecutionResult {
+                decision,
+                phase_decision: PhaseDecision::Stay,
+                persistence_error: None,
+            });
+        }
+        let previous_key = self
+            .notebook
+            .last_orchestration_decision_key
+            .replace(decision_key.clone());
+        let result = match self.apply_execution_decision(decision) {
+            Ok(result) => result,
+            Err(error) => {
+                self.notebook.last_orchestration_decision_key = previous_key;
+                return Err(error);
+            }
+        };
         self.append_event_recoverable(
             "progress",
             json!({
@@ -9640,6 +9709,7 @@ impl<'a> GatewayAgent<'a> {
                 "stage": result.decision.stage(),
                 "phase": self.phases.active(),
                 "graph_revision": self.notebook.orchestration.graph_revision,
+                "decision_idempotency_key": decision_key,
                 "remaining_required_nodes": snapshot
                     .remaining_required_nodes()
                     .iter()
@@ -10261,6 +10331,42 @@ impl<'a> GatewayAgent<'a> {
         })
     }
 
+    fn accept_deterministic_impact_map_if_available(&mut self, reason: &str) -> Result<bool> {
+        let Some((map, confidence)) = impact_map::fallback_from_persisted_evidence(
+            &self.notebook.files_inspected,
+            &self.notebook.searches_completed,
+            &self.notebook.acceptance_criteria,
+            &self.notebook.blocking_unknowns,
+            &self.notebook.architecture_findings,
+        )
+        .filter(|(map, confidence)| {
+            *confidence >= impact_map_fallback_threshold(self.manifest)
+                && impact_map::validate(map, self.notebook.acceptance_criteria.len()).is_empty()
+        }) else {
+            return Ok(false);
+        };
+        self.accept_impact_map(
+            map,
+            ArtifactSource::OrchestratorFallback,
+            confidence,
+            Some(&anyhow!(reason.to_owned())),
+        )?;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.impact_map_fallback_accepted",
+                "artifact_source": "orchestrator_fallback",
+                "confidence": confidence,
+                "reason_code": reason,
+                "process_health": "healthy",
+                "mission_outcome": "continuing",
+                "files_inspected": self.notebook.files_inspected,
+            }),
+            "impact-map deterministic fallback",
+        );
+        Ok(true)
+    }
+
     fn emit_guardrail(&self, code: &str, action: &str, message: &str) -> Result<()> {
         self.api.append_event(
             "progress",
@@ -10374,12 +10480,7 @@ impl<'a> GatewayAgent<'a> {
                 .notebook
                 .tool_progress
                 .iter()
-                .filter(|record| {
-                    matches!(
-                        record.class,
-                        ToolProgressClass::RecoverableFailure | ToolProgressClass::BlockingFailure
-                    )
-                })
+                .filter(|record| record.class.is_failure())
                 .cloned()
                 .collect(),
             current_plan: self.notebook.planned_changes.clone(),
@@ -10515,12 +10616,7 @@ impl<'a> GatewayAgent<'a> {
                 .notebook
                 .tool_progress
                 .iter()
-                .filter(|record| {
-                    matches!(
-                        record.class,
-                        ToolProgressClass::RecoverableFailure | ToolProgressClass::BlockingFailure
-                    )
-                })
+                .filter(|record| record.class.is_failure())
                 .cloned()
                 .collect(),
             current_plan: self.notebook.planned_changes.clone(),
@@ -10664,6 +10760,11 @@ impl<'a> GatewayAgent<'a> {
                     self.reconcile_execution_and_apply()?;
                 }
                 ExecutionPhase::Discovery => {
+                    if self.accept_deterministic_impact_map_if_available(
+                        "discovery_model_call_budget_exhausted_after_evidence_collection",
+                    )? {
+                        continue;
+                    }
                     self.emit_guardrail(
                         "discovery_budget_exhausted",
                         "terminate",
@@ -10875,6 +10976,12 @@ impl<'a> GatewayAgent<'a> {
                 return Ok(outcome);
             }
             let artifact_repair = self.phases.active() == ExecutionPhase::ArtifactRepair;
+            let impact_map_finalization = matches!(
+                self.current_decision.as_ref(),
+                Some(ExecutionDecision::ContinueDiscovery {
+                    action: crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. },
+                })
+            );
             let active_context_phase = self.phases.active();
             if previous_context_phase.is_some_and(|phase| phase != active_context_phase) {
                 turns.clear();
@@ -10882,6 +10989,8 @@ impl<'a> GatewayAgent<'a> {
             previous_context_phase = Some(active_context_phase);
             initial["content"] = Value::String(if artifact_repair {
                 compact_impact_map_repair_context(self.impact_map_failure.as_ref(), &self.notebook)
+            } else if impact_map_finalization {
+                compact_impact_map_finalization_context(&self.notebook)
             } else if matches!(
                 active_context_phase,
                 ExecutionPhase::Implementation | ExecutionPhase::Repair
@@ -10907,16 +11016,20 @@ impl<'a> GatewayAgent<'a> {
                     input.extend(turn.iter().cloned());
                 }
             }
-            let max_output_tokens = self.manifest.ai_gateway.maximum_output_tokens.min(16_384);
             let active_phase = self.phases.active();
+            let action_profile = ModelActionProfile::for_decision(
+                active_phase,
+                self.current_decision.as_ref(),
+                u64::try_from(self.manifest.ai_gateway.maximum_output_tokens).unwrap_or_default(),
+            );
             let mut request = json!({
                 "model": self.manifest.ai_gateway.model,
                 "input": input,
                 "instructions": hosted_agent_instructions(active_phase),
-                "max_output_tokens": max_output_tokens,
-                "reasoning": {"effort": "medium"},
-                "tools": hosted_tools_for_phase(active_phase),
-                "tool_choice": "auto",
+                "max_output_tokens": action_profile.max_output_tokens,
+                "reasoning": {"effort": action_profile.reasoning_effort},
+                "tools": hosted_tools_for_action(active_phase, self.current_decision.as_ref()),
+                "tool_choice": action_profile.tool_choice(),
                 "parallel_tool_calls": false,
                 "metadata": provider_request_metadata(
                     self.manifest.execution.execution_id,
@@ -10947,6 +11060,21 @@ impl<'a> GatewayAgent<'a> {
                 .then(|| self.reserve_graph_model_call(&request))
                 .flatten();
             let Some(reservation) = reservation else {
+                let compact_discovery_finalization = matches!(
+                    self.current_decision.as_ref(),
+                    Some(ExecutionDecision::ContinueDiscovery {
+                        action: crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. }
+                            | crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
+                    })
+                );
+                if compact_discovery_finalization
+                    && self.accept_deterministic_impact_map_if_available(
+                        "compact_finalization_cost_budget_exhausted",
+                    )?
+                {
+                    turns.clear();
+                    continue;
+                }
                 let changed_paths =
                     completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
                 if allow_budget_handoff && !changed_paths.is_empty() {
@@ -11788,7 +11916,25 @@ impl<'a> GatewayAgent<'a> {
                         .and_then(Value::as_str)
                         .unwrap_or("tool operation failed");
                     progress_detail = truncate_text(error, 1_000);
-                    if matches!(name.as_str(), "read_file" | "read_files" | "related_tests") {
+                    if error.contains("localized_discovery_complete") {
+                        progress_class = ToolProgressClass::ActionRedirected;
+                        progress_detail =
+                            "localized discovery evidence is complete; finalize the impact map"
+                                .into();
+                        self.append_event_recoverable(
+                            "progress",
+                            json!({
+                                "event_type": "worker.discovery_action_redirected",
+                                "from_action": "inspect_repository",
+                                "to_action": "finalize_impact_map",
+                                "reason_code": "localized_discovery_complete",
+                                "repository_failure": false,
+                                "tool_failure": false,
+                            }),
+                            "discovery action redirection",
+                        );
+                    } else if matches!(name.as_str(), "read_file" | "read_files" | "related_tests")
+                    {
                         if name != "read_files" {
                             self.tool_usage.failed_reads =
                                 self.tool_usage.failed_reads.saturating_add(1);
@@ -13370,6 +13516,15 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 phase.as_str()
             );
         }
+        if matches!(
+            phase,
+            ExecutionPhase::Discovery | ExecutionPhase::ArtifactRepair
+        ) && !discovery_action_permits_tool(self.current_decision.as_ref(), name)
+        {
+            bail!(
+                "discovery_action_tool_not_permitted: tool `{name}` is not available for the selected discovery action"
+            );
+        }
         if name == "search_text"
             && phase != ExecutionPhase::Discovery
             && arguments
@@ -13476,6 +13631,47 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
     }
 }
 
+fn execution_decision_idempotency_key(
+    snapshot: &crate::execution_graph::ExecutionSnapshot,
+    decision: &ExecutionDecision,
+) -> String {
+    let node = decision
+        .node_id()
+        .and_then(|node_id| snapshot.graph.node(node_id))
+        .or_else(|| snapshot.graph.active_node())
+        .or_else(|| snapshot.graph.next_runnable_node());
+    let node_id = node.map_or("none", |node| node.id.as_str());
+    let node_attempt = node.map_or(0, |node| {
+        u32::try_from(node.attempts.len()).unwrap_or(u32::MAX)
+    });
+    format!(
+        "{}:{}:{}:{}",
+        snapshot.graph.revision,
+        node_id,
+        node_attempt,
+        execution_decision_action_kind(decision),
+    )
+}
+
+fn orchestration_decision_is_new(last_applied_key: Option<&str>, candidate_key: &str) -> bool {
+    last_applied_key != Some(candidate_key)
+}
+
+const fn execution_decision_action_kind(decision: &ExecutionDecision) -> &'static str {
+    match decision {
+        ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
+        } => "inspect_repository",
+        ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. },
+        } => "finalize_impact_map",
+        ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
+        } => "repair_impact_map",
+        _ => execution_decision_name(decision),
+    }
+}
+
 fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
     match phase {
         ExecutionPhase::Discovery => matches!(
@@ -13543,7 +13739,6 @@ struct DecisionExecutionResult {
 const fn execution_decision_name(decision: &ExecutionDecision) -> &'static str {
     match decision {
         ExecutionDecision::ContinueDiscovery { .. } => "continue_discovery",
-        ExecutionDecision::FinalizeDiscovery => "finalize_discovery",
         ExecutionDecision::BuildPlan => "build_plan",
         ExecutionDecision::RepairPlan { .. } => "repair_plan",
         ExecutionDecision::ExecuteTarget { .. } => "execute_target",
@@ -13561,7 +13756,6 @@ const fn execution_decision_requires_model_work(decision: &ExecutionDecision) ->
     matches!(
         decision,
         ExecutionDecision::ContinueDiscovery { .. }
-            | ExecutionDecision::FinalizeDiscovery
             | ExecutionDecision::BuildPlan
             | ExecutionDecision::RepairPlan { .. }
             | ExecutionDecision::ExecuteTarget { .. }
@@ -13966,6 +14160,132 @@ fn hosted_tools_for_phase(phase: ExecutionPhase) -> Vec<Value> {
                 .is_some_and(|name| phase_permits_tool(phase, name))
         })
         .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModelActionProfile {
+    max_output_tokens: u64,
+    reasoning_effort: &'static str,
+    forced_tool: Option<&'static str>,
+}
+
+impl ModelActionProfile {
+    fn for_decision(
+        phase: ExecutionPhase,
+        decision: Option<&ExecutionDecision>,
+        configured_max_output_tokens: u64,
+    ) -> Self {
+        match decision {
+            Some(ExecutionDecision::ContinueDiscovery {
+                action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
+            }) => Self {
+                max_output_tokens: configured_max_output_tokens.min(4_096),
+                reasoning_effort: "medium",
+                forced_tool: None,
+            },
+            Some(ExecutionDecision::ContinueDiscovery {
+                action:
+                    crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. }
+                    | crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
+            }) => Self {
+                max_output_tokens: configured_max_output_tokens.min(2_048),
+                reasoning_effort: "low",
+                forced_tool: Some("record_impact_map"),
+            },
+            _ => Self {
+                max_output_tokens: configured_max_output_tokens.min(match phase {
+                    ExecutionPhase::ArtifactRepair => 2_048,
+                    ExecutionPhase::Discovery => 4_096,
+                    _ => 16_384,
+                }),
+                reasoning_effort: if phase == ExecutionPhase::ArtifactRepair {
+                    "low"
+                } else {
+                    "medium"
+                },
+                forced_tool: (phase == ExecutionPhase::ArtifactRepair)
+                    .then_some("record_impact_map"),
+            },
+        }
+    }
+
+    fn tool_choice(self) -> Value {
+        self.forced_tool.map_or_else(
+            || json!("auto"),
+            |name| json!({"type": "function", "name": name}),
+        )
+    }
+}
+
+fn hosted_tools_for_action(
+    phase: ExecutionPhase,
+    decision: Option<&ExecutionDecision>,
+) -> Vec<Value> {
+    let allowed = match decision {
+        Some(ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
+        }) => Some(
+            &[
+                "list_files",
+                "read_file",
+                "read_files",
+                "search_text",
+                "related_tests",
+            ][..],
+        ),
+        Some(ExecutionDecision::ContinueDiscovery {
+            action:
+                crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. }
+                | crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
+        }) => Some(&["record_impact_map"][..]),
+        _ => None,
+    };
+    let tools = hosted_tools_for_phase(phase);
+    allowed.map_or(tools.clone(), |allowed| {
+        tools
+            .into_iter()
+            .filter(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed.contains(&name))
+            })
+            .collect()
+    })
+}
+
+fn discovery_action_permits_tool(decision: Option<&ExecutionDecision>, name: &str) -> bool {
+    match decision {
+        Some(ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
+        }) => matches!(
+            name,
+            "list_files" | "read_file" | "read_files" | "search_text" | "related_tests"
+        ),
+        Some(ExecutionDecision::ContinueDiscovery {
+            action:
+                crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. }
+                | crate::hosted_orchestrator::DiscoveryAction::RepairImpactMap { .. },
+        }) => name == "record_impact_map",
+        _ => true,
+    }
+}
+
+fn compact_impact_map_finalization_context(notebook: &WorkerNotebook) -> String {
+    serde_json::to_string(&json!({
+        "instruction": "Repository inspection is complete. Use only the persisted evidence below and call record_impact_map exactly once.",
+        "acceptance_criteria": notebook.acceptance_criteria_v2,
+        "evidence": notebook.impact_evidence,
+        "files_inspected": notebook.files_inspected,
+        "searches_completed": notebook.searches_completed,
+        "architecture_findings": notebook.architecture_findings,
+        "known_related_tests": notebook.files_inspected.iter().filter(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains("test") || lower.contains("spec")
+        }).collect::<Vec<_>>(),
+        "blocking_unknowns": notebook.blocking_unknowns,
+        "canonical_schema": impact_map::schema(),
+    }))
+    .unwrap_or_else(|_| "Call record_impact_map exactly once using persisted evidence.".into())
 }
 
 fn compact_impact_map_repair_context(
@@ -18360,6 +18680,174 @@ mod tests {
     };
 
     #[test]
+    fn discovery_action_profiles_restrict_finalization_to_the_compact_forced_tool() {
+        assert!(!ToolProgressClass::ActionRedirected.is_failure());
+        let finalize = ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap {
+                evidence_ids: vec![crate::execution_graph::EvidenceId::new("evidence-1")],
+            },
+        };
+        let profile =
+            ModelActionProfile::for_decision(ExecutionPhase::Discovery, Some(&finalize), 16_384);
+        assert_eq!(profile.max_output_tokens, 2_048);
+        assert_eq!(profile.reasoning_effort, "low");
+        assert_eq!(
+            profile.tool_choice(),
+            json!({"type": "function", "name": "record_impact_map"})
+        );
+        let tool_names = hosted_tools_for_action(ExecutionPhase::Discovery, Some(&finalize))
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["record_impact_map"]);
+        assert!(!discovery_action_permits_tool(Some(&finalize), "read_file"));
+
+        let inspect = ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository {
+                inspection_scope: crate::hosted_orchestrator::InspectionScope::default(),
+            },
+        };
+        let inspection_tools = hosted_tools_for_action(ExecutionPhase::Discovery, Some(&inspect))
+            .into_iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            inspection_tools,
+            vec![
+                "list_files",
+                "read_file",
+                "read_files",
+                "search_text",
+                "related_tests",
+            ]
+        );
+        assert!(!inspection_tools.contains(&"record_impact_map".to_owned()));
+    }
+
+    #[test]
+    fn compact_finalization_cost_admits_the_third_discovery_call() {
+        use crate::execution_graph::{BudgetState, ExecutionNodeId, MissionBudget, NodeBudget};
+
+        let request = json!({
+            "model": "test-model",
+            "input": [{"role": "user", "content": "persisted evidence summary"}],
+            "max_output_tokens": 2_048,
+            "reasoning": {"effort": "low"},
+            "tools": [{"type": "function", "name": "record_impact_map"}],
+            "tool_choice": {"type": "function", "name": "record_impact_map"}
+        });
+        let estimate = estimate_model_call_request_cost(&request);
+        let node_id = ExecutionNodeId::new("discovery");
+        let node_budget = NodeBudget {
+            max_model_calls: 3,
+            max_cost_micros: 350_000,
+            max_duration: Duration::from_secs(120),
+            max_repair_attempts: 0,
+        };
+        let mut budget = BudgetState::new(MissionBudget::for_complexity(
+            crate::execution_graph::MissionComplexity::Small,
+        ));
+        budget.record_model_call(node_id.clone(), 40_000, Duration::from_secs(1));
+        budget.record_model_call(node_id.clone(), 39_070, Duration::from_secs(1));
+        let admission = budget.evaluate_model_call_admission(
+            &node_id,
+            &node_budget,
+            1,
+            estimate.estimated_request_cost,
+            Duration::ZERO,
+        );
+        assert!(admission.admitted, "{admission:?}");
+        assert_eq!(
+            admission.projected_node_cost,
+            79_070 + estimate.estimated_request_cost
+        );
+        assert!(admission.projected_node_cost <= admission.node_cost_limit);
+    }
+
+    #[test]
+    fn cost_rejection_telemetry_exposes_the_complete_failed_inequality() {
+        use crate::execution_graph::{BudgetState, ExecutionNodeId, MissionBudget, NodeBudget};
+
+        let request = json!({
+            "input": [{"role": "user", "content": "bounded context"}],
+            "max_output_tokens": 2_048,
+            "reasoning": {"effort": "low"}
+        });
+        let estimate = estimate_model_call_request_cost(&request);
+        let node_id = ExecutionNodeId::new("discovery");
+        let mut budget = BudgetState::new(MissionBudget::for_complexity(
+            crate::execution_graph::MissionComplexity::Small,
+        ));
+        budget.record_model_call(node_id.clone(), 340_000, Duration::ZERO);
+        let admission = budget.evaluate_model_call_admission(
+            &node_id,
+            &NodeBudget {
+                max_model_calls: 3,
+                max_cost_micros: 350_000,
+                max_duration: Duration::from_secs(120),
+                max_repair_attempts: 0,
+            },
+            1,
+            estimate.estimated_request_cost,
+            Duration::ZERO,
+        );
+        assert!(!admission.admitted);
+        let telemetry = model_call_admission_telemetry(&admission, &estimate);
+        assert_eq!(telemetry["rejection_reason"], "node_cost_budget_exhausted");
+        for field in [
+            "node_cost_limit",
+            "node_cost_consumed",
+            "node_cost_reserved",
+            "estimated_request_cost",
+            "projected_node_cost",
+            "input_tokens_estimated",
+            "max_output_tokens",
+            "reasoning_effort",
+            "cost_estimation_method",
+        ] {
+            assert!(
+                !telemetry[field].is_null(),
+                "missing telemetry field {field}"
+            );
+        }
+        assert!(
+            telemetry["projected_node_cost"].as_u64().unwrap()
+                > telemetry["node_cost_limit"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn orchestration_decision_key_changes_only_after_reconciliation_input_changes() {
+        let budget = crate::execution_graph::MissionBudget::for_complexity(
+            crate::execution_graph::MissionComplexity::Small,
+        );
+        let mut snapshot = crate::execution_graph::ExecutionSnapshot {
+            graph: crate::execution_graph::ExecutionGraph::bootstrap(
+                "graph",
+                "tree",
+                crate::execution_graph::MissionComplexity::Small,
+                &budget,
+            ),
+            ..crate::execution_graph::ExecutionSnapshot::default()
+        };
+        let decision = ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository {
+                inspection_scope: crate::hosted_orchestrator::InspectionScope::default(),
+            },
+        };
+        let first = execution_decision_idempotency_key(&snapshot, &decision);
+        assert_eq!(
+            first,
+            execution_decision_idempotency_key(&snapshot, &decision)
+        );
+        assert!(!orchestration_decision_is_new(Some(&first), &first));
+        snapshot.graph.revision += 1;
+        let after_event = execution_decision_idempotency_key(&snapshot, &decision);
+        assert_ne!(first, after_event);
+        assert!(orchestration_decision_is_new(Some(&first), &after_event));
+    }
+
+    #[test]
     fn fresh_clean_branch_does_not_enter_recovery_publication() {
         let manifest = test_manifest(Uuid::from_u128(0x2201));
         let startup = resolve_startup_mode(&manifest, true, &[]);
@@ -18525,9 +19013,49 @@ mod tests {
             .expect("first discovery admission was diagnosed as admitted");
         assert!(graph_checkpoint_index < discovery_request_index);
         assert!(admission_index < discovery_request_index);
+        let admission_request = &requests[admission_index];
+        for field in [
+            "node_cost_limit",
+            "node_cost_consumed",
+            "node_cost_reserved",
+            "estimated_request_cost",
+            "projected_node_cost",
+            "input_tokens_estimated",
+            "max_output_tokens",
+            "reasoning_effort",
+            "cost_estimation_method",
+        ] {
+            assert!(
+                admission_request.contains(&format!("\"{field}\"")),
+                "missing admission diagnostic {field}"
+            );
+        }
         let discovery_request = &requests[discovery_request_index];
         assert!(discovery_request.contains("\"phase\":\"discovery\""));
         assert!(discovery_request.contains("x-rustgrid-call-phase: discovery"));
+        let body = discovery_request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("gateway request body");
+        let payload: Value = serde_json::from_str(body).expect("gateway request JSON");
+        assert_eq!(payload["max_output_tokens"], 4_096);
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+        let tool_names = payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_names,
+            vec![
+                "list_files",
+                "read_file",
+                "read_files",
+                "search_text",
+                "related_tests",
+            ]
+        );
     }
 
     #[test]
@@ -24891,6 +25419,7 @@ Implement theme support.\n\n\
             required_gates: vec![],
             phase_budget: json!({}),
             last_successful_action: json!({"tool": "read_file"}),
+            last_orchestration_decision_key: None,
             finalization_revalidation: None,
             completion_artifact: None,
             orchestration: HostedOrchestrationCheckpoint::default(),
@@ -25567,6 +26096,7 @@ Implement theme support.\n\n\
             required_gates: vec![],
             phase_budget: json!({}),
             last_successful_action: json!({"tool": "read_files"}),
+            last_orchestration_decision_key: None,
             finalization_revalidation: None,
             completion_artifact: None,
             orchestration: HostedOrchestrationCheckpoint::default(),

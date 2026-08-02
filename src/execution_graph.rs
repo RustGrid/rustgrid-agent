@@ -88,6 +88,7 @@ string_id!(ExecutionNodeId);
 string_id!(MutationTargetId);
 string_id!(ValidationNodeId);
 string_id!(FailureId);
+string_id!(EvidenceId);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1110,6 +1111,15 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
+            let minimum_viable_node_cost = minimum_viable_node_cost(node);
+            if minimum_viable_node_cost > 0
+                && node.budget.max_cost_micros < minimum_viable_node_cost
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "budget_configuration_invalid: node `{}` kind={:?} max_model_calls={} max_cost_micros={} minimum_viable_node_cost={minimum_viable_node_cost}",
+                    node.id, node.kind, node.budget.max_model_calls, node.budget.max_cost_micros,
+                )));
+            }
         }
         let collections = self.derived_collections();
         let overlapping_targets = collections
@@ -1362,6 +1372,24 @@ impl ExecutionGraph {
             visit(self, &node.id, &mut visiting, &mut visited)?;
         }
         Ok(())
+    }
+}
+
+fn minimum_viable_node_cost(node: &ExecutionNode) -> u64 {
+    match node.kind {
+        ExecutionNodeKind::Discovery => {
+            let calls = u64::from(node.budget.max_model_calls);
+            match calls {
+                0 => 0,
+                // One normal bounded inspection plus 60k for every additional
+                // compact inspection/finalization or repair profile.
+                _ => 100_000_u64.saturating_add(calls.saturating_sub(1) * 60_000),
+            }
+        }
+        ExecutionNodeKind::Planning => {
+            u64::from(node.budget.max_model_calls).saturating_mul(100_000)
+        }
+        _ => 0,
     }
 }
 
@@ -2447,6 +2475,9 @@ pub struct ModelCallAdmission {
     pub rejection_reason: Option<&'static str>,
     pub node_cost_used: u64,
     pub node_cost_reserved: u64,
+    pub node_cost_limit: u64,
+    pub estimated_request_cost: u64,
+    pub projected_node_cost: u64,
     pub mission_cost_used: u64,
     pub mission_calls_used: u32,
 }
@@ -2602,6 +2633,9 @@ impl BudgetState {
             rejection_reason,
             node_cost_used: usage.cost_micros,
             node_cost_reserved: usage.cost_micros_reserved,
+            node_cost_limit: node_budget.max_cost_micros,
+            estimated_request_cost: estimated_cost_micros,
+            projected_node_cost: node_cost_after,
             mission_cost_used: self.total_cost_micros,
             mission_calls_used: self.total_model_calls,
         }
@@ -5156,6 +5190,21 @@ mod tests {
             node.kind,
             ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning
         )));
+    }
+
+    #[test]
+    fn incoherent_bootstrap_call_and_cost_budget_fails_graph_validation() {
+        let mission = MissionBudget::for_complexity(MissionComplexity::Tiny);
+        let mut graph =
+            ExecutionGraph::bootstrap("bootstrap", "tree", MissionComplexity::Tiny, &mission);
+        graph
+            .node_mut(&ExecutionNodeId::new("discovery"))
+            .unwrap()
+            .budget
+            .max_cost_micros = 219_999;
+        let error = graph.validate_invariants().unwrap_err();
+        assert!(error.message.contains("budget_configuration_invalid"));
+        assert!(error.message.contains("minimum_viable_node_cost=220000"));
     }
 
     #[test]

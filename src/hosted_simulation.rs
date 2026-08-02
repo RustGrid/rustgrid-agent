@@ -247,9 +247,7 @@ impl SimulationPhase {
 
     pub const fn for_decision(decision: &ExecutionDecision) -> Self {
         match decision {
-            ExecutionDecision::ContinueDiscovery { .. } | ExecutionDecision::FinalizeDiscovery => {
-                Self::Discovery
-            }
+            ExecutionDecision::ContinueDiscovery { .. } => Self::Discovery,
             ExecutionDecision::BuildPlan | ExecutionDecision::RepairPlan { .. } => Self::Planning,
             ExecutionDecision::ExecuteTarget { .. } => Self::Implementation,
             ExecutionDecision::RepairTarget { .. } => Self::Repair,
@@ -306,7 +304,6 @@ impl SimulationReport {
             .iter()
             .map(|decision| match decision {
                 ExecutionDecision::ContinueDiscovery { .. } => "continue_discovery",
-                ExecutionDecision::FinalizeDiscovery => "finalize_discovery",
                 ExecutionDecision::BuildPlan => "build_plan",
                 ExecutionDecision::RepairPlan { .. } => "repair_plan",
                 ExecutionDecision::ExecuteTarget { .. } => "execute_target",
@@ -475,13 +472,6 @@ impl SimulationHarness {
         match decision {
             ExecutionDecision::ContinueDiscovery { .. } => {
                 self.simulate_discovery()?;
-                Ok(None)
-            }
-            ExecutionDecision::FinalizeDiscovery => {
-                self.append(ExecutionDomainEvent::DiscoveryCompleted {
-                    sequence: self.sequence(),
-                    repository_fingerprint: self.snapshot.current_repository.fingerprint.clone(),
-                })?;
                 Ok(None)
             }
             ExecutionDecision::BuildPlan => {
