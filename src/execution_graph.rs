@@ -89,6 +89,7 @@ string_id!(MutationTargetId);
 string_id!(ValidationNodeId);
 string_id!(FailureId);
 string_id!(EvidenceId);
+string_id!(ArtifactId);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1386,8 +1387,11 @@ fn minimum_viable_node_cost(node: &ExecutionNode) -> u64 {
                 _ => 100_000_u64.saturating_add(calls.saturating_sub(1) * 60_000),
             }
         }
+        // One bounded 4,096-token BuildPlan request plus one compact repair
+        // request must fit the bootstrap envelope without pricing either as a
+        // generic 16,384-token agent turn.
         ExecutionNodeKind::Planning => {
-            u64::from(node.budget.max_model_calls).saturating_mul(100_000)
+            u64::from(node.budget.max_model_calls).saturating_mul(130_000)
         }
         _ => 0,
     }
@@ -1678,7 +1682,9 @@ fn assign_bootstrap_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionB
                 max_model_calls: planning_calls,
                 max_cost_micros: planning_cost,
                 max_duration: planning_duration,
-                max_repair_attempts: 0,
+                // The second bootstrap call is reserved for one bounded
+                // implementation-plan repair after an invalid first artifact.
+                max_repair_attempts: 1,
             },
             _ => NodeBudget::default(),
         };
@@ -5205,6 +5211,17 @@ mod tests {
         let error = graph.validate_invariants().unwrap_err();
         assert!(error.message.contains("budget_configuration_invalid"));
         assert!(error.message.contains("minimum_viable_node_cost=220000"));
+
+        let mut graph =
+            ExecutionGraph::bootstrap("bootstrap", "tree", MissionComplexity::Tiny, &mission);
+        graph
+            .node_mut(&ExecutionNodeId::new("planning"))
+            .unwrap()
+            .budget
+            .max_cost_micros = 259_999;
+        let error = graph.validate_invariants().unwrap_err();
+        assert!(error.message.contains("budget_configuration_invalid"));
+        assert!(error.message.contains("minimum_viable_node_cost=260000"));
     }
 
     #[test]

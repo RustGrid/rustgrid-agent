@@ -248,7 +248,7 @@ impl SimulationPhase {
     pub const fn for_decision(decision: &ExecutionDecision) -> Self {
         match decision {
             ExecutionDecision::ContinueDiscovery { .. } => Self::Discovery,
-            ExecutionDecision::BuildPlan | ExecutionDecision::RepairPlan { .. } => Self::Planning,
+            ExecutionDecision::ContinuePlanning { .. } => Self::Planning,
             ExecutionDecision::ExecuteTarget { .. } => Self::Implementation,
             ExecutionDecision::RepairTarget { .. } => Self::Repair,
             ExecutionDecision::RunValidation { .. } => Self::Validation,
@@ -304,8 +304,13 @@ impl SimulationReport {
             .iter()
             .map(|decision| match decision {
                 ExecutionDecision::ContinueDiscovery { .. } => "continue_discovery",
-                ExecutionDecision::BuildPlan => "build_plan",
-                ExecutionDecision::RepairPlan { .. } => "repair_plan",
+                ExecutionDecision::ContinuePlanning { action } => match action {
+                    crate::hosted_orchestrator::PlanningAction::BuildPlan { .. } => "build_plan",
+                    crate::hosted_orchestrator::PlanningAction::RepairPlan { .. } => "repair_plan",
+                    crate::hosted_orchestrator::PlanningAction::ResolveEvidenceGap { .. } => {
+                        "resolve_evidence_gap"
+                    }
+                },
                 ExecutionDecision::ExecuteTarget { .. } => "execute_target",
                 ExecutionDecision::RepairTarget { .. } => "repair_target",
                 ExecutionDecision::RunValidation { .. } => "run_validation",
@@ -474,11 +479,7 @@ impl SimulationHarness {
                 self.simulate_discovery()?;
                 Ok(None)
             }
-            ExecutionDecision::BuildPlan => {
-                self.simulate_planning()?;
-                Ok(None)
-            }
-            ExecutionDecision::RepairPlan { .. } => {
+            ExecutionDecision::ContinuePlanning { .. } => {
                 self.simulate_planning()?;
                 Ok(None)
             }

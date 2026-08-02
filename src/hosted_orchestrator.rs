@@ -40,14 +40,39 @@ pub struct ArtifactValidationError {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PlanningAction {
+    BuildPlan {
+        impact_map_id: ArtifactId,
+        evidence_ids: Vec<EvidenceId>,
+    },
+    RepairPlan {
+        validation_errors: Vec<PlanValidationError>,
+        previous_plan: PlanArtifact,
+    },
+    ResolveEvidenceGap {
+        missing_evidence: Vec<MissingEvidenceRequirement>,
+    },
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
-pub struct PlanRepair {
-    pub failure_id: Option<FailureId>,
-    #[serde(default)]
-    pub missing_criterion_ids: Vec<String>,
-    #[serde(default)]
-    pub invalid_fields: Vec<String>,
-    pub instruction: String,
+pub struct PlanValidationError {
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PlanArtifact {
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MissingEvidenceRequirement {
+    pub path: Option<String>,
+    pub symbol: Option<String>,
+    pub test_relationship: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -63,9 +88,8 @@ pub enum ExecutionDecision {
     ContinueDiscovery {
         action: DiscoveryAction,
     },
-    BuildPlan,
-    RepairPlan {
-        repair: PlanRepair,
+    ContinuePlanning {
+        action: PlanningAction,
     },
     ExecuteTarget {
         node_id: ExecutionNodeId,
@@ -102,7 +126,7 @@ impl ExecutionDecision {
     pub const fn stage(&self) -> HostedExecutionStage {
         match self {
             Self::ContinueDiscovery { .. } => HostedExecutionStage::Discovery,
-            Self::BuildPlan | Self::RepairPlan { .. } => HostedExecutionStage::Planning,
+            Self::ContinuePlanning { .. } => HostedExecutionStage::Planning,
             Self::ExecuteTarget { .. } | Self::RepairTarget { .. } => {
                 HostedExecutionStage::Implementation
             }
@@ -407,15 +431,36 @@ fn decision_for_node(
         ExecutionNodeKind::Planning => {
             if node.status == ExecutionNodeStatus::FailedRecoverable {
                 let failure = unresolved_failure_for_node(snapshot, &node.id)?;
-                Ok(ExecutionDecision::RepairPlan {
-                    repair: PlanRepair {
-                        failure_id: Some(failure.id.clone()),
-                        instruction: failure.message.clone(),
-                        ..PlanRepair::default()
+                let cached_paths = current_repository_evidence_paths(snapshot);
+                let missing_evidence = missing_plan_evidence_requirements(&failure.message)
+                    .into_iter()
+                    .filter(|requirement| {
+                        requirement
+                            .path
+                            .as_ref()
+                            .is_none_or(|path| !cached_paths.contains(&path.to_ascii_lowercase()))
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ExecutionDecision::ContinuePlanning {
+                    action: if missing_evidence.is_empty() {
+                        PlanningAction::RepairPlan {
+                            validation_errors: plan_validation_errors(&failure.message),
+                            previous_plan: previous_plan_artifact(&failure.message),
+                        }
+                    } else {
+                        PlanningAction::ResolveEvidenceGap { missing_evidence }
                     },
                 })
             } else {
-                Ok(ExecutionDecision::BuildPlan)
+                Ok(ExecutionDecision::ContinuePlanning {
+                    action: PlanningAction::BuildPlan {
+                        impact_map_id: ArtifactId::new(format!(
+                            "impact-map:{}",
+                            snapshot.current_repository.fingerprint
+                        )),
+                        evidence_ids: current_repository_evidence_ids(snapshot),
+                    },
+                })
             }
         }
         ExecutionNodeKind::SourceMutation | ExecutionNodeKind::TestMutation => {
@@ -569,6 +614,72 @@ fn artifact_validation_errors(message: &str) -> Vec<ArtifactValidationError> {
                 keyword: error.get("keyword")?.as_str()?.to_owned(),
                 message: error.get("message")?.as_str()?.to_owned(),
             })
+        })
+        .collect()
+}
+
+fn plan_validation_errors(message: &str) -> Vec<PlanValidationError> {
+    let value = serde_json::from_str::<serde_json::Value>(message).unwrap_or_default();
+    value
+        .get("validation_errors")
+        .or_else(|| value.get("invalid_fields"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|error| {
+            if let Some(message) = error.as_str() {
+                let path = message.split_once(':').map_or("$", |(path, _)| path);
+                return Some(PlanValidationError {
+                    path: path.trim().to_owned(),
+                    message: message.to_owned(),
+                });
+            }
+            Some(PlanValidationError {
+                path: error.get("path")?.as_str()?.to_owned(),
+                message: error.get("message")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn previous_plan_artifact(message: &str) -> PlanArtifact {
+    let value = serde_json::from_str::<serde_json::Value>(message).unwrap_or_default();
+    PlanArtifact {
+        value: value
+            .get("previous_plan")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    }
+}
+
+fn missing_plan_evidence_requirements(message: &str) -> Vec<MissingEvidenceRequirement> {
+    let value = serde_json::from_str::<serde_json::Value>(message).unwrap_or_default();
+    value
+        .get("missing_evidence")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|requirement| {
+            let reason = requirement.get("reason")?.as_str()?.trim().to_owned();
+            let candidate = MissingEvidenceRequirement {
+                path: requirement
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                symbol: requirement
+                    .get("symbol")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                test_relationship: requirement
+                    .get("test_relationship")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                reason,
+            };
+            (candidate.path.is_some()
+                || candidate.symbol.is_some()
+                || candidate.test_relationship.is_some())
+            .then_some(candidate)
         })
         .collect()
 }
@@ -921,12 +1032,147 @@ mod tests {
             .unwrap();
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
-            ExecutionDecision::BuildPlan
+            ExecutionDecision::ContinuePlanning {
+                action: PlanningAction::BuildPlan { .. }
+            }
         ));
         assert_eq!(
             state.graph.next_runnable_node().map(|node| node.kind),
             Some(ExecutionNodeKind::Planning)
         );
+    }
+
+    #[test]
+    fn planning_build_references_the_accepted_impact_map_and_discovery_evidence() {
+        let mut state = discovery_snapshot();
+        for path in [
+            "src/components/theme/ThemeProvider.tsx",
+            "tests/theme-provider.test.tsx",
+            "package.json",
+        ] {
+            state.evidence.capture_file(
+                path,
+                "tree-1",
+                None,
+                format!("evidence for {path}"),
+                false,
+            );
+        }
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryCompleted {
+                sequence: 1,
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        match reconcile_execution(&state).unwrap() {
+            ExecutionDecision::ContinuePlanning {
+                action:
+                    PlanningAction::BuildPlan {
+                        impact_map_id,
+                        evidence_ids,
+                    },
+            } => {
+                assert_eq!(impact_map_id.as_str(), "impact-map:tree-1");
+                assert_eq!(evidence_ids.len(), 3);
+            }
+            decision => panic!("expected typed plan build, got {decision:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_planning_evidence_is_reused_instead_of_scheduling_a_duplicate_read() {
+        let mut state = discovery_snapshot();
+        for path in [
+            "src/components/theme/ThemeProvider.tsx",
+            "tests/theme-provider.test.tsx",
+            "package.json",
+        ] {
+            state.evidence.capture_file(
+                path,
+                "tree-1",
+                None,
+                format!("evidence for {path}"),
+                false,
+            );
+        }
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryCompleted {
+                sequence: 1,
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        let planning_id = ExecutionNodeId::new("planning");
+        state
+            .graph
+            .set_node_status(&planning_id, ExecutionNodeStatus::FailedRecoverable)
+            .unwrap();
+        state.failures.record(FailureRecord::new(
+            "plan-invalid",
+            planning_id,
+            FailureCategory::ModelArtifactRecoverable,
+            1,
+            "tree-1",
+            serde_json::json!({
+                "validation_errors": ["$.planned_changes[0].intent: required"],
+                "previous_plan": {"implementation_status": "ready"},
+                "missing_evidence": [{
+                    "path": "src/components/theme/ThemeProvider.tsx",
+                    "reason": "provider behavior must be confirmed"
+                }]
+            })
+            .to_string(),
+        ));
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ContinuePlanning {
+                action: PlanningAction::RepairPlan { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn planning_schedules_reads_only_for_a_concrete_uncached_evidence_gap() {
+        let mut state = discovery_snapshot();
+        for path in ["src/theme.ts", "tests/theme.test.ts", "package.json"] {
+            state.evidence.capture_file(
+                path,
+                "tree-1",
+                None,
+                format!("evidence for {path}"),
+                false,
+            );
+        }
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryCompleted {
+                sequence: 1,
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        let planning_id = ExecutionNodeId::new("planning");
+        state
+            .graph
+            .set_node_status(&planning_id, ExecutionNodeStatus::FailedRecoverable)
+            .unwrap();
+        state.failures.record(FailureRecord::new(
+            "plan-evidence-gap",
+            planning_id,
+            FailureCategory::ModelArtifactRecoverable,
+            1,
+            "tree-1",
+            serde_json::json!({
+                "missing_evidence": [{
+                    "path": "src/new-theme-registry.ts",
+                    "reason": "registry relationship is not present in discovery evidence"
+                }]
+            })
+            .to_string(),
+        ));
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ContinuePlanning {
+                action: PlanningAction::ResolveEvidenceGap { missing_evidence }
+            } if missing_evidence[0].path.as_deref() == Some("src/new-theme-registry.ts")
+        ));
     }
 
     fn complete_node(snapshot: &mut ExecutionSnapshot, kind: ExecutionNodeKind) {
