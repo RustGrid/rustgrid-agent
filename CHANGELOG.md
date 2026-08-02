@@ -5,6 +5,48 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.25 - 2026-08-02
+
+### Changed
+
+- Split discovery into explicit repository inspection, impact-map finalization,
+  and impact-map repair actions selected from persisted evidence and artifact
+  state.
+- Give each discovery action a bounded provider profile: inspection exposes
+  only repository-reading tools, while finalization and repair expose and force
+  only `record_impact_map` with a compact output allowance.
+- Estimate admission cost from the exact action request and emit the complete
+  consumed, reserved, estimated, projected, and limiting cost calculation.
+
+### Fixed
+
+- Admit the third discovery call when the compact finalization request fits the
+  remaining node budget instead of reserving a generic high-output request.
+- Build a validated conservative impact map from persisted files, searches,
+  related tests, acceptance criteria, and architecture findings when even the
+  compact finalization request cannot fit.
+- Treat localized-discovery policy redirection as an action transition rather
+  than a failed repository operation, and prevent duplicate orchestration
+  decision application without an intervening graph event or action result.
+- Reject incoherent node configurations whose cost budget cannot reasonably
+  fund their configured model-call allowance.
+
+## 1.4.24 - 2026-08-02
+
+### Changed
+
+- Track reserved and consumed model calls separately and provision bounded
+  discovery and planning bootstrap allowances before authoritative planning.
+- Preserve structured healthy blocked outcomes while recording later workflow
+  conclusions as infrastructure metadata.
+
+### Fixed
+
+- Admit a call when consumed and reserved usage plus the request exactly equals
+  the node call limit, with atomic reservation and reconciliation.
+- Keep discovery active until an impact map, deterministic fallback, concrete
+  repository blocker, or genuinely exhausted budget is recorded.
+
 ## 1.4.23 - 2026-08-01
 
 ### Changed
