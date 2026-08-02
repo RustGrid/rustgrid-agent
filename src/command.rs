@@ -587,6 +587,14 @@ fn capture_cancellable_with_containment(
             .lock()
             .map(|last| last.elapsed())
             .unwrap_or_default();
+        // A short-lived command may complete between polling ticks, especially
+        // on a loaded macOS runner. Observe terminal state before classifying
+        // the same tick as idle so completed work is never reported as an
+        // inactivity timeout merely because the polling interval crossed the
+        // configured boundary.
+        if let Some(status) = child.try_wait().context("failed while checking command")? {
+            break status;
+        }
         if inactivity_timeout
             .is_some_and(|limit| started.elapsed() >= limit && last_output_age >= limit)
         {
@@ -610,9 +618,6 @@ fn capture_cancellable_with_containment(
                 last_output_age,
                 bytes_emitted: current_bytes,
             });
-        }
-        if let Some(status) = child.try_wait().context("failed while checking command")? {
-            break status;
         }
         thread::sleep(Duration::from_millis(250));
     };
@@ -1662,7 +1667,7 @@ while not os.path.exists(pid_file):
         let directory = tempfile::tempdir().unwrap();
         let mut activity = Vec::new();
         let output = capture_cancellable_with_containment(
-            "sh -c 'printf first; sleep 0.1; printf second >&2; sleep 0.1; printf third'",
+            "sh -c 'printf \"first\\n\"; sleep 0.1; printf \"second\\n\" >&2; sleep 0.1; printf \"third\\n\"'",
             directory.path(),
             &running,
             Duration::from_secs(2),
@@ -1670,7 +1675,7 @@ while not os.path.exists(pid_file):
             None,
             None,
             None,
-            Some(Duration::from_millis(350)),
+            Some(Duration::from_millis(1_500)),
             &mut |observation| activity.push(observation),
         )
         .unwrap();
@@ -1680,7 +1685,7 @@ while not os.path.exists(pid_file):
                 .iter()
                 .any(|observation| observation.bytes_emitted >= 5)
         );
-        assert!(activity.last().unwrap().bytes_emitted >= 16);
-        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(350));
+        assert!(activity.last().unwrap().bytes_emitted >= 19);
+        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(1_500));
     }
 }
