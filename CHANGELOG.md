@@ -5,6 +5,39 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.28 - 2026-08-02
+
+### Changed
+
+- Split mutation execution into explicit context preparation, target mutation,
+  deterministic target verification, and typed repair actions backed by
+  append-only graph events and a strongly typed repository fingerprint.
+- Build each mutation request from current-fingerprint target content,
+  accepted intent and criteria, relevant impact-map areas, related-test
+  excerpts, and preservation constraints instead of rediscovering the
+  repository.
+- Restrict target mutation calls to one exact path and the `apply_patch` and
+  `replace_file` tools, with a 4,096-token medium-reasoning profile and no
+  parallel tool calls.
+
+### Fixed
+
+- Reuse current target evidence without another model or repository-tool call,
+  and emit cache-hit telemetry with the evidence identity, content hash, and
+  repository fingerprint.
+- Verify successful writes deterministically from target hashes, repository
+  fingerprints, and the exact changed path before marking a mutation node
+  applied; treat already-applied targets as successful no-ops.
+- Reject free-form or no-change mutation responses as `MutationNotProduced`,
+  allow at most one repair call, and prevent a localized target from spending
+  repeated calls on repository exploration.
+- Keep one graph attempt active across context preparation, mutation, and
+  verification while preventing later targets from becoming eligible before
+  the active target terminates.
+- Report action-aware no-progress diagnostics including the active target,
+  calls, read paths, cache-eligible duplicates, and mutation tools offered and
+  invoked.
+
 ## 1.4.27 - 2026-08-02
 
 ### Changed
