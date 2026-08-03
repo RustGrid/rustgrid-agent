@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
@@ -12,6 +13,164 @@ use crate::{
     lifecycle::WorkerStatus,
     shutdown,
 };
+
+/// Control-plane capabilities consumed by lease supervision.
+pub trait LeaseControlPlane: Send + 'static {
+    type Error: fmt::Display + Send + 'static;
+
+    fn heartbeat(&self, worker_id: &str) -> Result<(), Self::Error>;
+    fn extend_lease(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<i64, LeaseRenewalError<Self::Error>>;
+}
+
+#[derive(Debug)]
+pub enum LeaseRenewalError<E> {
+    Lost(E),
+    Unavailable(E),
+}
+
+impl<E: fmt::Display> fmt::Display for LeaseRenewalError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lost(error) | Self::Unavailable(error) => error.fmt(formatter),
+        }
+    }
+}
+
+struct RustGridLeaseControlPlane(RustGridClient);
+
+impl LeaseControlPlane for RustGridLeaseControlPlane {
+    type Error = anyhow::Error;
+
+    fn heartbeat(&self, worker_id: &str) -> Result<(), Self::Error> {
+        self.0
+            .heartbeat_with_status(worker_id, WorkerStatus::Busy)
+            .map(|_| ())
+    }
+
+    fn extend_lease(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        lease_seconds: u64,
+    ) -> Result<i64, LeaseRenewalError<Self::Error>> {
+        self.0
+            .extend_lease(run_id, worker_id, lease_seconds)
+            .map(|run| run.row_version)
+            .map_err(|error| {
+                if is_lease_lost(&error) {
+                    LeaseRenewalError::Lost(error)
+                } else {
+                    LeaseRenewalError::Unavailable(error)
+                }
+            })
+    }
+}
+
+/// Host lifecycle and monotonic-time capability used by the supervisor loop.
+pub trait ExecutionEnvironment: Send + 'static {
+    fn now(&self) -> Duration;
+    fn shutdown_requested(&self) -> bool;
+    fn sleep(&self, duration: Duration);
+}
+
+struct SystemExecutionEnvironment {
+    origin: Instant,
+}
+
+impl SystemExecutionEnvironment {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl ExecutionEnvironment for SystemExecutionEnvironment {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        shutdown::requested()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseDecision {
+    Continue { healthy: bool, row_version: i64 },
+    StopLeaseLost,
+    StopTimedOut,
+    StopShutdown,
+}
+
+struct LeaseMonitor {
+    started_at: Duration,
+    last_lease_success: Duration,
+    uncertainty_limit: Duration,
+    run_timeout: Duration,
+}
+
+impl LeaseMonitor {
+    fn new(now: Duration, config: &RunSupervisorConfig) -> Self {
+        Self {
+            started_at: now,
+            last_lease_success: now,
+            uncertainty_limit: Duration::from_secs(
+                config
+                    .lease_seconds
+                    .saturating_sub(config.heartbeat_interval.as_secs().saturating_mul(2))
+                    .max(config.heartbeat_interval.as_secs()),
+            ),
+            run_timeout: config.run_timeout,
+        }
+    }
+
+    fn before_renewal(&self, now: Duration, shutdown_requested: bool) -> Option<LeaseDecision> {
+        if shutdown_requested {
+            Some(LeaseDecision::StopShutdown)
+        } else if now.saturating_sub(self.started_at) >= self.run_timeout {
+            Some(LeaseDecision::StopTimedOut)
+        } else {
+            None
+        }
+    }
+
+    fn observe<E>(
+        &mut self,
+        now: Duration,
+        heartbeat_ok: bool,
+        lease: &Result<i64, LeaseRenewalError<E>>,
+    ) -> LeaseDecision {
+        match lease {
+            Ok(row_version) => {
+                self.last_lease_success = now;
+                LeaseDecision::Continue {
+                    healthy: heartbeat_ok,
+                    row_version: *row_version,
+                }
+            }
+            Err(LeaseRenewalError::Lost(_)) => LeaseDecision::StopLeaseLost,
+            Err(LeaseRenewalError::Unavailable(_))
+                if now.saturating_sub(self.last_lease_success) >= self.uncertainty_limit =>
+            {
+                LeaseDecision::StopLeaseLost
+            }
+            Err(LeaseRenewalError::Unavailable(_)) => LeaseDecision::Continue {
+                healthy: false,
+                row_version: 0,
+            },
+        }
+    }
+}
 
 pub struct RunSupervisor {
     stop: Arc<AtomicBool>,
@@ -36,9 +195,28 @@ impl RunSupervisor {
         execution_running: Arc<AtomicBool>,
         config: RunSupervisorConfig,
     ) -> Self {
+        Self::start_with(
+            RustGridLeaseControlPlane(api),
+            SystemExecutionEnvironment::new(),
+            worker_id,
+            run_id,
+            row_version,
+            execution_running,
+            config,
+        )
+    }
+
+    fn start_with<C: LeaseControlPlane, E: ExecutionEnvironment>(
+        api: C,
+        environment: E,
+        worker_id: String,
+        run_id: String,
+        row_version: Arc<AtomicI64>,
+        execution_running: Arc<AtomicBool>,
+        config: RunSupervisorConfig,
+    ) -> Self {
         let heartbeat_interval = config.heartbeat_interval;
         let lease_seconds = config.lease_seconds;
-        let run_timeout = config.run_timeout;
         let stop = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
         let lease_lost = Arc::new(AtomicBool::new(false));
@@ -48,53 +226,50 @@ impl RunSupervisor {
         let thread_lease_lost = Arc::clone(&lease_lost);
         let thread_timed_out = Arc::clone(&timed_out);
         let handle = thread::spawn(move || {
-            let run_started = Instant::now();
-            let mut last_lease_success = Instant::now();
-            let uncertainty_limit = Duration::from_secs(
-                lease_seconds
-                    .saturating_sub(heartbeat_interval.as_secs().saturating_mul(2))
-                    .max(heartbeat_interval.as_secs()),
-            );
+            let mut monitor = LeaseMonitor::new(environment.now(), &config);
             while !thread_stop.load(Ordering::SeqCst) {
-                if shutdown::requested() {
+                if let Some(decision) =
+                    monitor.before_renewal(environment.now(), environment.shutdown_requested())
+                {
+                    if decision == LeaseDecision::StopTimedOut {
+                        thread_timed_out.store(true, Ordering::SeqCst);
+                    }
                     execution_running.store(false, Ordering::SeqCst);
                     break;
                 }
-                if run_started.elapsed() >= run_timeout {
-                    thread_timed_out.store(true, Ordering::SeqCst);
-                    execution_running.store(false, Ordering::SeqCst);
-                    break;
-                }
-                let heartbeat = api.heartbeat_with_status(&worker_id, WorkerStatus::Busy);
+                let heartbeat = api.heartbeat(&worker_id);
                 let lease = api.extend_lease(&run_id, &worker_id, lease_seconds);
                 let heartbeat_ok = heartbeat.is_ok();
                 if let Err(error) = heartbeat {
                     eprintln!("[warning] worker heartbeat failed: {error:#}");
                 }
-                match lease {
-                    Ok(run) => {
-                        row_version.store(run.row_version, Ordering::SeqCst);
-                        last_lease_success = Instant::now();
-                        thread_healthy.store(heartbeat_ok, Ordering::SeqCst);
-                    }
-                    Err(error) => {
-                        thread_healthy.store(false, Ordering::SeqCst);
-                        eprintln!("[warning] run lease renewal failed: {error:#}");
-                        if is_lease_lost(&error)
-                            || last_lease_success.elapsed() >= uncertainty_limit
-                        {
-                            thread_lease_lost.store(true, Ordering::SeqCst);
-                            execution_running.store(false, Ordering::SeqCst);
-                            break;
+                if let Err(error) = &lease {
+                    eprintln!("[warning] run lease renewal failed: {error}");
+                }
+                match monitor.observe(environment.now(), heartbeat_ok, &lease) {
+                    LeaseDecision::Continue {
+                        healthy,
+                        row_version: renewed_row_version,
+                    } => {
+                        thread_healthy.store(healthy, Ordering::SeqCst);
+                        if lease.is_ok() {
+                            row_version.store(renewed_row_version, Ordering::SeqCst);
                         }
                     }
+                    LeaseDecision::StopLeaseLost => {
+                        thread_healthy.store(false, Ordering::SeqCst);
+                        thread_lease_lost.store(true, Ordering::SeqCst);
+                        execution_running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    LeaseDecision::StopTimedOut | LeaseDecision::StopShutdown => unreachable!(),
                 }
                 let slices = heartbeat_interval.as_millis().div_ceil(250) as usize;
                 for _ in 0..slices {
                     if thread_stop.load(Ordering::SeqCst) {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(250));
+                    environment.sleep(Duration::from_millis(250));
                 }
             }
         });
@@ -139,6 +314,47 @@ mod tests {
 
     use super::*;
     use crate::config::{AppContext, Config};
+
+    #[test]
+    fn lease_loss_is_a_deterministic_supervision_decision() {
+        let config = RunSupervisorConfig {
+            heartbeat_interval: Duration::from_secs(5),
+            lease_seconds: 30,
+            run_timeout: Duration::from_secs(60),
+        };
+        let mut monitor = LeaseMonitor::new(Duration::ZERO, &config);
+        let lease: Result<i64, LeaseRenewalError<&str>> =
+            Err(LeaseRenewalError::Lost("ownership changed"));
+
+        assert_eq!(
+            monitor.observe(Duration::from_secs(5), true, &lease),
+            LeaseDecision::StopLeaseLost
+        );
+    }
+
+    #[test]
+    fn transient_lease_errors_stop_only_after_the_uncertainty_window() {
+        let config = RunSupervisorConfig {
+            heartbeat_interval: Duration::from_secs(5),
+            lease_seconds: 30,
+            run_timeout: Duration::from_secs(60),
+        };
+        let mut monitor = LeaseMonitor::new(Duration::ZERO, &config);
+        let lease: Result<i64, LeaseRenewalError<&str>> =
+            Err(LeaseRenewalError::Unavailable("temporary outage"));
+
+        assert_eq!(
+            monitor.observe(Duration::from_secs(19), false, &lease),
+            LeaseDecision::Continue {
+                healthy: false,
+                row_version: 0,
+            }
+        );
+        assert_eq!(
+            monitor.observe(Duration::from_secs(20), false, &lease),
+            LeaseDecision::StopLeaseLost
+        );
+    }
 
     #[test]
     fn lease_loss_cancels_only_its_execution_token() {

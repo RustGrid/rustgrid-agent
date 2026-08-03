@@ -1,6 +1,42 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
+/// Model invocation capability consumed by hosted model sessions.
+pub(crate) trait ModelProvider {
+    type Error: Into<anyhow::Error>;
+
+    fn invoke(
+        &self,
+        request: Value,
+        registration: &AiCallRegistration,
+        execution_deadline: Option<Instant>,
+    ) -> std::result::Result<Value, Self::Error>;
+}
+
+impl ModelProvider for HostedApiClient {
+    type Error = anyhow::Error;
+
+    fn invoke(
+        &self,
+        request: Value,
+        registration: &AiCallRegistration,
+        execution_deadline: Option<Instant>,
+    ) -> Result<Value> {
+        self.ai_response_until(request, registration, execution_deadline)
+    }
+}
+
+pub(super) fn invoke_model<P: ModelProvider>(
+    provider: &P,
+    request: Value,
+    registration: &AiCallRegistration,
+    execution_deadline: Option<Instant>,
+) -> Result<Value> {
+    provider
+        .invoke(request, registration, execution_deadline)
+        .map_err(Into::into)
+}
+
 pub(super) struct GatewayAgent<'a> {
     pub(super) api: HostedApiClient,
     pub(super) manifest: &'a HostedManifest,
@@ -1155,7 +1191,8 @@ impl<'a> GatewayAgent<'a> {
                 }
             };
             let model_call_started = Instant::now();
-            let response = match self.api.ai_response_until(
+            let response = match invoke_model(
+                &self.api,
                 request.clone(),
                 &registration,
                 Some(execution_deadline),
@@ -1229,6 +1266,7 @@ impl<'a> GatewayAgent<'a> {
                             );
                             if retryable {
                                 sleep_before_execution_retry(
+                                    self.api.clock.as_ref(),
                                     Some(execution_deadline),
                                     registration_retry_delay(
                                         registration_attempt,

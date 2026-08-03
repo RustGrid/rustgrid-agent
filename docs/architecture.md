@@ -64,6 +64,53 @@ and mutations are forbidden.
 - **Reporting:** writes the durable journal and publishes sequenced events, steps, comments, ticket states, and run states.
 - **Finalization:** maps one typed terminal outcome to cleanup and external side effects.
 
+## Ports and adapters
+
+Domain reconciliation remains data-in/data-out. `hosted_orchestrator` consumes an
+`ExecutionSnapshot` and returns one `ExecutionDecision`; it does not read the
+environment, call HTTP, run Git or subprocesses, touch the filesystem, or read a
+wall clock. `hosted_simulation` drives that same reducer from in-memory scripted
+effects for deterministic end-to-end tests.
+
+Side effects are reached through narrow, consumer-owned ports:
+
+| Consumer | Port | Production adapter | Responsibility |
+| --- | --- | --- | --- |
+| Persistent run supervision | `LeaseControlPlane` | `RustGridLeaseControlPlane` over `RustGridClient` | Worker heartbeat and run-lease renewal only |
+| Supervisor loop | `ExecutionEnvironment` | `SystemExecutionEnvironment` | Monotonic time, shutdown observation, and bounded sleeping |
+| Hosted lease supervision | `HostedLeaseControlPlane` | `HostedApiClient` | Hosted execution heartbeat and typed lease invalidation |
+| Hosted model session | `ModelProvider` | `HostedApiClient` AI-response adapter | One registered, deadline-bound model invocation |
+| Pull-request reconciliation | `GitHubPublisher` | `GitHubClient` | Find, create, update, and confirm draft state |
+| Branch publication | `RepositoryPublisher` | `GitRepositoryPublisher` over `Repo` | Reconcile and push one authorized branch/commit |
+| Recovery journal | `EventStore` | `FilesystemEventStore` | Load and atomically replace the versioned journal |
+| Hosted retry and credential policy | `HostedClock` | `SystemHostedClock` | System/monotonic time and retry sleeping |
+
+The traits live with the policy that consumes them. Read and mutation
+capabilities remain separate: for example, publication cannot use arbitrary
+GitHub endpoints, and lease supervision cannot mutate execution state beyond a
+renewal. Errors retain typed lease-loss and remote-branch-movement identities so
+reconciliation never depends on transport strings.
+
+The CLI is the composition root. Hosted execution explicitly loads the GitHub
+Actions environment, constructs the hardened HTTP client, exchanges OIDC,
+builds `HostedApiClient` with `SystemHostedClock`, and passes the concrete Git,
+GitHub, process-containment, and filesystem adapters into the application flow.
+The persistent worker similarly constructs `RustGridClient`; `RunSupervisor`
+wraps it in its lease-only adapter. There is no service locator or mutable
+dependency registry. Dynamic dispatch is limited to the clock stored by cloned
+hosted API adapters and the store retained by the non-generic public
+`RunJournal`; making either container generic would spread adapter types across
+the API and reporting layers. Orchestration, lease supervision, model
+invocation, and publication use static dispatch.
+
+Adapter contract tests continue to exercise real HTTP request shapes, Git
+force-with-lease behavior, atomic journal replacement, and GitHub publication
+fallbacks. In-memory fakes cover lease loss, transient and permanent failures,
+remote movement, duplicate publication, model-budget exhaustion, clock
+advancement, and journal write retry. The token-refresh contract test combines
+the manual clock with a loopback HTTP adapter fixture. Full in-memory replay
+uses no sockets, Git, subprocesses, or wall-clock waiting.
+
 ## Run sequence
 
 ```text

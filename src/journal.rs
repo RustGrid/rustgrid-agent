@@ -1,7 +1,9 @@
 use std::{
+    fmt,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +13,53 @@ use crate::{
     execution_graph::ExecutionSnapshot, lifecycle::RunPhase, optimization::DependencyState,
     token_consumption::TokenConsumption,
 };
+
+/// Durable event/checkpoint storage consumed by recovery journaling.
+pub trait EventStore: fmt::Debug + Send + Sync {
+    type Error: Into<anyhow::Error>;
+
+    fn load(&self, path: &Path) -> std::result::Result<Option<Vec<u8>>, Self::Error>;
+    fn persist_atomic(&self, path: &Path, contents: &[u8]) -> std::result::Result<(), Self::Error>;
+}
+
+#[derive(Debug, Default)]
+pub struct FilesystemEventStore;
+
+impl EventStore for FilesystemEventStore {
+    type Error = anyhow::Error;
+
+    fn load(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        path.is_file()
+            .then(|| fs::read(path).with_context(|| format!("could not read {}", path.display())))
+            .transpose()
+    }
+
+    fn persist_atomic(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        let parent = path
+            .parent()
+            .context("recovery journal path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+        let temporary = path.with_extension("json.tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .with_context(|| format!("could not open {}", temporary.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("could not write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("could not replace {}", path.display()))?;
+        sync_directory(parent)
+    }
+}
+
+fn filesystem_event_store() -> Arc<dyn EventStore<Error = anyhow::Error>> {
+    Arc::new(FilesystemEventStore)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryPlan {
@@ -63,6 +112,8 @@ pub struct RunJournal {
     pub hosted_execution: Option<ExecutionSnapshot>,
     #[serde(skip)]
     path: PathBuf,
+    #[serde(skip, default = "filesystem_event_store")]
+    store: Arc<dyn EventStore<Error = anyhow::Error>>,
 }
 
 impl RunJournal {
@@ -86,10 +137,17 @@ impl RunJournal {
     }
 
     pub fn create(path: &Path, run_id: &str, ticket_id: &str) -> Result<Self> {
+        Self::create_with_store(path, run_id, ticket_id, filesystem_event_store())
+    }
+
+    pub fn create_with_store(
+        path: &Path,
+        run_id: &str,
+        ticket_id: &str,
+        store: Arc<dyn EventStore<Error = anyhow::Error>>,
+    ) -> Result<Self> {
         let path = path.to_path_buf();
-        if path.is_file() {
-            let bytes =
-                fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
+        if let Some(bytes) = store.load(&path)? {
             let mut journal: Self = serde_json::from_slice(&bytes)
                 .with_context(|| format!("invalid recovery journal {}", path.display()))?;
             if journal.run_id != run_id || journal.ticket_id != ticket_id {
@@ -102,6 +160,7 @@ impl RunJournal {
                 );
             }
             journal.path = path;
+            journal.store = store;
             return Ok(journal);
         }
         let journal = Self {
@@ -122,6 +181,7 @@ impl RunJournal {
             dependency_state: None,
             hosted_execution: None,
             path,
+            store,
         };
         journal.persist()?;
         Ok(journal)
@@ -190,6 +250,7 @@ impl RunJournal {
         journal.token_consumption = TokenConsumption::default();
         journal.recovery_source_run_id = Some(source_run_id.to_owned());
         journal.path = path.to_path_buf();
+        journal.store = filesystem_event_store();
         journal.persist()?;
         Ok(journal)
     }
@@ -247,26 +308,8 @@ impl RunJournal {
     }
 
     fn persist(&self) -> Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .context("recovery journal path has no parent")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-        let temporary = self.path.with_extension("json.tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .with_context(|| format!("could not open {}", temporary.display()))?;
-        file.write_all(&serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("could not write {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("could not sync {}", temporary.display()))?;
-        fs::rename(&temporary, &self.path)
-            .with_context(|| format!("could not replace {}", self.path.display()))?;
-        sync_directory(parent)
+        let contents = serde_json::to_vec_pretty(self)?;
+        self.store.persist_atomic(&self.path, &contents)
     }
 }
 
@@ -285,7 +328,53 @@ fn sync_directory(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct FailOnceEventStore {
+        writes: AtomicUsize,
+        contents: std::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    impl EventStore for FailOnceEventStore {
+        type Error = anyhow::Error;
+
+        fn load(&self, _path: &Path) -> Result<Option<Vec<u8>>> {
+            Ok(self.contents.lock().unwrap().clone())
+        }
+
+        fn persist_atomic(&self, _path: &Path, contents: &[u8]) -> Result<()> {
+            let attempt = self.writes.fetch_add(1, Ordering::SeqCst);
+            if attempt == 1 {
+                anyhow::bail!("injected journal write failure");
+            }
+            *self.contents.lock().unwrap() = Some(contents.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retries_a_failed_journal_write_without_losing_the_checkpoint() {
+        let store = Arc::new(FailOnceEventStore::default());
+        let mut journal = RunJournal::create_with_store(
+            Path::new("memory/journal.json"),
+            "run-1",
+            "ticket-1",
+            store.clone(),
+        )
+        .unwrap();
+        assert!(journal.checkpoint(RunPhase::Executing, 4).is_err());
+        journal.checkpoint(RunPhase::Executing, 4).unwrap();
+
+        assert_eq!(store.writes.load(Ordering::SeqCst), 3);
+        let persisted: RunJournal =
+            serde_json::from_slice(store.contents.lock().unwrap().as_deref().unwrap()).unwrap();
+        assert_eq!(persisted.run_id, journal.run_id);
+        assert_eq!(persisted.phase, RunPhase::Executing);
+        assert_eq!(persisted.last_sequence, 4);
+    }
 
     #[test]
     fn persists_recovery_checkpoint_outside_worktree_changes() {

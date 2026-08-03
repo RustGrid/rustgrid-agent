@@ -1,5 +1,6 @@
 // Extracted from the hosted execution composition root.
 use super::*;
+use reqwest::{blocking::Client, header};
 
 pub(super) fn request_github_oidc(
     http: &Client,

@@ -32,6 +32,14 @@ pub struct RemoteBranchMoved {
     branch: String,
 }
 
+impl RemoteBranchMoved {
+    pub(crate) fn new(branch: impl Into<String>) -> Self {
+        Self {
+            branch: branch.into(),
+        }
+    }
+}
+
 impl std::fmt::Display for RemoteBranchMoved {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -352,10 +360,7 @@ impl Repo {
             return Ok(false);
         }
         if expected_remote.is_some() && remote_before.as_deref() != expected_remote {
-            return Err(RemoteBranchMoved {
-                branch: branch.to_owned(),
-            }
-            .into());
+            return Err(RemoteBranchMoved::new(branch).into());
         }
         let mut push_args = vec![
             "-c".to_owned(),
@@ -373,19 +378,13 @@ impl Repo {
         if !output.status.success() {
             let remote_after = self.remote_branch_commit(branch, environment.clone())?;
             if remote_after != remote_before {
-                return Err(RemoteBranchMoved {
-                    branch: branch.to_owned(),
-                }
-                .into());
+                return Err(RemoteBranchMoved::new(branch).into());
             }
             bail!("git push exited with {}: {}", output.status, output.stderr);
         }
         let remote = self.remote_branch_commit(branch, environment)?;
         if remote.as_deref() != Some(expected_commit) {
-            return Err(RemoteBranchMoved {
-                branch: branch.to_owned(),
-            }
-            .into());
+            return Err(RemoteBranchMoved::new(branch).into());
         }
         Ok(true)
     }

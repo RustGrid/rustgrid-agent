@@ -9,7 +9,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -20,12 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{
-    Method, StatusCode, Url,
-    blocking::{Client, Response},
-    header,
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -150,8 +144,13 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
     let http = hosted_http_client()?;
     let oidc_token = request_github_oidc(&http, &environment)?;
     let exchange = exchange_github_oidc(&http, &environment, execution_id, &oidc_token)?;
-    let api =
-        HostedApiClient::from_exchange(http, environment.api_root.clone(), execution_id, exchange)?;
+    let api = HostedApiClient::from_exchange(
+        http,
+        environment.api_root.clone(),
+        execution_id,
+        exchange,
+        Arc::new(SystemHostedClock),
+    )?;
     println!("[starting] Authenticated ephemeral GitHub Actions execution {execution_id}");
 
     let preparation = (|| {
@@ -471,7 +470,13 @@ pub fn report_emergency_failure(execution_id: Uuid) -> Result<()> {
     let http = hosted_http_client()?;
     let oidc_token = request_github_oidc(&http, &environment)?;
     let exchange = exchange_github_oidc(&http, &environment, execution_id, &oidc_token)?;
-    let api = HostedApiClient::from_exchange(http, environment.api_root, execution_id, exchange)?;
+    let api = HostedApiClient::from_exchange(
+        http,
+        environment.api_root,
+        execution_id,
+        exchange,
+        Arc::new(SystemHostedClock),
+    )?;
     report_emergency_failure_with_api(&api, execution_id)
 }
 
@@ -535,6 +540,72 @@ struct HostedSupervisor {
 }
 
 #[derive(Clone, Debug)]
+enum HostedLeaseFailure {
+    Temporary(String),
+    Invalidated(String),
+    Cancelled,
+}
+
+trait HostedLeaseControlPlane: Clone + Send + 'static {
+    fn renew_execution_lease(&self) -> std::result::Result<(), HostedLeaseFailure>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostedHeartbeatAction {
+    Continue,
+    Stop(HostedStopReason),
+}
+
+fn reconcile_hosted_heartbeat(
+    failures: &mut u8,
+    result: std::result::Result<(), HostedLeaseFailure>,
+) -> HostedHeartbeatAction {
+    match result {
+        Ok(()) => {
+            *failures = 0;
+            HostedHeartbeatAction::Continue
+        }
+        Err(failure) => {
+            *failures = failures.saturating_add(1);
+            let stop_immediately = matches!(
+                failure,
+                HostedLeaseFailure::Invalidated(_) | HostedLeaseFailure::Cancelled
+            );
+            if !stop_immediately && *failures < 3 {
+                return HostedHeartbeatAction::Continue;
+            }
+            HostedHeartbeatAction::Stop(match failure {
+                HostedLeaseFailure::Cancelled => HostedStopReason::Cancellation,
+                HostedLeaseFailure::Temporary(message)
+                | HostedLeaseFailure::Invalidated(message) => HostedStopReason::Infrastructure(
+                    truncate_text(&format!("heartbeat failed: {message}"), 2_000),
+                ),
+            })
+        }
+    }
+}
+
+impl HostedLeaseControlPlane for HostedApiClient {
+    fn renew_execution_lease(&self) -> std::result::Result<(), HostedLeaseFailure> {
+        self.heartbeat().map_err(|error| {
+            let hosted = error.downcast_ref::<HostedHttpError>();
+            if hosted.is_some_and(|failure| {
+                failure
+                    .effective_code()
+                    .to_ascii_lowercase()
+                    .contains("cancel")
+            }) {
+                HostedLeaseFailure::Cancelled
+            } else if hosted.is_some_and(HostedHttpError::invalidates_execution) {
+                HostedLeaseFailure::Invalidated(truncate_text(&format!("{error:#}"), 2_000))
+            } else {
+                HostedLeaseFailure::Temporary(truncate_text(&format!("{error:#}"), 2_000))
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum HostedStopReason {
     Cancellation,
     Infrastructure(String),
@@ -543,6 +614,14 @@ enum HostedStopReason {
 impl HostedSupervisor {
     fn start(
         api: HostedApiClient,
+        running: Arc<AtomicBool>,
+        stop_reason: Arc<Mutex<Option<HostedStopReason>>>,
+    ) -> Self {
+        Self::start_with(api, running, stop_reason)
+    }
+
+    fn start_with<C: HostedLeaseControlPlane>(
+        api: C,
         running: Arc<AtomicBool>,
         stop_reason: Arc<Mutex<Option<HostedStopReason>>>,
     ) -> Self {
@@ -559,37 +638,14 @@ impl HostedSupervisor {
                     thread::sleep(Duration::from_millis(250));
                     continue;
                 }
-                match api.heartbeat() {
-                    Ok(()) => failures = 0,
-                    Err(error) => {
-                        failures = failures.saturating_add(1);
-                        let invalidated = error
-                            .downcast_ref::<HostedHttpError>()
-                            .is_some_and(HostedHttpError::invalidates_execution);
-                        if invalidated || failures >= 3 {
-                            let reason = error
-                                .downcast_ref::<HostedHttpError>()
-                                .filter(|failure| {
-                                    failure
-                                        .effective_code()
-                                        .to_ascii_lowercase()
-                                        .contains("cancel")
-                                })
-                                .map_or_else(
-                                    || {
-                                        HostedStopReason::Infrastructure(truncate_text(
-                                            &format!("heartbeat failed: {error:#}"),
-                                            2_000,
-                                        ))
-                                    },
-                                    |_| HostedStopReason::Cancellation,
-                                );
-                            *stop_reason
-                                .lock()
-                                .expect("hosted stop reason lock poisoned") = Some(reason);
-                            running.store(false, Ordering::SeqCst);
-                            break;
-                        }
+                match reconcile_hosted_heartbeat(&mut failures, api.renew_execution_lease()) {
+                    HostedHeartbeatAction::Continue => {}
+                    HostedHeartbeatAction::Stop(reason) => {
+                        *stop_reason
+                            .lock()
+                            .expect("hosted stop reason lock poisoned") = Some(reason);
+                        running.store(false, Ordering::SeqCst);
+                        break;
                     }
                 }
                 next = Instant::now() + HEARTBEAT_INTERVAL;

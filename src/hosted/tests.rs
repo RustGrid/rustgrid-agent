@@ -1,4 +1,5 @@
 use super::*;
+use reqwest::{StatusCode, Url};
 fn hosted_production_source() -> &'static str {
     concat!(
         include_str!("authentication.rs"),
@@ -33,10 +34,72 @@ mod tests;
 }
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::TcpListener,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver},
+    },
 };
+
+struct ManualHostedClock {
+    system_origin: SystemTime,
+    instant_origin: Instant,
+    elapsed: Mutex<Duration>,
+}
+
+impl ManualHostedClock {
+    fn new(system_origin: SystemTime) -> Self {
+        Self {
+            system_origin,
+            instant_origin: Instant::now(),
+            elapsed: Mutex::new(Duration::ZERO),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let mut elapsed = self.elapsed.lock().unwrap();
+        *elapsed = elapsed.saturating_add(duration);
+    }
+}
+
+impl HostedClock for ManualHostedClock {
+    fn system_now(&self) -> SystemTime {
+        self.system_origin + *self.elapsed.lock().unwrap()
+    }
+
+    fn instant_now(&self) -> Instant {
+        self.instant_origin + *self.elapsed.lock().unwrap()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.advance(duration);
+    }
+}
+
+#[test]
+fn hosted_lease_retries_transient_errors_and_stops_on_permanent_loss() {
+    let mut failures = 0;
+    assert_eq!(
+        reconcile_hosted_heartbeat(
+            &mut failures,
+            Err(HostedLeaseFailure::Temporary("gateway unavailable".into())),
+        ),
+        HostedHeartbeatAction::Continue
+    );
+    assert_eq!(failures, 1);
+    assert_eq!(
+        reconcile_hosted_heartbeat(
+            &mut failures,
+            Err(HostedLeaseFailure::Invalidated(
+                "lease owner changed".into()
+            )),
+        ),
+        HostedHeartbeatAction::Stop(HostedStopReason::Infrastructure(
+            "heartbeat failed: lease owner changed".into()
+        ))
+    );
+}
 
 #[test]
 fn discovery_action_profiles_restrict_finalization_to_the_compact_forced_tool() {
@@ -2133,6 +2196,22 @@ fn test_api_client(api_root: Url, execution_id: Uuid) -> HostedApiClient {
         api_root.join("api/v1/").unwrap(),
         execution_id,
         exchange_response(execution_id),
+        Arc::new(SystemHostedClock),
+    )
+    .unwrap()
+}
+
+fn test_api_client_with_clock(
+    api_root: Url,
+    execution_id: Uuid,
+    clock: Arc<dyn HostedClock>,
+) -> HostedApiClient {
+    HostedApiClient::from_exchange(
+        hosted_http_client().unwrap(),
+        api_root.join("api/v1/").unwrap(),
+        execution_id,
+        exchange_response(execution_id),
+        clock,
     )
     .unwrap()
 }
@@ -2449,6 +2528,7 @@ fn rejects_incomplete_or_mismatched_hosted_execution_identity() {
             Url::parse("http://127.0.0.1:8080/api/v1/").unwrap(),
             execution_id,
             wrong_permissions,
+            Arc::new(SystemHostedClock),
         )
         .is_err()
     );
@@ -2545,6 +2625,7 @@ fn mission_retry_attempt_is_independent_from_github_run_attempt() {
         Url::parse("http://127.0.0.1:8080/api/v1/").unwrap(),
         execution_id,
         exchange,
+        Arc::new(SystemHostedClock),
     )
     .unwrap();
     let mut manifest = test_manifest(execution_id);
@@ -8468,12 +8549,16 @@ fn execution_token_refresh_rotates_the_in_memory_bearer() {
     ) else {
         return;
     };
-    let client = test_api_client(base, execution_id);
+    let clock = Arc::new(ManualHostedClock::new(
+        parse_rfc3339_utc("2026-08-03T00:00:00Z").unwrap(),
+    ));
+    let client = test_api_client_with_clock(base, execution_id, clock.clone());
     {
         let mut state = client.auth.lock().unwrap();
-        state.expires_at = SystemTime::now() + Duration::from_secs(1);
-        state.refresh_after = SystemTime::now();
+        state.expires_at = clock.system_now() + Duration::from_secs(600);
+        state.refresh_after = clock.system_now() + Duration::from_secs(300);
     }
+    clock.advance(Duration::from_secs(301));
     client.ensure_fresh().unwrap();
     server.join().unwrap();
     let request = request.recv().unwrap();
@@ -9437,4 +9522,158 @@ fn github_repository_token_must_have_a_safe_remaining_lifetime() {
     let client = test_api_client(base, execution_id);
     assert!(client.github_token("RustGrid/example").is_err());
     server.join().unwrap();
+}
+
+#[derive(Default)]
+struct FakeGitHubPublisher {
+    finds: std::sync::atomic::AtomicUsize,
+    creates: std::sync::atomic::AtomicUsize,
+    updates: std::sync::atomic::AtomicUsize,
+}
+
+impl GitHubPublisher for FakeGitHubPublisher {
+    type Error = anyhow::Error;
+
+    fn find_open_pull_request(
+        &self,
+        _repo: &RepoConfig,
+        _branch: &str,
+    ) -> Result<Option<crate::github::PullRequest>> {
+        self.finds.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(crate::github::PullRequest {
+            number: 17,
+            html_url: "https://github.com/RustGrid/example/pull/17".into(),
+            node_id: Some("PR_node".into()),
+            draft: true,
+            body: None,
+        }))
+    }
+
+    fn update_pull_request(
+        &self,
+        _repo: &RepoConfig,
+        number: u64,
+        _title: &str,
+        body: &str,
+    ) -> Result<crate::github::PullRequest> {
+        self.updates.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::github::PullRequest {
+            number,
+            html_url: format!("https://github.com/RustGrid/example/pull/{number}"),
+            node_id: Some("PR_node".into()),
+            draft: true,
+            body: Some(body.into()),
+        })
+    }
+
+    fn create_pull_request(
+        &self,
+        _repo: &RepoConfig,
+        _title: &str,
+        _body: &str,
+        _head: &str,
+        _base: &str,
+        _draft: bool,
+    ) -> Result<crate::github::PullRequest> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        anyhow::bail!("duplicate publication must not create another pull request")
+    }
+
+    fn set_draft(&self, _node_id: &str, _draft: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn duplicate_publication_requests_reconcile_the_existing_pull_request() {
+    let manifest = test_manifest(Uuid::from_u128(0x71717171_7171_4171_8171_717171717171));
+    let repo = manifest.repo_config().unwrap();
+    let publisher = FakeGitHubPublisher::default();
+
+    let pull = find_or_create_hosted_pull_request(
+        &publisher,
+        &repo,
+        &manifest,
+        &[],
+        &test_completion_evaluation(CompletionStatus::Partial),
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(pull.number, 17);
+    assert_eq!(publisher.finds.load(Ordering::SeqCst), 1);
+    assert_eq!(publisher.updates.load(Ordering::SeqCst), 1);
+    assert_eq!(publisher.creates.load(Ordering::SeqCst), 0);
+}
+
+struct MovedRepository;
+
+impl RepositoryPublisher for MovedRepository {
+    type Error = anyhow::Error;
+
+    fn reconcile_remote_branch(
+        &self,
+        branch: &str,
+        _commit: &str,
+    ) -> Result<crate::git::ReconciledCommit> {
+        Err(crate::git::RemoteBranchMoved::new(branch).into())
+    }
+
+    fn push(&self, _branch: &str, _commit: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn remote_branch_movement_remains_a_typed_publication_failure() {
+    let error = reconcile_publication_repository(&MovedRepository, "rustgrid/rg-1", "abc123")
+        .expect_err("remote movement must stop this publication attempt");
+
+    assert!(error.downcast_ref::<RemoteBranchMoved>().is_some());
+}
+
+#[derive(Debug)]
+struct ProviderExhausted;
+
+impl std::fmt::Display for ProviderExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("scripted provider responses exhausted")
+    }
+}
+
+impl std::error::Error for ProviderExhausted {}
+
+struct ExhaustedModelProvider;
+
+impl ModelProvider for ExhaustedModelProvider {
+    type Error = ProviderExhausted;
+
+    fn invoke(
+        &self,
+        _request: Value,
+        _registration: &AiCallRegistration,
+        _execution_deadline: Option<Instant>,
+    ) -> std::result::Result<Value, Self::Error> {
+        Err(ProviderExhausted)
+    }
+}
+
+#[test]
+fn model_provider_exhaustion_is_testable_without_gateway_transport() {
+    let error = invoke_model(
+        &ExhaustedModelProvider,
+        json!({"input": "bounded"}),
+        &ai_call_registration(
+            Uuid::from_u128(0x72727272_7272_4272_8272_727272727272),
+            1,
+            Uuid::from_u128(0x73737373_7373_4373_8373_737373737373),
+            0,
+            ExecutionPhase::Discovery,
+            0,
+        ),
+        None,
+    )
+    .expect_err("the fake provider has no response remaining");
+
+    assert!(error.downcast_ref::<ProviderExhausted>().is_some());
 }

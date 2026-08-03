@@ -1,5 +1,13 @@
 // Extracted from the hosted execution composition root.
 use super::*;
+use std::io::Read;
+
+use reqwest::{
+    Method, StatusCode, Url,
+    blocking::{Client, Response},
+    header,
+};
+use serde::de::DeserializeOwned;
 
 #[derive(Deserialize)]
 pub(super) struct GithubOidcResponse {
@@ -52,6 +60,7 @@ pub(super) struct HostedApiClient {
     pub(super) github_workflow_run_id: i64,
     pub(super) auth: Arc<Mutex<TokenState>>,
     pub(super) refresh_lock: Arc<Mutex<()>>,
+    pub(super) clock: Arc<dyn HostedClock>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -398,6 +407,7 @@ impl HostedApiClient {
         api_root: Url,
         execution_id: Uuid,
         exchange: ExchangeResponse,
+        clock: Arc<dyn HostedClock>,
     ) -> Result<Self> {
         if exchange.execution_id != execution_id
             || exchange.token_type != "Bearer"
@@ -421,7 +431,7 @@ impl HostedApiClient {
         let expires_at = parse_rfc3339_utc(&exchange.expires_at)
             .context("RustGrid returned an invalid execution-token expiry")?;
         if expires_at
-            .duration_since(SystemTime::now())
+            .duration_since(clock.system_now())
             .unwrap_or_default()
             < Duration::from_secs(30)
         {
@@ -444,6 +454,7 @@ impl HostedApiClient {
             github_workflow_run_id: exchange.github_workflow_run_id,
             auth: Arc::new(Mutex::new(state)),
             refresh_lock: Arc::new(Mutex::new(())),
+            clock,
         })
     }
 
@@ -544,7 +555,7 @@ impl HostedApiClient {
         let expires_at = parse_rfc3339_utc(&issued.expires_at)
             .context("RustGrid returned an invalid GitHub token expiry")?;
         if expires_at
-            .duration_since(SystemTime::now())
+            .duration_since(self.clock.system_now())
             .unwrap_or_default()
             < Duration::from_secs(30)
         {
@@ -568,7 +579,7 @@ impl HostedApiClient {
         registration: &AiCallRegistration,
         execution_deadline: Option<Instant>,
     ) -> Result<Value> {
-        ai_request_timeout(execution_deadline)?;
+        ai_request_timeout(self.clock.as_ref(), execution_deadline)?;
         self.ensure_fresh()?;
         let token = self.current_token()?;
         let path = format!("executions/{}/ai/responses", self.execution_id);
@@ -577,7 +588,7 @@ impl HostedApiClient {
             .join(&path)
             .with_context(|| format!("invalid RustGrid API path {path}"))?;
         for attempt in 0..3 {
-            let request_timeout = ai_request_timeout(execution_deadline)?;
+            let request_timeout = ai_request_timeout(self.clock.as_ref(), execution_deadline)?;
             let response = self
                 .http
                 .post(url.clone())
@@ -608,13 +619,13 @@ impl HostedApiClient {
                         .downcast_ref::<HostedHttpError>()
                         .is_some_and(HostedHttpError::retryable_gateway_transport_failure);
                     if can_retry_transport && attempt < 2 {
-                        sleep_before_ai_retry(execution_deadline, attempt)?;
+                        sleep_before_ai_retry(self.clock.as_ref(), execution_deadline, attempt)?;
                     } else {
                         return Err(error);
                     }
                 }
                 Err(_) if attempt < 2 => {
-                    sleep_before_ai_retry(execution_deadline, attempt)?;
+                    sleep_before_ai_retry(self.clock.as_ref(), execution_deadline, attempt)?;
                 }
                 Err(_) => bail!("RustGrid {path} transport failed"),
             }
@@ -652,7 +663,7 @@ impl HostedApiClient {
                 .auth
                 .lock()
                 .map_err(|_| anyhow!("execution-token lock is poisoned"))?;
-            SystemTime::now() >= state.refresh_after
+            self.clock.system_now() >= state.refresh_after
         };
         if refresh_required {
             self.refresh_token()?;
@@ -670,7 +681,7 @@ impl HostedApiClient {
                 .auth
                 .lock()
                 .map_err(|_| anyhow!("execution-token lock is poisoned"))?;
-            SystemTime::now() >= state.refresh_after
+            self.clock.system_now() >= state.refresh_after
         };
         if !refresh_required {
             return Ok(());
@@ -693,7 +704,7 @@ impl HostedApiClient {
             .context("RustGrid returned an invalid refreshed token expiry")?;
         if response.token_id.is_nil()
             || expires_at
-                .duration_since(SystemTime::now())
+                .duration_since(self.clock.system_now())
                 .unwrap_or_default()
                 < Duration::from_secs(30)
         {
@@ -792,10 +803,10 @@ impl HostedApiClient {
             }
             match request.send() {
                 Ok(response) if retryable_status(response.status()) && attempt + 1 < attempts => {
-                    thread::sleep(retry_delay(attempt));
+                    self.clock.sleep(retry_delay(attempt));
                 }
                 Ok(response) => return decode_response(response, path),
-                Err(_) if attempt + 1 < attempts => thread::sleep(retry_delay(attempt)),
+                Err(_) if attempt + 1 < attempts => self.clock.sleep(retry_delay(attempt)),
                 Err(_) => bail!("RustGrid {path} transport failed"),
             }
         }

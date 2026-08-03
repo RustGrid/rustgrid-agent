@@ -179,7 +179,8 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                 }
             };
             let model_call_started = Instant::now();
-            let evaluated_response = match self.api.ai_response_until(
+            let evaluated_response = match invoke_model(
+                &self.api,
                 request.clone(),
                 &registration,
                 Some(execution_deadline),

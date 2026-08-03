@@ -1,5 +1,34 @@
 // Extracted from the hosted execution composition root.
 use super::*;
+use reqwest::{StatusCode, Url};
+
+/// Time and sleeping used by hosted orchestration.
+///
+/// Keeping this port beside retry and expiry policy lets those decisions run
+/// against a deterministic clock without teaching the domain about threads or
+/// the operating system clock.
+pub(crate) trait HostedClock: Send + Sync {
+    fn system_now(&self) -> SystemTime;
+    fn instant_now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SystemHostedClock;
+
+impl HostedClock for SystemHostedClock {
+    fn system_now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+
+    fn instant_now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct SecretString(pub(super) String);
@@ -327,11 +356,14 @@ pub(super) fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(250_u64.saturating_mul(1_u64 << attempt.min(5)))
 }
 
-pub(super) fn ai_request_timeout(execution_deadline: Option<Instant>) -> Result<Duration> {
+pub(super) fn ai_request_timeout(
+    clock: &dyn HostedClock,
+    execution_deadline: Option<Instant>,
+) -> Result<Duration> {
     execution_deadline
         .map(|deadline| {
             deadline
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(clock.instant_now())
                 .filter(|remaining| !remaining.is_zero())
                 .context("hosted execution deadline was reached before the AI gateway request")
                 .map(|remaining| remaining.min(Duration::from_secs(90)))
@@ -341,28 +373,35 @@ pub(super) fn ai_request_timeout(execution_deadline: Option<Instant>) -> Result<
 }
 
 pub(super) fn sleep_before_execution_retry(
+    clock: &dyn HostedClock,
     execution_deadline: Option<Instant>,
     delay: Duration,
     operation: &str,
 ) -> Result<()> {
     if let Some(deadline) = execution_deadline {
         let remaining = deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(clock.instant_now())
             .filter(|remaining| *remaining > delay)
             .with_context(|| {
                 format!("hosted execution deadline was reached before the {operation} could start")
             })?;
         debug_assert!(remaining > delay);
     }
-    thread::sleep(delay);
+    clock.sleep(delay);
     Ok(())
 }
 
 pub(super) fn sleep_before_ai_retry(
+    clock: &dyn HostedClock,
     execution_deadline: Option<Instant>,
     attempt: usize,
 ) -> Result<()> {
-    sleep_before_execution_retry(execution_deadline, retry_delay(attempt), "AI gateway retry")
+    sleep_before_execution_retry(
+        clock,
+        execution_deadline,
+        retry_delay(attempt),
+        "AI gateway retry",
+    )
 }
 
 pub(super) fn registration_retry_delay(attempt: usize, semantic_call_id: Uuid) -> Duration {

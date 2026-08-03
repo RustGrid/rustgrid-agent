@@ -1,8 +1,142 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
-pub(super) fn find_or_create_hosted_pull_request(
-    github: &GitHubClient,
+/// GitHub mutation capability required by publication reconciliation.
+///
+/// The methods describe the idempotent pull-request workflow consumed here;
+/// transport details and unrelated GitHub endpoints remain in the adapter.
+pub(crate) trait GitHubPublisher {
+    type Error: Into<anyhow::Error>;
+
+    fn find_open_pull_request(
+        &self,
+        repo: &RepoConfig,
+        branch: &str,
+    ) -> std::result::Result<Option<crate::github::PullRequest>, Self::Error>;
+    fn update_pull_request(
+        &self,
+        repo: &RepoConfig,
+        number: u64,
+        title: &str,
+        body: &str,
+    ) -> std::result::Result<crate::github::PullRequest, Self::Error>;
+    fn create_pull_request(
+        &self,
+        repo: &RepoConfig,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+        draft: bool,
+    ) -> std::result::Result<crate::github::PullRequest, Self::Error>;
+    fn set_draft(&self, node_id: &str, draft: bool) -> std::result::Result<(), Self::Error>;
+}
+
+impl GitHubPublisher for GitHubClient {
+    type Error = anyhow::Error;
+
+    fn find_open_pull_request(
+        &self,
+        repo: &RepoConfig,
+        branch: &str,
+    ) -> Result<Option<crate::github::PullRequest>> {
+        GitHubClient::find_open_pull_request(self, repo, branch)
+    }
+
+    fn update_pull_request(
+        &self,
+        repo: &RepoConfig,
+        number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<crate::github::PullRequest> {
+        GitHubClient::update_pull_request(self, repo, number, title, body)
+    }
+
+    fn create_pull_request(
+        &self,
+        repo: &RepoConfig,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+        draft: bool,
+    ) -> Result<crate::github::PullRequest> {
+        self.create_pull_request_with_draft(repo, title, body, head, base, draft)
+    }
+
+    fn set_draft(&self, node_id: &str, draft: bool) -> Result<()> {
+        self.set_pull_request_draft(node_id, draft)
+    }
+}
+
+/// Git mutation capability needed by publication reconciliation.
+pub(crate) trait RepositoryPublisher {
+    type Error: Into<anyhow::Error>;
+
+    fn reconcile_remote_branch(
+        &self,
+        branch: &str,
+        commit: &str,
+    ) -> std::result::Result<crate::git::ReconciledCommit, Self::Error>;
+    fn push(&self, branch: &str, commit: &str) -> std::result::Result<(), Self::Error>;
+}
+
+pub(crate) struct GitRepositoryPublisher<'a> {
+    repo: &'a Repo,
+    token: &'a str,
+    web_base_url: &'a str,
+}
+
+impl<'a> GitRepositoryPublisher<'a> {
+    pub(crate) fn new(repo: &'a Repo, token: &'a str, web_base_url: &'a str) -> Self {
+        Self {
+            repo,
+            token,
+            web_base_url,
+        }
+    }
+}
+
+impl RepositoryPublisher for GitRepositoryPublisher<'_> {
+    type Error = anyhow::Error;
+
+    fn reconcile_remote_branch(
+        &self,
+        branch: &str,
+        commit: &str,
+    ) -> Result<crate::git::ReconciledCommit> {
+        self.repo
+            .reconcile_remote_branch(branch, commit, self.token, self.web_base_url)
+    }
+
+    fn push(&self, branch: &str, commit: &str) -> Result<()> {
+        self.repo
+            .push(branch, commit, self.token, self.web_base_url)
+            .map(|_| ())
+    }
+}
+
+pub(super) fn reconcile_publication_repository<R: RepositoryPublisher>(
+    repository: &R,
+    branch: &str,
+    commit: &str,
+) -> Result<crate::git::ReconciledCommit> {
+    repository
+        .reconcile_remote_branch(branch, commit)
+        .map_err(Into::into)
+}
+
+fn push_publication_repository<R: RepositoryPublisher>(
+    repository: &R,
+    branch: &str,
+    commit: &str,
+) -> Result<()> {
+    repository.push(branch, commit).map_err(Into::into)
+}
+
+pub(super) fn find_or_create_hosted_pull_request<P: GitHubPublisher>(
+    github: &P,
     repo_config: &RepoConfig,
     manifest: &HostedManifest,
     validation: &[ValidationResult],
@@ -11,8 +145,13 @@ pub(super) fn find_or_create_hosted_pull_request(
 ) -> Result<crate::github::PullRequest> {
     let title = hosted_pull_request_title(manifest, draft);
     let body = hosted_pull_request_body(manifest, validation, completeness);
-    if let Some(pull) = github.find_open_pull_request(repo_config, &manifest.github.branch)? {
-        let pull = github.update_pull_request(repo_config, pull.number, &title, &body)?;
+    if let Some(pull) = github
+        .find_open_pull_request(repo_config, &manifest.github.branch)
+        .map_err(Into::into)?
+    {
+        let pull = github
+            .update_pull_request(repo_config, pull.number, &title, &body)
+            .map_err(Into::into)?;
         return ensure_hosted_pull_request_draft_state(
             github,
             repo_config,
@@ -21,7 +160,7 @@ pub(super) fn find_or_create_hosted_pull_request(
             draft,
         );
     }
-    let pull = match github.create_pull_request_with_draft(
+    let pull = match github.create_pull_request(
         repo_config,
         &title,
         &body,
@@ -36,7 +175,7 @@ pub(super) fn find_or_create_hosted_pull_request(
             // deterministic head branch before surfacing the original error.
             match github.find_open_pull_request(repo_config, &manifest.github.branch) {
                 Ok(Some(pull)) => pull,
-                _ => return Err(create_error),
+                _ => return Err(create_error.into()),
             }
         }
     };
@@ -49,8 +188,8 @@ pub(super) fn find_or_create_hosted_pull_request(
     )
 }
 
-pub(super) fn ensure_hosted_pull_request_draft_state(
-    github: &GitHubClient,
+pub(super) fn ensure_hosted_pull_request_draft_state<P: GitHubPublisher>(
+    github: &P,
     repo_config: &RepoConfig,
     branch: &str,
     pull: crate::github::PullRequest,
@@ -63,9 +202,10 @@ pub(super) fn ensure_hosted_pull_request_draft_state(
         .node_id
         .as_deref()
         .context("GitHub pull request response has no node identity")?;
-    github.set_pull_request_draft(node_id, draft)?;
+    github.set_draft(node_id, draft).map_err(Into::into)?;
     let confirmed = github
-        .find_open_pull_request(repo_config, branch)?
+        .find_open_pull_request(repo_config, branch)
+        .map_err(Into::into)?
         .context("GitHub pull request disappeared while confirming its draft state")?;
     if confirmed.number != pull.number {
         bail!(
@@ -132,12 +272,9 @@ pub(super) fn publish_hosted_branch(
         containment.drain()?;
         let reconcile_result = (|| {
             let token = api.github_token(&manifest.github.repository)?;
-            repo.reconcile_remote_branch(
-                &manifest.github.branch,
-                commit,
-                token.expose(),
-                &manifest.github.web_base_url,
-            )
+            let repository =
+                GitRepositoryPublisher::new(repo, token.expose(), &manifest.github.web_base_url);
+            reconcile_publication_repository(&repository, &manifest.github.branch, commit)
         })();
         agent.ensure_active_or_checkpoint_cancellation()?;
         let reconciled = reconcile_result?;
@@ -231,12 +368,9 @@ pub(super) fn publish_hosted_branch(
         containment.drain()?;
         let push_result = (|| {
             let token = api.github_token(&manifest.github.repository)?;
-            repo.push(
-                &manifest.github.branch,
-                commit,
-                token.expose(),
-                &manifest.github.web_base_url,
-            )
+            let repository =
+                GitRepositoryPublisher::new(repo, token.expose(), &manifest.github.web_base_url);
+            push_publication_repository(&repository, &manifest.github.branch, commit)
         })();
         agent.ensure_active_or_checkpoint_cancellation()?;
         match push_result {
