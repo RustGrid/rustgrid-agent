@@ -1236,6 +1236,8 @@ fn run_hosted_execution(
                             ("validation_failure", "validation_failed_repair_incomplete", "repair"),
                         crate::execution_graph::IncompleteReason::ValidationInfrastructureFailure =>
                             ("infrastructure_failure", "validation_infrastructure_incomplete", "validation"),
+                        crate::execution_graph::IncompleteReason::TargetOperationConflict =>
+                            ("mutation_conflict", "target_operation_conflict", "implementation"),
                     };
                     completeness.status = CompletionStatus::Partial;
                     completeness.implementation_completeness = ImplementationCompleteness::Partial;

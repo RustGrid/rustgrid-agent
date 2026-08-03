@@ -150,6 +150,9 @@ impl ExecutionSnapshot {
             IncompleteReason::ValidationInfrastructureFailure => {
                 "draft publication after validation infrastructure failure"
             }
+            IncompleteReason::TargetOperationConflict => {
+                "draft publication after a late repository target operation conflict"
+            }
         };
         self.graph
             .nodes
@@ -383,6 +386,58 @@ impl ExecutionSnapshot {
                 .reusable_file(&target.path, &self.current_repository.fingerprint, None);
         let current_file_content = reusable_file.map(|evidence| evidence.captured_content.clone());
         let target_content_hash = reusable_file.map(|evidence| evidence.content_hash.clone());
+        let operation = target.effective_operation();
+        let expected_result_content_hash = self.events.iter().rev().find_map(|event| match event {
+            ExecutionDomainEvent::TargetMutationIntentRecorded {
+                node_id: recorded_node_id,
+                target_path,
+                operation: recorded_operation,
+                expected_result_content_hash,
+                accepted_intent_hash,
+                ..
+            } if recorded_node_id == node_id
+                && target_path == &target.path
+                && recorded_operation == &operation
+                && accepted_intent_hash == &hex::encode(Sha256::digest(target.intent.as_bytes())) =>
+            {
+                expected_result_content_hash.clone()
+            }
+            _ => None,
+        });
+        let prepared_probe = self.events.iter().rev().find_map(|event| match event {
+            ExecutionDomainEvent::TargetContextPrepared {
+                node_id: prepared_node_id,
+                target_path,
+                operation: prepared_operation,
+                source_path,
+                target_exists,
+                source_exists,
+                repository_fingerprint,
+                target_content_hash,
+                source_content_hash,
+                ..
+            } if prepared_node_id == node_id
+                && target_path == &target.path
+                && prepared_operation == &operation
+                && repository_fingerprint.as_str() == self.current_repository.fingerprint =>
+            {
+                Some(TargetStateProbe {
+                    operation: prepared_operation.clone(),
+                    target_path: target_path.clone(),
+                    target_exists: target_exists.unwrap_or(target_content_hash.is_some()),
+                    source_exists: *source_exists,
+                    target_content_hash: target_content_hash.clone(),
+                    source_content_hash: source_content_hash.clone(),
+                    expected_result_content_hash: expected_result_content_hash.clone(),
+                    repository_fingerprint: repository_fingerprint.clone(),
+                })
+            }
+            _ => None,
+        });
+        let source_file = operation.source_path().and_then(|path| {
+            self.evidence
+                .reusable_file(path, &self.current_repository.fingerprint, None)
+        });
         let accepted_intent_hash = hex::encode(Sha256::digest(target.intent.as_bytes()));
         let nearby_context = reusable_file
             .filter(|evidence| evidence.line_range.is_some())
@@ -394,10 +449,28 @@ impl ExecutionSnapshot {
             change_id: target.change_id.clone(),
             intent: target.intent.clone(),
             acceptance_criteria_ids: target.acceptance_criteria_ids.clone(),
-            target,
-            dependency_evidence,
+            target: target.clone(),
+            dependency_evidence: dependency_evidence.clone(),
             current_file_content,
             target_content_hash,
+            target_state_probe: prepared_probe.clone(),
+            inspection_outcome: prepared_probe.as_ref().map(TargetStateProbe::inspection_outcome),
+            source_file_content: source_file.map(|evidence| evidence.captured_content.clone()),
+            source_content_hash: source_file.map(|evidence| evidence.content_hash.clone()),
+            create_specification: matches!(operation, TargetOperation::CreateNew).then(|| {
+                CreateTargetSpecification {
+                    path: target.path.clone(),
+                    role: target.role.clone(),
+                    intent: target.intent.clone(),
+                    acceptance_criteria_ids: target.acceptance_criteria_ids.clone(),
+                    related_evidence_ids: dependency_evidence
+                        .iter()
+                        .map(|evidence| EvidenceId::new(evidence.evidence_id.clone()))
+                        .collect(),
+                    expected_artifact_kind: (!target.role.trim().is_empty())
+                        .then(|| target.role.clone()),
+                }
+            }),
             repository_fingerprint: self.current_repository.fingerprint.clone(),
             accepted_intent_hash,
             nearby_context,

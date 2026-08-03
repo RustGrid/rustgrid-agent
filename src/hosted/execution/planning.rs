@@ -390,6 +390,7 @@ pub(in crate::hosted) fn normalize_planned_changes(changes: &mut [PlannedChange]
                     change.targets.push(PlannedTarget {
                         path,
                         role: change.reason.clone(),
+                        operation: None,
                         new_file: false,
                         status: IntendedChangeStatus::Planned,
                     });
@@ -880,6 +881,7 @@ pub(in crate::hosted) fn deterministic_plan_from_impact_map(
                 targets: vec![PlannedTarget {
                     path: path.clone(),
                     role: role.into(),
+                    operation: Some(crate::execution_graph::TargetOperation::ModifyExisting),
                     new_file: false,
                     status: IntendedChangeStatus::Planned,
                 }],
@@ -1011,12 +1013,15 @@ pub(in crate::hosted) fn validate_planned_change_paths(
             if target.path.contains(';') {
                 bail!("invalid multi-path scalar target cannot reach implementation");
             }
-            let may_be_absent = target.new_file
-                || matches!(
-                    target.status,
-                    IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
-                );
-            let resolved = safe_repo_path(root, &target.path, may_be_absent).map_err(|error| {
+            let operation = target.effective_operation();
+            let may_be_absent = !matches!(
+                operation,
+                crate::execution_graph::TargetOperation::ModifyExisting
+            ) || matches!(
+                target.status,
+                IntendedChangeStatus::Applied | IntendedChangeStatus::Verified
+            );
+            let resolved = safe_repo_path(root, &target.path, true).map_err(|error| {
                 anyhow!(
                     "implementation plan target `{}` is invalid: {error:#}",
                     target.path
@@ -1024,9 +1029,80 @@ pub(in crate::hosted) fn validate_planned_change_paths(
             })?;
             if !may_be_absent && !resolved.exists() {
                 bail!(
-                    "implementation plan target `{}` does not exist and is not marked new_file",
+                    "implementation plan target `{}` does not exist for modify_existing",
                     target.path
                 );
+            }
+            if let Some(source) = operation.source_path() {
+                safe_repo_path(root, source, true).map_err(|error| {
+                    anyhow!("implementation plan source `{source}` is invalid: {error:#}")
+                })?;
+                if operation.destination_path(&target.path) != target.path {
+                    bail!(
+                        "implementation plan {} destination must equal target path `{}`",
+                        operation.as_str(),
+                        target.path
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::hosted) fn validate_explicit_target_operations(
+    changes: &[PlannedChange],
+) -> Result<()> {
+    for change in changes {
+        for target in &change.targets {
+            let operation = target.operation.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "target `{}` is missing required operation metadata",
+                    target.path
+                )
+            })?;
+            if target.role.trim().is_empty() {
+                bail!(
+                    "target `{}` requires a non-empty repository role",
+                    target.path
+                );
+            }
+            if target.new_file
+                != matches!(
+                    operation,
+                    crate::execution_graph::TargetOperation::CreateNew
+                )
+            {
+                bail!(
+                    "target `{}` has ambiguous new_file and operation metadata",
+                    target.path
+                );
+            }
+            match operation {
+                crate::execution_graph::TargetOperation::Rename {
+                    source,
+                    destination,
+                }
+                | crate::execution_graph::TargetOperation::Move {
+                    source,
+                    destination,
+                } => {
+                    if source.trim().is_empty() || destination.trim().is_empty() {
+                        bail!(
+                            "target `{}` requires non-empty source and destination",
+                            target.path
+                        );
+                    }
+                    if source == destination || destination != &target.path {
+                        bail!(
+                            "target `{}` has ambiguous source/destination metadata",
+                            target.path
+                        );
+                    }
+                }
+                crate::execution_graph::TargetOperation::ModifyExisting
+                | crate::execution_graph::TargetOperation::CreateNew
+                | crate::execution_graph::TargetOperation::DeleteExisting => {}
             }
         }
     }
@@ -1153,6 +1229,7 @@ pub(in crate::hosted) fn normalize_notebook_intended_changes(
                     intended.targets.push(PlannedTarget {
                         path,
                         role: intended.intent.clone(),
+                        operation: None,
                         new_file: false,
                         status: intended.status,
                     });
@@ -1172,6 +1249,7 @@ pub(in crate::hosted) fn normalize_notebook_intended_changes(
                         } else {
                             target.role.clone()
                         },
+                        operation: target.operation.clone(),
                         new_file: target.new_file,
                         status: target.status,
                     });
@@ -1288,5 +1366,115 @@ impl<'a> GatewayAgent<'a> {
             "implementation-plan deterministic fallback",
         );
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod operation_lifecycle_tests {
+    use super::*;
+
+    fn change(target: PlannedTarget) -> PlannedChange {
+        PlannedChange {
+            change_id: "change-1".into(),
+            parent_change_id: None,
+            path: String::new(),
+            targets: vec![target],
+            change: "perform the declared repository operation".into(),
+            reason: "satisfy ac-1".into(),
+            status: IntendedChangeStatus::Planned,
+            acceptance_criteria: vec!["ac-1".into()],
+            test_coverage: Vec::new(),
+        }
+    }
+
+    fn target(
+        path: &str,
+        operation: Option<crate::execution_graph::TargetOperation>,
+    ) -> PlannedTarget {
+        PlannedTarget {
+            path: path.into(),
+            role: "repository artifact".into(),
+            new_file: matches!(
+                operation,
+                Some(crate::execution_graph::TargetOperation::CreateNew)
+            ),
+            operation,
+            status: IntendedChangeStatus::Planned,
+        }
+    }
+
+    #[test]
+    fn accepted_provider_plan_requires_explicit_operation() {
+        let changes = [change(target("src/lib.rs", None))];
+        assert!(
+            validate_explicit_target_operations(&changes)
+                .unwrap_err()
+                .to_string()
+                .contains("missing required operation")
+        );
+    }
+
+    #[test]
+    fn plan_rejects_ambiguous_legacy_new_file_metadata() {
+        let mut planned = target(
+            "src/lib.rs",
+            Some(crate::execution_graph::TargetOperation::ModifyExisting),
+        );
+        planned.new_file = true;
+        assert!(
+            validate_explicit_target_operations(&[change(planned)])
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn rename_requires_distinct_source_and_matching_destination() {
+        let operation = crate::execution_graph::TargetOperation::Rename {
+            source: "old.rs".into(),
+            destination: "other.rs".into(),
+        };
+        assert!(
+            validate_explicit_target_operations(&[change(target("new.rs", Some(operation)))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn modify_requires_an_existing_repository_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let changes = [change(target(
+            "missing.rs",
+            Some(crate::execution_graph::TargetOperation::ModifyExisting),
+        ))];
+        assert!(
+            validate_planned_change_paths(directory.path(), &changes)
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
+        );
+    }
+
+    #[test]
+    fn create_allows_an_absent_safe_repository_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let changes = [change(target(
+            "new/deep/file.rs",
+            Some(crate::execution_graph::TargetOperation::CreateNew),
+        ))];
+        validate_explicit_target_operations(&changes).unwrap();
+        validate_planned_change_paths(directory.path(), &changes).unwrap();
+    }
+
+    #[test]
+    fn delete_can_reconcile_an_already_absent_safe_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let changes = [change(target(
+            "old/file.rs",
+            Some(crate::execution_graph::TargetOperation::DeleteExisting),
+        ))];
+        validate_explicit_target_operations(&changes).unwrap();
+        validate_planned_change_paths(directory.path(), &changes).unwrap();
     }
 }

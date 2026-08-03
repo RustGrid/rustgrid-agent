@@ -328,6 +328,23 @@ pub fn reconcile_execution(
         });
     }
 
+    if snapshot.failures.unresolved().any(|failure| {
+        failure.category == FailureCategory::PlanRepositoryConflict
+            || failure.category == FailureCategory::MutationConflict
+                && matches!(
+                    failure.code.as_deref(),
+                    Some("create_target_already_exists" | "destination_already_exists")
+                )
+    }) {
+        if snapshot.current_repository.has_changes() {
+            return incomplete_diff_decision(snapshot, IncompleteReason::TargetOperationConflict);
+        }
+        return Ok(ExecutionDecision::StopForGuardrail {
+            outcome: MissionOutcome::BlockedNoDiff,
+            reason: GuardrailReason::BlockingFailure,
+        });
+    }
+
     if let Some(failure) = snapshot
         .failures
         .unresolved()
@@ -609,20 +626,28 @@ fn decision_for_node(
                 let failure = unresolved_failure_for_node(snapshot, &node.id)?;
                 repair_target_decision(snapshot, node, failure)
             } else {
-                let mut target =
-                    snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+                let mut target = snapshot.target_execution_context(
+                    &node.id,
+                    tools_for_target_operation(
+                        node.target.as_ref().expect("mutation node target"),
+                    )?,
+                )?;
                 let prepared = snapshot.events.iter().rev().any(|event| {
                     matches!(
                         event,
                         ExecutionDomainEvent::TargetContextPrepared {
                             node_id,
                             target_path,
+                            operation,
+                            source_path,
                             repository_fingerprint,
                             target_content_hash,
                             accepted_intent_hash,
                             ..
                         } if node_id == &node.id
                             && target_path == &target.target.path
+                            && operation == &target.target.effective_operation()
+                            && source_path.as_deref() == target.target.effective_operation().source_path()
                             && repository_fingerprint.as_str()
                                 == snapshot.current_repository.fingerprint
                             && target_content_hash == &target.target_content_hash
@@ -885,7 +910,10 @@ fn repair_target_decision(
             "target repair was requested after its node repair budget was exhausted",
         ));
     }
-    let mut target = snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+    let mut target = snapshot.target_execution_context(
+        &node.id,
+        tools_for_target_operation(node.target.as_ref().expect("mutation node target"))?,
+    )?;
     if failure.category == FailureCategory::ValidationFailure {
         let implicated_paths = failure
             .assertion_failures
@@ -924,12 +952,16 @@ fn repair_target_decision(
             ExecutionDomainEvent::TargetContextPrepared {
                 node_id,
                 target_path,
+                operation,
+                source_path,
                 repository_fingerprint,
                 target_content_hash,
                 accepted_intent_hash,
                 ..
             } if node_id == &node.id
                 && target_path == &target.target.path
+                && operation == &target.target.effective_operation()
+                && source_path.as_deref() == target.target.effective_operation().source_path()
                 && repository_fingerprint.as_str() == snapshot.current_repository.fingerprint
                 && target_content_hash == &target.target_content_hash
                 && accepted_intent_hash == &target.accepted_intent_hash
@@ -964,6 +996,44 @@ fn repair_target_decision(
             failure: failure.clone(),
         },
         target,
+    })
+}
+
+fn tools_for_target_operation(
+    target: &crate::execution_graph::PlannedTarget,
+) -> Result<Vec<ToolKind>, OrchestrationInvariantError> {
+    let operation = target.effective_operation();
+    if let crate::execution_graph::TargetOperation::Rename {
+        source,
+        destination,
+    }
+    | crate::execution_graph::TargetOperation::Move {
+        source,
+        destination,
+    } = &operation
+        && (source.trim().is_empty()
+            || destination.trim().is_empty()
+            || source == destination
+            || destination != &target.path)
+    {
+        return Err(OrchestrationInvariantError::new(
+            "unsupported_operation_contract",
+            format!(
+                "{} requires distinct non-empty source and destination paths with destination equal to the target path",
+                operation.as_str()
+            ),
+        ));
+    }
+    Ok(match operation {
+        crate::execution_graph::TargetOperation::ModifyExisting => {
+            vec![ToolKind::ApplyPatch]
+        }
+        crate::execution_graph::TargetOperation::CreateNew => vec![ToolKind::CreateFile],
+        crate::execution_graph::TargetOperation::DeleteExisting => vec![ToolKind::DeleteFile],
+        crate::execution_graph::TargetOperation::Rename { .. } => {
+            vec![ToolKind::RenameFile, ToolKind::MoveFile]
+        }
+        crate::execution_graph::TargetOperation::Move { .. } => vec![ToolKind::MoveFile],
     })
 }
 
@@ -1201,6 +1271,7 @@ mod tests {
             },
             intent: format!("change {path}"),
             acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
             new_file: false,
         }
     }
@@ -1285,9 +1356,14 @@ mod tests {
                 sequence: 1,
                 node_id: node.id.clone(),
                 target_path: "src/theme.ts".into(),
+                operation: TargetOperation::ModifyExisting,
+                source_path: None,
+                target_exists: Some(true),
+                source_exists: None,
                 repository_fingerprint: RepositoryFingerprint::new("tree-1"),
                 evidence_ids: vec!["file-current".into()],
                 target_content_hash: None,
+                source_content_hash: None,
                 accepted_intent_hash: hex::encode(Sha256::digest(b"change src/theme.ts")),
             });
         assert!(matches!(
@@ -2447,6 +2523,73 @@ mod tests {
                 .iter()
                 .any(|node| node.id == remaining_id),
             "dependency override must not claim the remaining target was applied"
+        );
+    }
+
+    #[test]
+    fn malformed_relocation_contract_is_an_explicit_orchestration_failure() {
+        let mut malformed = target("move", "src/new.rs");
+        malformed.operation = TargetOperation::Move {
+            source: String::new(),
+            destination: "src/new.rs".into(),
+        };
+        let state = snapshot(&[malformed]);
+        let error = reconcile_execution(&state).unwrap_err();
+        assert_eq!(error.code, "unsupported_operation_contract");
+    }
+
+    #[test]
+    fn late_operation_conflict_preserves_applied_work_and_routes_incomplete_review() {
+        let mut state = snapshot(&[
+            target("first", "src/first.rs"),
+            target("second", "src/second.rs"),
+        ]);
+        let mutation_ids = state
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind.is_mutation())
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        state
+            .graph
+            .set_node_status(&mutation_ids[0], ExecutionNodeStatus::Applied)
+            .unwrap();
+        state
+            .graph
+            .set_node_status(&mutation_ids[1], ExecutionNodeStatus::FailedRecoverable)
+            .unwrap();
+        state.current_repository.fingerprint = "tree-2".into();
+        state
+            .current_repository
+            .changed_paths
+            .insert("src/first.rs".into());
+        let mut failure = FailureRecord::new(
+            "target-conflict",
+            mutation_ids[1].clone(),
+            FailureCategory::PlanRepositoryConflict,
+            1,
+            "tree-2",
+            "accepted modify target is absent",
+        );
+        failure.code = Some("expected_existing_target_missing".into());
+        failure.target_path = Some("src/second.rs".into());
+        state.failures.record(failure);
+
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ReviewIncompleteDiff {
+                reason: IncompleteReason::TargetOperationConflict,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.graph.node(&mutation_ids[0]).unwrap().status,
+            ExecutionNodeStatus::Applied
+        );
+        assert_eq!(
+            state.graph.node(&mutation_ids[1]).unwrap().status,
+            ExecutionNodeStatus::FailedRecoverable
         );
     }
 }

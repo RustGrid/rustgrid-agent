@@ -12,6 +12,7 @@ fn target(change_id: &str, path: &str, role: &str) -> GraphPlannedTarget {
         role: role.to_owned(),
         intent: format!("Implement {change_id}"),
         acceptance_criteria_ids: vec!["ac-1".to_owned()],
+        operation: Default::default(),
         new_file: false,
     }
 }
@@ -185,6 +186,7 @@ fn existing_vitest_target_inserts_focused_gate_before_broad_validation() {
         role: "test".into(),
         intent: "cover theme selection".into(),
         acceptance_criteria_ids: vec!["ac-1".into()],
+        operation: Default::default(),
         new_file: false,
     }];
     let gates = canonical_validation_gates_for_targets(&manifest, &targets, true);
@@ -210,6 +212,7 @@ fn startup_bootstrap_suppresses_redundant_install_unless_dependencies_change() {
         role: "source".into(),
         intent: "update theme".into(),
         acceptance_criteria_ids: vec![],
+        operation: Default::default(),
         new_file: false,
     };
     let gates =
@@ -274,6 +277,7 @@ fn accepted_plan() -> ImplementationPlan {
             targets: vec![PlannedTarget {
                 path: "src/lib.rs".to_owned(),
                 role: "production".to_owned(),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Planned,
             }],
@@ -311,6 +315,7 @@ fn complex_accepted_plan() -> ImplementationPlan {
         targets: vec![PlannedTarget {
             path: path.to_owned(),
             role: role.to_owned(),
+            operation: new_file.then_some(crate::execution_graph::TargetOperation::CreateNew),
             new_file,
             status: IntendedChangeStatus::Planned,
         }],
@@ -729,6 +734,7 @@ fn notebook_is_materialized_from_graph_failures_validation_and_events() {
             target_path: source.path.clone(),
             repository_fingerprint: "tree-1".to_owned(),
             evidence_id: "mutation-source".to_owned(),
+            created_target_evidence: None,
         }],
         failures,
         evidence,
@@ -1190,6 +1196,7 @@ fn duplicate_path_is_not_applied_without_node_specific_evidence() {
             target_path: "src/shared.rs".to_owned(),
             repository_fingerprint: "tree-1".to_owned(),
             evidence_id: "mutation-one".to_owned(),
+            created_target_evidence: None,
         }],
         ..HostedOrchestrationCheckpoint::default()
     };

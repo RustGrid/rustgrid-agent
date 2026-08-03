@@ -70,6 +70,7 @@ pub enum MissionOutcome {
 pub enum IncompleteReason {
     ValidationRepairProducedNoMutation,
     ValidationInfrastructureFailure,
+    TargetOperationConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

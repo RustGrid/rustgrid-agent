@@ -127,6 +127,7 @@ fn materialize_legacy_changes(
         group.targets.push(PlannedTarget {
             path: target.path.clone(),
             role: target.role.clone(),
+            operation: Some(target.effective_operation()),
             new_file: target.new_file,
             status: legacy_status_from_graph(node.status),
         });
@@ -392,6 +393,7 @@ const fn failure_category_code(category: FailureCategory) -> &'static str {
         FailureCategory::ModelArtifactRecoverable => "model_artifact_recoverable",
         FailureCategory::ToolRecoverable => "tool_recoverable",
         FailureCategory::MutationConflict => "mutation_conflict",
+        FailureCategory::PlanRepositoryConflict => "plan_repository_conflict",
         FailureCategory::TargetBlocked => "target_blocked",
         FailureCategory::ValidationFailure => "validation_failure",
         FailureCategory::InfrastructureFailure => "infrastructure_failure",
@@ -1459,6 +1461,15 @@ pub(super) fn canonical_plan_targets(plan: &ImplementationPlan) -> Vec<GraphPlan
                     .planned_new_files
                     .iter()
                     .any(|path| path == &change.path),
+                operation: if plan
+                    .planned_new_files
+                    .iter()
+                    .any(|path| path == &change.path)
+                {
+                    crate::execution_graph::TargetOperation::CreateNew
+                } else {
+                    crate::execution_graph::TargetOperation::ModifyExisting
+                },
             });
             continue;
         }
@@ -1477,6 +1488,7 @@ pub(super) fn canonical_plan_targets(plan: &ImplementationPlan) -> Vec<GraphPlan
                         .planned_new_files
                         .iter()
                         .any(|path| path == &target.path),
+                operation: target.effective_operation(),
             });
         }
     }

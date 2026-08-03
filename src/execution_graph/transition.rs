@@ -55,13 +55,37 @@ pub enum ExecutionDomainEvent {
         sequence: u64,
         node_id: ExecutionNodeId,
         target_path: String,
+        #[serde(default)]
+        operation: TargetOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_path: Option<RepositoryPath>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_exists: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_exists: Option<bool>,
         repository_fingerprint: RepositoryFingerprint,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_content_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_content_hash: Option<String>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         accepted_intent_hash: String,
         #[serde(default)]
         evidence_ids: Vec<String>,
+    },
+    TargetMutationIntentRecorded {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+        target_path: RepositoryPath,
+        operation: TargetOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_path: Option<RepositoryPath>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_result_content_hash: Option<ContentHash>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_source_content_hash: Option<ContentHash>,
+        repository_fingerprint: RepositoryFingerprint,
+        accepted_intent_hash: String,
     },
     TargetMutationProduced {
         sequence: u64,
@@ -78,6 +102,8 @@ pub enum ExecutionDomainEvent {
         target_path: String,
         repository_fingerprint: String,
         evidence_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_target_evidence: Option<CreatedTargetEvidence>,
     },
     MutationRejected {
         sequence: u64,
@@ -250,6 +276,7 @@ impl ExecutionDomainEvent {
             Self::GraphCreated { .. } => "graph_created",
             Self::NodeStarted { .. } => "node_started",
             Self::TargetContextPrepared { .. } => "target_context_prepared",
+            Self::TargetMutationIntentRecorded { .. } => "target_mutation_intent_recorded",
             Self::TargetMutationProduced { .. } => "target_mutation_produced",
             Self::MutationApplied { .. } => "mutation_applied",
             Self::MutationRejected { .. } => "mutation_rejected",
@@ -292,6 +319,7 @@ impl ExecutionDomainEvent {
             | Self::GraphCreated { sequence, .. }
             | Self::NodeStarted { sequence, .. }
             | Self::TargetContextPrepared { sequence, .. }
+            | Self::TargetMutationIntentRecorded { sequence, .. }
             | Self::TargetMutationProduced { sequence, .. }
             | Self::MutationApplied { sequence, .. }
             | Self::MutationRejected { sequence, .. }
@@ -327,6 +355,7 @@ impl ExecutionDomainEvent {
         match self {
             Self::NodeStarted { node_id, .. }
             | Self::TargetContextPrepared { node_id, .. }
+            | Self::TargetMutationIntentRecorded { node_id, .. }
             | Self::TargetMutationProduced { node_id, .. }
             | Self::MutationApplied { node_id, .. }
             | Self::MutationRejected { node_id, .. }
@@ -403,6 +432,7 @@ impl ExecutionGraph {
         let guarded_node = match event {
             ExecutionDomainEvent::NodeStarted { node_id, .. }
             | ExecutionDomainEvent::TargetContextPrepared { node_id, .. }
+            | ExecutionDomainEvent::TargetMutationIntentRecorded { node_id, .. }
             | ExecutionDomainEvent::TargetMutationProduced { node_id, .. }
             | ExecutionDomainEvent::MutationApplied { node_id, .. }
             | ExecutionDomainEvent::MutationSuperseded { node_id, .. }
@@ -454,6 +484,7 @@ impl ExecutionGraph {
                 self.revision = self.revision.saturating_add(1);
             }
             ExecutionDomainEvent::TargetContextPrepared { .. }
+            | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
             | ExecutionDomainEvent::TargetMutationProduced { .. } => {
                 // These events advance the action state while the same node
                 // attempt remains Running. The orchestrator derives the next
@@ -775,6 +806,7 @@ impl ExecutionGraph {
         })?;
         let kind_matches = match event {
             ExecutionDomainEvent::MutationApplied { .. }
+            | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
             | ExecutionDomainEvent::MutationRejected { .. }
             | ExecutionDomainEvent::MutationSuperseded { .. } => node.kind.is_mutation(),
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {

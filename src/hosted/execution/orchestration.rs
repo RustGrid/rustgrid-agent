@@ -7,13 +7,19 @@ pub(in crate::hosted) enum TargetContextPreparationResult {
     TargetContextAlreadyPrepared,
 }
 
+struct TargetContextIdentity<'a> {
+    node_id: &'a crate::execution_graph::ExecutionNodeId,
+    target_path: &'a str,
+    operation: &'a crate::execution_graph::TargetOperation,
+    source_path: Option<&'a str>,
+    target_content_hash: &'a Option<String>,
+    repository_fingerprint: &'a str,
+    accepted_intent_hash: &'a str,
+}
+
 fn target_context_already_prepared(
     events: &[crate::execution_graph::ExecutionDomainEvent],
-    node_id: &crate::execution_graph::ExecutionNodeId,
-    target_path: &str,
-    target_content_hash: &Option<String>,
-    repository_fingerprint: &str,
-    accepted_intent_hash: &str,
+    identity: &TargetContextIdentity<'_>,
 ) -> bool {
     events.iter().rev().any(|event| {
         matches!(
@@ -21,15 +27,19 @@ fn target_context_already_prepared(
             crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
                 node_id: prepared_node_id,
                 target_path: prepared_target_path,
+                operation: prepared_operation,
+                source_path: prepared_source_path,
                 repository_fingerprint: prepared_repository_fingerprint,
                 target_content_hash: prepared_target_content_hash,
                 accepted_intent_hash: prepared_intent_hash,
                 ..
-            } if prepared_node_id == node_id
-                && prepared_target_path == target_path
-                && prepared_repository_fingerprint.as_str() == repository_fingerprint
-                && prepared_target_content_hash == target_content_hash
-                && prepared_intent_hash == accepted_intent_hash
+            } if prepared_node_id == identity.node_id
+                && prepared_target_path == identity.target_path
+                && prepared_operation == identity.operation
+                && prepared_source_path.as_deref() == identity.source_path
+                && prepared_repository_fingerprint.as_str() == identity.repository_fingerprint
+                && prepared_target_content_hash == identity.target_content_hash
+                && prepared_intent_hash == identity.accepted_intent_hash
         )
     })
 }
@@ -2311,6 +2321,15 @@ impl<'a> GatewayAgent<'a> {
         category: crate::execution_graph::FailureCategory,
         detail: &str,
     ) -> Result<()> {
+        self.record_active_target_failure_with_code(category, None, detail)
+    }
+
+    pub(in crate::hosted) fn record_active_target_failure_with_code(
+        &mut self,
+        category: crate::execution_graph::FailureCategory,
+        code: Option<&str>,
+        detail: &str,
+    ) -> Result<()> {
         let (node_id, target_path) = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
                 node_id, target, ..
@@ -2339,6 +2358,7 @@ impl<'a> GatewayAgent<'a> {
             detail,
         );
         failure.target_path = target_path;
+        failure.code = code.map(str::to_owned);
         let older_failures = self
             .notebook
             .orchestration
@@ -2360,7 +2380,7 @@ impl<'a> GatewayAgent<'a> {
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::MutationRejected {
                 sequence: self.next_domain_event_sequence(),
-                node_id,
+                node_id: node_id.clone(),
                 failure,
             },
         )
@@ -2782,13 +2802,76 @@ impl<'a> GatewayAgent<'a> {
             .domain_events
             .last()
             .map_or(1, |event| event.sequence().saturating_add(1));
+        let created_target_evidence = self.current_decision.as_ref().and_then(|decision| {
+            let target = match decision {
+                ExecutionDecision::ExecuteTarget { target, .. } => &target.target,
+                ExecutionDecision::RepairTarget { context, .. } => &context.target.target,
+                _ => return None,
+            };
+            if !matches!(
+                target.effective_operation(),
+                crate::execution_graph::TargetOperation::CreateNew
+            ) {
+                return None;
+            }
+            let content = fs::read_to_string(self.repo.root.join(target_path)).ok()?;
+            let before = self
+                .notebook
+                .orchestration
+                .domain_events
+                .iter()
+                .rev()
+                .find_map(|event| {
+                    match event {
+                    crate::execution_graph::ExecutionDomainEvent::TargetMutationProduced {
+                        node_id: produced_node_id,
+                        expected_repository_fingerprint,
+                        ..
+                    } if produced_node_id == &node_id => {
+                        Some(expected_repository_fingerprint.clone())
+                    }
+                    crate::execution_graph::ExecutionDomainEvent::TargetMutationIntentRecorded {
+                        node_id: intent_node_id,
+                        repository_fingerprint,
+                        ..
+                    } if intent_node_id == &node_id => Some(repository_fingerprint.clone()),
+                    _ => None,
+                }
+                })
+                .unwrap_or_else(|| {
+                    crate::execution_graph::RepositoryFingerprint::new(
+                        self.notebook.repository_fingerprint.clone(),
+                    )
+                });
+            let validation_gate_ids = self
+                .notebook
+                .orchestration
+                .graph
+                .as_ref()
+                .into_iter()
+                .flat_map(|graph| graph.nodes.iter())
+                .filter(|node| node.required && node.kind.is_validation())
+                .map(|node| node.id.to_string())
+                .collect();
+            Some(crate::execution_graph::CreatedTargetEvidence {
+                path: target_path.to_owned(),
+                content_hash: sha256_text(&content),
+                repository_fingerprint_before: before,
+                repository_fingerprint_after: crate::execution_graph::RepositoryFingerprint::new(
+                    fingerprint.clone(),
+                ),
+                creation_tool: "create_file".into(),
+                validation_gate_ids,
+            })
+        });
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::MutationApplied {
                 sequence,
-                node_id,
+                node_id: node_id.clone(),
                 target_path: target_path.to_owned(),
                 repository_fingerprint: fingerprint.clone(),
                 evidence_id,
+                created_target_evidence,
             },
         )?;
         if let Some((failure_id, validation_node_id)) = validation_recovery {
@@ -2807,30 +2890,75 @@ impl<'a> GatewayAgent<'a> {
     pub(in crate::hosted) fn prepare_active_target_context(
         &mut self,
     ) -> Result<TargetContextPreparationResult> {
-        let (node_id, target_path, accepted_intent_hash) = match self.current_decision.as_ref() {
+        let (node_id, target, accepted_intent_hash) = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
                 node_id,
                 target: context,
                 ..
             }) => (
                 node_id.clone(),
-                context.target.path.clone(),
+                context.target.clone(),
                 context.accepted_intent_hash.clone(),
             ),
             _ => return Ok(TargetContextPreparationResult::Prepared),
         };
+        let target_path = target.path.clone();
+        let operation = target.effective_operation();
+        let source_path = operation.source_path().map(str::to_owned);
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        let inspected_path = match safe_repo_path(&self.repo.root, &target_path, true) {
+            Ok(path) => path,
+            Err(error) => {
+                let (category, code) = match error.kind {
+                    RepoPathErrorKind::NotAllowed => (
+                        crate::execution_graph::FailureCategory::PlanRepositoryConflict,
+                        "unsafe_target_path",
+                    ),
+                    RepoPathErrorKind::NotFound | RepoPathErrorKind::Infrastructure => (
+                        crate::execution_graph::FailureCategory::InfrastructureFailure,
+                        "target_inspection_failed",
+                    ),
+                };
+                self.record_active_target_failure_with_code(
+                    category,
+                    Some(code),
+                    &json!({
+                        "code": code,
+                        "operation": operation.as_str(),
+                        "target_path": target_path,
+                        "message": error.to_string(),
+                    })
+                    .to_string(),
+                )?;
+                return Ok(TargetContextPreparationResult::Prepared);
+            }
+        };
+        let target_exists = inspected_path.is_file();
         let mut evidence = self
             .notebook
             .orchestration
             .evidence
             .reusable_file(&target_path, &fingerprint, None)
-            .cloned();
-        if evidence.is_none() {
-            let target = safe_repo_path(&self.repo.root, &target_path, false)?;
-            let content = fs::read_to_string(&target).with_context(|| {
-                format!("could not prepare exact UTF-8 target context for {target_path}")
-            })?;
+            .cloned()
+            .filter(|_| target_exists);
+        if target_exists && evidence.is_none() {
+            let content = match fs::read_to_string(&inspected_path) {
+                Ok(content) => content,
+                Err(error) => {
+                    self.record_active_target_failure_with_code(
+                        crate::execution_graph::FailureCategory::InfrastructureFailure,
+                        Some("target_inspection_failed"),
+                        &json!({
+                            "code": "target_inspection_failed",
+                            "operation": operation.as_str(),
+                            "target_path": target_path,
+                            "error_kind": format!("{:?}", error.kind()),
+                        })
+                        .to_string(),
+                    )?;
+                    return Ok(TargetContextPreparationResult::Prepared);
+                }
+            };
             let captured = crate::execution_graph::FileEvidence::capture(
                 &target_path,
                 &fingerprint,
@@ -2848,16 +2976,226 @@ impl<'a> GatewayAgent<'a> {
             )?;
             evidence = Some(captured);
         }
-        let target_content_hash = evidence
-            .as_ref()
-            .map(|evidence| evidence.content_hash.clone());
+        let mut source_evidence = None;
+        let source_exists = if let Some(source_path) = source_path.as_deref() {
+            let source = match safe_repo_path(&self.repo.root, source_path, true) {
+                Ok(path) => path,
+                Err(error) => {
+                    let category = if error.kind == RepoPathErrorKind::NotAllowed {
+                        crate::execution_graph::FailureCategory::PlanRepositoryConflict
+                    } else {
+                        crate::execution_graph::FailureCategory::InfrastructureFailure
+                    };
+                    let code = if category
+                        == crate::execution_graph::FailureCategory::InfrastructureFailure
+                    {
+                        "target_inspection_failed"
+                    } else {
+                        "unsafe_source_path"
+                    };
+                    self.record_active_target_failure_with_code(
+                        category,
+                        Some(code),
+                        &json!({
+                            "code": code,
+                            "operation": operation.as_str(),
+                            "source_path": source_path,
+                            "target_path": target_path,
+                            "message": error.to_string(),
+                        })
+                        .to_string(),
+                    )?;
+                    return Ok(TargetContextPreparationResult::Prepared);
+                }
+            };
+            let exists = source.is_file();
+            if exists {
+                let content = match fs::read_to_string(&source) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        self.record_active_target_failure_with_code(
+                            crate::execution_graph::FailureCategory::InfrastructureFailure,
+                            Some("target_inspection_failed"),
+                            &json!({
+                                "code": "target_inspection_failed",
+                                "operation": operation.as_str(),
+                                "source_path": source_path,
+                                "error_kind": format!("{:?}", error.kind()),
+                            })
+                            .to_string(),
+                        )?;
+                        return Ok(TargetContextPreparationResult::Prepared);
+                    }
+                };
+                let captured = crate::execution_graph::FileEvidence::capture(
+                    source_path,
+                    &fingerprint,
+                    None,
+                    content,
+                    false,
+                );
+                self.append_execution_domain_event(
+                    crate::execution_graph::ExecutionDomainEvent::RepositoryEvidenceRecorded {
+                        sequence: self.next_domain_event_sequence(),
+                        evidence_id: captured.evidence_id.clone(),
+                        repository_fingerprint: fingerprint.clone(),
+                        evidence: Some(captured.clone()),
+                    },
+                )?;
+                source_evidence = Some(captured);
+            }
+            Some(exists)
+        } else {
+            None
+        };
+
+        let target_content_hash = evidence.as_ref().map(|value| value.content_hash.clone());
+        let expected_result_content_hash = self
+            .notebook
+            .orchestration
+            .domain_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                crate::execution_graph::ExecutionDomainEvent::TargetMutationIntentRecorded {
+                    node_id: recorded_node_id,
+                    target_path: recorded_target_path,
+                    operation: recorded_operation,
+                    expected_result_content_hash,
+                    accepted_intent_hash: recorded_intent_hash,
+                    ..
+                } if recorded_node_id == &node_id
+                    && recorded_target_path == &target_path
+                    && recorded_operation == &operation
+                    && recorded_intent_hash == &accepted_intent_hash =>
+                {
+                    expected_result_content_hash.clone()
+                }
+                _ => None,
+            });
+        let probe = crate::execution_graph::TargetStateProbe {
+            operation: operation.clone(),
+            target_path: target_path.clone(),
+            target_exists,
+            source_exists,
+            target_content_hash: target_content_hash.clone(),
+            source_content_hash: source_evidence
+                .as_ref()
+                .map(|value| value.content_hash.clone()),
+            expected_result_content_hash,
+            repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                fingerprint.clone(),
+            ),
+        };
+        let inspection_outcome = probe.inspection_outcome();
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.target_state_probed",
+                "node_id": node_id,
+                "operation": operation.as_str(),
+                "target_path": target_path,
+                "source_path": source_path,
+                "target_exists": target_exists,
+                "source_exists": source_exists,
+                "target_content_hash": target_content_hash,
+                "source_content_hash": probe.source_content_hash,
+                "expected_result_content_hash": probe.expected_result_content_hash,
+                "repository_fingerprint": fingerprint,
+                "inspection_outcome": inspection_outcome,
+                "process_health": "healthy",
+                "mission_outcome": "continuing",
+            }),
+            "target state probed",
+        );
+        if inspection_outcome
+            == crate::execution_graph::TargetInspectionOutcome::NewTargetConfirmedAbsent
+        {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.new_target_absence_confirmed",
+                    "node_id": node_id,
+                    "operation": operation.as_str(),
+                    "target_path": target_path,
+                    "target_exists": false,
+                    "repository_fingerprint": fingerprint,
+                    "verification_result": "confirmed_absent",
+                    "process_health": "healthy",
+                    "mission_outcome": "continuing",
+                }),
+                "new target absence confirmed",
+            );
+        }
+        if let crate::execution_graph::TargetInspectionOutcome::OperationConflict { conflict } =
+            &inspection_outcome
+        {
+            let category = if matches!(
+                conflict.code.as_str(),
+                "expected_existing_target_missing" | "expected_source_target_missing"
+            ) {
+                crate::execution_graph::FailureCategory::PlanRepositoryConflict
+            } else {
+                crate::execution_graph::FailureCategory::MutationConflict
+            };
+            let code = conflict.code.as_str();
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.target_operation_conflict",
+                    "node_id": node_id,
+                    "operation": operation.as_str(),
+                    "target_path": target_path,
+                    "source_path": source_path,
+                    "failure_code": code,
+                    "repository_fingerprint": fingerprint,
+                    "process_health": "healthy",
+                    "mission_outcome": "incomplete",
+                }),
+                "target operation conflict",
+            );
+            self.record_active_target_failure_with_code(
+                category,
+                Some(code),
+                &json!({
+                    "code": code,
+                    "operation": operation.as_str(),
+                    "target_path": target_path,
+                    "source_path": source_path,
+                })
+                .to_string(),
+            )?;
+            return Ok(TargetContextPreparationResult::Prepared);
+        }
+        if inspection_outcome == crate::execution_graph::TargetInspectionOutcome::AlreadyApplied {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.target_operation_already_applied",
+                    "node_id": node_id,
+                    "operation": operation.as_str(),
+                    "target_path": target_path,
+                    "source_path": source_path,
+                    "repository_fingerprint": fingerprint,
+                    "process_health": "healthy",
+                    "mission_outcome": "continuing",
+                }),
+                "target operation already applied",
+            );
+            self.record_active_target_applied(&target_path)?;
+            return Ok(TargetContextPreparationResult::Prepared);
+        }
         let already_prepared = target_context_already_prepared(
             &self.notebook.orchestration.domain_events,
-            &node_id,
-            &target_path,
-            &target_content_hash,
-            &fingerprint,
-            &accepted_intent_hash,
+            &TargetContextIdentity {
+                node_id: &node_id,
+                target_path: &target_path,
+                operation: &operation,
+                source_path: source_path.as_deref(),
+                target_content_hash: &target_content_hash,
+                repository_fingerprint: &fingerprint,
+                accepted_intent_hash: &accepted_intent_hash,
+            },
         );
         if already_prepared {
             return Ok(TargetContextPreparationResult::TargetContextAlreadyPrepared);
@@ -2866,19 +3204,46 @@ impl<'a> GatewayAgent<'a> {
             .as_ref()
             .map(|evidence| vec![evidence.evidence_id.clone()])
             .unwrap_or_default();
+        let mut evidence_ids = evidence_ids;
+        if let Some(source) = source_evidence.as_ref() {
+            evidence_ids.push(source.evidence_id.clone());
+        }
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
                 sequence: self.next_domain_event_sequence(),
-                node_id,
+                node_id: node_id.clone(),
                 target_path: target_path.clone(),
+                operation: operation.clone(),
+                source_path: source_path.clone(),
+                target_exists: Some(target_exists),
+                source_exists,
                 repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
                     fingerprint.clone(),
                 ),
                 target_content_hash: target_content_hash.clone(),
+                source_content_hash: source_evidence
+                    .as_ref()
+                    .map(|value| value.content_hash.clone()),
                 accepted_intent_hash,
                 evidence_ids,
             },
         )?;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.target_operation_context_prepared",
+                "node_id": node_id,
+                "operation": operation.as_str(),
+                "target_path": target_path,
+                "source_path": source_path,
+                "target_exists": target_exists,
+                "source_exists": source_exists,
+                "repository_fingerprint": fingerprint,
+                "process_health": "healthy",
+                "mission_outcome": "continuing",
+            }),
+            "target operation context prepared",
+        );
         if let Some(evidence) = evidence {
             self.append_event_recoverable(
                 "progress",
@@ -2939,15 +3304,78 @@ impl<'a> GatewayAgent<'a> {
         )
     }
 
+    pub(in crate::hosted) fn record_active_target_mutation_intent(
+        &mut self,
+        expected_result_content_hash: Option<String>,
+    ) -> Result<()> {
+        let (node_id, context) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id, target, ..
+            }) => (node_id.clone(), target.clone()),
+            _ => return Ok(()),
+        };
+        let operation = context.target.effective_operation();
+        let fingerprint = crate::execution_graph::RepositoryFingerprint::new(
+            context.repository_fingerprint.clone(),
+        );
+        let duplicate = self
+            .notebook
+            .orchestration
+            .domain_events
+            .iter()
+            .rev()
+            .any(|event| {
+                matches!(
+                    event,
+                    crate::execution_graph::ExecutionDomainEvent::TargetMutationIntentRecorded {
+                        node_id: recorded_node_id,
+                        target_path,
+                        operation: recorded_operation,
+                        expected_result_content_hash: recorded_result_hash,
+                        repository_fingerprint,
+                        accepted_intent_hash,
+                        ..
+                    } if recorded_node_id == &node_id
+                        && target_path == &context.target.path
+                        && recorded_operation == &operation
+                        && recorded_result_hash == &expected_result_content_hash
+                        && repository_fingerprint == &fingerprint
+                        && accepted_intent_hash == &context.accepted_intent_hash
+                )
+            });
+        if duplicate {
+            return Ok(());
+        }
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::TargetMutationIntentRecorded {
+                sequence: self.next_domain_event_sequence(),
+                node_id,
+                target_path: context.target.path.clone(),
+                operation: operation.clone(),
+                source_path: operation.source_path().map(str::to_owned),
+                expected_result_content_hash,
+                expected_source_content_hash: context.source_content_hash,
+                repository_fingerprint: fingerprint,
+                accepted_intent_hash: context.accepted_intent_hash,
+            },
+        )?;
+        self.persist_orchestration_checkpoint("target_mutation_intent_recorded", false)
+    }
+
     pub(in crate::hosted) fn verify_active_target_state(&mut self) -> Result<()> {
-        let (node_id, target_path) = match self.current_decision.as_ref() {
+        let (node_id, target_path, operation) = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
                 node_id,
                 action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { target, .. },
                 ..
-            }) => (node_id.clone(), target.path.clone()),
+            }) => (
+                node_id.clone(),
+                target.path.clone(),
+                target.effective_operation(),
+            ),
             _ => return Ok(()),
         };
+        let source_path = operation.source_path().map(str::to_owned);
         let produced = self
             .notebook
             .orchestration
@@ -2989,11 +3417,13 @@ impl<'a> GatewayAgent<'a> {
             self.append_event_recoverable(
                 "progress",
                 json!({
-                    "event_type": "worker.target_verification_completed",
+                    "event_type": "worker.target_operation_verified",
                     "node_id": node_id,
-                    "target": target_path,
-                    "mutation_tool": mutation_tool.clone(),
-                    "verified": false,
+                    "operation": operation.as_str(),
+                    "target_path": target_path,
+                    "source_path": source_path,
+                    "selected_mutation_tool": mutation_tool.clone(),
+                    "verification_result": "failed",
                     "before_content_hash": produced.1,
                     "after_content_hash": produced.2,
                     "repository_fingerprint": repository_fingerprint,
@@ -3013,11 +3443,13 @@ impl<'a> GatewayAgent<'a> {
         self.append_event_recoverable(
             "progress",
             json!({
-                "event_type": "worker.target_verification_completed",
+                "event_type": "worker.target_operation_verified",
                 "node_id": node_id,
-                "target": target_path,
-                "mutation_tool": mutation_tool,
-                "verified": true,
+                "operation": operation.as_str(),
+                "target_path": target_path,
+                "source_path": source_path,
+                "selected_mutation_tool": mutation_tool,
+                "verification_result": "verified",
                 "before_content_hash": produced.1,
                 "after_content_hash": produced.2,
                 "repository_fingerprint": repository_fingerprint,
@@ -3154,26 +3586,39 @@ mod tests {
             sequence: 1,
             node_id: node_id.clone(),
             target_path: "src/theme.ts".into(),
+            operation: crate::execution_graph::TargetOperation::ModifyExisting,
+            source_path: None,
+            target_exists: Some(true),
+            source_exists: None,
             repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new("tree-1"),
             target_content_hash: content_hash.clone(),
+            source_content_hash: None,
             accepted_intent_hash: "intent-1".into(),
             evidence_ids: vec!["file-1".into()],
         };
         assert!(target_context_already_prepared(
             std::slice::from_ref(&event),
-            &node_id,
-            "src/theme.ts",
-            &content_hash,
-            "tree-1",
-            "intent-1",
+            &TargetContextIdentity {
+                node_id: &node_id,
+                target_path: "src/theme.ts",
+                operation: &crate::execution_graph::TargetOperation::ModifyExisting,
+                source_path: None,
+                target_content_hash: &content_hash,
+                repository_fingerprint: "tree-1",
+                accepted_intent_hash: "intent-1",
+            },
         ));
         assert!(!target_context_already_prepared(
             std::slice::from_ref(&event),
-            &node_id,
-            "src/theme.ts",
-            &content_hash,
-            "tree-2",
-            "intent-1",
+            &TargetContextIdentity {
+                node_id: &node_id,
+                target_path: "src/theme.ts",
+                operation: &crate::execution_graph::TargetOperation::ModifyExisting,
+                source_path: None,
+                target_content_hash: &content_hash,
+                repository_fingerprint: "tree-2",
+                accepted_intent_hash: "intent-1",
+            },
         ));
     }
 }

@@ -543,10 +543,15 @@ impl SimulationHarness {
                 self.append(ExecutionDomainEvent::TargetContextPrepared {
                     sequence: self.sequence(),
                     node_id,
-                    target_path: target.target.path,
+                    target_path: target.target.path.clone(),
+                    operation: target.target.effective_operation(),
+                    source_path: None,
+                    target_exists: Some(true),
+                    source_exists: None,
                     repository_fingerprint: RepositoryFingerprint::new(fingerprint),
                     evidence_ids: vec![evidence.evidence_id],
                     target_content_hash: Some(evidence.content_hash),
+                    source_content_hash: None,
                     accepted_intent_hash: target.accepted_intent_hash,
                 })?;
                 Ok(None)
@@ -855,6 +860,7 @@ impl SimulationHarness {
                     target_path: target.path.clone(),
                     repository_fingerprint: after.clone(),
                     evidence_id,
+                    created_target_evidence: None,
                 })?;
                 if repairing {
                     self.reset_failed_validation_nodes()?;
@@ -1625,6 +1631,7 @@ mod tests {
                     role: "production".to_owned(),
                     intent: "repair parser behavior".to_owned(),
                     acceptance_criteria_ids: vec!["ac-1".to_owned()],
+                    operation: Default::default(),
                     new_file: false,
                 })
                 .with_validation_gate(ValidationGateSpec {

@@ -87,6 +87,9 @@ pub(super) fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "insert_before_symbol"
                 | "apply_patch"
                 | "replace_file"
+                | "create_file"
+                | "rename_file"
+                | "move_file"
                 | "record_no_valid_repair"
                 | "apply_unified_diff"
                 | "rewrite_small_file"
@@ -247,10 +250,20 @@ pub(super) fn hosted_tools() -> Vec<Value> {
                                         "properties": {
                                             "path": {"type": "string"},
                                             "role": {"type": "string"},
+                                            "operation": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "kind": {"type": "string", "enum": ["modify_existing", "create_new", "delete_existing", "rename", "move"]},
+                                                    "source": {"type": ["string", "null"]},
+                                                    "destination": {"type": ["string", "null"]}
+                                                },
+                                                "required": ["kind", "source", "destination"],
+                                                "additionalProperties": false
+                                            },
                                             "new_file": {"type": "boolean"},
                                             "status": {"type": "string", "enum": ["planned", "in_progress", "applied", "verified", "partial", "unresolved"]}
                                         },
-                                        "required": ["path", "role", "new_file", "status"],
+                                        "required": ["path", "role", "operation", "new_file", "status"],
                                         "additionalProperties": false
                                     }
                                 },
@@ -513,6 +526,57 @@ pub(super) fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "create_file",
+            "description": "Atomically create the exact absent target declared by a create_new operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "create_parents": {"type": "boolean"}
+                },
+                "required": ["change_id", "path", "content", "create_parents"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "rename_file",
+            "description": "Atomically rename the exact source to the exact absent destination declared by a rename operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "source": {"type": "string"},
+                    "create_parents": {"type": "boolean"}
+                },
+                "required": ["change_id", "path", "source", "create_parents"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
+            "name": "move_file",
+            "description": "Atomically move the exact source to the exact absent destination declared by a move operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "change_id": {"type": "string"},
+                    "path": {"type": "string"},
+                    "source": {"type": "string"},
+                    "create_parents": {"type": "boolean"}
+                },
+                "required": ["change_id", "path", "source", "create_parents"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
             "name": "report_write_progress",
             "description": "At the implementation-progress threshold, report the precise blocker or the next planned write instead of continuing exploration.",
             "parameters": {
@@ -718,6 +782,20 @@ pub(super) fn hosted_tools_for_action(
     phase: ExecutionPhase,
     decision: Option<&ExecutionDecision>,
 ) -> Vec<Value> {
+    let operation_tools =
+        |target: &crate::execution_graph::PlannedTarget| -> &'static [&'static str] {
+            match target.effective_operation() {
+                crate::execution_graph::TargetOperation::ModifyExisting => {
+                    &["apply_patch", "replace_file"]
+                }
+                crate::execution_graph::TargetOperation::CreateNew => &["create_file"],
+                crate::execution_graph::TargetOperation::DeleteExisting => &["delete_file"],
+                crate::execution_graph::TargetOperation::Rename { .. } => {
+                    &["rename_file", "move_file"]
+                }
+                crate::execution_graph::TargetOperation::Move { .. } => &["move_file"],
+            }
+        };
     let active_mutation_target = match decision {
         Some(ExecutionDecision::ExecuteTarget {
             action:
@@ -760,20 +838,41 @@ pub(super) fn hosted_tools_for_action(
         }) => Some(&[][..]),
         Some(ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+            target,
             ..
-        }) if mutation_failure_requires_replacement(failure) => Some(&["replace_file"][..]),
+        }) if mutation_failure_requires_replacement(failure) => Some(
+            if matches!(
+                target.target.effective_operation(),
+                crate::execution_graph::TargetOperation::ModifyExisting
+            ) {
+                &["replace_file"][..]
+            } else {
+                operation_tools(&target.target)
+            },
+        ),
         Some(ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+            target,
             ..
         }) if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
-            Some(&["apply_patch", "replace_file", "record_no_valid_repair"][..])
+            Some(
+                if matches!(
+                    target.target.effective_operation(),
+                    crate::execution_graph::TargetOperation::ModifyExisting
+                ) {
+                    &["apply_patch", "replace_file", "record_no_valid_repair"][..]
+                } else {
+                    operation_tools(&target.target)
+                },
+            )
         }
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
                 | crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+            target,
             ..
-        }) => Some(&["apply_patch", "replace_file"][..]),
+        }) => Some(operation_tools(&target.target)),
         _ => None,
     };
     let tools = hosted_tools_for_phase(phase);

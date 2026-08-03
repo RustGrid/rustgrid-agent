@@ -614,10 +614,24 @@ pub(super) struct PlannedTarget {
     pub(super) path: String,
     #[serde(default)]
     pub(super) role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) operation: Option<crate::execution_graph::TargetOperation>,
     #[serde(default)]
     pub(super) new_file: bool,
     #[serde(default)]
     pub(super) status: IntendedChangeStatus,
+}
+
+impl PlannedTarget {
+    pub(super) fn effective_operation(&self) -> crate::execution_graph::TargetOperation {
+        self.operation.clone().unwrap_or({
+            if self.new_file {
+                crate::execution_graph::TargetOperation::CreateNew
+            } else {
+                crate::execution_graph::TargetOperation::ModifyExisting
+            }
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -640,6 +654,7 @@ where
             PlannedTargetInput::Path(path) => PlannedTarget {
                 path,
                 role: String::new(),
+                operation: None,
                 new_file: false,
                 status: IntendedChangeStatus::Planned,
             },
@@ -986,6 +1001,7 @@ mod tests {
                 targets: vec![PlannedTarget {
                     path: "src/theme/provider.rs".into(),
                     role: "theme provider".into(),
+                    operation: Default::default(),
                     new_file: false,
                     status: IntendedChangeStatus::Applied,
                 }],

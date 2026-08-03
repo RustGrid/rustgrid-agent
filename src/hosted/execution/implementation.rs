@@ -205,18 +205,50 @@ impl<'a> GatewayAgent<'a> {
             .as_ref()
             .expect("the implementation plan was checked above");
         let target = authorize_planned_target(plan, &change_id, path)?;
-        safe_repo_path(&self.repo.root, path, target.new_file).map_err(|error| {
-            MutationPreflightError {
-                code: if error.kind == RepoPathErrorKind::NotAllowed {
-                    "mutation_target_outside_repository"
-                } else {
-                    "mutation_target_path_invalid"
-                },
-                change_id: change_id.clone(),
-                target: path.to_owned(),
-                message: error.to_string(),
-                repair_strategy: "repair_plan_metadata",
+        let operation = target.effective_operation();
+        let compatible = match operation {
+            crate::execution_graph::TargetOperation::ModifyExisting => {
+                matches!(name, "apply_patch" | "apply_unified_diff" | "replace_file")
             }
+            crate::execution_graph::TargetOperation::CreateNew => name == "create_file",
+            crate::execution_graph::TargetOperation::DeleteExisting => name == "delete_file",
+            crate::execution_graph::TargetOperation::Rename { .. } => {
+                matches!(name, "rename_file" | "move_file")
+            }
+            crate::execution_graph::TargetOperation::Move { .. } => name == "move_file",
+        };
+        if !compatible {
+            return Err(MutationPreflightError {
+                code: "mutation_tool_operation_mismatch",
+                change_id,
+                target: path.to_owned(),
+                message: format!(
+                    "tool `{name}` is incompatible with operation `{}`",
+                    operation.as_str()
+                ),
+                repair_strategy: "use_operation_bound_tool",
+            }
+            .into());
+        }
+        safe_repo_path(
+            &self.repo.root,
+            path,
+            !matches!(
+                operation,
+                crate::execution_graph::TargetOperation::ModifyExisting
+                    | crate::execution_graph::TargetOperation::DeleteExisting
+            ),
+        )
+        .map_err(|error| MutationPreflightError {
+            code: if error.kind == RepoPathErrorKind::NotAllowed {
+                "mutation_target_outside_repository"
+            } else {
+                "mutation_target_path_invalid"
+            },
+            change_id: change_id.clone(),
+            target: path.to_owned(),
+            message: error.to_string(),
+            repair_strategy: "repair_plan_metadata",
         })?;
         validate_write_repair_strategy(
             &self.notebook.write_attempts,

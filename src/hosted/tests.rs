@@ -230,6 +230,7 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
         role: "production".into(),
         intent: "extend the persisted theme state".into(),
         acceptance_criteria_ids: vec!["ac-1".into()],
+        operation: Default::default(),
         new_file: false,
     };
     let decision = ExecutionDecision::ExecuteTarget {
@@ -250,6 +251,11 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
             dependency_evidence: Vec::new(),
             current_file_content: Some("export type Theme = 'dark';".into()),
             target_content_hash: Some(hex::encode(Sha256::digest(b"export type Theme = 'dark';"))),
+            target_state_probe: None,
+            inspection_outcome: None,
+            source_file_content: None,
+            source_content_hash: None,
+            create_specification: None,
             repository_fingerprint: "tree-1".into(),
             accepted_intent_hash: hex::encode(Sha256::digest(b"extend the persisted theme state")),
             nearby_context: Vec::new(),
@@ -277,6 +283,53 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
         assert_eq!(
             tool["parameters"]["properties"]["path"]["enum"],
             json!(["src/components/theme/ThemeProvider.tsx"])
+        );
+    }
+
+    for (operation, expected_tools) in [
+        (
+            crate::execution_graph::TargetOperation::CreateNew,
+            vec!["create_file"],
+        ),
+        (
+            crate::execution_graph::TargetOperation::DeleteExisting,
+            vec!["delete_file"],
+        ),
+        (
+            crate::execution_graph::TargetOperation::Rename {
+                source: "src/components/theme/OldThemeProvider.tsx".into(),
+                destination: "src/components/theme/ThemeProvider.tsx".into(),
+            },
+            vec!["rename_file", "move_file"],
+        ),
+        (
+            crate::execution_graph::TargetOperation::Move {
+                source: "src/theme/ThemeProvider.tsx".into(),
+                destination: "src/components/theme/ThemeProvider.tsx".into(),
+            },
+            vec!["move_file"],
+        ),
+    ] {
+        let mut operation_decision = decision.clone();
+        if let ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::MutateTarget { target, .. },
+            target: context,
+            ..
+        } = &mut operation_decision
+        {
+            target.operation = operation.clone();
+            target.new_file = matches!(
+                operation,
+                crate::execution_graph::TargetOperation::CreateNew
+            );
+            context.target = target.clone();
+        }
+        assert_eq!(
+            hosted_tools_for_action(ExecutionPhase::Implementation, Some(&operation_decision))
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect::<Vec<_>>(),
+            expected_tools
         );
     }
 
@@ -334,6 +387,7 @@ fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
         role: "production".into(),
         intent: "apply all four theme classes consistently".into(),
         acceptance_criteria_ids: vec!["ac-1".into()],
+        operation: Default::default(),
         new_file: false,
     };
     let mut failure = crate::execution_graph::FailureRecord::new(
@@ -1454,6 +1508,7 @@ fn recovery_authorization_fixture() -> (
             role: "production".into(),
             intent: "preserve validated recovery work".into(),
             acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
             new_file: true,
         }],
         &[ValidationGateSpec {
@@ -1815,6 +1870,7 @@ fn fresh_run_infrastructure_timeout_publishes_draft_and_finishes_partial() {
             role: "production".into(),
             intent: "preserve the validated recovery change".into(),
             acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
             new_file: true,
         }],
         &[ValidationGateSpec {
@@ -3641,6 +3697,7 @@ fn implementation_plan_accepts_collective_criterion_coverage() {
             targets: vec![PlannedTarget {
                 path: (*path).into(),
                 role: format!("{name} implementation"),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Planned,
             }],
@@ -3827,6 +3884,7 @@ fn guided_recovery_context_and_admission_are_confined_to_the_current_target() {
             targets: vec![PlannedTarget {
                 path: (*path).into(),
                 role: "required target".into(),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Planned,
             }],
@@ -4454,6 +4512,7 @@ fn per_target_status_rolls_up_without_claiming_multi_file_completion() {
     change.targets.push(PlannedTarget {
         path: "src/components/theme/ThemeToggle.tsx".into(),
         role: "selector cycling".into(),
+        operation: Default::default(),
         new_file: false,
         status: IntendedChangeStatus::Planned,
     });
@@ -4720,6 +4779,7 @@ fn passing_validation_cannot_complete_an_unchanged_required_target() {
     change.targets.push(PlannedTarget {
         path: "src/components/theme/ThemeToggle.tsx".into(),
         role: "selector cycling".into(),
+        operation: Default::default(),
         new_file: false,
         status: IntendedChangeStatus::Planned,
     });
@@ -4790,6 +4850,7 @@ fn exact_five_target_diff_produces_an_authoritative_complete_declaration() {
             targets: vec![PlannedTarget {
                 path: (*path).into(),
                 role: "required AOPS-226 target".into(),
+                operation: Default::default(),
                 new_file: path.starts_with("tests/"),
                 status: IntendedChangeStatus::Applied,
             }],
@@ -4886,12 +4947,14 @@ fn resumed_reconciliation_unions_committed_and_dirty_target_paths() {
             PlannedTarget {
                 path: "provider.tsx".into(),
                 role: "previously committed target".into(),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Applied,
             },
             PlannedTarget {
                 path: "toggle.tsx".into(),
                 role: "new dirty target".into(),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Planned,
             },
@@ -5086,6 +5149,7 @@ fn restored_validation_results_reuse_current_unattached_graph_evidence() {
             role: "production".into(),
             intent: "update one".into(),
             acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
             new_file: false,
         }],
         &[ValidationGateSpec {
@@ -5300,6 +5364,7 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
             role: "source change".into(),
             intent: "apply the worker change".into(),
             acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
             new_file: true,
         }],
         &[ValidationGateSpec {
@@ -5508,6 +5573,7 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
             targets: vec![PlannedTarget {
                 path: "worker.txt".into(),
                 role: "source change".into(),
+                operation: Default::default(),
                 new_file: true,
                 status: IntendedChangeStatus::Applied,
             }],
@@ -5904,6 +5970,7 @@ it("defines every semantic token for light-blue without conflating primary and i
             targets: vec![PlannedTarget {
                 path: (*path).into(),
                 role: "required AOPS-226 target".into(),
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Applied,
             }],
@@ -6948,6 +7015,7 @@ fn production_preflight_classifies_duplicate_without_change_id_and_advances() {
             change_id: format!("theme-{}", index + 1),
             path: (*path).into(),
             role: "required attempt-20 target".into(),
+            operation: Default::default(),
             new_file: false,
             intent: "implement light-blue theme".into(),
             acceptance_criteria_ids: vec!["ac-1".into()],
@@ -7044,6 +7112,7 @@ fn validated_useful_partial_is_publishable_as_a_draft() {
     planned.targets.push(PlannedTarget {
         path: "tests/theme-palette.test.ts".into(),
         role: "remaining palette coverage".into(),
+        operation: Default::default(),
         new_file: false,
         status: IntendedChangeStatus::Planned,
     });
@@ -8175,6 +8244,7 @@ fn deterministic_criterion_evidence_joins_plan_graph_diff_and_relevant_gates() {
         role: "production".into(),
         intent: "persist and restore theme selection".into(),
         acceptance_criteria_ids: vec!["ac-1".into()],
+        operation: Default::default(),
         new_file: false,
     };
     let mut graph = build_execution_graph(
@@ -8208,6 +8278,7 @@ fn deterministic_criterion_evidence_joins_plan_graph_diff_and_relevant_gates() {
             targets: vec![PlannedTarget {
                 path: target.path.clone(),
                 role: target.role,
+                operation: Default::default(),
                 new_file: false,
                 status: IntendedChangeStatus::Applied,
             }],
@@ -8661,6 +8732,7 @@ fn test_planned_change() -> PlannedChange {
         targets: vec![PlannedTarget {
             path: "tests/theme-provider.test.tsx".into(),
             role: "focused theme coverage".into(),
+            operation: Default::default(),
             new_file: false,
             status: IntendedChangeStatus::Planned,
         }],

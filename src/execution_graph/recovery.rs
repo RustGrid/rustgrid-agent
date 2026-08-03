@@ -6,7 +6,147 @@ pub enum ToolKind {
     ApplyPatch,
     CreateFile,
     DeleteFile,
+    RenameFile,
+    MoveFile,
     RunFocusedCommand,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetStateProbe {
+    pub operation: TargetOperation,
+    pub target_path: RepositoryPath,
+    pub target_exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_exists: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_content_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_content_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_result_content_hash: Option<ContentHash>,
+    pub repository_fingerprint: RepositoryFingerprint,
+}
+
+impl TargetStateProbe {
+    pub fn inspection_outcome(&self) -> TargetInspectionOutcome {
+        let conflict = |code: &str, message: &str| TargetInspectionOutcome::OperationConflict {
+            conflict: TargetOperationConflict {
+                code: code.to_owned(),
+                operation: self.operation.clone(),
+                target_path: self.target_path.clone(),
+                source_path: self.operation.source_path().map(str::to_owned),
+                message: message.to_owned(),
+                recoverable: true,
+            },
+        };
+        match &self.operation {
+            TargetOperation::ModifyExisting if self.target_exists => {
+                TargetInspectionOutcome::ExistingTargetLoaded
+            }
+            TargetOperation::ModifyExisting => conflict(
+                "expected_existing_target_missing",
+                "the accepted modify target is absent",
+            ),
+            TargetOperation::CreateNew if !self.target_exists => {
+                TargetInspectionOutcome::NewTargetConfirmedAbsent
+            }
+            TargetOperation::CreateNew
+                if self.expected_result_content_hash.is_some()
+                    && self.expected_result_content_hash == self.target_content_hash =>
+            {
+                TargetInspectionOutcome::AlreadyApplied
+            }
+            TargetOperation::CreateNew => conflict(
+                "create_target_already_exists",
+                "the accepted create destination exists without matching mutation intent",
+            ),
+            TargetOperation::DeleteExisting if self.target_exists => {
+                TargetInspectionOutcome::ExistingTargetLoaded
+            }
+            TargetOperation::DeleteExisting => TargetInspectionOutcome::AlreadyApplied,
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. }
+                if self.source_exists == Some(true) && !self.target_exists =>
+            {
+                TargetInspectionOutcome::ExistingTargetLoaded
+            }
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. }
+                if self.source_exists == Some(false)
+                    && self.target_exists
+                    && self.expected_result_content_hash.is_some()
+                    && self.expected_result_content_hash == self.target_content_hash =>
+            {
+                TargetInspectionOutcome::AlreadyApplied
+            }
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. }
+                if self.source_exists == Some(false) && self.target_exists =>
+            {
+                conflict(
+                    "destination_content_mismatch",
+                    "the destination does not match the accepted source evidence",
+                )
+            }
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. }
+                if self.source_exists == Some(true) =>
+            {
+                conflict(
+                    "destination_already_exists",
+                    "the accepted destination already exists",
+                )
+            }
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. } => conflict(
+                "expected_source_target_missing",
+                "the accepted source and destination are both absent",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetOperationConflict {
+    pub code: String,
+    pub operation: TargetOperation,
+    pub target_path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<RepositoryPath>,
+    pub message: String,
+    #[serde(default)]
+    pub recoverable: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TargetInspectionOutcome {
+    ExistingTargetLoaded,
+    NewTargetConfirmedAbsent,
+    AlreadyApplied,
+    OperationConflict { conflict: TargetOperationConflict },
+    UnsafePath,
+    #[default]
+    InspectionInfrastructureFailure,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CreateTargetSpecification {
+    pub path: RepositoryPath,
+    pub role: String,
+    pub intent: String,
+    #[serde(default)]
+    pub acceptance_criteria_ids: Vec<String>,
+    #[serde(default)]
+    pub related_evidence_ids: Vec<EvidenceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_artifact_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CreatedTargetEvidence {
+    pub path: RepositoryPath,
+    pub content_hash: ContentHash,
+    pub repository_fingerprint_before: RepositoryFingerprint,
+    pub repository_fingerprint_after: RepositoryFingerprint,
+    pub creation_tool: String,
+    #[serde(default)]
+    pub validation_gate_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -22,6 +162,16 @@ pub struct TargetExecutionContext {
     pub current_file_content: Option<String>,
     #[serde(default)]
     pub target_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_state_probe: Option<TargetStateProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection_outcome: Option<TargetInspectionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_specification: Option<CreateTargetSpecification>,
     #[serde(default)]
     pub repository_fingerprint: String,
     #[serde(default)]
@@ -166,6 +316,7 @@ pub enum FailureCategory {
     #[default]
     ToolRecoverable,
     MutationConflict,
+    PlanRepositoryConflict,
     TargetBlocked,
     ValidationFailure,
     InfrastructureFailure,
@@ -180,6 +331,7 @@ impl FailureCategory {
             Self::ModelArtifactRecoverable
                 | Self::ToolRecoverable
                 | Self::MutationConflict
+                | Self::PlanRepositoryConflict
                 | Self::TargetBlocked
                 | Self::ValidationFailure
         )
@@ -194,7 +346,10 @@ impl FailureCategory {
     /// infrastructure, invariant, cancellation, and semantic blocker failures
     /// require their own explicit recovery event.
     pub const fn is_supersedable_by_applied_target(self) -> bool {
-        matches!(self, Self::ToolRecoverable | Self::MutationConflict)
+        matches!(
+            self,
+            Self::ToolRecoverable | Self::MutationConflict | Self::PlanRepositoryConflict
+        )
     }
 
     const fn node_status(self) -> ExecutionNodeStatus {
@@ -202,6 +357,7 @@ impl FailureCategory {
             Self::ModelArtifactRecoverable
             | Self::ToolRecoverable
             | Self::MutationConflict
+            | Self::PlanRepositoryConflict
             | Self::ValidationFailure => ExecutionNodeStatus::FailedRecoverable,
             Self::TargetBlocked
             | Self::InfrastructureFailure
@@ -212,7 +368,9 @@ impl FailureCategory {
 
     const fn is_valid_for_node_kind(self, kind: ExecutionNodeKind) -> bool {
         match self {
-            Self::MutationConflict | Self::TargetBlocked => kind.is_mutation(),
+            Self::MutationConflict | Self::PlanRepositoryConflict | Self::TargetBlocked => {
+                kind.is_mutation()
+            }
             Self::ValidationFailure => kind.is_validation(),
             Self::ModelArtifactRecoverable => kind.requires_model(),
             Self::ToolRecoverable => matches!(
@@ -248,6 +406,8 @@ pub struct FailureRecord {
     pub node_id: ExecutionNodeId,
     pub target_path: Option<String>,
     pub category: FailureCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     pub status: FailureStatus,
     /// Compatibility flags are serialized explicitly while `status` remains
     /// canonical. Constructors and store methods keep all three in sync.

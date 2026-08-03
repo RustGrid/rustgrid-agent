@@ -10,6 +10,19 @@ pub(super) use search::*;
 use super::*;
 
 impl<'a> GatewayAgent<'a> {
+    fn active_target_operation(
+        &self,
+    ) -> Option<(crate::execution_graph::TargetOperation, Option<String>)> {
+        let context = match self.current_decision.as_ref()? {
+            ExecutionDecision::ExecuteTarget { target, .. } => target,
+            ExecutionDecision::RepairTarget { context, .. } => &context.target,
+            _ => return None,
+        };
+        Some((
+            context.target.effective_operation(),
+            context.source_content_hash.clone(),
+        ))
+    }
     fn active_mutation_context(&self) -> Option<(String, Option<String>, String)> {
         let context = match self.current_decision.as_ref()? {
             ExecutionDecision::ExecuteTarget { target, .. } => target,
@@ -21,6 +34,25 @@ impl<'a> GatewayAgent<'a> {
             context.target_content_hash.clone(),
             context.repository_fingerprint.clone(),
         ))
+    }
+
+    fn verify_active_mutation_fingerprint(&self) -> Result<Option<String>> {
+        let (_, expected_hash, expected_repository_fingerprint) = self
+            .active_mutation_context()
+            .context("mutation requires an active deterministic target context")?;
+        let current_repository_fingerprint =
+            repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        if current_repository_fingerprint != expected_repository_fingerprint {
+            return Err(anyhow!(MutationApplicationError {
+                failure: MutationApplicationFailure::RepositoryChangedSinceContext,
+                message: "repository changed after deterministic target context preparation".into(),
+                patch_validation: None,
+                git_apply_check: None,
+                raw_patch_sha256: None,
+                target_content_hash: expected_hash,
+            }));
+        }
+        Ok(expected_hash)
     }
 
     fn active_mutation_attempts(
@@ -657,7 +689,132 @@ impl<'a> GatewayAgent<'a> {
             "delete_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
-                delete_repo_file(&self.repo.root, path)
+                let expected_hash = self.verify_active_mutation_fingerprint()?;
+                delete_repo_file(&self.repo.root, path, expected_hash.as_deref())
+            }
+            "create_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
+                let create_parents = object
+                    .get("create_parents")
+                    .and_then(Value::as_bool)
+                    .context("tool argument `create_parents` is missing")?;
+                self.verify_active_mutation_fingerprint()?;
+                self.record_active_target_mutation_intent(Some(sha256_text(content)))?;
+                let creation_context = self.current_decision.as_ref().and_then(|decision| {
+                    let (node_id, target) = match decision {
+                        ExecutionDecision::ExecuteTarget {
+                            node_id, target, ..
+                        } => (node_id, &target.target),
+                        _ => return None,
+                    };
+                    let operation = target.effective_operation();
+                    Some((
+                        node_id.clone(),
+                        operation.as_str().to_owned(),
+                        operation.source_path().map(str::to_owned),
+                        self.notebook.repository_fingerprint.clone(),
+                    ))
+                });
+                let (node_id, operation, source_path, repository_fingerprint) = creation_context
+                    .unwrap_or_else(|| {
+                        (
+                            crate::execution_graph::ExecutionNodeId::default(),
+                            "create_new".to_owned(),
+                            None,
+                            self.notebook.repository_fingerprint.clone(),
+                        )
+                    });
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.create_target_started",
+                        "node_id": node_id,
+                        "operation": operation,
+                        "target_path": path,
+                        "source_path": source_path,
+                        "repository_fingerprint": repository_fingerprint,
+                        "selected_mutation_tool": name,
+                        "verification_result": "pending",
+                        "process_health": "healthy",
+                        "mission_outcome": "continuing",
+                    }),
+                    "target creation started",
+                );
+                match create_repo_file_atomically(&self.repo.root, path, content, create_parents) {
+                    Ok(output) => {
+                        self.append_event_recoverable(
+                            "progress",
+                            json!({
+                                "event_type": "worker.create_target_completed",
+                                "node_id": node_id,
+                                "operation": operation,
+                                "target_path": path,
+                                "source_path": source_path,
+                                "content_hash": sha256_text(content),
+                                "repository_fingerprint_before": repository_fingerprint,
+                                "selected_mutation_tool": name,
+                                "verification_result": "content_verified",
+                                "process_health": "healthy",
+                                "mission_outcome": "continuing",
+                            }),
+                            "target creation completed",
+                        );
+                        Ok(output)
+                    }
+                    Err(error) => {
+                        let mutation_error = error.downcast_ref::<MutationApplicationError>();
+                        let failure_code = mutation_error
+                            .map_or("target_creation_failed", |error| error.failure.as_str());
+                        let process_health = if mutation_error.is_some() {
+                            "healthy"
+                        } else {
+                            "degraded"
+                        };
+                        self.append_event_recoverable(
+                            "progress",
+                            json!({
+                                "event_type": "worker.target_creation_failed",
+                                "target_path": path,
+                                "creation_tool": name,
+                                "failure_code": failure_code,
+                                "process_health": process_health,
+                                "mission_outcome": "continuing",
+                            }),
+                            "target creation failed",
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            "rename_file" | "move_file" => {
+                self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
+                let path = required_tool_string(object, "path", 4_096)?;
+                let source = required_tool_string(object, "source", 4_096)?;
+                let create_parents = object
+                    .get("create_parents")
+                    .and_then(Value::as_bool)
+                    .context("tool argument `create_parents` is missing")?;
+                let (operation, source_hash) = self
+                    .active_target_operation()
+                    .context("move requires an active operation-aware target context")?;
+                self.verify_active_mutation_fingerprint()?;
+                self.record_active_target_mutation_intent(source_hash.clone())?;
+                if operation.source_path() != Some(source)
+                    || operation.destination_path(path) != path
+                {
+                    bail!(
+                        "mutation_tool_operation_mismatch: source or destination differs from accepted plan"
+                    );
+                }
+                move_repo_file_atomically(
+                    &self.repo.root,
+                    source,
+                    path,
+                    source_hash.as_deref(),
+                    create_parents,
+                )
             }
             "repository_snapshot" => {
                 if matches!(
@@ -787,10 +944,12 @@ impl<'a> GatewayAgent<'a> {
                     self.notebook.planning_repair.as_ref(),
                 );
                 let normalized_legacy_targets =
-                    match normalize_planned_changes(&mut plan.planned_changes).and_then(|count| {
-                        validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
-                        Ok(count)
-                    }) {
+                    match validate_explicit_target_operations(&plan.planned_changes)
+                        .and_then(|()| normalize_planned_changes(&mut plan.planned_changes))
+                        .and_then(|count| {
+                            validate_planned_change_paths(&self.repo.root, &plan.planned_changes)?;
+                            Ok(count)
+                        }) {
                         Ok(count) => count,
                         Err(error) => {
                             repair.invalid_fields.push(format!(
@@ -1183,6 +1342,9 @@ pub(in crate::hosted) fn is_source_mutation_tool(name: &str) -> bool {
             | "apply_unified_diff"
             | "rewrite_small_file"
             | "delete_file"
+            | "create_file"
+            | "rename_file"
+            | "move_file"
     )
 }
 

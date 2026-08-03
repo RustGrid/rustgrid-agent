@@ -879,6 +879,7 @@
                 target_path: "src/theme.ts".to_owned(),
                 repository_fingerprint: "tree-2".to_owned(),
                 evidence_id: "mutation-theme-tree-2".to_owned(),
+                created_target_evidence: None,
             })
             .expect("record mutation evidence");
         assert!(
@@ -1222,4 +1223,158 @@
             assert_eq!(replayed.failures, persisted.failures);
             assert_eq!(replayed.evidence, persisted.evidence);
         }
+    }
+    #[test]
+    fn target_operations_have_stable_structured_wire_forms() {
+        let cases = [
+            (TargetOperation::ModifyExisting, "modify_existing"),
+            (TargetOperation::CreateNew, "create_new"),
+            (TargetOperation::DeleteExisting, "delete_existing"),
+            (TargetOperation::Rename { source: "a".into(), destination: "b".into() }, "rename"),
+            (TargetOperation::Move { source: "a".into(), destination: "dir/b".into() }, "move"),
+        ];
+        for (operation, kind) in cases {
+            let encoded = serde_json::to_value(&operation).unwrap();
+            assert_eq!(encoded["kind"], kind);
+            assert_eq!(serde_json::from_value::<TargetOperation>(encoded).unwrap(), operation);
+        }
+    }
+
+    #[test]
+    fn legacy_new_file_metadata_maps_only_to_create_operation() {
+        let mut planned = target("src/new.rs", "production");
+        planned.new_file = true;
+        assert_eq!(planned.effective_operation(), TargetOperation::CreateNew);
+        planned.new_file = false;
+        assert_eq!(planned.effective_operation(), TargetOperation::ModifyExisting);
+    }
+
+    #[test]
+    fn operation_source_and_destination_are_typed_not_inferred() {
+        let rename = TargetOperation::Rename { source: "old.rs".into(), destination: "new.rs".into() };
+        assert_eq!(rename.source_path(), Some("old.rs"));
+        assert_eq!(rename.destination_path("ignored"), "new.rs");
+        assert_eq!(TargetOperation::DeleteExisting.source_path(), None);
+        assert_eq!(TargetOperation::DeleteExisting.destination_path("old.rs"), "old.rs");
+    }
+
+    #[test]
+    fn target_state_probe_preserves_operation_hashes_and_existence() {
+        let probe = TargetStateProbe {
+            operation: TargetOperation::Move { source: "a".into(), destination: "b".into() },
+            target_path: "b".into(),
+            target_exists: false,
+            source_exists: Some(true),
+            target_content_hash: None,
+            source_content_hash: Some("hash-a".into()),
+            expected_result_content_hash: Some("hash-a".into()),
+            repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+        };
+        let replayed: TargetStateProbe = serde_json::from_value(serde_json::to_value(&probe).unwrap()).unwrap();
+        assert_eq!(replayed, probe);
+    }
+
+    #[test]
+    fn target_state_probe_classifies_every_operation_state_without_strings() {
+        let classify = |operation, target_exists, source_exists| {
+            TargetStateProbe {
+                operation,
+                target_path: "destination".into(),
+                target_exists,
+                source_exists,
+                repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+                ..TargetStateProbe::default()
+            }
+            .inspection_outcome()
+        };
+        assert_eq!(classify(TargetOperation::ModifyExisting, true, None), TargetInspectionOutcome::ExistingTargetLoaded);
+        assert!(matches!(classify(TargetOperation::ModifyExisting, false, None), TargetInspectionOutcome::OperationConflict { conflict } if conflict.code == "expected_existing_target_missing"));
+        assert_eq!(classify(TargetOperation::CreateNew, false, None), TargetInspectionOutcome::NewTargetConfirmedAbsent);
+        assert!(matches!(classify(TargetOperation::CreateNew, true, None), TargetInspectionOutcome::OperationConflict { conflict } if conflict.code == "create_target_already_exists"));
+        let matching = |operation, source_exists| TargetStateProbe {
+            operation,
+            target_path: "destination".into(),
+            target_exists: true,
+            source_exists,
+            target_content_hash: Some("expected".into()),
+            expected_result_content_hash: Some("expected".into()),
+            repository_fingerprint: RepositoryFingerprint::new("tree-2"),
+            ..TargetStateProbe::default()
+        }.inspection_outcome();
+        assert_eq!(matching(TargetOperation::CreateNew, None), TargetInspectionOutcome::AlreadyApplied);
+        assert_eq!(classify(TargetOperation::DeleteExisting, false, None), TargetInspectionOutcome::AlreadyApplied);
+        let rename = TargetOperation::Rename { source: "source".into(), destination: "destination".into() };
+        assert_eq!(matching(rename.clone(), Some(false)), TargetInspectionOutcome::AlreadyApplied);
+        assert!(matches!(classify(rename.clone(), true, Some(true)), TargetInspectionOutcome::OperationConflict { conflict } if conflict.code == "destination_already_exists"));
+        assert!(matches!(classify(rename, false, Some(false)), TargetInspectionOutcome::OperationConflict { conflict } if conflict.code == "expected_source_target_missing"));
+    }
+
+    #[test]
+    fn inspection_conflict_keeps_machine_code_separate_from_message() {
+        let conflict = TargetOperationConflict {
+            code: "create_target_already_exists".into(),
+            operation: TargetOperation::CreateNew,
+            target_path: "src/new.rs".into(),
+            source_path: None,
+            message: "destination is occupied".into(),
+            recoverable: true,
+        };
+        let outcome = TargetInspectionOutcome::OperationConflict { conflict: conflict.clone() };
+        let replayed: TargetInspectionOutcome = serde_json::from_value(serde_json::to_value(&outcome).unwrap()).unwrap();
+        assert_eq!(replayed, outcome);
+        assert_eq!(conflict.code, "create_target_already_exists");
+    }
+
+    #[test]
+    fn create_specification_is_language_and_framework_neutral() {
+        let specification = CreateTargetSpecification {
+            path: "docs/architecture.note".into(),
+            role: "repository documentation".into(),
+            intent: "record the lifecycle contract".into(),
+            acceptance_criteria_ids: vec!["ac-1".into()],
+            related_evidence_ids: vec![EvidenceId::new("evidence-1")],
+            expected_artifact_kind: Some("documentation".into()),
+        };
+        assert_eq!(specification.path, "docs/architecture.note");
+        assert!(!serde_json::to_string(&specification).unwrap().contains("rust"));
+    }
+
+    #[test]
+    fn failure_code_survives_event_replay_without_message_parsing() {
+        let mut failure = FailureRecord::new("failure-1", "source-000", FailureCategory::MutationConflict, 1, "tree-1", "human context");
+        failure.code = Some("destination_already_exists".into());
+        let replayed: FailureRecord = serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
+        assert_eq!(replayed.code.as_deref(), Some("destination_already_exists"));
+        assert_eq!(replayed.message, "human context");
+    }
+
+    #[test]
+    fn created_target_evidence_binds_before_and_after_fingerprints() {
+        let evidence = CreatedTargetEvidence {
+            path: "src/new.rs".into(),
+            content_hash: "content".into(),
+            repository_fingerprint_before: RepositoryFingerprint::new("before"),
+            repository_fingerprint_after: RepositoryFingerprint::new("after"),
+            creation_tool: "create_file".into(),
+            validation_gate_ids: vec!["build".into()],
+        };
+        assert_ne!(evidence.repository_fingerprint_before, evidence.repository_fingerprint_after);
+        assert_eq!(evidence.creation_tool, "create_file");
+        let event = ExecutionDomainEvent::MutationApplied {
+            sequence: 1,
+            node_id: ExecutionNodeId::new("source-create"),
+            target_path: evidence.path.clone(),
+            repository_fingerprint: evidence.repository_fingerprint_after.to_string(),
+            evidence_id: "mutation-create".into(),
+            created_target_evidence: Some(evidence.clone()),
+        };
+        let replayed: ExecutionDomainEvent =
+            serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+        assert!(matches!(
+            replayed,
+            ExecutionDomainEvent::MutationApplied {
+                created_target_evidence: Some(replayed),
+                ..
+            } if replayed == evidence
+        ));
     }

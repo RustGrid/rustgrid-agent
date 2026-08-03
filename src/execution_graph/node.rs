@@ -106,6 +106,52 @@ impl ExecutionNodeStatus {
     }
 }
 
+pub type RepositoryPath = String;
+pub type ContentHash = String;
+
+#[derive(Clone, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetOperation {
+    #[default]
+    ModifyExisting,
+    CreateNew,
+    DeleteExisting,
+    Rename {
+        source: RepositoryPath,
+        destination: RepositoryPath,
+    },
+    Move {
+        source: RepositoryPath,
+        destination: RepositoryPath,
+    },
+}
+
+impl TargetOperation {
+    pub fn source_path(&self) -> Option<&str> {
+        match self {
+            Self::Rename { source, .. } | Self::Move { source, .. } => Some(source),
+            Self::ModifyExisting | Self::CreateNew | Self::DeleteExisting => None,
+        }
+    }
+
+    pub fn destination_path<'a>(&'a self, fallback: &'a str) -> &'a str {
+        match self {
+            Self::Rename { destination, .. } | Self::Move { destination, .. } => destination,
+            Self::ModifyExisting | Self::CreateNew | Self::DeleteExisting => fallback,
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ModifyExisting => "modify_existing",
+            Self::CreateNew => "create_new",
+            Self::DeleteExisting => "delete_existing",
+            Self::Rename { .. } => "rename",
+            Self::Move { .. } => "move",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PlannedTarget {
     pub change_id: String,
@@ -116,14 +162,32 @@ pub struct PlannedTarget {
     pub acceptance_criteria_ids: Vec<String>,
     #[serde(default)]
     pub new_file: bool,
+    #[serde(default)]
+    pub operation: TargetOperation,
 }
 
 /// A repository mutation target is plan-owned data, not a generic graph id.
 pub type MutationTarget = PlannedTarget;
 
 impl PlannedTarget {
+    pub fn effective_operation(&self) -> TargetOperation {
+        if self.new_file && self.operation == TargetOperation::ModifyExisting {
+            TargetOperation::CreateNew
+        } else {
+            self.operation.clone()
+        }
+    }
     pub fn mutation_target_id(&self) -> MutationTargetId {
-        MutationTargetId::new(format!("{}:{}:{}", self.change_id, self.path, self.role))
+        let operation = self.effective_operation();
+        MutationTargetId::new(format!(
+            "{}:{}:{}:{}:{}:{}",
+            self.change_id,
+            self.path,
+            self.role,
+            operation.as_str(),
+            operation.source_path().unwrap_or_default(),
+            operation.destination_path(&self.path),
+        ))
     }
 
     pub fn is_test_target(&self) -> bool {

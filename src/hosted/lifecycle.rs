@@ -458,6 +458,7 @@ mod tests {
                 .map(|(index, status)| PlannedTarget {
                     path: format!("src/{index}.tsx"),
                     role: "source".into(),
+                    operation: Default::default(),
                     new_file: false,
                     status: *status,
                 })

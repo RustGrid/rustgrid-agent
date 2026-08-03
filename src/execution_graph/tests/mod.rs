@@ -7,6 +7,7 @@ fn target(path: &str, role: &str) -> PlannedTarget {
         role: role.to_owned(),
         intent: format!("update {path}"),
         acceptance_criteria_ids: vec!["ac-1".to_owned()],
+        operation: Default::default(),
         new_file: false,
     }
 }

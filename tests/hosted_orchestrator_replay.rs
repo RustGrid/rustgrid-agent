@@ -21,6 +21,11 @@ fn target(path: &str, role: &str, criteria: &[&str]) -> PlannedTarget {
             .iter()
             .map(|criterion| (*criterion).to_owned())
             .collect(),
+        operation: if role.contains("new") {
+            rustgrid_agent::execution_graph::TargetOperation::CreateNew
+        } else {
+            rustgrid_agent::execution_graph::TargetOperation::ModifyExisting
+        },
         new_file: role.contains("new"),
     }
 }

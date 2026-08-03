@@ -1,6 +1,10 @@
 // Extracted from the hosted execution composition root.
 use super::*;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use std::ffi::CString;
 use std::io::Write as _;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use std::os::unix::ffi::OsStrExt as _;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +101,50 @@ impl std::fmt::Display for MutationApplicationError {
 }
 
 impl std::error::Error for MutationApplicationError {}
+
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_vendor = "apple")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-clobber rename is unsupported on this platform",
+        ))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ValidatedPatch {
@@ -908,6 +956,135 @@ pub(in crate::hosted) fn replace_repo_file_atomically(
     )
 }
 
+pub(in crate::hosted) fn create_repo_file_atomically(
+    root: &Path,
+    path: &str,
+    content: &str,
+    create_parents: bool,
+) -> Result<String> {
+    if content.is_empty() || content.contains('\0') || content.len() > MAX_MODEL_FILE_BYTES {
+        return Err(anyhow!(MutationApplicationError::new(
+            MutationApplicationFailure::ReplacementContentInvalid,
+            "creation content is empty, contains NUL, or exceeds the hosted limit",
+        )));
+    }
+    let target = safe_repo_path(root, path, true)?;
+    if target.exists() {
+        bail!("create_target_already_exists: create_file requires an absent target");
+    }
+    let parent = target
+        .parent()
+        .context("creation target has no repository parent")?;
+    if !parent.exists() {
+        if !create_parents {
+            bail!("create_parent_missing: parent creation was not explicitly permitted");
+        }
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create safe parent directories for {path}"))?;
+        safe_repo_path(root, path, true)?;
+    }
+    let temporary = parent.join(format!(".rustgrid-creation-{}", Uuid::new_v4().simple()));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .context("could not create atomic creation file")?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        rename_no_replace(&temporary, &target).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow!("create_target_already_exists: target appeared during atomic creation")
+            } else {
+                anyhow!(error).context(format!(
+                    "could not atomically create repository file {path}"
+                ))
+            }
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
+    let verified = fs::read_to_string(&target)
+        .with_context(|| format!("could not verify created UTF-8 repository file {path}"))?;
+    if verified != content {
+        bail!("created target verification failed");
+    }
+    mutation_output(
+        path,
+        None,
+        Some(sha256_text(&verified)),
+        "complete_file".into(),
+        format!("created {}-byte file", verified.len()),
+    )
+}
+
+pub(in crate::hosted) fn move_repo_file_atomically(
+    root: &Path,
+    source_path: &str,
+    destination_path: &str,
+    expected_source_content_hash: Option<&str>,
+    create_parents: bool,
+) -> Result<String> {
+    let source = safe_repo_path(root, source_path, false)?;
+    let destination = safe_repo_path(root, destination_path, true)?;
+    if !source.is_file() {
+        bail!("expected_source_target_missing: source is not a regular file");
+    }
+    if destination.exists() {
+        bail!("destination_already_exists: move destination must be absent");
+    }
+    let content = fs::read_to_string(&source)
+        .with_context(|| format!("could not read UTF-8 source file {source_path}"))?;
+    let source_hash = sha256_text(&content);
+    if expected_source_content_hash.is_some_and(|expected| expected != source_hash) {
+        return Err(anyhow!(MutationApplicationError {
+            failure: MutationApplicationFailure::RepositoryChangedSinceContext,
+            message: "source content changed after deterministic context preparation".into(),
+            patch_validation: None,
+            git_apply_check: None,
+            raw_patch_sha256: None,
+            target_content_hash: Some(source_hash),
+        }));
+    }
+    let parent = destination
+        .parent()
+        .context("move destination has no repository parent")?;
+    if !parent.exists() {
+        if !create_parents {
+            bail!("move_parent_missing: parent creation was not explicitly permitted");
+        }
+        fs::create_dir_all(parent).with_context(|| {
+            format!("could not create safe parent directories for {destination_path}")
+        })?;
+        safe_repo_path(root, destination_path, true)?;
+    }
+    rename_no_replace(&source, &destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            anyhow!("destination_already_exists: move destination appeared during relocation")
+        } else {
+            anyhow!(error).context(format!(
+                "could not move repository file {source_path} to {destination_path}"
+            ))
+        }
+    })?;
+    let verified = fs::read_to_string(&destination).with_context(|| {
+        format!("could not verify moved UTF-8 repository file {destination_path}")
+    })?;
+    if source.exists() || verified != content {
+        bail!("moved target verification failed");
+    }
+    mutation_output(
+        destination_path,
+        None,
+        Some(sha256_text(&verified)),
+        "complete_file".into(),
+        format!("moved {source_path} to {destination_path}"),
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // Names are the persisted mutation contract requested by the worker protocol.
@@ -986,17 +1163,32 @@ pub(crate) fn apply_structured_edit(
     replace_repo_file_atomically(root, path, &updated, Some(&current_hash))
 }
 
-pub(in crate::hosted) fn delete_repo_file(root: &Path, path: &str) -> Result<String> {
+pub(in crate::hosted) fn delete_repo_file(
+    root: &Path,
+    path: &str,
+    expected_target_content_hash: Option<&str>,
+) -> Result<String> {
     let target = safe_repo_path(root, path, false)?;
     if !target.is_file() {
         bail!("delete_file target is not a regular file");
     }
     let content = fs::read_to_string(&target)
         .with_context(|| format!("could not read UTF-8 repository file {path}"))?;
+    let content_hash = sha256_text(&content);
+    if expected_target_content_hash.is_some_and(|expected| expected != content_hash) {
+        return Err(anyhow!(MutationApplicationError {
+            failure: MutationApplicationFailure::RepositoryChangedSinceContext,
+            message: "delete target changed after deterministic context preparation".into(),
+            patch_validation: None,
+            git_apply_check: None,
+            raw_patch_sha256: None,
+            target_content_hash: Some(content_hash),
+        }));
+    }
     fs::remove_file(&target).with_context(|| format!("could not delete repository file {path}"))?;
     mutation_output(
         path,
-        Some(sha256_text(&content)),
+        Some(content_hash),
         None,
         "complete_file".into(),
         format!("deleted {}-byte file", content.len()),
@@ -1015,6 +1207,147 @@ mod tests {
         fs::create_dir_all(target.parent().expect("target parent")).expect("target directory");
         fs::write(target, content).expect("target content");
         directory
+    }
+
+    #[test]
+    fn create_file_requires_an_absent_target() {
+        let directory = repository("existing\n");
+        let error = create_repo_file_atomically(directory.path(), TARGET, "new\n", false)
+            .expect_err("existing creation target must conflict");
+        assert!(error.to_string().contains("create_target_already_exists"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join(TARGET)).unwrap(),
+            "existing\n"
+        );
+    }
+
+    #[test]
+    fn no_clobber_rename_preserves_a_destination_that_already_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        fs::write(&source, "source\n").unwrap();
+        fs::write(&destination, "destination\n").unwrap();
+        let error = rename_no_replace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(source).unwrap(), "source\n");
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination\n");
+    }
+
+    #[test]
+    fn create_file_is_atomic_and_verifies_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let output =
+            create_repo_file_atomically(directory.path(), "src/new.rs", "pub fn new() {}\n", true)
+                .unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("src/new.rs")).unwrap(),
+            "pub fn new() {}\n"
+        );
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert!(output["before_sha256"].is_null());
+        assert_eq!(output["after_sha256"], sha256_text("pub fn new() {}\n"));
+    }
+
+    #[test]
+    fn create_file_does_not_create_parents_without_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = create_repo_file_atomically(directory.path(), "new/deep/file.rs", "x\n", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("create_parent_missing"));
+        assert!(!directory.path().join("new").exists());
+    }
+
+    #[test]
+    fn create_file_rejects_empty_nul_and_traversal_content_or_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(create_repo_file_atomically(directory.path(), "empty", "", false).is_err());
+        assert!(create_repo_file_atomically(directory.path(), "nul", "a\0b", false).is_err());
+        assert!(create_repo_file_atomically(directory.path(), "../escape", "x", true).is_err());
+    }
+
+    #[test]
+    fn move_file_preserves_exact_content_and_removes_source() {
+        let directory = repository("source\n");
+        let hash = sha256_text("source\n");
+        let output = move_repo_file_atomically(
+            directory.path(),
+            TARGET,
+            "src/moved/provider.tsx",
+            Some(&hash),
+            true,
+        )
+        .unwrap();
+        assert!(!directory.path().join(TARGET).exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("src/moved/provider.tsx")).unwrap(),
+            "source\n"
+        );
+        assert!(output.contains("moved"));
+    }
+
+    #[test]
+    fn move_file_rejects_existing_destination_without_mutation() {
+        let directory = repository("source\n");
+        let destination = directory.path().join("src/destination.tsx");
+        fs::write(&destination, "destination\n").unwrap();
+        assert!(
+            move_repo_file_atomically(directory.path(), TARGET, "src/destination.tsx", None, false)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join(TARGET)).unwrap(),
+            "source\n"
+        );
+        assert_eq!(fs::read_to_string(destination).unwrap(), "destination\n");
+    }
+
+    #[test]
+    fn move_file_rejects_a_stale_source_hash() {
+        let directory = repository("source\n");
+        let error = move_repo_file_atomically(
+            directory.path(),
+            TARGET,
+            "src/destination.tsx",
+            Some("stale"),
+            false,
+        )
+        .unwrap_err();
+        let typed = error.downcast_ref::<MutationApplicationError>().unwrap();
+        assert_eq!(
+            typed.failure,
+            MutationApplicationFailure::RepositoryChangedSinceContext
+        );
+        assert!(directory.path().join(TARGET).exists());
+    }
+
+    #[test]
+    fn delete_file_verifies_hash_and_removes_only_the_target() {
+        let directory = repository("delete me\n");
+        fs::write(directory.path().join("keep.txt"), "keep\n").unwrap();
+        let hash = sha256_text("delete me\n");
+        let output = delete_repo_file(directory.path(), TARGET, Some(&hash)).unwrap();
+        assert!(!directory.path().join(TARGET).exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("keep.txt")).unwrap(),
+            "keep\n"
+        );
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert!(output["after_sha256"].is_null());
+    }
+
+    #[test]
+    fn delete_file_rejects_a_stale_hash_without_deleting() {
+        let directory = repository("current\n");
+        let error = delete_repo_file(directory.path(), TARGET, Some("stale")).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<MutationApplicationError>()
+                .unwrap()
+                .failure,
+            MutationApplicationFailure::RepositoryChangedSinceContext
+        );
+        assert!(directory.path().join(TARGET).exists());
     }
 
     fn patch(old_path: &str, new_path: &str, hunk: &str) -> String {
