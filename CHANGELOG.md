@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.29 - 2026-08-03
+
+### Changed
+
+- Split the hosted runtime and execution graph into bounded modules with
+  explicit contracts for orchestration, lifecycle, provider interaction,
+  recovery, publication, telemetry, transitions, validation, and persistence.
+- Introduce typed sub-effect ports for repository, journal, control-plane, and
+  publication operations so orchestration depends on narrow capabilities and
+  tests can exercise failure behavior deterministically.
+- Replace unstructured cross-module failures with bounded subsystem errors and
+  an exhaustive top-level execution-failure taxonomy that carries structured
+  retryability, terminal-outcome, and telemetry decisions.
+- Add a secret-scanned repository packaging helper for producing a reviewable
+  tracked-source archive without local credentials or untracked files.
+
+### Fixed
+
+- Preserve error sources and human-readable context while ensuring sensitive
+  authentication values cannot appear in formatted errors or source chains.
+- Map cancellation and lease loss explicitly so cancellation cannot become an
+  infrastructure failure and a stale lease cannot authorize terminal writes.
+- Replace string-based failure classification with compiler-checked mappings
+  for terminal outcomes and telemetry codes, including retryable control-plane
+  and provider-budget failures.
+- Make the incremental stdout/stderr activity regression test independent of a
+  machine-specific inactivity deadline while retaining its activity assertions.
+
 ## 1.4.28 - 2026-08-02
 
 ### Changed
