@@ -5,6 +5,38 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.32 - 2026-08-03
+
+### Changed
+
+- Parse ANSI-decorated structured validation failures into typed assertion
+  evidence containing the test file, suite path, test name, source location,
+  assertion kind, expected and received values, implicated paths, and bounded
+  diagnostic context.
+- Rank validation-repair targets from generic repository evidence: assertion
+  specificity, direct test imports, source-versus-test role, value occurrence,
+  and normalized semantic overlap. Selection does not depend on ticket names,
+  component roles, framework concepts, or specific state values.
+- Build repair requests only after refreshing bounded current-fingerprint
+  evidence for the selected target, failing test, and implicated changed files.
+- Expose typed validation-repair actions and structured parsing, evidence,
+  ranking, context-validation, transition-comparison, and incomplete-review
+  telemetry.
+
+### Fixed
+
+- Prevent recognized validation failures from silently producing empty failing
+  test and implicated-path collections; incomplete primary parsing now emits a
+  bounded diagnostic event and uses a conservative structured fallback.
+- Prevent validation repair from invoking a model without the selected target's
+  current content, content hash, repository fingerprint, diff context, failure
+  evidence, and accepted implementation intent.
+- Preserve applied mutation status when a focused gate fails, and allow an
+  unresolved or no-mutation validation repair to enter the explicit incomplete
+  diff-review path without an illegal lifecycle transition.
+- Keep incomplete validation review draft-only and partial-reviewable while
+  preserving failed and pending gate evidence for recovery and publication.
+
 ## 1.4.31 - 2026-08-03
 
 ### Changed
