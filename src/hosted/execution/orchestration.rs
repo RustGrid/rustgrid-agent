@@ -1105,6 +1105,11 @@ impl<'a> GatewayAgent<'a> {
                 action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
                 ..
             } => Some(ExecutionPhase::Repair),
+            ExecutionDecision::ExecuteTarget { target, .. }
+                if target.validation_repair.is_some() =>
+            {
+                Some(ExecutionPhase::Repair)
+            }
             ExecutionDecision::ExecuteTarget { .. } => Some(ExecutionPhase::Implementation),
             ExecutionDecision::RepairTarget { .. } => Some(ExecutionPhase::Repair),
             ExecutionDecision::RunValidation { .. } => Some(ExecutionPhase::Validation),
@@ -1119,7 +1124,11 @@ impl<'a> GatewayAgent<'a> {
         let previous = self.phases.active();
         if let Some(next) = phase
             && next != previous
-            && (!previous.stage().can_transition_to(next.stage())
+            && (!(previous.stage().can_transition_to(next.stage())
+                || matches!(
+                    (previous, next),
+                    (ExecutionPhase::Repair, ExecutionPhase::DiffReview)
+                ))
                 || !legal_phase_transition(previous, next))
         {
             bail!(
@@ -1142,12 +1151,53 @@ impl<'a> GatewayAgent<'a> {
                 ExecutionDecision::ExecuteTarget {
                     action:
                         crate::hosted_orchestrator::MutationAction::RepairTarget {
-                            target, failure, ..
+                            target: repair_target,
+                            failure,
+                            ..
                         },
+                    target,
                     ..
                 } if failure.category
                     == crate::execution_graph::FailureCategory::ValidationFailure =>
                 {
+                    let repair = target.validation_repair.as_ref();
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.repair_evidence_built",
+                            "validation_gate": failure.node_id,
+                            "selected_repair_target": target.target.path,
+                            "target_content_hash": target.target_content_hash,
+                            "repository_fingerprint": target.repository_fingerprint,
+                            "implicated_paths": repair.map(|context| context.implicated_targets.iter().map(|excerpt| excerpt.path.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
+                            "existing_diff_paths": repair.map(|context| context.existing_diff_paths.as_slice()).unwrap_or_default(),
+                        }),
+                        "validation repair evidence construction",
+                    );
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.repair_target_ranked",
+                            "validation_gate": failure.node_id,
+                            "selected_repair_target": target.target.path,
+                            "target_role": target.target.role,
+                            "selection_basis": "structured_assertion_and_source_contract",
+                            "diff_fingerprint": target.repository_fingerprint,
+                        }),
+                        "validation repair target ranking",
+                    );
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.repair_context_validated",
+                            "validation_gate": failure.node_id,
+                            "selected_repair_target": target.target.path,
+                            "has_current_file_content": target.current_file_content.is_some(),
+                            "has_target_content_hash": target.target_content_hash.is_some(),
+                            "repository_fingerprint": target.repository_fingerprint,
+                        }),
+                        "validation repair context validation",
+                    );
                     self.append_event_recoverable(
                         "validation",
                         json!({
@@ -1159,7 +1209,7 @@ impl<'a> GatewayAgent<'a> {
                             "implicated_paths": failure.assertion_failures.iter()
                                 .flat_map(|assertion| assertion.implicated_paths.iter())
                                 .collect::<BTreeSet<_>>(),
-                            "selected_repair_target": target.path,
+                            "selected_repair_target": repair_target.path,
                             "diff_fingerprint": self.notebook.repository_fingerprint,
                         }),
                         "validation repair target selection",
@@ -2337,15 +2387,17 @@ impl<'a> GatewayAgent<'a> {
         let target_contents = mutation_target_paths
             .iter()
             .map(|path| {
-                let content = self
-                    .notebook
-                    .orchestration
-                    .evidence
-                    .files
-                    .values()
-                    .filter(|evidence| evidence.path == *path)
-                    .max_by_key(|evidence| &evidence.repository_fingerprint)
-                    .map_or_else(String::new, |evidence| evidence.captured_content.clone());
+                let content = safe_repo_path(&self.repo.root, path, false)
+                    .ok()
+                    .and_then(|absolute| fs::read_to_string(absolute).ok())
+                    .or_else(|| {
+                        self.notebook
+                            .orchestration
+                            .evidence
+                            .reusable_file(path, &fingerprint, None)
+                            .map(|evidence| evidence.captured_content.clone())
+                    })
+                    .unwrap_or_default();
                 (path.clone(), content)
             })
             .collect::<Vec<_>>();
@@ -2363,6 +2415,34 @@ impl<'a> GatewayAgent<'a> {
                     .map(|node| (failure, node.id.clone()))
             })
             .collect::<Vec<_>>();
+        for (path, content) in &target_contents {
+            if content.is_empty() {
+                continue;
+            }
+            let evidence = crate::execution_graph::FileEvidence::capture(
+                path,
+                &fingerprint,
+                None,
+                content.clone(),
+                false,
+            );
+            if !self
+                .notebook
+                .orchestration
+                .evidence
+                .files
+                .contains_key(&evidence.evidence_id)
+            {
+                self.append_execution_domain_event(
+                    crate::execution_graph::ExecutionDomainEvent::RepositoryEvidenceRecorded {
+                        sequence: self.next_domain_event_sequence(),
+                        evidence_id: evidence.evidence_id.clone(),
+                        repository_fingerprint: fingerprint.clone(),
+                        evidence: Some(evidence),
+                    },
+                )?;
+            }
+        }
         for (failure, node_id) in mapped {
             let Some(category) = validation_failure_category(&failure.status) else {
                 // Cancellation is checkpointed by the active-process guard and
@@ -2392,16 +2472,64 @@ impl<'a> GatewayAgent<'a> {
                     &failure.output,
                     &target_contents,
                 );
+                if record.assertion_failures.is_empty()
+                    && looks_like_structured_test_failure(&failure.output)
+                {
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.validation_output_parse_incomplete",
+                            "validation_gate": failure.id,
+                            "parser": "vitest",
+                            "raw_excerpt": truncate_text(&failure.output, 2_000),
+                            "fallback_attempted": true,
+                            "diff_fingerprint": fingerprint,
+                        }),
+                        "incomplete structured validation parsing",
+                    );
+                    if let Some(fallback) = fallback_validation_assertion_failure(
+                        &failure.command,
+                        &failure.output,
+                        &target_contents,
+                    ) {
+                        record.assertion_failures.push(fallback);
+                    }
+                }
                 record.target_path = validation_repair_target_hint(
                     &record.assertion_failures,
                     &mutation_target_paths,
                 )
                 .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics));
+                if let Some(assertion) = record.assertion_failures.iter().find(|assertion| {
+                    format!("{} {}", assertion.suite_path.join(" "), assertion.test_name)
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .any(|token| token.contains("cycle") || token.contains("label"))
+                }) {
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.transition_contract_compared",
+                            "validation_gate": failure.id,
+                            "test_file": assertion.test_file,
+                            "suite_path": assertion.suite_path,
+                            "test_name": assertion.test_name,
+                            "expected_transition": assertion.expected,
+                            "observed_transition": assertion.received,
+                            "selected_repair_target": record.target_path,
+                            "implicated_paths": assertion.implicated_paths,
+                            "diff_fingerprint": fingerprint,
+                        }),
+                        "validation transition contract comparison",
+                    );
+                }
                 self.append_event_recoverable(
                     "validation",
                     json!({
-                        "event_type": "worker.validation_failure_parsed",
+                        "event_type": "worker.validation_output_parsed",
                         "validation_gate": failure.id,
+                        "parser": "vitest",
+                        "assertion_count": record.assertion_failures.len(),
                         "failing_tests": record.assertion_failures,
                         "implicated_paths": record.assertion_failures.iter()
                             .flat_map(|assertion| assertion.implicated_paths.iter())

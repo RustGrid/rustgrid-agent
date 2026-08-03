@@ -198,6 +198,7 @@ pub(super) fn legal_phase_transition(from: ExecutionPhase, to: ExecutionPhase) -
             | (ExecutionPhase::Implementation, ExecutionPhase::Validation)
             | (ExecutionPhase::Repair, ExecutionPhase::Implementation)
             | (ExecutionPhase::Repair, ExecutionPhase::Validation)
+            | (ExecutionPhase::Repair, ExecutionPhase::DiffReview)
             | (ExecutionPhase::Validation, ExecutionPhase::Repair)
             | (ExecutionPhase::Validation, ExecutionPhase::DiffReview)
             | (

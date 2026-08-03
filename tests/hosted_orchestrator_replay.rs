@@ -63,8 +63,9 @@ fn normal_route_positions(report: &SimulationReport) -> (usize, usize, usize, us
                         rustgrid_agent::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
                         | rustgrid_agent::hosted_orchestrator::MutationAction::MutateTarget { .. }
                         | rustgrid_agent::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
+                    target,
                     ..
-                }
+                } if target.validation_repair.is_none()
             )
         })
         .expect("mutation decision");

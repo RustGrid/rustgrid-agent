@@ -1282,7 +1282,7 @@ fn validation_failure_target_hint_requires_one_explicit_planned_path() {
 
 #[test]
 fn vitest_assertions_are_structured_and_select_an_implicated_source_target() {
-    let output = r#"
+    let output = r#"[31m
  FAIL  tests/theme-provider.test.tsx > ThemeProvider > applies the light-blue root class
 AssertionError: expected 'theme-root' to contain 'light-blue'
 Expected: "light-blue"
@@ -1300,7 +1300,7 @@ AssertionError: expected 'light-blue' to be 'red'
 Expected: "red"
 Received: "light-blue"
  ❯ tests/theme-provider.test.tsx:77:26
-"#;
+[0m"#;
     let candidates = vec![
         (
             "src/components/theme/ThemeProvider.tsx".into(),
@@ -1322,6 +1322,10 @@ Received: "light-blue"
     );
     assert_eq!(assertions.len(), 3);
     assert_eq!(assertions[0].expected, "light-blue");
+    assert_eq!(assertions[0].suite_path, ["ThemeProvider"]);
+    assert_eq!(assertions[0].test_name, "applies the light-blue root class");
+    assert_eq!(assertions[0].source_line, Some(41));
+    assert_eq!(assertions[0].source_column, Some(38));
     assert_eq!(assertions[0].received, "theme-root");
     assert_eq!(assertions[2].expected, "red");
     assert_eq!(assertions[2].received, "light-blue");
@@ -1336,8 +1340,47 @@ Received: "light-blue"
         .collect::<Vec<_>>();
     assert_eq!(
         validation_repair_target_hint(&assertions, &targets).as_deref(),
-        Some("src/components/theme/ThemeProvider.tsx")
+        Some("src/components/theme/ThemeToggle.tsx")
     );
+}
+
+#[test]
+fn vitest_fallback_preserves_a_bounded_structured_failure_when_header_is_unknown() {
+    let output = concat!(
+        "\u{1b}[31m",
+        " FAIL  tests/theme-provider.test.tsx > ThemeProvider > cycles through all themes\n",
+        "Error: values differ\n",
+        "Expected: \"red\"\n",
+        "Received: \"light-blue\"\n",
+        " ❯ tests/theme-provider.test.tsx:111:27\n",
+        "\u{1b}[0m"
+    );
+    let candidates = vec![(
+        "tests/theme-provider.test.tsx".into(),
+        "expect(label).toBe('red');".into(),
+    )];
+    assert!(looks_like_structured_test_failure(output));
+    assert!(
+        parse_validation_assertion_failures(
+            "npx vitest run tests/theme-provider.test.tsx",
+            output,
+            &candidates
+        )
+        .is_empty()
+    );
+    let fallback = fallback_validation_assertion_failure(
+        "npx vitest run tests/theme-provider.test.tsx",
+        output,
+        &candidates,
+    )
+    .expect("fallback assertion");
+    assert_eq!(fallback.suite_path, ["ThemeProvider"]);
+    assert_eq!(fallback.test_name, "cycles through all themes");
+    assert_eq!(fallback.expected, "red");
+    assert_eq!(fallback.received, "light-blue");
+    assert_eq!(fallback.source_line, Some(111));
+    assert_eq!(fallback.source_column, Some(27));
+    assert!(fallback.context.len() <= output.len());
 }
 
 fn recovery_authorization_fixture() -> (
@@ -6815,6 +6858,10 @@ fn lifecycle_transition_table_rejects_skipping_validation() {
     assert!(legal_phase_transition(
         ExecutionPhase::Repair,
         ExecutionPhase::Validation
+    ));
+    assert!(legal_phase_transition(
+        ExecutionPhase::Repair,
+        ExecutionPhase::DiffReview
     ));
     assert!(!legal_phase_transition(
         ExecutionPhase::Repair,

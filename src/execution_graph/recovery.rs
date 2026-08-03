@@ -80,11 +80,28 @@ pub enum ValidationRepairDiagnosis {
     Inconclusive,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairAction {
+    BuildRepairEvidence,
+    DiagnoseFailure,
+    SelectRepairTarget,
+    MutateRepairTarget,
+    VerifyRepair,
+    RerunFailedGate,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValidationAssertionFailure {
     pub test_file: String,
+    #[serde(default)]
+    pub suite_path: Vec<String>,
     pub test_name: String,
     pub source_location: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_column: Option<u32>,
     pub assertion_kind: String,
     pub expected: String,
     pub received: String,
@@ -94,6 +111,8 @@ pub struct ValidationAssertionFailure {
     pub diagnosis: Option<ValidationRepairDiagnosis>,
     #[serde(default)]
     pub evidence: String,
+    #[serde(default)]
+    pub context: String,
     #[serde(default)]
     pub proposed_repair: String,
     #[serde(default)]

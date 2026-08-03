@@ -918,6 +918,44 @@ fn repair_target_decision(
                 .collect(),
         });
     }
+    let context_prepared = snapshot.events.iter().rev().any(|event| {
+        matches!(
+            event,
+            ExecutionDomainEvent::TargetContextPrepared {
+                node_id,
+                target_path,
+                repository_fingerprint,
+                target_content_hash,
+                accepted_intent_hash,
+                ..
+            } if node_id == &node.id
+                && target_path == &target.target.path
+                && repository_fingerprint.as_str() == snapshot.current_repository.fingerprint
+                && target_content_hash == &target.target_content_hash
+                && accepted_intent_hash == &target.accepted_intent_hash
+        )
+    });
+    if failure.category == FailureCategory::ValidationFailure && !context_prepared {
+        target.allowed_tools.clear();
+        return Ok(ExecutionDecision::ExecuteTarget {
+            node_id: node.id.clone(),
+            action: MutationAction::PrepareTargetContext {
+                node_id: node.id.clone(),
+                target: target.target.clone(),
+            },
+            target,
+        });
+    }
+    if failure.category == FailureCategory::ValidationFailure
+        && !target.target.new_file
+        && (target.current_file_content.is_none() || target.target_content_hash.is_none())
+    {
+        return Err(OrchestrationInvariantError::for_node(
+            "repair_context_incomplete",
+            node.id.clone(),
+            "validation repair target exists but its current content or content hash is missing",
+        ));
+    }
     Ok(ExecutionDecision::ExecuteTarget {
         node_id: node.id.clone(),
         action: MutationAction::RepairTarget {
@@ -1681,7 +1719,7 @@ mod tests {
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
             ExecutionDecision::ExecuteTarget {
-                action: MutationAction::RepairTarget { ref target, .. },
+                action: MutationAction::PrepareTargetContext { ref target, .. },
                 ..
             } if target.path == "src/components/theme/ThemeProvider.tsx"
         ));
@@ -1822,9 +1860,9 @@ mod tests {
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
             ExecutionDecision::ExecuteTarget {
-                action: MutationAction::RepairTarget { ref failure, .. },
+                action: MutationAction::PrepareTargetContext { ref target, .. },
                 ..
-            } if failure.id == FailureId::new("attempt-30-focused-failure")
+            } if target.path == "src/components/theme/ThemeProvider.tsx"
         ));
     }
 
@@ -2258,9 +2296,9 @@ mod tests {
                 FailureCategory::ValidationFailure => assert!(matches!(
                     reconcile_execution(&state).expect("repair decision"),
                     ExecutionDecision::ExecuteTarget {
-                        action: MutationAction::RepairTarget { failure, .. },
+                        action: MutationAction::PrepareTargetContext { .. },
                         ..
-                    } if failure.id == failure_id
+                    }
                 )),
                 _ => unreachable!("fixture only covers validation failure categories"),
             }

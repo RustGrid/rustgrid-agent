@@ -253,6 +253,11 @@ impl SimulationPhase {
                 action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
                 ..
             } => Self::Repair,
+            ExecutionDecision::ExecuteTarget { target, .. }
+                if target.validation_repair.is_some() =>
+            {
+                Self::Repair
+            }
             ExecutionDecision::ExecuteTarget { .. } => Self::Implementation,
             ExecutionDecision::RepairTarget { .. } => Self::Repair,
             ExecutionDecision::RunValidation { .. } => Self::Validation,
@@ -502,6 +507,48 @@ impl SimulationHarness {
             }
             ExecutionDecision::ContinuePlanning { .. } => {
                 self.simulate_planning()?;
+                Ok(None)
+            }
+            ExecutionDecision::ExecuteTarget {
+                node_id,
+                action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                target,
+            } => {
+                if self
+                    .snapshot
+                    .graph
+                    .node(&node_id)
+                    .is_none_or(|node| node.status != ExecutionNodeStatus::Applied)
+                {
+                    self.simulate_target(node_id, target.target, false)?;
+                    return Ok(None);
+                }
+                let fingerprint = self.snapshot.current_repository.fingerprint.clone();
+                let content = target.current_file_content.unwrap_or_else(|| {
+                    format!("simulated current content for {}", target.target.path)
+                });
+                let evidence = crate::execution_graph::FileEvidence::capture(
+                    &target.target.path,
+                    &fingerprint,
+                    None,
+                    content,
+                    false,
+                );
+                self.append(ExecutionDomainEvent::RepositoryEvidenceRecorded {
+                    sequence: self.sequence(),
+                    evidence_id: evidence.evidence_id.clone(),
+                    repository_fingerprint: fingerprint.clone(),
+                    evidence: Some(evidence.clone()),
+                })?;
+                self.append(ExecutionDomainEvent::TargetContextPrepared {
+                    sequence: self.sequence(),
+                    node_id,
+                    target_path: target.target.path,
+                    repository_fingerprint: RepositoryFingerprint::new(fingerprint),
+                    evidence_ids: vec![evidence.evidence_id],
+                    target_content_hash: Some(evidence.content_hash),
+                    accepted_intent_hash: target.accepted_intent_hash,
+                })?;
                 Ok(None)
             }
             ExecutionDecision::ExecuteTarget {
@@ -1619,6 +1666,13 @@ mod tests {
         assert!(matches!(
             apply_next_decision(&mut harness),
             ExecutionDecision::RunValidation { .. }
+        ));
+        assert!(matches!(
+            apply_next_decision(&mut harness),
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                ..
+            }
         ));
         assert!(matches!(
             apply_next_decision(&mut harness),

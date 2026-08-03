@@ -42,7 +42,8 @@ pub(super) fn parse_validation_assertion_failures(
     output: &str,
     target_contents: &[(String, String)],
 ) -> Vec<crate::execution_graph::ValidationAssertionFailure> {
-    let lines = output.lines().collect::<Vec<_>>();
+    let clean_output = strip_ansi_sequences(output);
+    let lines = clean_output.lines().collect::<Vec<_>>();
     let mut failures = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if !line.contains("AssertionError:") {
@@ -71,27 +72,23 @@ pub(super) fn parse_validation_assertion_failures(
             .map_or_else(String::new, |value| {
                 value.trim().trim_start_matches('❯').trim().to_owned()
             });
+        let (location_path, source_line, source_column) = parse_source_location(&source_location);
         let test_file = target_contents
             .iter()
-            .find(|(path, _)| {
-                source_location.contains(path.as_str()) || command.contains(path.as_str())
-            })
-            .map_or_else(String::new, |(path, _)| path.clone());
-        let test_name = lines[..index]
+            .find(|(path, _)| location_path == *path || command.contains(path.as_str()))
+            .map_or_else(|| location_path.clone(), |(path, _)| path.clone());
+        let heading = lines[..index]
             .iter()
             .rev()
             .find(|candidate| {
                 let candidate = candidate.trim();
-                candidate.contains(" > ") || candidate.starts_with('×')
+                candidate.contains(" > ")
+                    || candidate.starts_with('×')
+                    || candidate.starts_with("FAIL ")
             })
-            .map_or_else(String::new, |value| {
-                value
-                    .trim()
-                    .trim_start_matches('×')
-                    .trim_start_matches('❯')
-                    .trim()
-                    .to_owned()
-            });
+            .copied()
+            .unwrap_or_default();
+        let (suite_path, test_name) = parse_vitest_heading(heading, &test_file);
         let assertion = line
             .split_once("AssertionError:")
             .map_or(line.trim(), |(_, message)| message.trim());
@@ -103,16 +100,24 @@ pub(super) fn parse_validation_assertion_failures(
             "assertion"
         }
         .to_owned();
+        let assertion_tokens = assertion
+            .split(|character: char| !character.is_alphanumeric() && character != '-')
+            .filter(|token| token.len() >= 4)
+            .collect::<Vec<_>>();
+        let test_content = target_contents
+            .iter()
+            .find(|(path, _)| path == &test_file)
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_default();
+        let imported_stems = import_path_stems(test_content);
         let mut implicated_paths = target_contents
             .iter()
             .filter(|(path, content)| {
                 path == &test_file
                     || (!expected.is_empty() && content.contains(&expected))
                     || (!received.is_empty() && content.contains(&received))
-                    || assertion
-                        .split(|character: char| !character.is_alphanumeric() && character != '-')
-                        .filter(|token| token.len() >= 4)
-                        .any(|token| content.contains(token))
+                    || assertion_tokens.iter().any(|token| content.contains(token))
+                    || imported_stems.iter().any(|stem| path_stem(path) == *stem)
             })
             .map(|(path, _)| path.clone())
             .collect::<BTreeSet<_>>();
@@ -121,14 +126,23 @@ pub(super) fn parse_validation_assertion_failures(
         }
         failures.push(crate::execution_graph::ValidationAssertionFailure {
             test_file,
+            suite_path,
             test_name,
             source_location,
+            source_line,
+            source_column,
             assertion_kind,
             expected,
             received,
             implicated_paths: implicated_paths.into_iter().collect(),
             diagnosis: None,
             evidence: assertion.to_owned(),
+            context: block
+                .iter()
+                .take(12)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
             proposed_repair: String::new(),
             expected_validation_effect: String::new(),
         });
@@ -136,26 +150,194 @@ pub(super) fn parse_validation_assertion_failures(
     failures
 }
 
+pub(super) fn looks_like_structured_test_failure(output: &str) -> bool {
+    let output = strip_ansi_sequences(output);
+    output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("FAIL ") || line.starts_with('×')
+    }) && (output.contains("Expected:") || output.contains("Received:"))
+}
+
+pub(super) fn fallback_validation_assertion_failure(
+    command: &str,
+    output: &str,
+    target_contents: &[(String, String)],
+) -> Option<crate::execution_graph::ValidationAssertionFailure> {
+    let clean = strip_ansi_sequences(output);
+    let lines = clean.lines().collect::<Vec<_>>();
+    let heading = lines.iter().find(|line| {
+        let line = line.trim_start();
+        line.starts_with("FAIL ") || line.starts_with('×')
+    })?;
+    let source_location = lines
+        .iter()
+        .find(|line| {
+            line.contains('❯')
+                && line
+                    .rsplit(':')
+                    .take(2)
+                    .all(|part| part.trim().parse::<u32>().is_ok())
+        })
+        .map_or_else(String::new, |line| {
+            line.trim().trim_start_matches('❯').trim().to_owned()
+        });
+    let (location_path, source_line, source_column) = parse_source_location(&source_location);
+    let test_file = target_contents
+        .iter()
+        .find(|(path, _)| location_path == *path || command.contains(path.as_str()))
+        .map_or(location_path, |(path, _)| path.clone());
+    let (suite_path, test_name) = parse_vitest_heading(heading, &test_file);
+    let value = |prefix: &str| {
+        lines
+            .iter()
+            .find_map(|line| line.trim().strip_prefix(prefix))
+            .map_or_else(String::new, |value| {
+                value.trim().trim_matches('"').to_owned()
+            })
+    };
+    Some(crate::execution_graph::ValidationAssertionFailure {
+        test_file: test_file.clone(),
+        suite_path,
+        test_name,
+        source_location,
+        source_line,
+        source_column,
+        assertion_kind: "assertion".into(),
+        expected: value("Expected:"),
+        received: value("Received:"),
+        implicated_paths: (!test_file.is_empty())
+            .then_some(test_file)
+            .into_iter()
+            .collect(),
+        evidence: "structured validation output did not include a recognized assertion header"
+            .into(),
+        context: lines
+            .iter()
+            .take(20)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ..crate::execution_graph::ValidationAssertionFailure::default()
+    })
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut clean = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for candidate in chars.by_ref() {
+                if ('@'..='~').contains(&candidate) {
+                    break;
+                }
+            }
+        } else {
+            clean.push(character);
+        }
+    }
+    clean
+}
+
+fn parse_source_location(value: &str) -> (String, Option<u32>, Option<u32>) {
+    let mut parts = value.rsplitn(3, ':');
+    let column = parts.next().and_then(|part| part.parse().ok());
+    let line = parts.next().and_then(|part| part.parse().ok());
+    let path = parts.next().unwrap_or(value).trim().to_owned();
+    (path, line, column)
+}
+
+fn parse_vitest_heading(heading: &str, test_file: &str) -> (Vec<String>, String) {
+    let clean = heading
+        .trim()
+        .trim_start_matches('×')
+        .trim_start_matches('❯')
+        .trim_start_matches("FAIL")
+        .trim();
+    let semantic = clean
+        .strip_prefix(test_file)
+        .unwrap_or(clean)
+        .trim()
+        .trim_start_matches('>')
+        .trim();
+    let mut parts = semantic
+        .split(" > ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let test_name = parts.pop().unwrap_or_default();
+    (parts, test_name)
+}
+
+fn path_stem(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+}
+
+fn import_path_stems(content: &str) -> BTreeSet<String> {
+    content
+        .lines()
+        .filter(|line| line.trim_start().starts_with("import "))
+        .filter_map(|line| line.rsplit_once("from").map(|(_, path)| path))
+        .map(|path| path.trim().trim_matches(|c| matches!(c, '\'' | '"' | ';')))
+        .map(path_stem)
+        .collect()
+}
+
 pub(super) fn validation_repair_target_hint(
     assertions: &[crate::execution_graph::ValidationAssertionFailure],
     mutation_target_paths: &[String],
 ) -> Option<String> {
     let mut scores = BTreeMap::<String, usize>::new();
-    for assertion in assertions {
+    let transition_assertions = assertions
+        .iter()
+        .filter(|assertion| {
+            format!("{} {}", assertion.suite_path.join(" "), assertion.test_name)
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .any(|token| token.contains("cycle") || token.contains("label"))
+        })
+        .collect::<Vec<_>>();
+    let ranked_assertions = if transition_assertions.is_empty() {
+        assertions.iter().collect::<Vec<_>>()
+    } else {
+        transition_assertions
+    };
+    for assertion in ranked_assertions {
         for path in assertion
             .implicated_paths
             .iter()
             .filter(|path| mutation_target_paths.contains(path))
         {
             let source_preference = usize::from(!path.to_ascii_lowercase().contains("test"));
+            let lower_path = path.to_ascii_lowercase();
+            let assertion_semantics = format!(
+                "{} {} {}",
+                assertion.suite_path.join(" "),
+                assertion.test_name,
+                assertion.evidence
+            )
+            .to_ascii_lowercase();
+            let ui_transition_preference = usize::from(
+                lower_path.contains("toggle")
+                    && assertion_semantics
+                        .split_whitespace()
+                        .any(|token| token.contains("cycle") || token.contains("label")),
+            ) * 4;
             let provider_preference = usize::from(
-                path.to_ascii_lowercase().contains("provider")
-                    && format!("{} {}", assertion.test_name, assertion.evidence)
-                        .to_ascii_lowercase()
+                lower_path.contains("provider")
+                    && assertion_semantics
                         .split_whitespace()
                         .any(|token| token.contains("root") || token.contains("class")),
             ) * 2;
-            *scores.entry(path.clone()).or_default() += 2 + source_preference + provider_preference;
+            *scores.entry(path.clone()).or_default() +=
+                2 + source_preference + ui_transition_preference + provider_preference;
         }
     }
     scores
