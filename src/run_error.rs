@@ -98,20 +98,14 @@ pub fn classify(error: &anyhow::Error) -> RunErrorKind {
             RunFailure::Invariant { .. } => RunErrorKind::Invariant,
         };
     }
-
-    let message = format!("{error:#}").to_ascii_lowercase();
-    if message.contains("401") || message.contains("403") || message.contains("unauthorized") {
-        RunErrorKind::Authentication
-    } else if message.contains("timed out")
-        || message.contains("connection")
-        || message.contains("temporarily unavailable")
-        || message.contains("502")
-        || message.contains("503")
-        || message.contains("504")
-    {
-        RunErrorKind::Transient
-    } else {
-        RunErrorKind::ExternalPermanent
+    if crate::api::typed_access_error(error).is_some() {
+        return RunErrorKind::Authentication;
+    }
+    match crate::api::typed_control_plane_error(error) {
+        Some(crate::error::ControlPlaneError::Retryable { .. }) => RunErrorKind::Transient,
+        Some(crate::error::ControlPlaneError::Rejected { .. }) | None => {
+            RunErrorKind::ExternalPermanent
+        }
     }
 }
 

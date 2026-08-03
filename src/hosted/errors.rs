@@ -1,6 +1,184 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct HostedLeaseLost {
+    pub(super) operation: &'static str,
+    pub(super) detail: String,
+}
+
+impl std::fmt::Display for HostedLeaseLost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "hosted execution lease was lost during {}; stale terminal writes are suppressed: {}",
+            self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for HostedLeaseLost {}
+
+#[derive(Debug)]
+pub(super) struct HostedInvariantFailure {
+    pub(super) code: &'static str,
+    pub(super) message: String,
+}
+
+impl HostedInvariantFailure {
+    pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for HostedInvariantFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for HostedInvariantFailure {}
+
+pub(super) fn classify_hosted_execution_failure(
+    error: &anyhow::Error,
+) -> Option<crate::error::ExecutionFailure> {
+    use crate::error::{
+        AccessError, CancellationError, ControlPlaneError, ExecutionFailure, ExecutionFailureKind,
+        InfrastructureError, ManifestError, ProviderError,
+    };
+
+    if let Some(http) = error.downcast_ref::<HostedHttpError>() {
+        let context = http.to_string();
+        let kind = match http.code.as_str() {
+            "execution_cancelled" | "execution_completion_preempted_by_cancellation" => {
+                ExecutionFailureKind::Cancellation(CancellationError::Requested)
+            }
+            "execution_lost" | "execution_lease_lost" => ExecutionFailureKind::LeaseLost {
+                operation: http.path.clone(),
+            },
+            "execution_token_invalid" => {
+                ExecutionFailureKind::Access(AccessError::AuthenticationRejected)
+            }
+            "execution_token_scope_invalid" | "execution_ai_access_revoked" => {
+                ExecutionFailureKind::Access(AccessError::AuthorizationRejected)
+            }
+            _ => match http.failure_class() {
+                AiFailureClass::RequestValidation | AiFailureClass::ProviderValidation => {
+                    ExecutionFailureKind::Provider(ProviderError::Protocol)
+                }
+                AiFailureClass::ProviderAuthentication => {
+                    ExecutionFailureKind::Access(AccessError::AuthorizationRejected)
+                }
+                AiFailureClass::ProviderRateLimit
+                | AiFailureClass::ProviderServer
+                | AiFailureClass::ProviderTimeout
+                | AiFailureClass::ProviderDispatchUncertain => {
+                    ExecutionFailureKind::ControlPlane(ControlPlaneError::Retryable {
+                        operation: http.path.clone(),
+                        status: Some(http.status.as_u16()),
+                        request_id: http.request_id.clone(),
+                    })
+                }
+                AiFailureClass::RegistrationConflict | AiFailureClass::Gateway
+                    if http.retryable == Some(true)
+                        || http.retryable_gateway_transport_failure() =>
+                {
+                    ExecutionFailureKind::ControlPlane(ControlPlaneError::Retryable {
+                        operation: http.path.clone(),
+                        status: Some(http.status.as_u16()),
+                        request_id: http.request_id.clone(),
+                    })
+                }
+                AiFailureClass::RegistrationConflict | AiFailureClass::Gateway => {
+                    ExecutionFailureKind::ControlPlane(ControlPlaneError::Rejected {
+                        operation: http.path.clone(),
+                        status: Some(http.status.as_u16()),
+                        request_id: http.request_id.clone(),
+                    })
+                }
+            },
+        };
+        return Some(ExecutionFailure::with_safe_source(
+            kind,
+            context,
+            "the hosted control-plane operation returned a structured rejection",
+        ));
+    }
+    if let Some(lease) = error.downcast_ref::<HostedLeaseLost>() {
+        return Some(ExecutionFailure::with_safe_source(
+            ExecutionFailureKind::LeaseLost {
+                operation: lease.operation.into(),
+            },
+            lease.to_string(),
+            "hosted lease authority was invalidated",
+        ));
+    }
+    if error.downcast_ref::<HostedInvariantFailure>().is_some()
+        || error
+            .downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::execution_graph::GraphInvariantError>()
+            .is_some()
+    {
+        return Some(ExecutionFailure::with_safe_source(
+            ExecutionFailureKind::Invariant,
+            error.to_string(),
+            "the hosted execution graph or lifecycle invariant was rejected",
+        ));
+    }
+    if error
+        .downcast_ref::<HostedProviderContractFailure>()
+        .is_some()
+    {
+        return Some(ExecutionFailure::with_safe_source(
+            ExecutionFailureKind::Provider(ProviderError::Protocol),
+            error.to_string(),
+            "the provider payload did not satisfy the hosted protocol contract",
+        ));
+    }
+    if error.downcast_ref::<ExecutionBudgetMismatch>().is_some() {
+        return Some(ExecutionFailure::with_safe_source(
+            ExecutionFailureKind::Manifest(ManifestError::InvalidPolicy),
+            error.to_string(),
+            "the signed execution budget was inconsistent across manifest fields",
+        ));
+    }
+    if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
+        return Some(ExecutionFailure::with_safe_source(
+            ExecutionFailureKind::Infrastructure(InfrastructureError {
+                component: "hosted startup".into(),
+                retryable: true,
+            }),
+            failure.message.clone(),
+            failure.underlying.to_string(),
+        ));
+    }
+    if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
+        let kind = match failure.code.as_str() {
+            "execution_ai_budget_exceeded" | "phase_model_call_budget_exhausted" => {
+                ExecutionFailureKind::Provider(ProviderError::BudgetExhausted)
+            }
+            "invalid_model_artifact" | "impact_map_invalid" => {
+                ExecutionFailureKind::Provider(ProviderError::InvalidArtifact)
+            }
+            _ => ExecutionFailureKind::Infrastructure(InfrastructureError {
+                component: "hosted orchestration".into(),
+                retryable: failure.recoverable,
+            }),
+        };
+        return Some(ExecutionFailure::with_safe_source(
+            kind,
+            failure.message.clone(),
+            failure.underlying_error.message.clone(),
+        ));
+    }
+    None
+}
+
 pub(super) fn classify_mutation_application_exhausted(
     mut failure: HostedAgentExecutionFailure,
 ) -> HostedAgentExecutionFailure {

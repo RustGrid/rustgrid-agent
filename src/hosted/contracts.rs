@@ -162,22 +162,36 @@ pub(super) struct HostedProviderContractFailure {
 impl HostedProviderContractFailure {
     pub(super) fn from_validation(error: anyhow::Error) -> Self {
         let message = error.to_string();
-        let code = message
-            .split_once(':')
-            .map(|(code, _)| code)
-            .filter(|code| {
-                matches!(
-                    *code,
-                    "ai_provider_request_invalid"
-                        | "ai_tool_schema_invalid"
-                        | "ai_response_schema_invalid"
-                )
-            })
-            .unwrap_or("ai_provider_request_invalid")
+        let code = error
+            .downcast_ref::<ProviderProtocolDiagnostic>()
+            .map_or("ai_provider_request_invalid", |failure| failure.code)
             .to_owned();
         Self { code, message }
     }
 }
+
+#[derive(Debug)]
+pub(super) struct ProviderProtocolDiagnostic {
+    pub(super) code: &'static str,
+    message: String,
+}
+
+impl ProviderProtocolDiagnostic {
+    pub(super) fn new(code: &'static str, error: anyhow::Error) -> Self {
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderProtocolDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderProtocolDiagnostic {}
 
 impl std::fmt::Display for HostedProviderContractFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -14,6 +14,73 @@ use crate::{
     token_consumption::TokenConsumption,
 };
 
+pub type JournalResult<T> = std::result::Result<T, JournalError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JournalOperation {
+    Load,
+    Persist,
+    Validate,
+    AdoptRecovery,
+}
+
+#[derive(Debug)]
+pub struct JournalError {
+    pub operation: JournalOperation,
+    message: String,
+    source: Option<JournalDiagnostic>,
+}
+
+#[derive(Debug)]
+struct JournalDiagnostic(String);
+
+impl std::fmt::Display for JournalDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for JournalDiagnostic {}
+
+impl JournalError {
+    fn validation(message: impl Into<String>) -> Self {
+        Self {
+            operation: JournalOperation::Validate,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn from_anyhow(operation: JournalOperation, error: anyhow::Error) -> Self {
+        let message = error.to_string();
+        Self {
+            operation,
+            message: message.clone(),
+            source: Some(JournalDiagnostic(message)),
+        }
+    }
+}
+
+impl From<anyhow::Error> for JournalError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::from_anyhow(JournalOperation::Persist, error)
+    }
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JournalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &dyn std::error::Error)
+    }
+}
+
 /// Durable event/checkpoint storage consumed by recovery journaling.
 pub trait EventStore: fmt::Debug + Send + Sync {
     type Error: Into<anyhow::Error>;
@@ -117,7 +184,7 @@ pub struct RunJournal {
 }
 
 impl RunJournal {
-    pub fn recovery_plan(&self) -> Result<RecoveryPlan> {
+    pub fn recovery_plan(&self) -> JournalResult<RecoveryPlan> {
         match (
             self.commit.as_ref(),
             self.pull_request_url.as_ref(),
@@ -132,11 +199,13 @@ impl RunJournal {
                 url: url.clone(),
                 number,
             }),
-            _ => anyhow::bail!("recovery journal contains an incomplete publication checkpoint"),
+            _ => Err(JournalError::validation(
+                "recovery journal contains an incomplete publication checkpoint",
+            )),
         }
     }
 
-    pub fn create(path: &Path, run_id: &str, ticket_id: &str) -> Result<Self> {
+    pub fn create(path: &Path, run_id: &str, ticket_id: &str) -> JournalResult<Self> {
         Self::create_with_store(path, run_id, ticket_id, filesystem_event_store())
     }
 
@@ -145,19 +214,25 @@ impl RunJournal {
         run_id: &str,
         ticket_id: &str,
         store: Arc<dyn EventStore<Error = anyhow::Error>>,
-    ) -> Result<Self> {
+    ) -> JournalResult<Self> {
         let path = path.to_path_buf();
-        if let Some(bytes) = store.load(&path)? {
+        if let Some(bytes) = store
+            .load(&path)
+            .map_err(|error| JournalError::from_anyhow(JournalOperation::Load, error))?
+        {
             let mut journal: Self = serde_json::from_slice(&bytes)
-                .with_context(|| format!("invalid recovery journal {}", path.display()))?;
+                .with_context(|| format!("invalid recovery journal {}", path.display()))
+                .map_err(|error| JournalError::from_anyhow(JournalOperation::Validate, error))?;
             if journal.run_id != run_id || journal.ticket_id != ticket_id {
-                anyhow::bail!("recovery journal identity does not match claimed run");
+                return Err(JournalError::validation(
+                    "recovery journal identity does not match claimed run",
+                ));
             }
             if journal.schema_version != 1 {
-                anyhow::bail!(
+                return Err(JournalError::validation(format!(
                     "unsupported recovery journal schema version {}",
                     journal.schema_version
-                );
+                )));
             }
             journal.path = path;
             journal.store = store;
@@ -187,21 +262,25 @@ impl RunJournal {
         Ok(journal)
     }
 
-    pub fn checkpoint(&mut self, phase: RunPhase, sequence: u64) -> Result<()> {
+    pub fn checkpoint(&mut self, phase: RunPhase, sequence: u64) -> JournalResult<()> {
         self.phase = phase;
         self.last_sequence = sequence;
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn checkpoint_hosted_execution(&mut self, snapshot: ExecutionSnapshot) -> Result<()> {
+    pub fn checkpoint_hosted_execution(
+        &mut self,
+        snapshot: ExecutionSnapshot,
+    ) -> JournalResult<()> {
         snapshot
             .validate_invariants()
-            .context("cannot persist an invalid hosted execution snapshot")?;
+            .context("cannot persist an invalid hosted execution snapshot")
+            .map_err(|error| JournalError::from_anyhow(JournalOperation::Validate, error))?;
         self.hosted_execution = Some(snapshot);
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn resume_active_run(&mut self) -> Result<()> {
+    pub fn resume_active_run(&mut self) -> JournalResult<()> {
         if self.phase.is_terminal() {
             self.phase = RunPhase::Claimed;
             self.last_error = None;
@@ -215,13 +294,17 @@ impl RunJournal {
         run_id: &str,
         ticket_id: &str,
         source_run_id: &str,
-    ) -> Result<Self> {
+    ) -> JournalResult<Self> {
         let bytes = fs::read(path)
-            .with_context(|| format!("could not read recovery journal {}", path.display()))?;
+            .with_context(|| format!("could not read recovery journal {}", path.display()))
+            .map_err(|error| JournalError::from_anyhow(JournalOperation::AdoptRecovery, error))?;
         let mut journal: Self = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid recovery journal {}", path.display()))?;
+            .with_context(|| format!("invalid recovery journal {}", path.display()))
+            .map_err(|error| JournalError::from_anyhow(JournalOperation::Validate, error))?;
         if journal.schema_version != 1 || journal.ticket_id != ticket_id {
-            anyhow::bail!("recovery journal identity does not match the retrying run");
+            return Err(JournalError::validation(
+                "recovery journal identity does not match the retrying run",
+            ));
         }
         if journal.run_id == run_id
             && journal.recovery_source_run_id.as_deref() == Some(source_run_id)
@@ -230,17 +313,23 @@ impl RunJournal {
             return Ok(journal);
         }
         if journal.run_id != source_run_id {
-            anyhow::bail!("recovery journal does not belong to the requested source run");
+            return Err(JournalError::validation(
+                "recovery journal does not belong to the requested source run",
+            ));
         }
         if !journal.phase.is_terminal() || journal.phase == RunPhase::Succeeded {
-            anyhow::bail!("recovery source run is not an unsuccessful terminal run");
+            return Err(JournalError::validation(
+                "recovery source run is not an unsuccessful terminal run",
+            ));
         }
         if journal
             .executor
             .as_ref()
             .is_none_or(|executor| executor.state != "retained")
         {
-            anyhow::bail!("recovery source run has no successfully retained executor");
+            return Err(JournalError::validation(
+                "recovery source run has no successfully retained executor",
+            ));
         }
         journal.run_id = run_id.to_owned();
         journal.phase = RunPhase::Claimed;
@@ -262,49 +351,49 @@ impl RunJournal {
             .map(|executor| executor.id.as_str())
     }
 
-    pub fn record_branch(&mut self, branch: &str) -> Result<()> {
+    pub fn record_branch(&mut self, branch: &str) -> JournalResult<()> {
         self.branch = Some(branch.to_owned());
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_commit(&mut self, commit: &str) -> Result<()> {
+    pub fn record_commit(&mut self, commit: &str) -> JournalResult<()> {
         self.commit = Some(commit.to_owned());
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_pull_request(&mut self, url: &str, number: u64) -> Result<()> {
+    pub fn record_pull_request(&mut self, url: &str, number: u64) -> JournalResult<()> {
         self.pull_request_url = Some(url.to_owned());
         self.pull_request_number = Some(number);
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_progress_sequence(&mut self, sequence: u64) -> Result<()> {
+    pub fn record_progress_sequence(&mut self, sequence: u64) -> JournalResult<()> {
         self.progress_sequence = sequence;
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_error(&mut self, error: &str) -> Result<()> {
+    pub fn record_error(&mut self, error: &str) -> JournalResult<()> {
         self.last_error = Some(error.to_owned());
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_token_consumption(&mut self, consumption: TokenConsumption) -> Result<()> {
+    pub fn record_token_consumption(&mut self, consumption: TokenConsumption) -> JournalResult<()> {
         self.token_consumption = consumption;
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_dependency_state(&mut self, state: DependencyState) -> Result<()> {
+    pub fn record_dependency_state(&mut self, state: DependencyState) -> JournalResult<()> {
         self.dependency_state = Some(state);
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
-    pub fn record_executor(&mut self, kind: &str, id: &str, state: &str) -> Result<()> {
+    pub fn record_executor(&mut self, kind: &str, id: &str, state: &str) -> JournalResult<()> {
         self.executor = Some(ExecutorCheckpoint {
             kind: kind.into(),
             id: id.into(),
             state: state.into(),
         });
-        self.persist()
+        self.persist().map_err(Into::into)
     }
 
     fn persist(&self) -> Result<()> {

@@ -166,9 +166,10 @@ impl<'a> Reporter<'a> {
             delta.output_tokens,
         )?;
         self.token_consumption.set(consumption);
-        self.journal
+        Ok(self
+            .journal
             .borrow_mut()
-            .record_token_consumption(consumption)
+            .record_token_consumption(consumption)?)
     }
 
     pub(crate) fn dependency_state(&self) -> Option<crate::optimization::DependencyState> {
@@ -179,7 +180,7 @@ impl<'a> Reporter<'a> {
         &self,
         state: crate::optimization::DependencyState,
     ) -> Result<()> {
-        self.journal.borrow_mut().record_dependency_state(state)
+        Ok(self.journal.borrow_mut().record_dependency_state(state)?)
     }
 
     pub(crate) fn flush_telemetry(&self) {
@@ -225,9 +226,10 @@ impl<'a> Reporter<'a> {
             }
         };
         self.progress_sequence.set(published_sequence);
-        self.journal
+        Ok(self
+            .journal
             .borrow_mut()
-            .record_progress_sequence(published_sequence)
+            .record_progress_sequence(published_sequence)?)
     }
 
     pub(crate) fn step(
@@ -296,11 +298,11 @@ impl<'a> Reporter<'a> {
     }
 
     pub(crate) fn recovery_plan(&self) -> Result<RecoveryPlan> {
-        self.journal.borrow().recovery_plan()
+        Ok(self.journal.borrow().recovery_plan()?)
     }
 
     pub(crate) fn record_error(&self, message: &str) -> Result<()> {
-        self.journal.borrow_mut().record_error(message)
+        Ok(self.journal.borrow_mut().record_error(message)?)
     }
 
     pub(crate) fn report_token_consumption(&self) -> Result<()> {
@@ -310,19 +312,19 @@ impl<'a> Reporter<'a> {
     }
 
     pub(crate) fn record_executor(&self, kind: &str, id: &str, state: &str) -> Result<()> {
-        self.journal.borrow_mut().record_executor(kind, id, state)
+        Ok(self.journal.borrow_mut().record_executor(kind, id, state)?)
     }
 
     pub(crate) fn record_branch(&self, branch: &str) -> Result<()> {
-        self.journal.borrow_mut().record_branch(branch)
+        Ok(self.journal.borrow_mut().record_branch(branch)?)
     }
 
     pub(crate) fn record_commit(&self, commit: &str) -> Result<()> {
-        self.journal.borrow_mut().record_commit(commit)
+        Ok(self.journal.borrow_mut().record_commit(commit)?)
     }
 
     pub(crate) fn record_pull_request(&self, url: &str, number: u64) -> Result<()> {
-        self.journal.borrow_mut().record_pull_request(url, number)
+        Ok(self.journal.borrow_mut().record_pull_request(url, number)?)
     }
 
     pub(crate) fn update_run(&self, status: AgentRunStatus, message: Option<&str>) -> Result<()> {

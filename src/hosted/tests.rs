@@ -95,9 +95,22 @@ fn hosted_lease_retries_transient_errors_and_stops_on_permanent_loss() {
                 "lease owner changed".into()
             )),
         ),
-        HostedHeartbeatAction::Stop(HostedStopReason::Infrastructure(
-            "heartbeat failed: lease owner changed".into()
-        ))
+        HostedHeartbeatAction::Stop(HostedStopReason::LeaseLost("lease owner changed".into()))
+    );
+}
+
+#[test]
+fn hosted_lease_loss_suppresses_stale_terminal_writes() {
+    let error = anyhow!(HostedLeaseLost {
+        operation: "heartbeat",
+        detail: "lease owner changed".into(),
+    });
+    assert!(!may_publish_hosted_terminal_state(&error));
+    assert_eq!(
+        classify_hosted_execution_failure(&error)
+            .expect("typed lease loss")
+            .terminal_outcome(),
+        crate::error::TerminalOutcome::LeaseLost
     );
 }
 
@@ -1469,8 +1482,11 @@ fn recovery_publication_rejects_zero_diff_stale_validation_and_terminal_state() 
 
 #[test]
 fn orchestration_recovery_wrapper_is_narrow_and_one_shot() {
-    let invariant = anyhow!("illegal hosted lifecycle transition from repair to validation")
-        .context("hosted execution failed");
+    let invariant = anyhow!(HostedInvariantFailure::new(
+        "illegal_lifecycle_transition",
+        "illegal hosted lifecycle transition from repair to validation",
+    ))
+    .context("hosted execution failed");
     assert!(is_hosted_orchestration_invariant_error(&invariant));
     assert!(!is_hosted_orchestration_invariant_error(&anyhow!(
         "required validation command failed"
@@ -8932,7 +8948,9 @@ fn startup_provider_schema_failure_preserves_exact_code_path_and_zero_dispatch_e
         "strict": true
     }]);
     let validation = validate_provider_tool_definitions(&invalid).unwrap_err();
-    let error = anyhow::Error::new(HostedProviderContractFailure::from_validation(validation));
+    let error = anyhow::Error::new(HostedProviderContractFailure::from_validation(anyhow!(
+        ProviderProtocolDiagnostic::new("ai_tool_schema_invalid", validation)
+    )));
 
     let (code, message) = safe_failure(&error, false);
     assert_eq!(code, "ai_tool_schema_invalid");

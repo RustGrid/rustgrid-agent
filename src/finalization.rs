@@ -21,28 +21,32 @@ pub(crate) fn finalize(
             reporter.update_run(AgentRunStatus::Succeeded, Some(summary.output_summary()))?;
             Ok(summary)
         }
-        RunOutcome::LeaseLost(error) => {
+        RunOutcome::LeaseLost(failure) => {
             let _ = reporter.record_error("run lease ownership was lost");
+            let error = anyhow::Error::new(failure);
             Err(error.context("skipped stale terminal updates"))
         }
-        RunOutcome::Cancelled(error) => {
+        RunOutcome::Cancelled(failure) => {
             report_consumption_for_unsuccessful_run(reporter);
             reporter.cancel()?;
-            Err(error)
+            Err(anyhow::Error::new(failure))
         }
-        RunOutcome::TimedOut(error) => {
+        RunOutcome::TimedOut(failure) => {
             report_consumption_for_unsuccessful_run(reporter);
             reporter.set_phase(RunPhase::TimedOut);
+            let error = anyhow::Error::new(failure);
             reporter.fail(&error)?;
             Err(error)
         }
-        RunOutcome::Blocked(error) => {
+        RunOutcome::Blocked(failure) => {
             report_consumption_for_unsuccessful_run(reporter);
+            let error = anyhow::Error::new(failure);
             reporter.fail(&error)?;
             Err(error)
         }
-        RunOutcome::Failed(error) => {
+        RunOutcome::Failed(failure) => {
             report_consumption_for_unsuccessful_run(reporter);
+            let error = anyhow::Error::new(failure);
             reporter.fail_retryable(&error)?;
             Err(error)
         }

@@ -147,31 +147,13 @@ pub(super) fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, S
             "The requested, resolved, and worker-received model-call budgets did not match.".into(),
         );
     }
-    let text = error.to_string().to_ascii_lowercase();
-    if text.contains("validation") {
-        (
-            "validation_failed".into(),
-            "One or more required repository validation commands failed.".into(),
-        )
-    } else if text.contains("pull request") {
-        (
-            "pull_request_creation_failed".into(),
-            "The hosted execution could not create or verify its pull request.".into(),
-        )
-    } else if text.contains("model-call budget") || text.contains("budget") {
-        (
-            "execution_ai_budget_exceeded".into(),
-            "The hosted execution exhausted its configured AI budget.".into(),
-        )
-    } else {
-        (
-            "orchestration_initialization_failed".into(),
-            format!(
-                "Hosted orchestration failed: {}",
-                truncate_text(&error.to_string(), 2_000)
-            ),
-        )
-    }
+    (
+        "orchestration_initialization_failed".into(),
+        format!(
+            "Hosted orchestration failed: {}",
+            truncate_text(&error.to_string(), 2_000)
+        ),
+    )
 }
 
 pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Value {

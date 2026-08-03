@@ -67,6 +67,7 @@ use authentication::*;
 use contracts::*;
 use control_plane::*;
 use environment::*;
+use errors::*;
 use execution::*;
 use lifecycle_state::*;
 use model_session::*;
@@ -136,7 +137,14 @@ const EXECUTION_PERMISSIONS: [&str; 7] = [
     "mission:read",
 ];
 
-pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
+pub fn execute_github_actions(execution_id: Uuid) -> crate::error::ExecutionResult<()> {
+    execute_github_actions_impl(execution_id).map_err(|error| {
+        classify_hosted_execution_failure(&error)
+            .unwrap_or_else(|| crate::error::ExecutionFailure::from_anyhow(error))
+    })
+}
+
+fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
     let environment = GithubActionsEnvironment::load(execution_id)?;
     environment.require_execute_context()?;
     let git_author = environment.git_author()?;
@@ -277,6 +285,10 @@ pub fn execute_github_actions(execution_id: Uuid) -> Result<()> {
                 "hosted execution produced invalid terminal mission outcome `{}`",
                 result.completeness.status.as_str()
             ))
+        }
+        Err(error) if !may_publish_hosted_terminal_state(&error) => {
+            eprintln!("[warning] {error}; skipped stale hosted terminal updates");
+            Err(error)
         }
         Err(error)
             if error
@@ -576,8 +588,8 @@ fn reconcile_hosted_heartbeat(
             }
             HostedHeartbeatAction::Stop(match failure {
                 HostedLeaseFailure::Cancelled => HostedStopReason::Cancellation,
-                HostedLeaseFailure::Temporary(message)
-                | HostedLeaseFailure::Invalidated(message) => HostedStopReason::Infrastructure(
+                HostedLeaseFailure::Invalidated(message) => HostedStopReason::LeaseLost(message),
+                HostedLeaseFailure::Temporary(message) => HostedStopReason::Infrastructure(
                     truncate_text(&format!("heartbeat failed: {message}"), 2_000),
                 ),
             })
@@ -590,10 +602,10 @@ impl HostedLeaseControlPlane for HostedApiClient {
         self.heartbeat().map_err(|error| {
             let hosted = error.downcast_ref::<HostedHttpError>();
             if hosted.is_some_and(|failure| {
-                failure
-                    .effective_code()
-                    .to_ascii_lowercase()
-                    .contains("cancel")
+                matches!(
+                    failure.effective_code(),
+                    "execution_cancelled" | "execution_completion_preempted_by_cancellation"
+                )
             }) {
                 HostedLeaseFailure::Cancelled
             } else if hosted.is_some_and(HostedHttpError::invalidates_execution) {
@@ -608,6 +620,7 @@ impl HostedLeaseControlPlane for HostedApiClient {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HostedStopReason {
     Cancellation,
+    LeaseLost(String),
     Infrastructure(String),
 }
 
@@ -1058,7 +1071,10 @@ fn run_hosted_execution(
                     PhaseDecision::Transition(ExecutionPhase::Validation)
                 ) && agent.phases.active() != ExecutionPhase::Validation
                 {
-                    bail!("validation repair left required implementation targets unresolved");
+                    return Err(anyhow!(HostedInvariantFailure::new(
+                        "required_implementation_targets_unresolved",
+                        "validation repair left required implementation targets unresolved",
+                    )));
                 }
                 validation_round = validation_round.saturating_add(1);
                 validation = run_graph_validation_sequence(
@@ -1541,6 +1557,10 @@ fn run_hosted_execution(
             ))
         }
     }
+}
+
+fn may_publish_hosted_terminal_state(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HostedLeaseLost>().is_none()
 }
 
 #[cfg(test)]

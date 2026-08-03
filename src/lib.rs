@@ -5,6 +5,7 @@ pub mod command;
 pub mod config;
 pub mod coordinator;
 pub mod credentials;
+pub mod error;
 mod execution;
 pub mod execution_graph;
 mod executor;

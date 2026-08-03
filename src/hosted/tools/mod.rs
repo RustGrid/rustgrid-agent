@@ -1207,28 +1207,8 @@ pub(in crate::hosted) fn repo_file_sha256(root: &Path, path: &str) -> Option<Str
     Some(hex::encode(Sha256::digest(bytes)))
 }
 
-pub(in crate::hosted) fn classify_write_failure(error: &str) -> (String, Option<usize>) {
-    if error.contains("replace_match_not_unique") {
-        let match_count = error
-            .split("found ")
-            .nth(1)
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse().ok());
-        ("mutation_content_conflict".into(), match_count)
-    } else if error.contains("symbol_match_not_unique") {
-        let match_count = error
-            .split("found ")
-            .nth(1)
-            .and_then(|value| value.split_whitespace().next())
-            .and_then(|value| value.parse().ok());
-        ("mutation_content_conflict".into(), match_count)
-    } else if error.contains("strategy exhausted") || error.contains("line range") {
-        ("mutation_content_conflict".into(), None)
-    } else if error.contains("unified diff") {
-        ("mutation_patch_failed".into(), None)
-    } else {
-        ("mutation_content_conflict".into(), None)
-    }
+pub(in crate::hosted) fn classify_write_failure(_error: &str) -> (String, Option<usize>) {
+    ("mutation_content_conflict".into(), None)
 }
 
 pub(in crate::hosted) fn tool_intent_sha256(name: &str, arguments: &str) -> String {

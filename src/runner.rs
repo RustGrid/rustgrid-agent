@@ -121,7 +121,11 @@ impl Drop for WorkerProcessLock {
     }
 }
 
-pub fn register(context: &AppContext) -> Result<()> {
+pub fn register(context: &AppContext) -> crate::error::ExecutionResult<()> {
+    register_impl(context).map_err(crate::error::ExecutionFailure::from_anyhow)
+}
+
+fn register_impl(context: &AppContext) -> Result<()> {
     console_event("starting", "Connecting to announced RustGrid worker", "36");
     let api = RustGridClient::new(context)?;
     let worker = connect_worker(context, &api)?;
@@ -133,7 +137,14 @@ pub fn register(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub fn run_ticket(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
+pub fn run_ticket(
+    context: &AppContext,
+    ticket_id: &str,
+) -> crate::error::ExecutionResult<RunSummary> {
+    run_ticket_impl(context, ticket_id).map_err(crate::error::ExecutionFailure::from_anyhow)
+}
+
+fn run_ticket_impl(context: &AppContext, ticket_id: &str) -> Result<RunSummary> {
     let _process_lock = WorkerProcessLock::acquire(context)?;
     sweep_workspaces(context, &HashSet::new())?;
     let api = RustGridClient::new(context)?;
@@ -227,7 +238,8 @@ fn execute_claimed(
         )
         .map(|recovery| (recovery.journal, recovery.workspace_id)),
         None => RunJournal::create(&journal_path, &run.id, &ticket.id)
-            .map(|journal| (journal, run.id.clone())),
+            .map(|journal| (journal, run.id.clone()))
+            .map_err(anyhow::Error::new),
     };
     let (mut journal, workspace_id) = match recovery {
         Ok(recovery) => recovery,
@@ -491,10 +503,11 @@ fn execute_claimed(
     let timed_out = supervisor.timed_out();
     drop(supervisor);
     let outcome = RunOutcome::resolve(
-        result,
+        result.map_err(crate::error::ExecutionFailure::from_anyhow),
         lease_lost,
         timed_out,
         running.load(Ordering::SeqCst),
+        shutdown::requested() || shutdown::drain_requested(),
         execution_policy.timeout_seconds,
     );
     if let Some(handle) = executor_handle.borrow().as_ref() {
@@ -1244,7 +1257,15 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
     Ok(summary)
 }
 
-pub fn watch(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
+pub fn watch(
+    context: &AppContext,
+    interval: Duration,
+    once: bool,
+) -> crate::error::ExecutionResult<()> {
+    watch_impl(context, interval, once).map_err(crate::error::ExecutionFailure::from_anyhow)
+}
+
+fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
     let _process_lock = WorkerProcessLock::acquire(context)?;
     if once && context.config.max_concurrency != 1 {
         bail!(
@@ -1491,13 +1512,17 @@ fn bounded_text(value: &str, max: usize) -> String {
     format!("{}\n...[truncated]", &value[..end])
 }
 
-pub fn serve(context: &AppContext, interval: Duration) -> Result<()> {
+pub fn serve(context: &AppContext, interval: Duration) -> crate::error::ExecutionResult<()> {
+    serve_impl(context, interval).map_err(crate::error::ExecutionFailure::from_anyhow)
+}
+
+fn serve_impl(context: &AppContext, interval: Duration) -> Result<()> {
     context
         .config
         .executor
         .validate_production(context.config.max_concurrency)?;
     Executor::from_config(&context.config.executor).preflight(&context.workspace_root)?;
-    watch(context, interval, false)
+    watch_impl(context, interval, false)
 }
 
 fn sweep_workspaces(context: &AppContext, protected_run_ids: &HashSet<String>) -> Result<()> {

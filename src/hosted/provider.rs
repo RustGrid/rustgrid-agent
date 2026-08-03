@@ -591,7 +591,7 @@ impl ModelActionProfile {
             Some(ExecutionDecision::ExecuteTarget {
                 action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
                 ..
-            }) if mutation_failure_requires_replacement(&failure.message) => Self {
+            }) if mutation_failure_requires_replacement(failure) => Self {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
                 forced_tool: Some("replace_file"),
@@ -740,9 +740,7 @@ pub(super) fn hosted_tools_for_action(
         Some(ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
             ..
-        }) if mutation_failure_requires_replacement(&failure.message) => {
-            Some(&["replace_file"][..])
-        }
+        }) if mutation_failure_requires_replacement(failure) => Some(&["replace_file"][..]),
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
@@ -1025,7 +1023,7 @@ pub(super) fn hosted_agent_instructions_for_decision(
                     target, failure, ..
                 },
             ..
-        }) if mutation_failure_requires_replacement(&failure.message) => format!(
+        }) if mutation_failure_requires_replacement(failure) => format!(
             "Repair exactly `{}` with one forced `replace_file` call. Use the exact current target content and mutation_repair diagnostic in the authoritative input. The rejected patch was not applied. Return the complete replacement file, preserve unrelated behavior, and do not emit another patch or inspect another path.",
             target.path
         ),
@@ -1042,15 +1040,10 @@ pub(super) fn hosted_agent_instructions_for_decision(
     }
 }
 
-pub(super) fn mutation_failure_requires_replacement(message: &str) -> bool {
-    [
-        "mutation_application_failure:invalid_patch_target",
-        "mutation_application_failure:invalid_patch_syntax",
-        "mutation_application_failure:patch_context_mismatch",
-        "mutation_application_failure:patch_would_modify_unexpected_path",
-    ]
-    .iter()
-    .any(|category| message.contains(category))
+pub(super) fn mutation_failure_requires_replacement(
+    failure: &crate::execution_graph::FailureRecord,
+) -> bool {
+    failure.category == crate::execution_graph::FailureCategory::MutationConflict
 }
 
 pub(super) fn hosted_agent_instructions(phase: ExecutionPhase) -> String {

@@ -207,7 +207,7 @@ impl<'a> GatewayAgent<'a> {
         let target = authorize_planned_target(plan, &change_id, path)?;
         safe_repo_path(&self.repo.root, path, target.new_file).map_err(|error| {
             MutationPreflightError {
-                code: if error.to_string().contains("escape") {
+                code: if error.kind == RepoPathErrorKind::NotAllowed {
                     "mutation_target_outside_repository"
                 } else {
                     "mutation_target_path_invalid"

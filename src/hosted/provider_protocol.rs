@@ -144,13 +144,23 @@ pub(super) fn validate_provider_request_envelope(request: &Value) -> Result<()> 
         }
     }
     if let Some(tools) = request.get("tools") {
-        validate_provider_tool_definitions(tools)?;
+        validate_provider_tool_definitions(tools).map_err(|error| {
+            anyhow!(ProviderProtocolDiagnostic::new(
+                "ai_tool_schema_invalid",
+                error,
+            ))
+        })?;
     }
     if let Some(tool_choice) = request.get("tool_choice") {
         validate_provider_tool_choice(tool_choice, request.get("tools"))?;
     }
     if let Some(text) = request.get("text") {
-        validate_provider_text_configuration(text)?;
+        validate_provider_text_configuration(text).map_err(|error| {
+            anyhow!(ProviderProtocolDiagnostic::new(
+                "ai_response_schema_invalid",
+                error,
+            ))
+        })?;
     }
     if let Some(metadata) = request.get("metadata") {
         let metadata = metadata

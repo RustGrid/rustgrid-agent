@@ -1,6 +1,52 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::hosted) enum RepoPathErrorKind {
+    NotAllowed,
+    NotFound,
+    Infrastructure,
+}
+
+#[derive(Debug)]
+pub(in crate::hosted) struct RepoPathError {
+    pub(in crate::hosted) kind: RepoPathErrorKind,
+    message: String,
+    source: Option<std::io::Error>,
+}
+
+impl RepoPathError {
+    fn new(kind: RepoPathErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn io(kind: RepoPathErrorKind, message: impl Into<String>, source: std::io::Error) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+}
+
+impl std::fmt::Display for RepoPathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RepoPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &dyn std::error::Error)
+    }
+}
+
 #[cfg(test)]
 pub(in crate::hosted) fn validate_model_command(value: &str) -> Result<()> {
     if value.contains('\n') || value.contains('\r') {
@@ -59,50 +105,85 @@ pub(in crate::hosted) fn safe_repo_path(
     root: &Path,
     value: &str,
     allow_missing: bool,
-) -> Result<PathBuf> {
+) -> std::result::Result<PathBuf, RepoPathError> {
     let relative = Path::new(value);
     if relative.is_absolute() {
-        bail!("repository tool path must be relative");
+        return Err(RepoPathError::new(
+            RepoPathErrorKind::NotAllowed,
+            "repository tool path must be relative",
+        ));
     }
     let mut normalized = PathBuf::new();
     for component in relative.components() {
         match component {
             Component::CurDir => {}
             Component::Normal(name) if name != ".git" => normalized.push(name),
-            Component::Normal(_) => bail!("repository tools cannot access .git"),
-            _ => bail!("repository tool path cannot escape the checkout"),
+            Component::Normal(_) => {
+                return Err(RepoPathError::new(
+                    RepoPathErrorKind::NotAllowed,
+                    "repository tools cannot access .git",
+                ));
+            }
+            _ => {
+                return Err(RepoPathError::new(
+                    RepoPathErrorKind::NotAllowed,
+                    "repository tool path cannot escape the checkout",
+                ));
+            }
         }
     }
     if normalized.as_os_str().is_empty() {
         normalized.push(".");
     }
-    let root = root
-        .canonicalize()
-        .context("could not canonicalize repository root")?;
+    let root = root.canonicalize().map_err(|source| {
+        RepoPathError::io(
+            RepoPathErrorKind::Infrastructure,
+            "could not canonicalize repository root",
+            source,
+        )
+    })?;
     let candidate = root.join(&normalized);
     let mut cursor = root.clone();
     for component in normalized.components() {
         cursor.push(component.as_os_str());
         match fs::symlink_metadata(&cursor) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("repository tools cannot traverse symbolic links")
+                return Err(RepoPathError::new(
+                    RepoPathErrorKind::NotAllowed,
+                    "repository tools cannot traverse symbolic links",
+                ));
             }
             Ok(_) => {}
             Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
                 break;
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("could not inspect repository path {value}"));
+                let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                    RepoPathErrorKind::NotFound
+                } else {
+                    RepoPathErrorKind::Infrastructure
+                };
+                return Err(RepoPathError::io(
+                    kind,
+                    format!("could not inspect repository path {value}"),
+                    error,
+                ));
             }
         }
     }
     if candidate.exists() {
-        let canonical = candidate
-            .canonicalize()
-            .with_context(|| format!("could not canonicalize repository path {value}"))?;
+        let canonical = candidate.canonicalize().map_err(|source| {
+            RepoPathError::io(
+                RepoPathErrorKind::Infrastructure,
+                format!("could not canonicalize repository path {value}"),
+                source,
+            )
+        })?;
         if !canonical.starts_with(&root) {
-            bail!("repository tool path escaped the checkout");
+            return Err(RepoPathError::new(
+                RepoPathErrorKind::NotAllowed,
+                "repository tool path escaped the checkout",
+            ));
         }
     }
     Ok(candidate)
@@ -170,12 +251,10 @@ pub(in crate::hosted) enum FileReadStatus {
 }
 
 pub(in crate::hosted) fn read_error_progress_class(error: &str) -> ToolProgressClass {
-    if error.contains("repository_access_failed") {
-        ToolProgressClass::BlockingFailure
-    } else if error.contains("duplicate") {
-        ToolProgressClass::Duplicate
-    } else {
-        ToolProgressClass::RecoverableFailure
+    match error {
+        "repository_access_failed" => ToolProgressClass::BlockingFailure,
+        "duplicate_read" | "duplicate_search" => ToolProgressClass::Duplicate,
+        _ => ToolProgressClass::RecoverableFailure,
     }
 }
 
@@ -273,17 +352,10 @@ pub(in crate::hosted) fn prevalidate_repo_file(
         Ok(path) => path,
         Err(error) => {
             let message = error.to_string();
-            let code = if message.contains("could not inspect repository path") {
-                "path_not_found"
-            } else if message.contains("symbolic")
-                || message.contains("escape")
-                || message.contains("absolute")
-                || message.contains("cannot access .git")
-                || message.contains("must be relative")
-            {
-                "path_not_allowed"
-            } else {
-                "repository_access_failed"
+            let code = match error.kind {
+                RepoPathErrorKind::NotAllowed => "path_not_allowed",
+                RepoPathErrorKind::NotFound => "path_not_found",
+                RepoPathErrorKind::Infrastructure => "repository_access_failed",
             };
             return Err(Box::new(failed_file_read(value, code, message, None, None)));
         }

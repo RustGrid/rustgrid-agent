@@ -933,7 +933,8 @@ impl RustGridClient {
                     status,
                     path: path.to_owned(),
                     request_id,
-                    body: truncate(&text, 2000),
+                    error_code: response_error_code(&text),
+                    body: truncate(&redact_remote_body(&text), 2000),
                 });
             }
             if text.trim().is_empty() {
@@ -943,6 +944,7 @@ impl RustGridClient {
                 status,
                 path: path.to_owned(),
                 request_id,
+                error_code: None,
                 body: format!("invalid JSON response: {error}"),
             })?;
             return Ok((value, etag));
@@ -1001,25 +1003,66 @@ fn retry_delay(attempt: u32, session_id: Uuid, policy: RetryPolicy) -> Duration 
 
 pub fn is_lease_lost(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
-        let detail = failure.body.to_ascii_lowercase();
-        let identifies_lease_loss = detail.contains("lease")
-            || detail.contains("ownership")
-            || detail.contains("assigned worker");
         (failure.status == StatusCode::NOT_FOUND && failure.path.ends_with("/lease"))
             || (failure.status == StatusCode::CONFLICT
                 && (failure.path.ends_with("/lease")
                     || ((failure.path.ends_with("/events")
                         || failure.path.ends_with("/manifest")
                         || failure.path.ends_with("/github-token"))
-                        && identifies_lease_loss)))
+                        && matches!(
+                            failure.error_code.as_deref(),
+                            Some(
+                                "lease_lost"
+                                    | "run_lease_lost"
+                                    | "worker_lease_lost"
+                                    | "execution_lost"
+                                    | "execution_ownership_lost"
+                                    | "assigned_worker_mismatch"
+                            )
+                        ))))
     })
+}
+
+pub(crate) fn typed_access_error(error: &anyhow::Error) -> Option<crate::error::AccessError> {
+    let failure = error.downcast_ref::<HttpFailure>()?;
+    match failure.status {
+        StatusCode::UNAUTHORIZED => Some(crate::error::AccessError::AuthenticationRejected),
+        StatusCode::FORBIDDEN => Some(crate::error::AccessError::AuthorizationRejected),
+        _ => None,
+    }
+}
+
+pub(crate) fn typed_control_plane_error(
+    error: &anyhow::Error,
+) -> Option<crate::error::ControlPlaneError> {
+    let failure = error.downcast_ref::<HttpFailure>()?;
+    let fields = (
+        failure.path.clone(),
+        Some(failure.status.as_u16()),
+        failure.request_id.clone(),
+    );
+    Some(
+        if failure.status == StatusCode::TOO_MANY_REQUESTS || failure.status.is_server_error() {
+            crate::error::ControlPlaneError::Retryable {
+                operation: fields.0,
+                status: fields.1,
+                request_id: fields.2,
+            }
+        } else {
+            crate::error::ControlPlaneError::Rejected {
+                operation: fields.0,
+                status: fields.1,
+                request_id: fields.2,
+            }
+        },
+    )
 }
 
 fn is_idle_stream_timeout(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ) || error.to_string().to_ascii_lowercase().contains("timed out")
+    )
 }
 
 #[derive(Debug)]
@@ -1027,6 +1070,7 @@ struct HttpFailure {
     status: StatusCode,
     path: String,
     request_id: Option<String>,
+    error_code: Option<String>,
     body: String,
 }
 
@@ -1036,6 +1080,7 @@ impl HttpFailure {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             path: path.to_owned(),
             request_id: None,
+            error_code: None,
             body: error.to_string(),
         }
     }
@@ -1058,6 +1103,54 @@ impl std::fmt::Display for HttpFailure {
 }
 
 impl std::error::Error for HttpFailure {}
+
+fn response_error_code(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("code")
+        .or_else(|| value.get("error").and_then(|error| error.get("code")))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn redact_remote_body(body: &str) -> String {
+    fn redact(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let normalized = key.to_ascii_lowercase();
+                    if [
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                        "api_key",
+                    ]
+                    .iter()
+                    .any(|sensitive| normalized.contains(sensitive))
+                    {
+                        *value = Value::String("<redacted>".into());
+                    } else {
+                        redact(value);
+                    }
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(redact),
+            Value::String(text) => {
+                *text = crate::error::redact_diagnostic(std::mem::take(text));
+            }
+            _ => {}
+        }
+    }
+
+    if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+        redact(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| "remote error response was invalid".into())
+    } else {
+        crate::error::redact_diagnostic(body.to_owned())
+    }
+}
 
 fn deserialize_envelope<T: DeserializeOwned>(mut value: Value, keys: &[&str]) -> Result<T> {
     for key in keys {
@@ -1131,6 +1224,7 @@ mod tests {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/lease".into(),
             request_id: None,
+            error_code: Some("run_lease_lost".into()),
             body: "run lease ownership was lost".into(),
         });
         assert!(is_conflict(&conflict));
@@ -1140,6 +1234,7 @@ mod tests {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/manifest".into(),
             request_id: None,
+            error_code: Some("manifest_ambiguous".into()),
             body: "multiple repositories".into(),
         });
         assert!(!is_lease_lost(&ambiguous_manifest));
@@ -1148,6 +1243,7 @@ mod tests {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/manifest".into(),
             request_id: None,
+            error_code: Some("run_lease_lost".into()),
             body: "agent run lease is not active for this worker".into(),
         });
         assert!(is_lease_lost(&expired_manifest));
@@ -1156,6 +1252,7 @@ mod tests {
             status: StatusCode::CONFLICT,
             path: "agent-runs/run/github-token".into(),
             request_id: None,
+            error_code: Some("github_permissions_invalid".into()),
             body: "GitHub App installation requires contents:write".into(),
         });
         assert!(!is_lease_lost(&github_permissions));
@@ -1164,6 +1261,7 @@ mod tests {
             status: StatusCode::SERVICE_UNAVAILABLE,
             path: "agent-runs/run/lease".into(),
             request_id: None,
+            error_code: None,
             body: "retry".into(),
         });
         assert!(!is_conflict(&transient));
@@ -1181,6 +1279,17 @@ mod tests {
         assert!(!is_idempotency_busy_body(
             r#"{"error":"agent run lease is not active for this worker","code":"conflict"}"#
         ));
+    }
+
+    #[test]
+    fn remote_error_diagnostics_redact_secret_fields_and_bearer_values() {
+        let secret = "rg_secret_123";
+        let body = format!(
+            r#"{{"code":"denied","access_token":"{secret}","message":"authorization Bearer {secret}"}}"#
+        );
+        let redacted = redact_remote_body(&body);
+        assert!(!redacted.contains(secret));
+        assert!(redacted.contains("<redacted>"));
     }
 
     #[test]

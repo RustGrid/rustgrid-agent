@@ -95,7 +95,11 @@ fn run() -> Result<()> {
         Commands::Execute {
             provider: ExecutionProvider::GithubActions,
             execution_id,
-        } => return rustgrid_agent::hosted::execute_github_actions(*execution_id),
+        } => {
+            return Ok(rustgrid_agent::hosted::execute_github_actions(
+                *execution_id,
+            )?);
+        }
         Commands::ReportEmergencyFailure {
             provider: ExecutionProvider::GithubActions,
             execution_id,
@@ -125,19 +129,23 @@ fn run() -> Result<()> {
         Commands::Register => {
             eprintln!("[warning] `register` is deprecated; use `rustgrid-agent login`");
             let context = AppContext::load(&config_path)?;
-            runner::register(&context)
+            Ok(runner::register(&context)?)
         }
         Commands::Run { ticket_id } => {
             let context = AppContext::load(&config_path)?;
-            runner::run_ticket(&context, &ticket_id).map(|_| ())
+            Ok(runner::run_ticket(&context, &ticket_id).map(|_| ())?)
         }
         Commands::Watch { interval, once } => {
             let context = AppContext::load(&config_path)?;
-            runner::watch(&context, Duration::from_secs(interval), once)
+            Ok(runner::watch(
+                &context,
+                Duration::from_secs(interval),
+                once,
+            )?)
         }
         Commands::Serve { interval } => {
             let context = AppContext::load(&config_path)?;
-            runner::serve(&context, Duration::from_secs(interval))
+            Ok(runner::serve(&context, Duration::from_secs(interval))?)
         }
         Commands::Status { json } => {
             let context = AppContext::load(&config_path)?;

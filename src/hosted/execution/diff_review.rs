@@ -9,7 +9,10 @@ impl<'a> GatewayAgent<'a> {
             .iter()
             .any(|gate| gate.required && gate.status != ValidationStatus::Passed)
         {
-            bail!("lifecycle invariant violated: diff review requires every required gate to pass");
+            return Err(anyhow!(HostedInvariantFailure::new(
+                "diff_review_before_validation",
+                "diff review requires every required gate to pass",
+            )));
         }
         let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
         let changed = changed_paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -29,7 +32,10 @@ impl<'a> GatewayAgent<'a> {
             PhaseDecision::Transition(ExecutionPhase::DiffReview)
         ) && self.phases.active() != ExecutionPhase::DiffReview
         {
-            bail!("lifecycle invariant violated: diff review requires the validation phase");
+            return Err(anyhow!(HostedInvariantFailure::new(
+                "diff_review_phase_invalid",
+                "diff review requires the validation phase",
+            )));
         }
         let node_id = self.graph_node_id(crate::execution_graph::ExecutionNodeKind::DiffReview)?;
         let evidence_ids = self

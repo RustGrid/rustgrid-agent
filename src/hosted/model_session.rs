@@ -929,7 +929,10 @@ impl<'a> GatewayAgent<'a> {
         if !matches!(decision, PhaseDecision::Transition(ExecutionPhase::Repair))
             && self.phases.active() != ExecutionPhase::Repair
         {
-            bail!("lifecycle invariant violated: failed validation must enter repair");
+            return Err(anyhow!(HostedInvariantFailure::new(
+                "validation_repair_transition_invalid",
+                "failed validation must enter repair",
+            )));
         }
         let diagnostics = failures
             .iter()
@@ -1993,8 +1996,12 @@ impl<'a> GatewayAgent<'a> {
                         .get("error")
                         .and_then(Value::as_str)
                         .unwrap_or("tool operation failed");
+                    let error_code = result
+                        .get("error_code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool_operation_failed");
                     progress_detail = truncate_text(error, 1_000);
-                    if error.contains("localized_discovery_complete") {
+                    if error_code == "localized_discovery_complete" {
                         progress_class = ToolProgressClass::ActionRedirected;
                         progress_detail =
                             "localized discovery evidence is complete; finalize the impact map"
@@ -2019,7 +2026,7 @@ impl<'a> GatewayAgent<'a> {
                         }
                         progress_class = read_error_progress_class(error);
                     } else if name == "search_text" {
-                        progress_class = if error.contains("duplicate_search") {
+                        progress_class = if error_code == "duplicate_search" {
                             ToolProgressClass::Duplicate
                         } else {
                             ToolProgressClass::RecoverableFailure

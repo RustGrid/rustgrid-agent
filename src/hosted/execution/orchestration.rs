@@ -436,6 +436,13 @@ impl<'a> GatewayAgent<'a> {
             .lock()
             .expect("hosted stop reason lock poisoned")
             .clone();
+        if let Some(HostedStopReason::LeaseLost(detail)) = stop_reason.as_ref() {
+            let _ = self.containment.drain();
+            return Err(anyhow!(HostedLeaseLost {
+                operation: "heartbeat",
+                detail: detail.clone(),
+            }));
+        }
         if let Some(HostedStopReason::Infrastructure(detail)) = stop_reason {
             let _ = self.containment.drain();
             self.reconcile_authoritative_target_state()?;
@@ -1594,7 +1601,12 @@ impl<'a> GatewayAgent<'a> {
             &self.notebook.validation_evidence,
             &snapshot.current_repository.fingerprint,
         )
-        .map_err(|error| anyhow!("lifecycle invariant violated: {error}"))?;
+        .map_err(|error| {
+            anyhow!(HostedInvariantFailure::new(
+                "lifecycle_invariant_violated",
+                error,
+            ))
+        })?;
         let unresolved = snapshot.failures.has_unresolved();
         let status = implementation_completion_status(
             &self.notebook.intended_changes,

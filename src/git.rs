@@ -38,6 +38,10 @@ impl RemoteBranchMoved {
             branch: branch.into(),
         }
     }
+
+    pub(crate) fn branch(&self) -> &str {
+        &self.branch
+    }
 }
 
 impl std::fmt::Display for RemoteBranchMoved {

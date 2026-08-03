@@ -424,7 +424,27 @@ pub enum DirectOperation {
     AddComment { body: String },
 }
 
-pub fn direct_operation(manifest: &ExecutionManifest) -> anyhow::Result<Option<DirectOperation>> {
+#[derive(Debug)]
+pub struct MissionContractError {
+    message: String,
+    source: serde_json::Error,
+}
+
+impl std::fmt::Display for MissionContractError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MissionContractError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub fn direct_operation(
+    manifest: &ExecutionManifest,
+) -> std::result::Result<Option<DirectOperation>, MissionContractError> {
     manifest
         .run
         .metadata
@@ -432,7 +452,10 @@ pub fn direct_operation(manifest: &ExecutionManifest) -> anyhow::Result<Option<D
         .cloned()
         .map(serde_json::from_value)
         .transpose()
-        .map_err(Into::into)
+        .map_err(|source| MissionContractError {
+            message: "execution manifest contains an invalid direct operation".into(),
+            source,
+        })
 }
 
 fn explicit_class(metadata: &serde_json::Value) -> Option<MissionClass> {

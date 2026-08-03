@@ -4,7 +4,53 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-use crate::config::RepoConfig;
+use crate::{config::RepoConfig, error::ManifestError};
+
+pub type ManifestResult<T> = std::result::Result<T, ManifestValidationError>;
+
+#[derive(Debug)]
+pub struct ManifestValidationError {
+    pub kind: ManifestError,
+    message: String,
+    source: ManifestDiagnostic,
+}
+
+#[derive(Debug)]
+struct ManifestDiagnostic(String);
+
+impl std::fmt::Display for ManifestDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ManifestDiagnostic {}
+
+impl ManifestValidationError {
+    fn from_anyhow(kind: ManifestError, error: anyhow::Error) -> Self {
+        let nested_kind = error
+            .downcast_ref::<Self>()
+            .map_or(kind, |failure| failure.kind);
+        let message = error.to_string();
+        Self {
+            kind: nested_kind,
+            message: message.clone(),
+            source: ManifestDiagnostic(message),
+        }
+    }
+}
+
+impl std::fmt::Display for ManifestValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ManifestValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExecutionManifest {
@@ -136,7 +182,13 @@ impl ExecutionPolicy {
 }
 
 impl ExecutionManifest {
-    pub fn fresh_start(&self) -> Result<bool> {
+    pub fn fresh_start(&self) -> ManifestResult<bool> {
+        self.fresh_start_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidSignature, error)
+        })
+    }
+
+    fn fresh_start_impl(&self) -> Result<bool> {
         match self.run.metadata.get("fresh_start") {
             None => Ok(false),
             Some(serde_json::Value::Bool(value)) => Ok(*value),
@@ -144,7 +196,13 @@ impl ExecutionManifest {
         }
     }
 
-    pub fn resume_from_run_id(&self) -> Result<Option<&str>> {
+    pub fn resume_from_run_id(&self) -> ManifestResult<Option<&str>> {
+        self.resume_from_run_id_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidSignature, error)
+        })
+    }
+
+    fn resume_from_run_id_impl(&self) -> Result<Option<&str>> {
         let Some(value) = self.run.metadata.get("resume_from_run_id") else {
             return Ok(None);
         };
@@ -164,7 +222,13 @@ impl ExecutionManifest {
         Ok(Some(source_run_id))
     }
 
-    pub fn validate(&self, run_id: &str, ticket_id: &str) -> Result<()> {
+    pub fn validate(&self, run_id: &str, ticket_id: &str) -> ManifestResult<()> {
+        self.validate_impl(run_id, ticket_id).map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidSignature, error)
+        })
+    }
+
+    fn validate_impl(&self, run_id: &str, ticket_id: &str) -> Result<()> {
         if self.manifest_version != 2 {
             bail!(
                 "unsupported execution manifest version {}",
@@ -238,12 +302,24 @@ impl ExecutionManifest {
         Ok(())
     }
 
-    pub fn policy(&self) -> Result<ExecutionPolicy> {
+    pub fn policy(&self) -> ManifestResult<ExecutionPolicy> {
+        self.policy_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidPolicy, error)
+        })
+    }
+
+    fn policy_impl(&self) -> Result<ExecutionPolicy> {
         serde_json::from_value(self.execution_policy.clone())
             .context("execution manifest contains an invalid execution policy")
     }
 
-    pub fn repo_config(&self) -> Result<RepoConfig> {
+    pub fn repo_config(&self) -> ManifestResult<RepoConfig> {
+        self.repo_config_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidSignature, error)
+        })
+    }
+
+    fn repo_config_impl(&self) -> Result<RepoConfig> {
         let (owner, name) = self
             .repository
             .split_once('/')
@@ -257,7 +333,13 @@ impl ExecutionManifest {
         })
     }
 
-    pub fn normalized_required_workflows(&self) -> Result<Vec<String>> {
+    pub fn normalized_required_workflows(&self) -> ManifestResult<Vec<String>> {
+        self.normalized_required_workflows_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidPolicy, error)
+        })
+    }
+
+    fn normalized_required_workflows_impl(&self) -> Result<Vec<String>> {
         let mut workflows = Vec::new();
         let mut seen = HashSet::new();
         for configured in &self.required_workflows {
@@ -295,7 +377,13 @@ fn validate_https_url(name: &str, value: &str) -> Result<Url> {
 }
 
 impl ExecutionPolicy {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> ManifestResult<()> {
+        self.validate_impl().map_err(|error| {
+            ManifestValidationError::from_anyhow(ManifestError::InvalidPolicy, error)
+        })
+    }
+
+    fn validate_impl(&self) -> Result<()> {
         if self.policy_version != 1
             || !(1..=86_400).contains(&self.timeout_seconds)
             || self.codex.command.is_empty()

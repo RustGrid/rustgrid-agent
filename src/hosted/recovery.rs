@@ -160,16 +160,13 @@ pub(super) fn authorize_recovery_publication(
 }
 
 pub(super) fn is_hosted_orchestration_invariant_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("hosted orchestration invariant")
-            || message.contains("orchestration_invariant")
-            || message.contains("lifecycle invariant")
-            || message.contains("illegal hosted lifecycle transition")
-            || message.contains("hosted orchestrator returned")
-            || message.contains("required implementation targets unresolved")
-            || message.contains("did not produce the expected terminal outcome")
-    })
+    error.downcast_ref::<HostedInvariantFailure>().is_some()
+        || error
+            .downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
+            .is_some()
+        || error
+            .downcast_ref::<crate::execution_graph::GraphInvariantError>()
+            .is_some()
 }
 
 pub(super) fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
