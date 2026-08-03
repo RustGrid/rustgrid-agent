@@ -173,6 +173,9 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
             acceptance_criteria_ids: vec!["ac-1".into()],
             dependency_evidence: Vec::new(),
             current_file_content: Some("export type Theme = 'dark';".into()),
+            target_content_hash: Some(hex::encode(Sha256::digest(b"export type Theme = 'dark';"))),
+            repository_fingerprint: "tree-1".into(),
+            accepted_intent_hash: hex::encode(Sha256::digest(b"extend the persisted theme state")),
             nearby_context: Vec::new(),
             allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
             remaining_node_budget: Default::default(),
@@ -199,6 +202,49 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
             json!(["src/components/theme/ThemeProvider.tsx"])
         );
     }
+
+    let ExecutionDecision::ExecuteTarget {
+        node_id,
+        target: context,
+        ..
+    } = decision
+    else {
+        unreachable!()
+    };
+    let mut failure = crate::execution_graph::FailureRecord::new(
+        "failure-1",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        "tree-1",
+        "mutation_application_failure:patch_context_mismatch: patch context is stale",
+    );
+    failure.target_path = Some(context.target.path.clone());
+    let repair = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id,
+            target: context.target.clone(),
+            failure,
+        },
+        target: context,
+    };
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&repair), 16_384);
+    assert_eq!(
+        profile.tool_choice(),
+        json!({"type": "function", "name": "replace_file"})
+    );
+    assert_eq!(
+        hosted_tools_for_action(ExecutionPhase::Repair, Some(&repair))
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["replace_file"]
+    );
+    assert!(
+        hosted_agent_instructions_for_decision(ExecutionPhase::Repair, Some(&repair))
+            .contains("rejected patch was not applied")
+    );
 }
 
 #[test]
@@ -2181,6 +2227,23 @@ fn test_execution_failure(code: &str, message: &str) -> HostedAgentExecutionFail
         provider_attempts: None,
         actual_cost_micros: None,
     }
+}
+
+#[test]
+fn exhausted_mutation_is_healthy_blocked_and_never_an_initialization_failure() {
+    let mut failure = test_execution_failure(
+        "mutation_application_exhausted",
+        "bounded mutation strategies were rejected",
+    );
+    failure.category = "orchestration_initialization_failed";
+    let failure = super::errors::classify_mutation_application_exhausted(failure);
+    assert_eq!(failure.category, "MutationFailure");
+    assert_eq!(failure.code, "mutation_application_exhausted");
+    assert_eq!(failure.phase, ExecutionPhase::Implementation);
+    assert_eq!(failure.status, "blocked");
+    assert_eq!(failure.mission_outcome, "blocked");
+    assert_eq!(failure.process_health, "healthy");
+    assert!(failure.recoverable);
 }
 
 fn test_environment(execution_id: Uuid) -> GithubActionsEnvironment {
@@ -7135,6 +7198,7 @@ fn resumed_notebook_skips_completed_discovery_and_planning() {
         tool_progress: vec![],
         intended_changes: vec![],
         write_attempts: vec![],
+        mutation_diagnostics: vec![],
         write_preflight_rejections: vec![],
         remaining_work: vec!["Update tokens".into()],
         remaining_work_v2: vec![],
@@ -7813,6 +7877,7 @@ fn test_discovery_notebook(phase: ExecutionPhase) -> WorkerNotebook {
         tool_progress: vec![],
         intended_changes: vec![],
         write_attempts: vec![],
+        mutation_diagnostics: vec![],
         write_preflight_rejections: vec![],
         remaining_work: vec![],
         remaining_work_v2: vec![],

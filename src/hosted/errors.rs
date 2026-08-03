@@ -1,7 +1,31 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
+pub(super) fn classify_mutation_application_exhausted(
+    mut failure: HostedAgentExecutionFailure,
+) -> HostedAgentExecutionFailure {
+    failure.status = "blocked";
+    failure.category = "MutationFailure";
+    failure.process_health = "healthy";
+    failure.mission_outcome = "blocked";
+    failure.blocker = Some("mutation_application_exhausted".into());
+    failure.phase = ExecutionPhase::Implementation;
+    failure.resume_phase = ExecutionPhase::Implementation.as_str().into();
+    failure
+}
+
 impl<'a> GatewayAgent<'a> {
+    pub(super) fn has_unresolved_mutation_application_failure(&self) -> bool {
+        self.notebook
+            .orchestration
+            .failures
+            .unresolved()
+            .any(|failure| {
+                failure.category == crate::execution_graph::FailureCategory::MutationConflict
+                    && failure.message.starts_with("mutation_application_failure:")
+            })
+    }
+
     pub(super) fn emit_guardrail(&self, code: &str, action: &str, message: &str) -> Result<()> {
         self.api.append_event(
             "progress",
@@ -188,6 +212,20 @@ impl<'a> GatewayAgent<'a> {
         failure.mission_outcome = "blocked";
         failure.blocker = Some("no_reviewable_diff".into());
         anyhow!(failure)
+    }
+
+    pub(super) fn mutation_application_exhausted_failure(&self) -> anyhow::Error {
+        let error = self.execution_failure(
+            "mutation_application_exhausted",
+            "The target-bound mutation and its single bounded repair were rejected without changing repository content.",
+            None,
+            true,
+            "Resume from the persisted target context after correcting the recorded mutation blocker.",
+        );
+        let failure = error
+            .downcast::<HostedAgentExecutionFailure>()
+            .expect("execution_failure always returns HostedAgentExecutionFailure");
+        anyhow!(classify_mutation_application_exhausted(failure))
     }
 
     pub(super) fn infrastructure_stop_failure(&self, detail: &str) -> anyhow::Error {

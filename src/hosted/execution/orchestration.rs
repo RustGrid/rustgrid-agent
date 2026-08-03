@@ -1,6 +1,39 @@
 // Extracted from the hosted execution composition root.
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::hosted) enum TargetContextPreparationResult {
+    Prepared,
+    TargetContextAlreadyPrepared,
+}
+
+fn target_context_already_prepared(
+    events: &[crate::execution_graph::ExecutionDomainEvent],
+    node_id: &crate::execution_graph::ExecutionNodeId,
+    target_path: &str,
+    target_content_hash: &Option<String>,
+    repository_fingerprint: &str,
+    accepted_intent_hash: &str,
+) -> bool {
+    events.iter().rev().any(|event| {
+        matches!(
+            event,
+            crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
+                node_id: prepared_node_id,
+                target_path: prepared_target_path,
+                repository_fingerprint: prepared_repository_fingerprint,
+                target_content_hash: prepared_target_content_hash,
+                accepted_intent_hash: prepared_intent_hash,
+                ..
+            } if prepared_node_id == node_id
+                && prepared_target_path == target_path
+                && prepared_repository_fingerprint.as_str() == repository_fingerprint
+                && prepared_target_content_hash == target_content_hash
+                && prepared_intent_hash == accepted_intent_hash
+        )
+    })
+}
+
 impl<'a> GatewayAgent<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::hosted) fn new(
@@ -1169,6 +1202,10 @@ impl<'a> GatewayAgent<'a> {
                 .graph_node_id(ExecutionNodeKind::Planning)
                 .ok()
                 .and_then(|node_id| node_started(&node_id, self)),
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                ..
+            } => None,
             ExecutionDecision::ExecuteTarget { node_id, .. }
             | ExecutionDecision::RepairTarget { node_id, .. }
             | ExecutionDecision::ReviewDiff { node_id }
@@ -1472,6 +1509,24 @@ impl<'a> GatewayAgent<'a> {
                 status,
             });
             context.cached_current_file_content = target.current_file_content.clone();
+            context.target_content_hash = target.target_content_hash.clone();
+            context.repository_fingerprint = target.repository_fingerprint.clone();
+            context.mutation_repair = matches!(
+                self.current_decision.as_ref(),
+                Some(ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                    ..
+                }) | Some(ExecutionDecision::RepairTarget { .. })
+            )
+            .then(|| {
+                self.notebook
+                    .mutation_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| diagnostic.target_path == target.target.path)
+                    .cloned()
+            })
+            .flatten();
             context.cached_nearby_context = target.nearby_context.clone();
             context.graph_node_id = Some(target.node_id.clone());
             context.dependency_evidence = target.dependency_evidence.clone();
@@ -1512,7 +1567,11 @@ impl<'a> GatewayAgent<'a> {
                     .missing_file_contents
                     .retain(|path| path != &target.target.path);
             }
-            context.instruction = "Mutate only current_target using the persisted evidence bundle. Do not rediscover the repository. Return exactly one target-bound mutation, or a concrete typed blocker; verification is deterministic and model-free.".into();
+            context.instruction = if context.mutation_repair.is_some() {
+                "Repair only current_target from its exact current content. The rejected mutation was not applied. Follow mutation_repair.repair_strategy and do not repeat the rejected patch strategy.".into()
+            } else {
+                "Mutate only current_target using the persisted evidence bundle. Do not rediscover the repository. Return exactly one target-bound mutation, or a concrete typed blocker; verification is deterministic and model-free.".into()
+            };
         }
         Ok(context)
     }
@@ -2077,6 +2136,24 @@ impl<'a> GatewayAgent<'a> {
             detail,
         );
         failure.target_path = target_path;
+        let older_failures = self
+            .notebook
+            .orchestration
+            .failures
+            .unresolved_for_node(&node_id)
+            .filter(|older| older.category == category && older.id != failure.id)
+            .map(|older| older.id.clone())
+            .collect::<Vec<_>>();
+        for failure_id in older_failures {
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::FailureSuperseded {
+                    sequence: self.next_domain_event_sequence(),
+                    node_id: node_id.clone(),
+                    failure_id,
+                    repository_fingerprint: failure.repository_fingerprint.clone(),
+                },
+            )?;
+        }
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::MutationRejected {
                 sequence: self.next_domain_event_sequence(),
@@ -2217,6 +2294,35 @@ impl<'a> GatewayAgent<'a> {
             "mutation-{}",
             sha256_text(&format!("{node_id}\0{target_path}\0{fingerprint}"))
         );
+        let superseded_mutation_failures = self
+            .notebook
+            .orchestration
+            .failures
+            .unresolved_for_node(&node_id)
+            .filter(|failure| {
+                failure.category == crate::execution_graph::FailureCategory::MutationConflict
+                    && failure.target_path.as_deref() == Some(target_path)
+            })
+            .map(|failure| failure.id.clone())
+            .collect::<Vec<_>>();
+        for failure_id in superseded_mutation_failures {
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::FailureRecovered {
+                    sequence: self.next_domain_event_sequence(),
+                    node_id: node_id.clone(),
+                    failure_id: failure_id.clone(),
+                    repository_fingerprint: fingerprint.clone(),
+                },
+            )?;
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::FailureSuperseded {
+                    sequence: self.next_domain_event_sequence(),
+                    node_id: node_id.clone(),
+                    failure_id,
+                    repository_fingerprint: fingerprint.clone(),
+                },
+            )?;
+        }
         let sequence = self
             .notebook
             .orchestration
@@ -2245,23 +2351,64 @@ impl<'a> GatewayAgent<'a> {
         Ok(())
     }
 
-    pub(in crate::hosted) fn prepare_active_target_context(&mut self) -> Result<()> {
-        let (node_id, target_path) = match self.current_decision.as_ref() {
+    pub(in crate::hosted) fn prepare_active_target_context(
+        &mut self,
+    ) -> Result<TargetContextPreparationResult> {
+        let (node_id, target_path, accepted_intent_hash) = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
                 node_id,
-                action:
-                    crate::hosted_orchestrator::MutationAction::PrepareTargetContext { target, .. },
+                target: context,
                 ..
-            }) => (node_id.clone(), target.path.clone()),
-            _ => return Ok(()),
+            }) => (
+                node_id.clone(),
+                context.target.path.clone(),
+                context.accepted_intent_hash.clone(),
+            ),
+            _ => return Ok(TargetContextPreparationResult::Prepared),
         };
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
-        let evidence = self
+        let mut evidence = self
             .notebook
             .orchestration
             .evidence
             .reusable_file(&target_path, &fingerprint, None)
             .cloned();
+        if evidence.is_none() {
+            let target = safe_repo_path(&self.repo.root, &target_path, false)?;
+            let content = fs::read_to_string(&target).with_context(|| {
+                format!("could not prepare exact UTF-8 target context for {target_path}")
+            })?;
+            let captured = crate::execution_graph::FileEvidence::capture(
+                &target_path,
+                &fingerprint,
+                None,
+                content,
+                false,
+            );
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::RepositoryEvidenceRecorded {
+                    sequence: self.next_domain_event_sequence(),
+                    evidence_id: captured.evidence_id.clone(),
+                    repository_fingerprint: fingerprint.clone(),
+                    evidence: Some(captured.clone()),
+                },
+            )?;
+            evidence = Some(captured);
+        }
+        let target_content_hash = evidence
+            .as_ref()
+            .map(|evidence| evidence.content_hash.clone());
+        let already_prepared = target_context_already_prepared(
+            &self.notebook.orchestration.domain_events,
+            &node_id,
+            &target_path,
+            &target_content_hash,
+            &fingerprint,
+            &accepted_intent_hash,
+        );
+        if already_prepared {
+            return Ok(TargetContextPreparationResult::TargetContextAlreadyPrepared);
+        }
         let evidence_ids = evidence
             .as_ref()
             .map(|evidence| vec![evidence.evidence_id.clone()])
@@ -2274,6 +2421,8 @@ impl<'a> GatewayAgent<'a> {
                 repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
                     fingerprint.clone(),
                 ),
+                target_content_hash: target_content_hash.clone(),
+                accepted_intent_hash,
                 evidence_ids,
             },
         )?;
@@ -2293,7 +2442,8 @@ impl<'a> GatewayAgent<'a> {
                 "target evidence cache hit",
             );
         }
-        self.persist_orchestration_checkpoint("target_context_prepared", false)
+        self.persist_orchestration_checkpoint("target_context_prepared", false)?;
+        Ok(TargetContextPreparationResult::Prepared)
     }
 
     pub(in crate::hosted) fn record_active_target_mutation_produced(
@@ -2367,10 +2517,39 @@ impl<'a> GatewayAgent<'a> {
             })
             .context("target verification requires a produced mutation event")?;
         let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+        let repository_fingerprint =
+            repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        let mutation_tool = self
+            .notebook
+            .write_attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.target == target_path)
+            .map(|attempt| attempt.tool.clone());
+        let usage = self.notebook.orchestration.budget.usage_for(&node_id);
+        let mutation_attempt = usage.model_calls_consumed;
+        let repair_attempt = usage.repair_attempts;
         if produced.0 != target_path
             || produced.1 == produced.2
             || !changed_paths.contains(&target_path)
         {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.target_verification_completed",
+                    "node_id": node_id,
+                    "target": target_path,
+                    "mutation_tool": mutation_tool.clone(),
+                    "verified": false,
+                    "before_content_hash": produced.1,
+                    "after_content_hash": produced.2,
+                    "repository_fingerprint": repository_fingerprint,
+                    "failure_category": MutationApplicationFailure::MutationProducedNoChange,
+                    "mutation_attempt": mutation_attempt,
+                    "repair_attempt": repair_attempt,
+                }),
+                "target mutation verification",
+            );
             self.record_active_target_failure(
                 crate::execution_graph::FailureCategory::MutationConflict,
                 "MutationNotProduced: deterministic verification found no attributable target change",
@@ -2378,6 +2557,23 @@ impl<'a> GatewayAgent<'a> {
             return Ok(());
         }
         self.record_active_target_applied(&target_path)?;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.target_verification_completed",
+                "node_id": node_id,
+                "target": target_path,
+                "mutation_tool": mutation_tool,
+                "verified": true,
+                "before_content_hash": produced.1,
+                "after_content_hash": produced.2,
+                "repository_fingerprint": repository_fingerprint,
+                "failure_category": Value::Null,
+                "mutation_attempt": mutation_attempt,
+                "repair_attempt": repair_attempt,
+            }),
+            "target mutation verification",
+        );
         self.persist_orchestration_checkpoint("target_state_verified", true)
     }
 
@@ -2393,6 +2589,11 @@ impl<'a> GatewayAgent<'a> {
             }
             | ExecutionDecision::Finish { .. } => Ok(result.phase_decision),
             ExecutionDecision::StopForGuardrail { outcome, reason } => {
+                if reason == crate::execution_graph::GuardrailReason::NodeBudgetExhausted
+                    && self.has_unresolved_mutation_application_failure()
+                {
+                    return Err(self.mutation_application_exhausted_failure());
+                }
                 Err(self.execution_failure(
                     "execution_graph_guardrail",
                     format!(
@@ -2485,5 +2686,41 @@ impl<'a> GatewayAgent<'a> {
             "remote reconciliation finalization proof",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_context_identity_is_idempotent_and_fingerprint_bound() {
+        let node_id = crate::execution_graph::ExecutionNodeId::new("source-000");
+        let content_hash = Some("content-1".to_owned());
+        let event = crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
+            sequence: 1,
+            node_id: node_id.clone(),
+            target_path: "src/theme.ts".into(),
+            repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new("tree-1"),
+            target_content_hash: content_hash.clone(),
+            accepted_intent_hash: "intent-1".into(),
+            evidence_ids: vec!["file-1".into()],
+        };
+        assert!(target_context_already_prepared(
+            std::slice::from_ref(&event),
+            &node_id,
+            "src/theme.ts",
+            &content_hash,
+            "tree-1",
+            "intent-1",
+        ));
+        assert!(!target_context_already_prepared(
+            std::slice::from_ref(&event),
+            &node_id,
+            "src/theme.ts",
+            &content_hash,
+            "tree-2",
+            "intent-1",
+        ));
     }
 }

@@ -501,11 +501,17 @@ fn decision_for_node(
                         event,
                         ExecutionDomainEvent::TargetContextPrepared {
                             node_id,
+                            target_path,
                             repository_fingerprint,
+                            target_content_hash,
+                            accepted_intent_hash,
                             ..
                         } if node_id == &node.id
+                            && target_path == &target.target.path
                             && repository_fingerprint.as_str()
                                 == snapshot.current_repository.fingerprint
+                            && target_content_hash == &target.target_content_hash
+                            && accepted_intent_hash == &target.accepted_intent_hash
                     )
                 });
                 let mutation_produced =
@@ -783,7 +789,7 @@ fn unresolved_failure_for_node<'a>(
     snapshot
         .failures
         .unresolved_for_node(node_id)
-        .next()
+        .max_by_key(|failure| failure.attempt)
         .ok_or_else(|| {
             OrchestrationInvariantError::for_node(
                 "recoverable_node_without_failure",
@@ -980,6 +986,7 @@ pub fn classify_mutation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn target(change_id: &str, path: &str) -> PlannedTarget {
         PlannedTarget {
@@ -1078,6 +1085,8 @@ mod tests {
                 target_path: "src/theme.ts".into(),
                 repository_fingerprint: RepositoryFingerprint::new("tree-1"),
                 evidence_ids: vec!["file-current".into()],
+                target_content_hash: None,
+                accepted_intent_hash: hex::encode(Sha256::digest(b"change src/theme.ts")),
             });
         assert!(matches!(
             reconcile_execution(&state).expect("mutate decision"),

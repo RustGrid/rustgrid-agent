@@ -10,6 +10,45 @@ pub(super) use search::*;
 use super::*;
 
 impl<'a> GatewayAgent<'a> {
+    fn active_mutation_context(&self) -> Option<(String, Option<String>, String)> {
+        let context = match self.current_decision.as_ref()? {
+            ExecutionDecision::ExecuteTarget { target, .. } => target,
+            ExecutionDecision::RepairTarget { context, .. } => &context.target,
+            _ => return None,
+        };
+        Some((
+            context.target.path.clone(),
+            context.target_content_hash.clone(),
+            context.repository_fingerprint.clone(),
+        ))
+    }
+
+    fn active_mutation_attempts(
+        &self,
+    ) -> (Option<crate::execution_graph::ExecutionNodeId>, usize, u32) {
+        let node_id = self
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id)
+            .cloned();
+        let mutation_attempt = node_id.as_ref().map_or(0, |node_id| {
+            self.notebook
+                .orchestration
+                .graph
+                .as_ref()
+                .and_then(|graph| graph.node(node_id))
+                .map_or(0, |node| node.attempts.len())
+        });
+        let repair_attempt = node_id.as_ref().map_or(0, |node_id| {
+            self.notebook
+                .orchestration
+                .budget
+                .usage_for(node_id)
+                .repair_attempts
+        });
+        (node_id, mutation_attempt, repair_attempt)
+    }
+
     pub(in crate::hosted) fn execute_tool(
         &mut self,
         name: &str,
@@ -450,7 +489,16 @@ impl<'a> GatewayAgent<'a> {
                     .and_then(Value::as_str)
                     .filter(|value| value.len() <= MAX_MODEL_FILE_BYTES)
                     .context("tool argument `new_text` is missing or too large")?;
-                replace_unique_repo_text(&self.repo.root, path, old_text, new_text)
+                apply_structured_edit(
+                    &self.repo.root,
+                    &StructuredEdit::ReplaceExactText {
+                        path: path.to_owned(),
+                        expected: old_text.to_owned(),
+                        replacement: new_text.to_owned(),
+                        expected_occurrences: 1,
+                    },
+                    None,
+                )
             }
             "replace_range" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
@@ -473,25 +521,113 @@ impl<'a> GatewayAgent<'a> {
                 let path = required_tool_string(object, "path", 4_096)?;
                 let symbol = required_tool_string(object, "symbol", MAX_MODEL_FILE_BYTES)?;
                 let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
-                insert_relative_to_symbol(
-                    &self.repo.root,
-                    path,
-                    symbol,
-                    content,
-                    name == "insert_after_symbol",
-                )
+                let edit = if name == "insert_after_symbol" {
+                    StructuredEdit::InsertAfterExactText {
+                        path: path.to_owned(),
+                        anchor: symbol.to_owned(),
+                        content: content.to_owned(),
+                    }
+                } else {
+                    StructuredEdit::InsertBeforeExactText {
+                        path: path.to_owned(),
+                        anchor: symbol.to_owned(),
+                        content: content.to_owned(),
+                    }
+                };
+                apply_structured_edit(&self.repo.root, &edit, None)
             }
             "apply_patch" | "apply_unified_diff" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let patch = required_tool_string(object, "patch", MAX_MODEL_FILE_BYTES)?;
-                apply_repo_unified_diff(&self.repo.root, path, patch)
+                let (_, expected_hash, expected_repository_fingerprint) = self
+                    .active_mutation_context()
+                    .context("patch mutation requires an active deterministic target context")?;
+                let current_repository_fingerprint =
+                    repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+                if current_repository_fingerprint != expected_repository_fingerprint {
+                    return Err(anyhow!(MutationApplicationError {
+                        failure: MutationApplicationFailure::RepositoryChangedSinceContext,
+                        message:
+                            "repository changed after deterministic target context preparation"
+                                .into(),
+                        patch_validation: None,
+                        git_apply_check: None,
+                        raw_patch_sha256: Some(sha256_text(patch)),
+                        target_content_hash: expected_hash.clone(),
+                    }));
+                }
+                let diagnostics = patch_target_diagnostics(&self.repo.root, path, patch)?;
+                let (node_id, mutation_attempt, repair_attempt) = self.active_mutation_attempts();
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_payload_validated",
+                        "node_id": node_id,
+                        "target_path": path,
+                        "mutation_tool": name,
+                        "target_content_hash": expected_hash,
+                        "repository_fingerprint": current_repository_fingerprint,
+                        "normalized_patch_paths": diagnostics.normalized_paths,
+                        "mutation_attempt": mutation_attempt,
+                        "repair_attempt": repair_attempt,
+                    }),
+                    "mutation payload validation",
+                );
+                apply_repo_unified_diff_with_context(
+                    &self.repo.root,
+                    path,
+                    patch,
+                    expected_hash.as_deref(),
+                )
             }
             "replace_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
                 let content = required_tool_string(object, "content", MAX_MODEL_FILE_BYTES)?;
-                write_repo_file(&self.repo.root, path, content, false)
+                let (_, expected_hash, expected_repository_fingerprint) =
+                    self.active_mutation_context().context(
+                        "full-file replacement requires an active deterministic target context",
+                    )?;
+                let current_repository_fingerprint =
+                    repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+                if current_repository_fingerprint != expected_repository_fingerprint {
+                    return Err(anyhow!(MutationApplicationError {
+                        failure: MutationApplicationFailure::RepositoryChangedSinceContext,
+                        message:
+                            "repository changed after deterministic target context preparation"
+                                .into(),
+                        patch_validation: None,
+                        git_apply_check: None,
+                        raw_patch_sha256: None,
+                        target_content_hash: expected_hash.clone(),
+                    }));
+                }
+                let output = replace_repo_file_atomically(
+                    &self.repo.root,
+                    path,
+                    content,
+                    expected_hash.as_deref(),
+                )?;
+                let (node_id, mutation_attempt, repair_attempt) = self.active_mutation_attempts();
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_replacement_applied",
+                        "node_id": node_id,
+                        "target_path": path,
+                        "mutation_tool": name,
+                        "target_content_hash": expected_hash,
+                        "repository_fingerprint": current_repository_fingerprint,
+                        "fallback_strategy": "replace_file",
+                        "normalized_patch_paths": [],
+                        "failure_category": Value::Null,
+                        "mutation_attempt": mutation_attempt,
+                        "repair_attempt": repair_attempt,
+                    }),
+                    "mutation replacement application",
+                );
+                Ok(output)
             }
             "rewrite_small_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);

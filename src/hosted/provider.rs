@@ -589,6 +589,15 @@ impl ModelActionProfile {
     ) -> Self {
         match decision {
             Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            }) if mutation_failure_requires_replacement(&failure.message) => Self {
+                max_output_tokens: configured_max_output_tokens.min(4_096),
+                reasoning_effort: "medium",
+                forced_tool: Some("replace_file"),
+                require_tool: true,
+            },
+            Some(ExecutionDecision::ExecuteTarget {
                 action:
                     crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
                     | crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
@@ -728,6 +737,12 @@ pub(super) fn hosted_tools_for_action(
                 | crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
             ..
         }) => Some(&[][..]),
+        Some(ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+            ..
+        }) if mutation_failure_requires_replacement(&failure.message) => {
+            Some(&["replace_file"][..])
+        }
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
@@ -1006,6 +1021,16 @@ pub(super) fn hosted_agent_instructions_for_decision(
     match decision {
         Some(ExecutionDecision::ExecuteTarget {
             action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    target, failure, ..
+                },
+            ..
+        }) if mutation_failure_requires_replacement(&failure.message) => format!(
+            "Repair exactly `{}` with one forced `replace_file` call. Use the exact current target content and mutation_repair diagnostic in the authoritative input. The rejected patch was not applied. Return the complete replacement file, preserve unrelated behavior, and do not emit another patch or inspect another path.",
+            target.path
+        ),
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { target, .. }
                 | crate::hosted_orchestrator::MutationAction::RepairTarget { target, .. },
             ..
@@ -1015,6 +1040,17 @@ pub(super) fn hosted_agent_instructions_for_decision(
         ),
         _ => hosted_agent_instructions(phase),
     }
+}
+
+pub(super) fn mutation_failure_requires_replacement(message: &str) -> bool {
+    [
+        "mutation_application_failure:invalid_patch_target",
+        "mutation_application_failure:invalid_patch_syntax",
+        "mutation_application_failure:patch_context_mismatch",
+        "mutation_application_failure:patch_would_modify_unexpected_path",
+    ]
+    .iter()
+    .any(|category| message.contains(category))
 }
 
 pub(super) fn hosted_agent_instructions(phase: ExecutionPhase) -> String {

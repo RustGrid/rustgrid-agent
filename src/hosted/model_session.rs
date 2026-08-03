@@ -406,6 +406,9 @@ pub(super) fn implementation_start_context_from_notebook(
         remaining_call_budget,
         current_target,
         cached_current_file_content: None,
+        target_content_hash: None,
+        repository_fingerprint: notebook.repository_fingerprint.clone(),
+        mutation_repair: None,
         cached_nearby_context: Vec::new(),
         graph_node_id: None,
         dependency_evidence: Vec::new(),
@@ -543,7 +546,7 @@ impl<'a> GatewayAgent<'a> {
                     action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                     ..
                 } => {
-                    self.prepare_active_target_context()?;
+                    let _ = self.prepare_active_target_context()?;
                     continue;
                 }
                 ExecutionDecision::ExecuteTarget {
@@ -571,6 +574,11 @@ impl<'a> GatewayAgent<'a> {
                             budget_exhausted: true,
                             explicit_declaration: self.declaration.clone(),
                         }));
+                    }
+                    if reason == crate::execution_graph::GuardrailReason::NodeBudgetExhausted
+                        && self.has_unresolved_mutation_application_failure()
+                    {
+                        return Err(self.mutation_application_exhausted_failure());
                     }
                     return Err(self.execution_failure(
                         "execution_graph_guardrail",
@@ -1874,9 +1882,17 @@ impl<'a> GatewayAgent<'a> {
                                 })
                             }
                         } else {
+                            let mutation_application =
+                                error.downcast_ref::<MutationApplicationError>().cloned();
                             let error = truncate_text(&format!("{error:#}"), 4_000);
                             if is_source_mutation_tool(&name) {
-                                let (error_code, match_count) = classify_write_failure(&error);
+                                let (error_code, match_count) =
+                                    mutation_application.as_ref().map_or_else(
+                                        || classify_write_failure(&error),
+                                        |application| {
+                                            (application.failure.as_str().to_owned(), None)
+                                        },
+                                    );
                                 self.tool_usage.failed_writes =
                                     self.tool_usage.failed_writes.saturating_add(1);
                                 self.tool_usage.write_execution_failures =
@@ -1895,6 +1911,19 @@ impl<'a> GatewayAgent<'a> {
                                     after_sha256: None,
                                 };
                                 self.notebook.write_attempts.push(attempt);
+                                if let Some(application) = mutation_application.as_ref() {
+                                    self.record_mutation_application_diagnostic(
+                                        &name,
+                                        &arguments,
+                                        target.as_deref().unwrap_or_default(),
+                                        application,
+                                    )?;
+                                    if application.failure
+                                        == MutationApplicationFailure::RepositoryChangedSinceContext
+                                    {
+                                        let _ = self.prepare_active_target_context()?;
+                                    }
+                                }
                                 self.tool_failures.push(ToolFailureRecord {
                                     attempt_index,
                                     change_id,
@@ -2069,5 +2098,113 @@ impl<'a> GatewayAgent<'a> {
             turns.push_back(turn);
             compact_hosted_turns(&mut turns);
         }
+    }
+}
+
+impl GatewayAgent<'_> {
+    fn record_mutation_application_diagnostic(
+        &mut self,
+        tool: &str,
+        rejected_payload: &str,
+        target_path: &str,
+        application: &MutationApplicationError,
+    ) -> Result<()> {
+        let repository_fingerprint =
+            repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        let (mutation_attempt, repair_attempt) = self
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id)
+            .map_or((0, 0), |node_id| {
+                let mutation_attempt = self
+                    .notebook
+                    .orchestration
+                    .graph
+                    .as_ref()
+                    .and_then(|graph| graph.node(node_id))
+                    .map_or(0, |node| {
+                        u32::try_from(node.attempts.len()).unwrap_or(u32::MAX)
+                    });
+                let repair_attempt = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .usage_for(node_id)
+                    .repair_attempts;
+                (mutation_attempt, repair_attempt)
+            });
+        let node_id = self
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id)
+            .cloned();
+        let normalized_paths = application
+            .patch_validation
+            .as_ref()
+            .map_or_else(Vec::new, |validation| validation.normalized_paths.clone());
+        let raw_patch_hash = application
+            .raw_patch_sha256
+            .clone()
+            .or_else(|| Some(sha256_text(rejected_payload)));
+        let repair_strategy = application.failure.repair_strategy().to_owned();
+        self.notebook
+            .mutation_diagnostics
+            .push(MutationDiagnosticArtifact {
+                tool: tool.to_owned(),
+                rejected_mutation_payload: truncate_text(rejected_payload, 64 * 1024),
+                raw_patch_hash: raw_patch_hash.clone(),
+                target_path: target_path.to_owned(),
+                normalized_paths: normalized_paths.clone(),
+                target_content_hash: application.target_content_hash.clone(),
+                repository_fingerprint: repository_fingerprint.clone(),
+                git_apply_check_result: application.git_apply_check.clone(),
+                failure_category: application.failure,
+                repair_strategy: repair_strategy.clone(),
+                mutation_attempt,
+                repair_attempt,
+            });
+        if self.notebook.mutation_diagnostics.len() > 8 {
+            let excess = self.notebook.mutation_diagnostics.len() - 8;
+            self.notebook.mutation_diagnostics.drain(..excess);
+        }
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.mutation_application_failed",
+                "node_id": node_id.clone(),
+                "tool": tool,
+                "target": target_path,
+                "raw_patch_hash": raw_patch_hash,
+                "normalized_paths": normalized_paths,
+                "target_content_hash": application.target_content_hash,
+                "repository_fingerprint": repository_fingerprint,
+                "failure_category": application.failure,
+                "repair_strategy": repair_strategy,
+                "mutation_attempt": mutation_attempt,
+                "repair_attempt": repair_attempt,
+            }),
+            "mutation application failure",
+        );
+        if application.failure.repair_strategy() == "replace_file" {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.mutation_fallback_selected",
+                    "node_id": node_id,
+                    "target": target_path,
+                    "mutation_tool": tool,
+                    "target_content_hash": application.target_content_hash,
+                    "repository_fingerprint": repository_fingerprint,
+                    "normalized_patch_paths": normalized_paths,
+                    "fallback": "replace_file",
+                    "failure_category": application.failure,
+                    "raw_patch_hash": raw_patch_hash,
+                    "mutation_attempt": mutation_attempt,
+                    "repair_attempt": repair_attempt,
+                }),
+                "mutation fallback selection",
+            );
+        }
+        Ok(())
     }
 }

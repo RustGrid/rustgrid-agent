@@ -2194,6 +2194,12 @@ pub struct TargetExecutionContext {
     pub dependency_evidence: Vec<EvidenceSummary>,
     pub current_file_content: Option<String>,
     #[serde(default)]
+    pub target_content_hash: Option<String>,
+    #[serde(default)]
+    pub repository_fingerprint: String,
+    #[serde(default)]
+    pub accepted_intent_hash: String,
+    #[serde(default)]
     pub nearby_context: Vec<FileExcerpt>,
     #[serde(default)]
     pub allowed_tools: Vec<ToolKind>,
@@ -3083,6 +3089,10 @@ pub enum ExecutionDomainEvent {
         node_id: ExecutionNodeId,
         target_path: String,
         repository_fingerprint: RepositoryFingerprint,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_content_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        accepted_intent_hash: String,
         #[serde(default)]
         evidence_ids: Vec<String>,
     },
@@ -4056,6 +4066,8 @@ impl ExecutionSnapshot {
             self.evidence
                 .reusable_file(&target.path, &self.current_repository.fingerprint, None);
         let current_file_content = reusable_file.map(|evidence| evidence.captured_content.clone());
+        let target_content_hash = reusable_file.map(|evidence| evidence.content_hash.clone());
+        let accepted_intent_hash = hex::encode(Sha256::digest(target.intent.as_bytes()));
         let nearby_context = reusable_file
             .filter(|evidence| evidence.line_range.is_some())
             .map(FileExcerpt::from)
@@ -4069,6 +4081,9 @@ impl ExecutionSnapshot {
             target,
             dependency_evidence,
             current_file_content,
+            target_content_hash,
+            repository_fingerprint: self.current_repository.fingerprint.clone(),
+            accepted_intent_hash,
             nearby_context,
             allowed_tools,
             remaining_node_budget: self.budget.remaining_for(&node.id, &node.budget),

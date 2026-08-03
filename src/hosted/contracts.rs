@@ -677,6 +677,23 @@ pub(super) struct WriteAttemptRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct MutationDiagnosticArtifact {
+    pub(super) tool: String,
+    pub(super) rejected_mutation_payload: String,
+    pub(super) raw_patch_hash: Option<String>,
+    pub(super) target_path: String,
+    #[serde(default)]
+    pub(super) normalized_paths: Vec<String>,
+    pub(super) target_content_hash: Option<String>,
+    pub(super) repository_fingerprint: String,
+    pub(super) git_apply_check_result: Option<String>,
+    pub(super) failure_category: MutationApplicationFailure,
+    pub(super) repair_strategy: String,
+    pub(super) mutation_attempt: u32,
+    pub(super) repair_attempt: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct MutationPreflightRecord {
     pub(super) change_id: String,
     pub(super) target: String,

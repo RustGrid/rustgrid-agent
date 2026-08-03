@@ -310,6 +310,9 @@ pub(super) struct ImplementationStartContext {
     pub(super) remaining_call_budget: usize,
     pub(super) current_target: Option<ImplementationTarget>,
     pub(super) cached_current_file_content: Option<String>,
+    pub(super) target_content_hash: Option<String>,
+    pub(super) repository_fingerprint: String,
+    pub(super) mutation_repair: Option<MutationDiagnosticArtifact>,
     pub(super) cached_nearby_context: Vec<crate::execution_graph::FileExcerpt>,
     pub(super) graph_node_id: Option<crate::execution_graph::ExecutionNodeId>,
     pub(super) dependency_evidence: Vec<crate::execution_graph::EvidenceSummary>,
@@ -412,6 +415,8 @@ pub(super) struct WorkerNotebook {
     pub(super) intended_changes: Vec<IntendedChangeRecord>,
     #[serde(default)]
     pub(super) write_attempts: Vec<WriteAttemptRecord>,
+    #[serde(default)]
+    pub(super) mutation_diagnostics: Vec<MutationDiagnosticArtifact>,
     #[serde(default)]
     pub(super) write_preflight_rejections: Vec<MutationPreflightRecord>,
     #[serde(default)]
@@ -1109,6 +1114,7 @@ pub(super) fn new_worker_notebook(
         planning_repair: None,
         intended_changes: Vec::new(),
         write_attempts: Vec::new(),
+        mutation_diagnostics: Vec::new(),
         write_preflight_rejections: Vec::new(),
         completed_changes: Vec::new(),
         failed_changes: Vec::new(),
