@@ -5,6 +5,39 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.31 - 2026-08-03
+
+### Changed
+
+- Build compact, deterministic completion-evidence packets from accepted
+  changes, verified graph targets, changed paths, relevant validation gates,
+  diff-review findings, unresolved failures, and external-review requirements.
+- Use a bounded 3,072-token, low-reasoning completion profile and skip the
+  provider call when deterministic repository evidence already proves the
+  terminal result.
+- Publish one canonical terminal result containing the domain outcome, process
+  health, reason code, publication details, completion evaluation, and
+  remaining work; compatibility events derive from that result.
+- Expose discovery, planning, initial mutation, target repair, validation
+  diagnosis, validation repair, diff-review, and completion-call accounting in
+  terminal telemetry.
+
+### Fixed
+
+- Preserve healthy complete, complete-pending-review, partial-reviewable, and
+  blocked outcomes as successful worker exits instead of allowing a later
+  compatibility result to report generic uncertainty or process failure.
+- Treat selection, cycling, persistence, restoration, fallback, regression,
+  and build behavior as automated verification while leaving genuine product,
+  design, accessibility, visual, and deployment decisions for external review.
+- Prevent optional model interpretation from erasing or downgrading
+  deterministic criterion-to-diff evidence.
+- Reject completion nodes whose configured cost budget cannot fund one compact
+  completion action, while keeping rejected pre-provider admission visible
+  without consuming a provider call.
+- Keep pull-request draft state independent from process success so completed
+  implementation awaiting product or design review remains healthy and draft.
+
 ## 1.4.30 - 2026-08-03
 
 ### Changed
