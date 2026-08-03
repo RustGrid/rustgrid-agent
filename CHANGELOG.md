@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.30 - 2026-08-03
+
+### Changed
+
+- Add an explicit incomplete-diff review path that preserves applied work,
+  evaluates partial completion, and authorizes only draft publication when
+  required validation remains failed or pending.
+- Persist structured validation assertion evidence, bounded implicated repair
+  targets, typed source-versus-test diagnoses, and typed no-mutation repair
+  results for deterministic reconciliation and recovery.
+- Separate validation-repair budgets and model-call accounting from completed
+  mutation nodes, and emit lifecycle telemetry for parsing, diagnosis, target
+  selection, incomplete review, partial evaluation, and draft publication.
+
+### Fixed
+
+- Keep successfully applied source and test mutation nodes applied after a
+  focused code-validation failure instead of returning completed work to the
+  mutation queue.
+- Route a no-mutation validation repair with a non-empty safe diff through
+  deterministic review and a partial-reviewable draft rather than reporting an
+  orchestration initialization failure.
+- Preserve failed and pending required gates, external-review requirements, and
+  typed draft-only dependency overrides in recovery and pull-request output.
+- Enforce `replace_file` as the only available and accepted mutation tool after
+  a replacement fallback is selected, and resume partial runs from validation
+  repair without repeating discovery, planning, or applied mutations.
+
 ## 1.4.29 - 2026-08-03
 
 ### Changed
