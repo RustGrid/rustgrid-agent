@@ -268,8 +268,7 @@ fn attempt_19_acceptance_criteria_are_covered_collectively() {
         report
             .snapshot
             .graph
-            .nodes
-            .iter()
+            .nodes()
             .filter(|node| node.kind.is_mutation())
             .count(),
         4
@@ -341,8 +340,7 @@ fn attempt_20_duplicate_first_target_advances_through_all_five_targets() {
         report
             .snapshot
             .graph
-            .nodes
-            .iter()
+            .nodes()
             .filter(|node| node.required)
             .all(|node| node.status.is_success())
     );
