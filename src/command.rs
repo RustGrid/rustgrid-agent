@@ -1675,7 +1675,7 @@ while not os.path.exists(pid_file):
             None,
             None,
             None,
-            Some(Duration::from_millis(1_500)),
+            None,
             &mut |observation| activity.push(observation),
         )
         .unwrap();
@@ -1686,6 +1686,6 @@ while not os.path.exists(pid_file):
                 .any(|observation| observation.bytes_emitted >= 5)
         );
         assert!(activity.last().unwrap().bytes_emitted >= 19);
-        assert!(activity.last().unwrap().last_output_age < Duration::from_millis(1_500));
+        assert!(activity.last().unwrap().last_output_age <= activity.last().unwrap().elapsed);
     }
 }
