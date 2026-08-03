@@ -158,6 +158,28 @@ pub(super) fn looks_like_structured_test_failure(output: &str) -> bool {
     }) && (output.contains("Expected:") || output.contains("Received:"))
 }
 
+pub(super) fn structured_validation_paths(output: &str) -> BTreeSet<String> {
+    let output = strip_ansi_sequences(output);
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_start_matches('×').trim();
+            if let Some(heading) = line.strip_prefix("FAIL ") {
+                return heading
+                    .split(" > ")
+                    .next()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned);
+            }
+            let location = line.strip_prefix('❯')?.trim();
+            let (path, source_line, source_column) = parse_source_location(location);
+            (source_line.is_some() && source_column.is_some() && !path.is_empty()).then_some(path)
+        })
+        .take(4)
+        .collect()
+}
+
 pub(super) fn fallback_validation_assertion_failure(
     command: &str,
     output: &str,
@@ -293,51 +315,71 @@ fn import_path_stems(content: &str) -> BTreeSet<String> {
 pub(super) fn validation_repair_target_hint(
     assertions: &[crate::execution_graph::ValidationAssertionFailure],
     mutation_target_paths: &[String],
+    target_contents: &[(String, String)],
 ) -> Option<String> {
     let mut scores = BTreeMap::<String, usize>::new();
-    let transition_assertions = assertions
+    let highest_specificity = assertions
         .iter()
-        .filter(|assertion| {
-            format!("{} {}", assertion.suite_path.join(" "), assertion.test_name)
-                .to_ascii_lowercase()
-                .split_whitespace()
-                .any(|token| token.contains("cycle") || token.contains("label"))
-        })
-        .collect::<Vec<_>>();
-    let ranked_assertions = if transition_assertions.is_empty() {
-        assertions.iter().collect::<Vec<_>>()
-    } else {
-        transition_assertions
-    };
-    for assertion in ranked_assertions {
+        .map(assertion_specificity)
+        .max()
+        .unwrap_or_default();
+    for assertion in assertions
+        .iter()
+        .filter(|assertion| assertion_specificity(assertion) == highest_specificity)
+    {
+        let test_content = target_contents
+            .iter()
+            .find(|(path, _)| path == &assertion.test_file)
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_default();
+        let imported_stems = import_path_stems(test_content);
+        let semantic_tokens =
+            normalized_semantic_tokens(&format!("{} {}", assertion.test_name, assertion.evidence));
+        let primary_semantic_token = assertion
+            .test_name
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .find(|token| token.len() >= 5)
+            .map(normalize_semantic_token);
         for path in assertion
             .implicated_paths
             .iter()
             .filter(|path| mutation_target_paths.contains(path))
         {
-            let source_preference = usize::from(!path.to_ascii_lowercase().contains("test"));
-            let lower_path = path.to_ascii_lowercase();
-            let assertion_semantics = format!(
-                "{} {} {}",
-                assertion.suite_path.join(" "),
-                assertion.test_name,
-                assertion.evidence
-            )
-            .to_ascii_lowercase();
-            let ui_transition_preference = usize::from(
-                lower_path.contains("toggle")
-                    && assertion_semantics
-                        .split_whitespace()
-                        .any(|token| token.contains("cycle") || token.contains("label")),
-            ) * 4;
-            let provider_preference = usize::from(
-                lower_path.contains("provider")
-                    && assertion_semantics
-                        .split_whitespace()
-                        .any(|token| token.contains("root") || token.contains("class")),
+            let content = target_contents
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, content)| content.as_str())
+                .unwrap_or_default();
+            let normalized_content = content.to_ascii_lowercase();
+            let source_preference = usize::from(!is_test_path(path)) * 4;
+            let direct_import = usize::from(imported_stems.contains(&path_stem(path))) * 6;
+            let expected_evidence = usize::from(
+                !assertion.expected.is_empty() && content.contains(&assertion.expected),
             ) * 2;
-            *scores.entry(path.clone()).or_default() +=
-                2 + source_preference + ui_transition_preference + provider_preference;
+            let received_evidence = usize::from(
+                !assertion.received.is_empty() && content.contains(&assertion.received),
+            ) * 2;
+            let paired_value_evidence =
+                usize::from(expected_evidence > 0 && received_evidence > 0) * 2;
+            let semantic_overlap = semantic_tokens
+                .iter()
+                .filter(|token| normalized_content.contains(token.as_str()))
+                .count()
+                .min(4)
+                * 3;
+            let primary_semantic_overlap = usize::from(
+                primary_semantic_token
+                    .as_ref()
+                    .is_some_and(|token| normalized_content.contains(token)),
+            ) * 4;
+            *scores.entry(path.clone()).or_default() += 1
+                + source_preference
+                + direct_import
+                + expected_evidence
+                + received_evidence
+                + paired_value_evidence
+                + semantic_overlap
+                + primary_semantic_overlap;
         }
     }
     scores
@@ -348,6 +390,47 @@ pub(super) fn validation_repair_target_hint(
                 .then_with(|| right_path.cmp(left_path))
         })
         .map(|(path, _)| path)
+}
+
+pub(super) fn assertion_specificity(
+    assertion: &crate::execution_graph::ValidationAssertionFailure,
+) -> usize {
+    match assertion.assertion_kind.as_str() {
+        "equality" => 3,
+        "contains" => 2,
+        _ => 1,
+    }
+}
+
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower
+        .split('/')
+        .any(|component| matches!(component, "test" | "tests" | "spec" | "specs"))
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.contains("_test.")
+}
+
+fn normalized_semantic_tokens(value: &str) -> BTreeSet<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| token.len() >= 5)
+        .map(normalize_semantic_token)
+        .collect()
+}
+
+fn normalize_semantic_token(token: &str) -> String {
+    let mut token = token.to_ascii_lowercase();
+    if token.ends_with("ies") && token.len() > 5 {
+        token.truncate(token.len() - 3);
+        token.push('y');
+    } else if token.ends_with("es") && token.len() > 5 {
+        token.truncate(token.len() - 1);
+    } else if token.ends_with('s') && token.len() > 5 {
+        token.pop();
+    }
+    token
 }
 
 pub(super) fn committed_head_for_publication(

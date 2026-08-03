@@ -1339,7 +1339,7 @@ Received: "light-blue"
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     assert_eq!(
-        validation_repair_target_hint(&assertions, &targets).as_deref(),
+        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
         Some("src/components/theme/ThemeToggle.tsx")
     );
 }
@@ -1381,6 +1381,50 @@ fn vitest_fallback_preserves_a_bounded_structured_failure_when_header_is_unknown
     assert_eq!(fallback.source_line, Some(111));
     assert_eq!(fallback.source_column, Some(27));
     assert!(fallback.context.len() <= output.len());
+}
+
+#[test]
+fn repair_target_ranking_depends_on_evidence_not_ticket_vocabulary_or_filenames() {
+    let output = r#"
+ FAIL  checks/state-machine.spec.ts > arbitrary suite > advances the selected state
+AssertionError: expected 'intermediate' to be 'complete'
+Expected: "complete"
+Received: "intermediate"
+ ❯ checks/state-machine.spec.ts:29:17
+"#;
+    let candidates = vec![
+        (
+            "lib/catalog.ts".into(),
+            "export const states = ['initial', 'intermediate', 'complete'];".into(),
+        ),
+        (
+            "lib/presenter.ts".into(),
+            "export const advance = () => current === 'intermediate' ? 'complete' : current;"
+                .into(),
+        ),
+        (
+            "checks/state-machine.spec.ts".into(),
+            "import { advance } from '../lib/presenter';\nexpect(advance()).toBe('complete');"
+                .into(),
+        ),
+    ];
+    let assertions = parse_validation_assertion_failures(
+        "npx vitest run checks/state-machine.spec.ts",
+        output,
+        &candidates,
+    );
+    let targets = candidates
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        Some("lib/presenter.ts")
+    );
+    assert_eq!(
+        structured_validation_paths(output),
+        BTreeSet::from(["checks/state-machine.spec.ts".to_owned()])
+    );
 }
 
 fn recovery_authorization_fixture() -> (

@@ -2384,7 +2384,16 @@ impl<'a> GatewayAgent<'a> {
             .filter(|node| node.kind.is_mutation())
             .filter_map(|node| node.target.as_ref().map(|target| target.path.clone()))
             .collect::<Vec<_>>();
-        let target_contents = mutation_target_paths
+        let evidence_paths = mutation_target_paths
+            .iter()
+            .cloned()
+            .chain(
+                failures
+                    .iter()
+                    .flat_map(|failure| structured_validation_paths(&failure.output)),
+            )
+            .collect::<BTreeSet<_>>();
+        let target_contents = evidence_paths
             .iter()
             .map(|path| {
                 let content = safe_repo_path(&self.repo.root, path, false)
@@ -2498,14 +2507,14 @@ impl<'a> GatewayAgent<'a> {
                 record.target_path = validation_repair_target_hint(
                     &record.assertion_failures,
                     &mutation_target_paths,
+                    &target_contents,
                 )
                 .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics));
-                if let Some(assertion) = record.assertion_failures.iter().find(|assertion| {
-                    format!("{} {}", assertion.suite_path.join(" "), assertion.test_name)
-                        .to_ascii_lowercase()
-                        .split_whitespace()
-                        .any(|token| token.contains("cycle") || token.contains("label"))
-                }) {
+                if let Some(assertion) = record
+                    .assertion_failures
+                    .iter()
+                    .max_by_key(|assertion| assertion_specificity(assertion))
+                {
                     self.append_event_recoverable(
                         "validation",
                         json!({
