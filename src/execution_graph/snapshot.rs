@@ -46,6 +46,15 @@ impl ExecutionSnapshot {
             .filter(|node| node.status.satisfies_dependency())
             .map(|node| node.id.clone())
             .chain(self.graph.dependency_satisfaction_overrides.iter().cloned())
+            .chain(
+                self.graph
+                    .dependency_overrides
+                    .iter()
+                    .filter(|override_| {
+                        override_.allowed_outcome == MissionOutcome::PartialReviewable
+                    })
+                    .map(|override_| override_.unsatisfied_dependency.clone()),
+            )
             .collect::<BTreeSet<_>>();
 
         if self.graph.recovery_publication_dependency_override
@@ -123,6 +132,90 @@ impl ExecutionSnapshot {
             })
     }
 
+    pub fn has_incomplete_diff_review_request(&self) -> bool {
+        current_execution_epoch(&self.events).iter().any(|event| {
+            matches!(event, ExecutionDomainEvent::IncompleteDiffReviewRequested { .. })
+        })
+    }
+
+    pub fn incomplete_diff_dependency_overrides(
+        &self,
+        diff_review_node: &ExecutionNodeId,
+        reason: IncompleteReason,
+    ) -> Vec<DependencyOverride> {
+        let reason = match reason {
+            IncompleteReason::ValidationRepairProducedNoMutation => {
+                "draft publication after failed code validation and no valid repair mutation"
+            }
+            IncompleteReason::ValidationInfrastructureFailure => {
+                "draft publication after validation infrastructure failure"
+            }
+        };
+        self.graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.required
+                    && node.kind.is_validation()
+                    && !node.status.satisfies_dependency()
+            })
+            .map(|node| DependencyOverride {
+                dependent_node: diff_review_node.clone(),
+                unsatisfied_dependency: node.id.clone(),
+                reason: reason.to_owned(),
+                allowed_outcome: MissionOutcome::PartialReviewable,
+            })
+            .collect()
+    }
+
+    pub fn target_state(&self, node_id: &ExecutionNodeId) -> Option<TargetState> {
+        let node = self.graph.node(node_id)?;
+        let target = node.target.as_ref()?;
+        let mutation_status = match node.status {
+            ExecutionNodeStatus::Applied
+            | ExecutionNodeStatus::Passed
+            | ExecutionNodeStatus::Completed
+            | ExecutionNodeStatus::Superseded => MutationStatus::Applied,
+            ExecutionNodeStatus::Running => MutationStatus::Running,
+            ExecutionNodeStatus::FailedRecoverable => MutationStatus::FailedRecoverable,
+            ExecutionNodeStatus::FailedBlocking => MutationStatus::FailedBlocking,
+            ExecutionNodeStatus::Pending
+            | ExecutionNodeStatus::Ready
+            | ExecutionNodeStatus::Skipped => MutationStatus::Planned,
+        };
+        let target_failure = self.failures.unresolved().find(|failure| {
+            failure.category == FailureCategory::ValidationFailure
+                && (failure.target_path.as_deref() == Some(target.path.as_str())
+                    || failure.assertion_failures.iter().any(|assertion| {
+                        assertion.test_file == target.path
+                            || assertion.implicated_paths.contains(&target.path)
+                    }))
+        });
+        let validation_status = if target_failure.is_some() {
+            ValidationStatus::FailedCode
+        } else if self
+            .failures
+            .unresolved()
+            .any(|failure| failure.category == FailureCategory::InfrastructureFailure)
+        {
+            ValidationStatus::FailedInfrastructure
+        } else if self
+            .graph
+            .nodes
+            .iter()
+            .filter(|candidate| candidate.required && candidate.kind.is_validation())
+            .all(|candidate| candidate.status == ExecutionNodeStatus::Passed)
+        {
+            ValidationStatus::Passed
+        } else {
+            ValidationStatus::Pending
+        };
+        Some(TargetState {
+            mutation_status,
+            validation_status,
+        })
+    }
+
     /// Returns the deterministic set of current validation proof required to
     /// authorize recovery publication. Every required gate must be represented
     /// by attached, passed evidence for the current repository fingerprint.
@@ -191,19 +284,26 @@ impl ExecutionSnapshot {
     pub fn recovery_publication_validation_evidence_ids(
         &self,
     ) -> Result<Vec<String>, GraphInvariantError> {
-        let infrastructure_partial = self.has_partial_reviewable_guardrail()
+        let validation_partial = (self.has_partial_reviewable_guardrail()
+            || self.has_incomplete_diff_review_request())
             && self.failures.unresolved().next().is_some()
             && self
                 .failures
                 .unresolved()
-                .all(|failure| failure.category == FailureCategory::InfrastructureFailure)
+                .all(|failure| {
+                    matches!(
+                        failure.category,
+                        FailureCategory::ValidationFailure
+                            | FailureCategory::InfrastructureFailure
+                    )
+                })
             && self
                 .graph
                 .nodes
                 .iter()
                 .filter(|node| node.required && node.kind.is_mutation())
                 .all(|node| node.status.satisfies_dependency());
-        if !infrastructure_partial {
+        if !validation_partial {
             return self.current_required_validation_evidence_ids();
         }
 
@@ -301,6 +401,7 @@ impl ExecutionSnapshot {
             repository_fingerprint: self.current_repository.fingerprint.clone(),
             accepted_intent_hash,
             nearby_context,
+            validation_repair: None,
             allowed_tools,
             remaining_node_budget: self.budget.remaining_for(&node.id, &node.budget),
         })
@@ -366,6 +467,27 @@ impl ExecutionSnapshot {
                 )));
             }
         }
+        if let ExecutionDomainEvent::ValidationRepairStarted {
+            validation_node_id,
+            ..
+        } = &event
+        {
+            let node = self.graph.node(validation_node_id).ok_or_else(|| {
+                GraphInvariantError::new(format!(
+                    "validation repair refers to unknown node `{validation_node_id}`"
+                ))
+            })?;
+            if self
+                .budget
+                .usage_for(validation_node_id)
+                .validation_repair_attempts
+                >= node.budget.max_repair_attempts.max(1)
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "validation node `{validation_node_id}` cannot start another bounded repair"
+                )));
+            }
+        }
 
         let dependency_satisfaction = self.dependency_satisfaction_ids();
         self.graph
@@ -377,6 +499,14 @@ impl ExecutionSnapshot {
                     .expect("a target repair start always refers to a node")
                     .clone(),
             );
+        }
+        if let ExecutionDomainEvent::ValidationRepairStarted {
+            validation_node_id,
+            ..
+        } = &event
+        {
+            self.budget
+                .record_validation_repair_attempt(validation_node_id.clone());
         }
         match &event {
             ExecutionDomainEvent::RepositoryEvidenceRecorded {

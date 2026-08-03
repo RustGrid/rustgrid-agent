@@ -132,6 +132,32 @@ impl ExecutionGraph {
                 )));
             }
         }
+        for override_ in &self.dependency_overrides {
+            let dependent = self.node(&override_.dependent_node).ok_or_else(|| {
+                GraphInvariantError::new(format!(
+                    "dependency override refers to unknown dependent node `{}`",
+                    override_.dependent_node
+                ))
+            })?;
+            self.node(&override_.unsatisfied_dependency).ok_or_else(|| {
+                GraphInvariantError::new(format!(
+                    "dependency override refers to unknown dependency `{}`",
+                    override_.unsatisfied_dependency
+                ))
+            })?;
+            if dependent.kind != ExecutionNodeKind::DiffReview
+                || override_.allowed_outcome != MissionOutcome::PartialReviewable
+                || !self.transitively_depends_on(
+                    &override_.dependent_node,
+                    &override_.unsatisfied_dependency,
+                )
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "dependency override from `{}` to `{}` is not a draft-only diff-review override",
+                    override_.dependent_node, override_.unsatisfied_dependency
+                )));
+            }
+        }
         if self.recovery_publication_dependency_override {
             let publication = self
                 .nodes
@@ -227,6 +253,14 @@ impl ExecutionGraph {
             .filter(|node| node.status.satisfies_dependency())
             .map(|node| node.id.clone())
             .chain(self.dependency_satisfaction_overrides.iter().cloned())
+            .chain(
+                self.dependency_overrides
+                    .iter()
+                    .filter(|override_| {
+                        override_.allowed_outcome == MissionOutcome::PartialReviewable
+                    })
+                    .map(|override_| override_.unsatisfied_dependency.clone()),
+            )
             .chain(additionally_satisfied.iter().cloned())
             .collect::<BTreeSet<_>>();
         if self.recovery_publication_dependency_override

@@ -256,7 +256,8 @@ impl SimulationPhase {
             ExecutionDecision::ExecuteTarget { .. } => Self::Implementation,
             ExecutionDecision::RepairTarget { .. } => Self::Repair,
             ExecutionDecision::RunValidation { .. } => Self::Validation,
-            ExecutionDecision::ReviewDiff { .. } => Self::DiffReview,
+            ExecutionDecision::ReviewDiff { .. }
+            | ExecutionDecision::ReviewIncompleteDiff { .. } => Self::DiffReview,
             ExecutionDecision::EvaluateCompletion { .. } => Self::CompletionEvaluation,
             ExecutionDecision::Publish { .. } => Self::Publication,
             ExecutionDecision::StopForGuardrail {
@@ -334,6 +335,7 @@ impl SimulationReport {
                 ExecutionDecision::RepairTarget { .. } => "repair_target",
                 ExecutionDecision::RunValidation { .. } => "run_validation",
                 ExecutionDecision::ReviewDiff { .. } => "review_diff",
+                ExecutionDecision::ReviewIncompleteDiff { .. } => "review_incomplete_diff",
                 ExecutionDecision::EvaluateCompletion { .. } => "evaluate_completion",
                 ExecutionDecision::Publish { .. } => "publish",
                 ExecutionDecision::Finish { .. } => "finish",
@@ -525,6 +527,19 @@ impl SimulationHarness {
                 Ok(None)
             }
             ExecutionDecision::ReviewDiff { node_id } => {
+                self.simulate_diff_review(node_id)?;
+                Ok(None)
+            }
+            ExecutionDecision::ReviewIncompleteDiff { node_id, reason } => {
+                let dependency_overrides = self
+                    .snapshot
+                    .incomplete_diff_dependency_overrides(&node_id, reason);
+                self.append(ExecutionDomainEvent::IncompleteDiffReviewRequested {
+                    sequence: self.sequence(),
+                    node_id: node_id.clone(),
+                    reason,
+                    dependency_overrides,
+                })?;
                 self.simulate_diff_review(node_id)?;
                 Ok(None)
             }

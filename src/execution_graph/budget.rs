@@ -10,6 +10,24 @@ pub struct NodeBudgetUsage {
     #[serde(with = "duration_millis")]
     pub duration: Duration,
     pub repair_attempts: u32,
+    #[serde(default)]
+    pub validation_repair_attempts: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ModelCallBreakdown {
+    pub initial_target_mutation_calls: u32,
+    pub target_mutation_repair_calls: u32,
+    pub validation_diagnosis_calls: u32,
+    pub validation_repair_mutation_calls: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelCallPurpose {
+    InitialTargetMutation,
+    TargetMutationRepair,
+    ValidationDiagnosis,
+    ValidationRepairMutation,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -110,6 +128,8 @@ pub struct BudgetState {
     pub node_usage: BTreeMap<ExecutionNodeId, NodeBudgetUsage>,
     #[serde(default)]
     pub progress_events: Vec<ProgressEvent>,
+    #[serde(default)]
+    pub model_call_breakdown: ModelCallBreakdown,
     pub progress_score: u64,
     pub progress_window: ProgressWindow,
 }
@@ -131,6 +151,7 @@ impl BudgetState {
             elapsed: Duration::ZERO,
             node_usage: BTreeMap::new(),
             progress_events: Vec::new(),
+            model_call_breakdown: ModelCallBreakdown::default(),
             progress_score: 0,
             progress_window: ProgressWindow::default(),
         }
@@ -392,6 +413,29 @@ impl BudgetState {
     pub fn record_repair_attempt(&mut self, node_id: ExecutionNodeId) {
         let usage = self.node_usage.entry(node_id).or_default();
         usage.repair_attempts = usage.repair_attempts.saturating_add(1);
+    }
+
+    pub fn record_validation_repair_attempt(&mut self, node_id: ExecutionNodeId) {
+        let usage = self.node_usage.entry(node_id).or_default();
+        usage.validation_repair_attempts = usage.validation_repair_attempts.saturating_add(1);
+    }
+
+    pub fn record_model_call_purpose(&mut self, purpose: ModelCallPurpose) {
+        let counter = match purpose {
+            ModelCallPurpose::InitialTargetMutation => {
+                &mut self.model_call_breakdown.initial_target_mutation_calls
+            }
+            ModelCallPurpose::TargetMutationRepair => {
+                &mut self.model_call_breakdown.target_mutation_repair_calls
+            }
+            ModelCallPurpose::ValidationDiagnosis => {
+                &mut self.model_call_breakdown.validation_diagnosis_calls
+            }
+            ModelCallPurpose::ValidationRepairMutation => {
+                &mut self.model_call_breakdown.validation_repair_mutation_calls
+            }
+        };
+        *counter = counter.saturating_add(1);
     }
 
     pub fn record_progress(&mut self, event: ProgressEvent) {

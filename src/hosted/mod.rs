@@ -1048,6 +1048,10 @@ fn run_hosted_execution(
                 let repair_tree_after =
                     repository_state_fingerprint(&repo, &manifest.github.base_sha)?;
                 if repair_tree_after == repair_tree_before {
+                    agent.record_validation_repair_no_mutation(
+                        &failures,
+                        "bounded validation repair produced no repository mutation",
+                    )?;
                     agent.append_event_recoverable(
                         "validation",
                         json!({
@@ -1096,9 +1100,16 @@ fn run_hosted_execution(
         };
         let validation_passed = validation.iter().all(|result| result.status == "passed");
         let diff_decision = agent.peek_execution_decision()?;
+        let incomplete_review_reason = match &diff_decision {
+            ExecutionDecision::ReviewIncompleteDiff { reason, .. } => Some(*reason),
+            _ => None,
+        };
         let review_paths = match diff_decision {
             ExecutionDecision::ReviewDiff { .. } if validation_passed => {
                 agent.deterministic_diff_review()?
+            }
+            ExecutionDecision::ReviewIncompleteDiff { reason, .. } => {
+                agent.deterministic_incomplete_diff_review(reason)?
             }
             ExecutionDecision::EvaluateCompletion { .. }
             | ExecutionDecision::Publish { .. }
@@ -1168,8 +1179,63 @@ fn run_hosted_execution(
         }
         let mut completeness = match completion_decision {
             ExecutionDecision::EvaluateCompletion { .. } => {
-                let completeness =
+                let mut completeness =
                     agent.evaluate_completion(&implementation, &validation, &review_paths)?;
+                if let Some(reason) = incomplete_review_reason {
+                    let (failure_category, reason_code, failure_phase) = match reason {
+                        crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMutation =>
+                            ("validation_failure", "validation_failed_repair_incomplete", "repair"),
+                        crate::execution_graph::IncompleteReason::ValidationInfrastructureFailure =>
+                            ("infrastructure_failure", "validation_infrastructure_incomplete", "validation"),
+                    };
+                    completeness.status = CompletionStatus::Partial;
+                    completeness.implementation_completeness = ImplementationCompleteness::Partial;
+                    completeness.verification_readiness =
+                        VerificationReadiness::PendingManualReview;
+                    completeness.evaluation_source = EvaluationSource::OrchestratorFallback;
+                    completeness.confidence = 1.0;
+                    for failure in validation.iter().filter(|result| result.status != "passed") {
+                        push_unique(
+                            &mut completeness.remaining_automated_verification,
+                            format!(
+                                "Reconcile `{}` and rerun `{}`.",
+                                failure.id, failure.command
+                            ),
+                        );
+                    }
+                    for gate in agent
+                        .notebook
+                        .required_gates
+                        .iter()
+                        .filter(|gate| gate.required && gate.status != ValidationStatus::Passed)
+                    {
+                        push_unique(
+                            &mut completeness.remaining_automated_verification,
+                            format!("Run required gate `{}`: `{}`.", gate.gate_id, gate.command),
+                        );
+                    }
+                    completeness.summary = format!(
+                        "RustGrid preserved the applied repository diff for draft review after {reason:?}; required validation remains incomplete."
+                    );
+                    agent.append_event_recoverable(
+                        "result",
+                        json!({
+                            "event_type": "worker.partial_reviewable_evaluated",
+                            "category": failure_category,
+                            "reason_code": reason_code,
+                            "phase": failure_phase,
+                            "recoverable": true,
+                            "reason": reason,
+                            "mission_outcome": "partial_reviewable",
+                            "process_health": "healthy",
+                            "changed_paths": review_paths,
+                            "failed_gates": validation.iter()
+                                .filter(|result| result.status != "passed")
+                                .collect::<Vec<_>>(),
+                        }),
+                        "partial-reviewable evaluation",
+                    );
+                }
                 agent.record_completion_evaluated(
                     &completeness,
                     review_paths.clone(),
@@ -1461,7 +1527,26 @@ fn run_hosted_execution(
                             ..crate::execution_graph::RepositorySnapshot::default()
                         },
                     )
-                    .has_partial_reviewable_guardrail() =>
+                    .has_partial_reviewable_guardrail()
+                || agent
+                    .notebook
+                    .orchestration
+                    .snapshot(
+                        manifest.execution.execution_id.to_string(),
+                        crate::execution_graph::RepositorySnapshot {
+                            fingerprint: agent.notebook.repository_fingerprint.clone(),
+                            source_tree_hash: agent.notebook.repository_fingerprint.clone(),
+                            changed_paths: completion_changed_paths(
+                                &repo,
+                                &manifest.github.base_sha,
+                            )
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                            ..crate::execution_graph::RepositorySnapshot::default()
+                        },
+                    )
+                    .has_incomplete_diff_review_request() =>
         {
             let recovery = attempt_safe_recovery_publication(
                 &mut agent,

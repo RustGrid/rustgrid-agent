@@ -2133,6 +2133,13 @@ impl<'a> GatewayAgent<'a> {
                     explicit_declaration: self.declaration.clone(),
                 });
             }
+            if self.phases.active() == ExecutionPhase::DiffReview {
+                return Ok(ImplementationOutcome {
+                    summary: "Bounded validation repair produced a typed no-valid-repair result; preserving the applied diff for incomplete review.".into(),
+                    budget_exhausted: true,
+                    explicit_declaration: self.declaration.clone(),
+                });
+            }
             if let Some(summary) = mutation_preflight_halt {
                 return Ok(ImplementationOutcome {
                     summary,

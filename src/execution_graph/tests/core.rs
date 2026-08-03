@@ -15,6 +15,39 @@
         }
     }
 
+    #[test]
+    fn validation_repair_budget_and_call_accounting_are_separate_from_mutation_work() {
+        let graph = graph();
+        let validation = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::ValidationFocused)
+            .expect("focused validation node");
+        let mutation = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_mutation())
+            .expect("mutation node");
+        assert!(validation.budget.max_model_calls >= 1);
+
+        let mut budget = BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Small));
+        budget.record_validation_repair_attempt(validation.id.clone());
+        budget.record_model_call_purpose(ModelCallPurpose::ValidationDiagnosis);
+        budget.record_model_call_purpose(ModelCallPurpose::ValidationRepairMutation);
+
+        assert_eq!(budget.usage_for(&validation.id).validation_repair_attempts, 1);
+        assert_eq!(budget.usage_for(&validation.id).repair_attempts, 0);
+        assert_eq!(budget.usage_for(&mutation.id).repair_attempts, 0);
+        assert_eq!(budget.model_call_breakdown.validation_diagnosis_calls, 1);
+        assert_eq!(
+            budget
+                .model_call_breakdown
+                .validation_repair_mutation_calls,
+            1
+        );
+        assert_eq!(budget.model_call_breakdown.target_mutation_repair_calls, 0);
+    }
+
     fn one_call_budget() -> (BudgetState, ExecutionNodeId, NodeBudget) {
         (
             BudgetState::new(MissionBudget {
@@ -1175,4 +1208,3 @@
             assert_eq!(replayed.evidence, persisted.evidence);
         }
     }
-

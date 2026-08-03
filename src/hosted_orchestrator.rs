@@ -133,6 +133,10 @@ pub enum ExecutionDecision {
     ReviewDiff {
         node_id: ExecutionNodeId,
     },
+    ReviewIncompleteDiff {
+        node_id: ExecutionNodeId,
+        reason: IncompleteReason,
+    },
     EvaluateCompletion {
         node_id: ExecutionNodeId,
     },
@@ -157,9 +161,9 @@ impl ExecutionDecision {
                 HostedExecutionStage::Implementation
             }
             Self::RunValidation { .. } => HostedExecutionStage::Validation,
-            Self::ReviewDiff { .. } | Self::EvaluateCompletion { .. } => {
-                HostedExecutionStage::Review
-            }
+            Self::ReviewDiff { .. }
+            | Self::ReviewIncompleteDiff { .. }
+            | Self::EvaluateCompletion { .. } => HostedExecutionStage::Review,
             Self::Publish { .. } => HostedExecutionStage::Publication,
             Self::Finish { .. } | Self::StopForGuardrail { .. } => HostedExecutionStage::Terminal,
         }
@@ -171,8 +175,23 @@ impl ExecutionDecision {
             | Self::RepairTarget { node_id, .. }
             | Self::RunValidation { node_id, .. }
             | Self::ReviewDiff { node_id }
+            | Self::ReviewIncompleteDiff { node_id, .. }
             | Self::EvaluateCompletion { node_id } => Some(node_id),
             _ => None,
+        }
+    }
+
+    pub fn budget_node_id(&self) -> Option<&ExecutionNodeId> {
+        match self {
+            Self::ExecuteTarget {
+                action: MutationAction::RepairTarget { failure, .. },
+                ..
+            }
+            | Self::RepairTarget {
+                context: TargetRepairContext { failure, .. },
+                ..
+            } if failure.category == FailureCategory::ValidationFailure => Some(&failure.node_id),
+            _ => self.node_id(),
         }
     }
 }
@@ -293,6 +312,12 @@ pub fn reconcile_execution(
         .unresolved()
         .find(|failure| failure.category.is_infrastructure())
     {
+        if snapshot.current_repository.has_changes() && all_required_mutations_applied(snapshot) {
+            return incomplete_diff_decision(
+                snapshot,
+                IncompleteReason::ValidationInfrastructureFailure,
+            );
+        }
         return Ok(ExecutionDecision::StopForGuardrail {
             outcome: MissionOutcome::FailedInfrastructure,
             reason: if failure.category == FailureCategory::InfrastructureFailure {
@@ -308,6 +333,21 @@ pub fn reconcile_execution(
         .unresolved()
         .find(|failure| failure.category == FailureCategory::ValidationFailure)
     {
+        if matches!(
+            latest_validation_repair_result(snapshot, &failure.id),
+            Some(RepairResult::NoMutation { .. })
+        ) {
+            if !snapshot.current_repository.has_changes() {
+                return Ok(ExecutionDecision::StopForGuardrail {
+                    outcome: MissionOutcome::BlockedNoDiff,
+                    reason: GuardrailReason::BlockingFailure,
+                });
+            }
+            return incomplete_diff_decision(
+                snapshot,
+                IncompleteReason::ValidationRepairProducedNoMutation,
+            );
+        }
         if let Some(path) = failure.target_path.as_deref() {
             let matching_nodes = snapshot
                 .graph
@@ -417,6 +457,81 @@ pub fn reconcile_execution(
         "graph_stalled",
         "required graph work remains but no node is runnable",
     ))
+}
+
+fn all_required_mutations_applied(snapshot: &ExecutionSnapshot) -> bool {
+    snapshot
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.required && node.kind.is_mutation())
+        .all(|node| node.status == ExecutionNodeStatus::Applied)
+}
+
+fn latest_validation_repair_result<'a>(
+    snapshot: &'a ExecutionSnapshot,
+    failure_id: &FailureId,
+) -> Option<&'a RepairResult> {
+    current_execution_epoch(&snapshot.events)
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ExecutionDomainEvent::ValidationRepairCompleted {
+                failure_id: repaired_failure_id,
+                result,
+                ..
+            } if repaired_failure_id == failure_id => Some(result),
+            _ => None,
+        })
+}
+
+fn incomplete_diff_decision(
+    snapshot: &ExecutionSnapshot,
+    reason: IncompleteReason,
+) -> Result<ExecutionDecision, OrchestrationInvariantError> {
+    let diff_review = snapshot
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::DiffReview)
+        .ok_or_else(|| {
+            OrchestrationInvariantError::new(
+                "incomplete_diff_review_node_missing",
+                "partial-reviewable execution requires a diff-review node",
+            )
+        })?;
+    if diff_review.status != ExecutionNodeStatus::Completed {
+        return Ok(ExecutionDecision::ReviewIncompleteDiff {
+            node_id: diff_review.id.clone(),
+            reason,
+        });
+    }
+
+    let completion = snapshot
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::CompletionEvaluation)
+        .ok_or_else(|| {
+            OrchestrationInvariantError::new(
+                "incomplete_completion_node_missing",
+                "partial-reviewable execution requires a completion-evaluation node",
+            )
+        })?;
+    if completion.status != ExecutionNodeStatus::Completed {
+        return Ok(ExecutionDecision::EvaluateCompletion {
+            node_id: completion.id.clone(),
+        });
+    }
+
+    if snapshot.publication.is_published() {
+        return Ok(ExecutionDecision::Finish {
+            outcome: MissionOutcome::PartialReviewable,
+        });
+    }
+    Ok(ExecutionDecision::Publish {
+        mode: PublicationMode::Draft,
+    })
 }
 
 fn decision_for_node(
@@ -770,7 +885,39 @@ fn repair_target_decision(
             "target repair was requested after its node repair budget was exhausted",
         ));
     }
-    let target = snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+    let mut target = snapshot.target_execution_context(&node.id, vec![ToolKind::ApplyPatch])?;
+    if failure.category == FailureCategory::ValidationFailure {
+        let implicated_paths = failure
+            .assertion_failures
+            .iter()
+            .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let implicated_targets = implicated_paths
+            .iter()
+            .filter_map(|path| {
+                snapshot.evidence.reusable_file(
+                    path,
+                    &snapshot.current_repository.fingerprint,
+                    None,
+                )
+            })
+            .map(FileExcerpt::from)
+            .collect();
+        target.validation_repair = Some(ValidationRepairContext {
+            focused_validation_command: failure.validation_command.clone().unwrap_or_default(),
+            assertion_failures: failure.assertion_failures.clone(),
+            implicated_targets,
+            selected_target: target.target.path.clone(),
+            repository_fingerprint: snapshot.current_repository.fingerprint.clone(),
+            accepted_implementation_intent: target.intent.clone(),
+            existing_diff_paths: snapshot
+                .current_repository
+                .changed_paths
+                .iter()
+                .cloned()
+                .collect(),
+        });
+    }
     Ok(ExecutionDecision::ExecuteTarget {
         node_id: node.id.clone(),
         action: MutationAction::RepairTarget {
@@ -918,6 +1065,23 @@ fn hard_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> 
 }
 
 fn repair_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> bool {
+    if let Some(validation_failure) = snapshot.failures.unresolved().find(|failure| {
+        failure.category == FailureCategory::ValidationFailure
+            && (failure.target_path.as_deref()
+                == node.target.as_ref().map(|target| target.path.as_str())
+                || failure.assertion_failures.iter().any(|assertion| {
+                    node.target
+                        .as_ref()
+                        .is_some_and(|target| assertion.implicated_paths.contains(&target.path))
+                }))
+    }) && let Some(validation_node) = snapshot.graph.node(&validation_failure.node_id)
+    {
+        return snapshot
+            .budget
+            .usage_for(&validation_node.id)
+            .validation_repair_attempts
+            >= validation_node.budget.max_repair_attempts.max(1);
+    }
     let repair_pending = node.status == ExecutionNodeStatus::FailedRecoverable
         || snapshot.failures.unresolved().any(|failure| {
             failure.category.creates_repair_work()
@@ -1367,6 +1531,304 @@ mod tests {
     }
 
     #[test]
+    fn failed_validation_no_mutation_routes_applied_diff_to_draft_review() {
+        let targets = [
+            target("provider", "src/components/theme/ThemeProvider.tsx"),
+            target("toggle", "src/components/theme/ThemeToggle.tsx"),
+            target("styles", "src/styles/globals.css"),
+            target("tests", "tests/theme-provider.test.tsx"),
+        ];
+        let gates = [
+            ValidationGateSpec {
+                gate_id: "focused-theme-provider".into(),
+                gate_type: ValidationGateType::FocusedTest,
+                command: "npx vitest run tests/theme-provider.test.tsx".into(),
+                required: true,
+                ..ValidationGateSpec::default()
+            },
+            ValidationGateSpec {
+                gate_id: "suite".into(),
+                gate_type: ValidationGateType::TestSuite,
+                command: "npm test".into(),
+                required: true,
+                ..ValidationGateSpec::default()
+            },
+            ValidationGateSpec {
+                gate_id: "build".into(),
+                gate_type: ValidationGateType::Build,
+                command: "npm run build".into(),
+                required: true,
+                ..ValidationGateSpec::default()
+            },
+        ];
+        let budget = MissionBudget::for_complexity(MissionComplexity::Small);
+        let mut state = ExecutionSnapshot {
+            run_id: "attempt-30".into(),
+            current_repository: RepositorySnapshot {
+                fingerprint: "tree-after-four-mutations".into(),
+                source_tree_hash: "tree-after-four-mutations".into(),
+                changed_paths: targets.iter().map(|target| target.path.clone()).collect(),
+                ..RepositorySnapshot::default()
+            },
+            graph: ExecutionGraph::from_targets(
+                "attempt-30-graph",
+                MissionComplexity::Small,
+                "tree-before",
+                &targets,
+                &gates,
+                &budget,
+            ),
+            budget: BudgetState::new(budget),
+            ..ExecutionSnapshot::default()
+        };
+        for node in state
+            .graph
+            .nodes
+            .iter_mut()
+            .filter(|node| node.kind.is_mutation())
+        {
+            node.status = ExecutionNodeStatus::Applied;
+        }
+        state.graph.refresh_readiness();
+        let validation_node = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::ValidationFocused)
+            .expect("focused validation")
+            .id
+            .clone();
+        let validation_gate = state
+            .graph
+            .node(&validation_node)
+            .and_then(|node| node.validation.as_ref())
+            .expect("focused validation gate")
+            .clone();
+        let validation_fingerprint = validation_gate.fingerprint("tree-after-four-mutations");
+        state
+            .append_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+                sequence: 1,
+                node_id: validation_node.clone(),
+                evidence: ValidationEvidenceRecord {
+                    evidence_id: "attempt-30-focused-evidence".into(),
+                    node_id: validation_node.clone(),
+                    gate_id: validation_gate.gate_id,
+                    fingerprint: validation_fingerprint.clone(),
+                    repository_fingerprint: "tree-after-four-mutations".into(),
+                    command: validation_gate.command,
+                    working_directory: validation_gate.working_directory,
+                    status: ValidationEvidenceStatus::Failed,
+                    exit_code: Some(1),
+                    output_summary: "3 focused assertions failed".into(),
+                    duration: std::time::Duration::from_millis(100),
+                },
+            })
+            .unwrap();
+        let mut failure = FailureRecord::new(
+            "attempt-30-focused-failure",
+            validation_node.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-after-four-mutations",
+            "3 focused assertions failed",
+        );
+        failure.target_path = Some("src/components/theme/ThemeProvider.tsx".into());
+        failure.validation_command = Some("npx vitest run tests/theme-provider.test.tsx".into());
+        failure.assertion_failures = vec![ValidationAssertionFailure {
+            test_file: "tests/theme-provider.test.tsx".into(),
+            test_name: "restores light-blue".into(),
+            expected: "light-blue".into(),
+            received: String::new(),
+            implicated_paths: vec![
+                "src/components/theme/ThemeProvider.tsx".into(),
+                "tests/theme-provider.test.tsx".into(),
+            ],
+            ..ValidationAssertionFailure::default()
+        }];
+        state
+            .append_event(ExecutionDomainEvent::FailureRecorded {
+                sequence: 2,
+                failure: failure.clone(),
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::ValidationFailed {
+                sequence: 3,
+                node_id: validation_node.clone(),
+                failure_id: failure.id.clone(),
+                fingerprint: validation_fingerprint,
+            })
+            .unwrap();
+
+        assert!(
+            state
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind.is_mutation())
+                .all(|node| node.status == ExecutionNodeStatus::Applied)
+        );
+        assert_eq!(
+            state
+                .graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == ExecutionNodeKind::ValidationSuite)
+                .unwrap()
+                .status,
+            ExecutionNodeStatus::Pending
+        );
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::RepairTarget { ref target, .. },
+                ..
+            } if target.path == "src/components/theme/ThemeProvider.tsx"
+        ));
+
+        state
+            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: 4,
+                validation_node_id: validation_node,
+                failure_id: failure.id,
+                result: RepairResult::NoMutation {
+                    diagnosis: Some(ValidationRepairDiagnosis::Inconclusive),
+                    reason: "no safe mutation".into(),
+                },
+            })
+            .unwrap();
+        let (diff_node, reason) = match reconcile_execution(&state).unwrap() {
+            ExecutionDecision::ReviewIncompleteDiff { node_id, reason } => (node_id, reason),
+            decision => panic!("expected incomplete review, got {decision:?}"),
+        };
+        let overrides = state.incomplete_diff_dependency_overrides(&diff_node, reason);
+        assert_eq!(overrides.len(), 3);
+        assert!(
+            overrides.iter().all(|override_| {
+                override_.allowed_outcome == MissionOutcome::PartialReviewable
+            })
+        );
+        state
+            .append_event(ExecutionDomainEvent::IncompleteDiffReviewRequested {
+                sequence: 5,
+                node_id: diff_node.clone(),
+                reason,
+                dependency_overrides: overrides,
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::DiffReviewed {
+                sequence: 6,
+                node_id: diff_node,
+                evidence_ids: Vec::new(),
+            })
+            .unwrap();
+        let completion_node = match reconcile_execution(&state).unwrap() {
+            ExecutionDecision::EvaluateCompletion { node_id } => node_id,
+            decision => panic!("expected partial completion evaluation, got {decision:?}"),
+        };
+        state
+            .append_event(ExecutionDomainEvent::CompletionEvaluated {
+                sequence: 7,
+                node_id: completion_node,
+                outcome: MissionOutcome::PartialReviewable,
+            })
+            .unwrap();
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::Publish {
+                mode: PublicationMode::Draft
+            }
+        ));
+        assert!(
+            state
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind.is_mutation())
+                .all(|node| node.status == ExecutionNodeStatus::Applied)
+        );
+        assert_eq!(
+            state.target_state(
+                &state
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|node| {
+                        node.target
+                            .as_ref()
+                            .is_some_and(|target| target.path == "tests/theme-provider.test.tsx")
+                    })
+                    .unwrap()
+                    .id
+            ),
+            Some(TargetState {
+                mutation_status: MutationStatus::Applied,
+                validation_status: ValidationStatus::FailedCode,
+            })
+        );
+
+        let publication_node = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::Publication)
+            .expect("publication node")
+            .id
+            .clone();
+        for event in [
+            ExecutionDomainEvent::PublicationStarted {
+                sequence: 8,
+                node_id: publication_node.clone(),
+                mode: PublicationMode::Draft,
+            },
+            ExecutionDomainEvent::CommitCreated {
+                sequence: 9,
+                node_id: publication_node.clone(),
+                commit_sha: "attempt-30-commit".into(),
+            },
+            ExecutionDomainEvent::BranchPushed {
+                sequence: 10,
+                node_id: publication_node.clone(),
+                branch: "rustgrid/attempt-30".into(),
+            },
+            ExecutionDomainEvent::PullRequestCreated {
+                sequence: 11,
+                node_id: publication_node,
+                url: "https://example.test/pull/30".into(),
+                number: Some(30),
+                draft: true,
+            },
+            ExecutionDomainEvent::RunFinished {
+                sequence: 12,
+                outcome: MissionOutcome::PartialReviewable,
+            },
+            ExecutionDomainEvent::ExecutionResumed {
+                sequence: 13,
+                execution_attempt: 31,
+                previous_outcome: Some(MissionOutcome::PartialReviewable),
+            },
+        ] {
+            state.append_event(event).unwrap();
+        }
+        assert!(
+            state
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind.is_mutation())
+                .all(|node| node.status == ExecutionNodeStatus::Applied)
+        );
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::RepairTarget { ref failure, .. },
+                ..
+            } if failure.id == FailureId::new("attempt-30-focused-failure")
+        ));
+    }
+
+    #[test]
     fn already_applied_mutation_is_a_no_op_not_a_failure() {
         let mut state = snapshot(&[target("one", "src/one.rs")]);
         let node = state
@@ -1788,9 +2250,9 @@ mod tests {
             match category {
                 FailureCategory::InfrastructureFailure => assert_eq!(
                     reconcile_execution(&state).expect("infrastructure decision"),
-                    ExecutionDecision::StopForGuardrail {
-                        outcome: MissionOutcome::FailedInfrastructure,
-                        reason: GuardrailReason::InfrastructureFailure,
+                    ExecutionDecision::ReviewIncompleteDiff {
+                        node_id: ExecutionNodeId::new("diff-review"),
+                        reason: IncompleteReason::ValidationInfrastructureFailure,
                     }
                 ),
                 FailureCategory::ValidationFailure => assert!(matches!(

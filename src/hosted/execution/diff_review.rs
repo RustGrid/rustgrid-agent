@@ -70,4 +70,62 @@ impl<'a> GatewayAgent<'a> {
         );
         Ok(changed_paths)
     }
+
+    pub(in crate::hosted) fn deterministic_incomplete_diff_review(
+        &mut self,
+        reason: crate::execution_graph::IncompleteReason,
+    ) -> Result<Vec<String>> {
+        let applied = self.reconcile_execution_and_apply()?;
+        let node_id = match applied.decision {
+            ExecutionDecision::ReviewIncompleteDiff {
+                node_id,
+                reason: selected_reason,
+            } if selected_reason == reason => node_id,
+            ref decision => {
+                return Err(anyhow!(HostedInvariantFailure::new(
+                    "incomplete_diff_review_decision_changed",
+                    format!(
+                        "expected incomplete diff review, received `{}`",
+                        execution_decision_name(decision)
+                    ),
+                )));
+            }
+        };
+        let changed_paths = completion_changed_paths(self.repo, &self.manifest.github.base_sha)?;
+        if changed_paths.is_empty() {
+            return Err(anyhow!(HostedInvariantFailure::new(
+                "incomplete_diff_review_requires_changes",
+                "incomplete diff review requires a non-empty repository diff",
+            )));
+        }
+        let snapshot = self.build_execution_snapshot()?;
+        let overrides = snapshot.incomplete_diff_dependency_overrides(&node_id, reason);
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.incomplete_diff_review_started",
+                "reason": reason,
+                "changed_paths": changed_paths,
+                "diff_fingerprint": snapshot.current_repository.fingerprint,
+                "dependency_overrides": overrides,
+            }),
+            "incomplete diff review start",
+        );
+        let evidence_ids = self
+            .notebook
+            .validation_evidence
+            .iter()
+            .map(|evidence| evidence.evidence_id.clone())
+            .collect::<Vec<_>>();
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::DiffReviewed {
+                sequence: self.next_domain_event_sequence(),
+                node_id,
+                evidence_ids,
+            },
+        )?;
+        self.diff_reviewed = true;
+        self.persist_orchestration_checkpoint("incomplete_diff_review_completed", true)?;
+        Ok(changed_paths)
+    }
 }

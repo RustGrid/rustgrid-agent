@@ -253,6 +253,7 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
             repository_fingerprint: "tree-1".into(),
             accepted_intent_hash: hex::encode(Sha256::digest(b"extend the persisted theme state")),
             nearby_context: Vec::new(),
+            validation_repair: None,
             allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
             remaining_node_budget: Default::default(),
         },
@@ -320,6 +321,61 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
     assert!(
         hosted_agent_instructions_for_decision(ExecutionPhase::Repair, Some(&repair))
             .contains("rejected patch was not applied")
+    );
+}
+
+#[test]
+fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
+    let node_id = crate::execution_graph::ExecutionNodeId::new("source-000");
+    let validation_node = crate::execution_graph::ExecutionNodeId::new("validation-focused-000");
+    let target = crate::execution_graph::PlannedTarget {
+        change_id: "theme-provider".into(),
+        path: "src/components/theme/ThemeProvider.tsx".into(),
+        role: "production".into(),
+        intent: "apply all four theme classes consistently".into(),
+        acceptance_criteria_ids: vec!["ac-1".into()],
+        new_file: false,
+    };
+    let mut failure = crate::execution_graph::FailureRecord::new(
+        "validation-failure",
+        validation_node,
+        crate::execution_graph::FailureCategory::ValidationFailure,
+        1,
+        "tree-2",
+        "focused assertions failed",
+    );
+    failure.target_path = Some(target.path.clone());
+    let decision = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id: node_id.clone(),
+            target: target.clone(),
+            failure,
+        },
+        target: crate::execution_graph::TargetExecutionContext {
+            node_id,
+            change_id: target.change_id.clone(),
+            intent: target.intent.clone(),
+            target,
+            repository_fingerprint: "tree-2".into(),
+            allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
+            ..crate::execution_graph::TargetExecutionContext::default()
+        },
+    };
+    assert_eq!(
+        hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision))
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["apply_patch", "replace_file", "record_no_valid_repair"]
+    );
+    assert!(
+        hosted_agent_instructions_for_decision(ExecutionPhase::Repair, Some(&decision))
+            .contains("Do not emit a free-form answer")
+    );
+    assert_eq!(
+        decision.budget_node_id().unwrap().as_str(),
+        "validation-focused-000"
     );
 }
 
@@ -1221,6 +1277,66 @@ fn validation_failure_target_hint_requires_one_explicit_planned_path() {
         .as_deref(),
         Some("src/shared.rs"),
         "the orchestrator must receive the shared path and reject its ambiguous node identity"
+    );
+}
+
+#[test]
+fn vitest_assertions_are_structured_and_select_an_implicated_source_target() {
+    let output = r#"
+ FAIL  tests/theme-provider.test.tsx > ThemeProvider > applies the light-blue root class
+AssertionError: expected 'theme-root' to contain 'light-blue'
+Expected: "light-blue"
+Received: "theme-root"
+ ❯ tests/theme-provider.test.tsx:41:38
+
+ FAIL  tests/theme-provider.test.tsx > ThemeProvider > restores the saved light-blue root class
+AssertionError: expected 'theme-root' to contain 'light-blue'
+Expected: "light-blue"
+Received: "theme-root"
+ ❯ tests/theme-provider.test.tsx:58:38
+
+ FAIL  tests/theme-provider.test.tsx > ThemeProvider > cycles through four themes
+AssertionError: expected 'light-blue' to be 'red'
+Expected: "red"
+Received: "light-blue"
+ ❯ tests/theme-provider.test.tsx:77:26
+"#;
+    let candidates = vec![
+        (
+            "src/components/theme/ThemeProvider.tsx".into(),
+            "const themes = ['dark', 'light', 'light-blue', 'red']; document.documentElement.classList.add(theme);".into(),
+        ),
+        (
+            "src/components/theme/ThemeToggle.tsx".into(),
+            "const cycle = ['dark', 'light', 'light-blue', 'red'];".into(),
+        ),
+        (
+            "tests/theme-provider.test.tsx".into(),
+            "expect(root.className).toContain('light-blue'); expect(theme).toBe('red');".into(),
+        ),
+    ];
+    let assertions = parse_validation_assertion_failures(
+        "npx vitest run tests/theme-provider.test.tsx",
+        output,
+        &candidates,
+    );
+    assert_eq!(assertions.len(), 3);
+    assert_eq!(assertions[0].expected, "light-blue");
+    assert_eq!(assertions[0].received, "theme-root");
+    assert_eq!(assertions[2].expected, "red");
+    assert_eq!(assertions[2].received, "light-blue");
+    assert!(
+        assertions[2]
+            .implicated_paths
+            .contains(&"src/components/theme/ThemeToggle.tsx".to_owned())
+    );
+    let targets = candidates
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validation_repair_target_hint(&assertions, &targets).as_deref(),
+        Some("src/components/theme/ThemeProvider.tsx")
     );
 }
 
@@ -7513,6 +7629,58 @@ fn partial_pull_request_is_prominently_marked_incomplete_and_resumable() {
     assert!(body.contains("### Resume action"));
     assert!(body.contains("without repeating discovery, planning, or completed work"));
     assert!(title.starts_with("[INCOMPLETE]"));
+}
+
+#[test]
+fn validation_incomplete_draft_lists_failed_and_pending_gates() {
+    let manifest = test_manifest(Uuid::from_u128(0x11111111_1111_4111_8111_111111111111));
+    let validation = vec![
+        ValidationResult {
+            id: "focused".into(),
+            command: "npx vitest run tests/theme-provider.test.tsx".into(),
+            status: "failed_code".into(),
+            output: "AssertionError: expected root class\nExpected: light-blue\nReceived:\n❯ tests/theme-provider.test.tsx:42:17".into(),
+        },
+        ValidationResult {
+            id: "suite".into(),
+            command: "npm test".into(),
+            status: "pending".into(),
+            output: String::new(),
+        },
+        ValidationResult {
+            id: "build".into(),
+            command: "npm run build".into(),
+            status: "pending".into(),
+            output: String::new(),
+        },
+    ];
+    let completeness = CompletionEvaluation {
+        status: CompletionStatus::Partial,
+        implementation_completeness: ImplementationCompleteness::Partial,
+        verification_readiness: VerificationReadiness::PendingManualReview,
+        evaluation_source: EvaluationSource::OrchestratorFallback,
+        confidence: 1.0,
+        criteria: vec![],
+        remaining_implementation_work: vec!["Reconcile root class behavior.".into()],
+        remaining_automated_verification: vec![
+            "Rerun focused tests.".into(),
+            "Run full suite and build.".into(),
+        ],
+        pending_external_review: vec!["Obtain product/design approval.".into()],
+        optional_follow_up: vec![],
+        review_checklist: vec![],
+        unrecovered_tool_failures: vec!["Validation repair produced no mutation.".into()],
+        summary: "Applied changes are preserved for draft review; validation is incomplete.".into(),
+    };
+
+    let body = hosted_pull_request_body(&manifest, &validation, &completeness);
+    assert!(body.contains("Known validation failures"));
+    assert!(body.contains("Expected: light-blue"));
+    assert!(body.contains("Received:"));
+    assert!(body.contains("- npm test not yet run"));
+    assert!(body.contains("- npm run build not yet run"));
+    assert!(body.contains("Obtain product/design approval"));
+    assert!(body.contains("without repeating discovery, planning, or completed work"));
 }
 
 #[test]

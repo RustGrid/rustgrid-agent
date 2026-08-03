@@ -351,6 +351,42 @@ pub(super) fn hosted_pull_request_body(
             infrastructure_incomplete.join("\n")
         )
     };
+    let code_failures = validation
+        .iter()
+        .filter(|result| matches!(result.status.as_str(), "failed" | "failed_code"))
+        .map(|result| {
+            let assertion_lines = result
+                .output
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    trimmed.contains("AssertionError:")
+                        || trimmed.starts_with("Expected:")
+                        || trimmed.starts_with("Received:")
+                        || trimmed.starts_with('❯')
+                })
+                .take(16)
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            format!(
+                "- `{}`\n  {}",
+                result.command,
+                if assertion_lines.is_empty() {
+                    truncate_text(&result.output, 1_000).replace('\n', "\n  ")
+                } else {
+                    assertion_lines.join("\n  ")
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    let code_failure_notice = if code_failures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Known validation failures:\n{}\n\n",
+            code_failures.join("\n")
+        )
+    };
     let completeness_heading = match completeness.status {
         CompletionStatus::Complete => "Implementation completeness: **complete**",
         CompletionStatus::CompletePendingExternalReview => {
@@ -402,15 +438,21 @@ pub(super) fn hosted_pull_request_body(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let review_checklist = if completeness.review_checklist.is_empty() {
+    let mut review_items = completeness
+        .review_checklist
+        .iter()
+        .map(|item| format!("- [ ] {}", item.description))
+        .collect::<Vec<_>>();
+    for pending in &completeness.pending_external_review {
+        let item = format!("- [ ] {pending}");
+        if !review_items.contains(&item) {
+            review_items.push(item);
+        }
+    }
+    let review_checklist = if review_items.is_empty() {
         "- None.".into()
     } else {
-        completeness
-            .review_checklist
-            .iter()
-            .map(|item| format!("- [ ] {}", item.description))
-            .collect::<Vec<_>>()
-            .join("\n")
+        review_items.join("\n")
     };
     let partial_summary = if requires_implementation_continuation(completeness.status) {
         let completed = completeness
@@ -449,7 +491,7 @@ Criterion evidence:\n{}\n\n\
 Remaining implementation work:\n{}\n\n\
 Remaining automated verification:\n{}\n\n\
 External review checklist:\n{}\n\n\
-Optional follow-up:\n{}\n\n{}{}Technical validation:\n{}\n\n\
+Optional follow-up:\n{}\n\n{}{}{}Technical validation:\n{}\n\n\
 _The OpenAI credential remained encrypted in RustGrid and was never sent to this runner._",
         completeness_heading,
         external_review_notice,
@@ -474,6 +516,7 @@ _The OpenAI credential remained encrypted in RustGrid and was never sent to this
         review_checklist,
         render_items(&completeness.optional_follow_up),
         partial_summary,
+        code_failure_notice,
         infrastructure_notice,
         if checks.is_empty() {
             "- No required validation commands configured.".into()

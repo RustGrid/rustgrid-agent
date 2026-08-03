@@ -855,7 +855,7 @@ impl<'a> GatewayAgent<'a> {
         let node_id = self
             .current_decision
             .as_ref()
-            .and_then(ExecutionDecision::node_id)
+            .and_then(ExecutionDecision::budget_node_id)
             .cloned()
             .or_else(|| {
                 self.notebook
@@ -952,6 +952,12 @@ impl<'a> GatewayAgent<'a> {
             .orchestration
             .budget
             .consume_model_call_reservation(reservation, call_cost_micros, duration);
+        if let Some(purpose) = self.current_model_call_purpose() {
+            self.notebook
+                .orchestration
+                .budget
+                .record_model_call_purpose(purpose);
+        }
         if estimated {
             self.append_event_recoverable(
                 "progress",
@@ -967,6 +973,53 @@ impl<'a> GatewayAgent<'a> {
             );
         }
         Ok(())
+    }
+
+    fn current_model_call_purpose(&self) -> Option<crate::execution_graph::ModelCallPurpose> {
+        match self.current_decision.as_ref()? {
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::MutateTarget { .. },
+                ..
+            } => Some(crate::execution_graph::ModelCallPurpose::InitialTargetMutation),
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            }
+            | ExecutionDecision::RepairTarget {
+                context: crate::hosted_orchestrator::TargetRepairContext { failure, .. },
+                ..
+            } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+                let diagnosed_without_mutation = self
+                    .notebook
+                    .orchestration
+                    .domain_events
+                    .iter()
+                    .rev()
+                    .any(|event| {
+                        matches!(
+                            event,
+                            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                                failure_id,
+                                result: crate::execution_graph::RepairResult::NoMutation { .. },
+                                ..
+                            } if failure_id == &failure.id
+                        )
+                    });
+                Some(if diagnosed_without_mutation {
+                    crate::execution_graph::ModelCallPurpose::ValidationDiagnosis
+                } else {
+                    crate::execution_graph::ModelCallPurpose::ValidationRepairMutation
+                })
+            }
+            ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            }
+            | ExecutionDecision::RepairTarget { .. } => {
+                Some(crate::execution_graph::ModelCallPurpose::TargetMutationRepair)
+            }
+            _ => None,
+        }
     }
 
     /// A dispatched call is canonical budget usage even when no successful
@@ -1001,6 +1054,12 @@ impl<'a> GatewayAgent<'a> {
             .orchestration
             .budget
             .consume_model_call_reservation(reservation, call_cost_micros, duration);
+        if let Some(purpose) = self.current_model_call_purpose() {
+            self.notebook
+                .orchestration
+                .budget
+                .record_model_call_purpose(purpose);
+        }
         self.append_event_recoverable(
             "progress",
             json!({
@@ -1049,7 +1108,8 @@ impl<'a> GatewayAgent<'a> {
             ExecutionDecision::ExecuteTarget { .. } => Some(ExecutionPhase::Implementation),
             ExecutionDecision::RepairTarget { .. } => Some(ExecutionPhase::Repair),
             ExecutionDecision::RunValidation { .. } => Some(ExecutionPhase::Validation),
-            ExecutionDecision::ReviewDiff { .. } => Some(ExecutionPhase::DiffReview),
+            ExecutionDecision::ReviewDiff { .. }
+            | ExecutionDecision::ReviewIncompleteDiff { .. } => Some(ExecutionPhase::DiffReview),
             ExecutionDecision::EvaluateCompletion { .. } => {
                 Some(ExecutionPhase::CompletionEvaluation)
             }
@@ -1077,6 +1137,56 @@ impl<'a> GatewayAgent<'a> {
         }
         let decision_event_added =
             self.notebook.orchestration.domain_events.len() > event_count_before;
+        if decision_event_added {
+            match &decision {
+                ExecutionDecision::ExecuteTarget {
+                    action:
+                        crate::hosted_orchestrator::MutationAction::RepairTarget {
+                            target, failure, ..
+                        },
+                    ..
+                } if failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+                {
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.validation_repair_target_selected",
+                            "validation_gate": failure.node_id,
+                            "failing_tests": failure.assertion_failures.iter()
+                                .map(|assertion| assertion.test_name.as_str())
+                                .collect::<Vec<_>>(),
+                            "implicated_paths": failure.assertion_failures.iter()
+                                .flat_map(|assertion| assertion.implicated_paths.iter())
+                                .collect::<BTreeSet<_>>(),
+                            "selected_repair_target": target.path,
+                            "diff_fingerprint": self.notebook.repository_fingerprint,
+                        }),
+                        "validation repair target selection",
+                    );
+                }
+                ExecutionDecision::Publish {
+                    mode:
+                        crate::execution_graph::PublicationMode::Draft
+                        | crate::execution_graph::PublicationMode::DraftRecovery,
+                } => {
+                    self.append_event_recoverable(
+                        "publication",
+                        json!({
+                            "event_type": "worker.draft_publication_started",
+                            "publication_mode": decision,
+                            "publication_outcome": "partial_reviewable",
+                            "override_reason": self.notebook.orchestration.graph.as_ref()
+                                .and_then(|graph| graph.dependency_overrides.first())
+                                .map(|override_| override_.reason.as_str()),
+                            "diff_fingerprint": self.notebook.repository_fingerprint,
+                        }),
+                        "draft publication start",
+                    );
+                }
+                _ => {}
+            }
+        }
         if decision_event_added && (phase.is_none() || phase == Some(previous)) {
             self.persist_orchestration_checkpoint("decision_domain_event_applied", false)?;
         }
@@ -1213,10 +1323,41 @@ impl<'a> GatewayAgent<'a> {
                 action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                 ..
             } => None,
+            ExecutionDecision::ExecuteTarget {
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        target, failure, ..
+                    },
+                ..
+            } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+                Some(ExecutionDomainEvent::ValidationRepairStarted {
+                    sequence,
+                    validation_node_id: failure.node_id.clone(),
+                    failure_id: failure.id.clone(),
+                    selected_target: target.path.clone(),
+                    implicated_paths: failure
+                        .assertion_failures
+                        .iter()
+                        .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                })
+            }
             ExecutionDecision::ExecuteTarget { node_id, .. }
             | ExecutionDecision::RepairTarget { node_id, .. }
             | ExecutionDecision::ReviewDiff { node_id }
             | ExecutionDecision::EvaluateCompletion { node_id } => node_started(node_id, self),
+            ExecutionDecision::ReviewIncompleteDiff { node_id, reason } => {
+                let snapshot = self.build_execution_snapshot()?;
+                Some(ExecutionDomainEvent::IncompleteDiffReviewRequested {
+                    sequence,
+                    node_id: node_id.clone(),
+                    reason: *reason,
+                    dependency_overrides: snapshot
+                        .incomplete_diff_dependency_overrides(node_id, *reason),
+                })
+            }
             ExecutionDecision::RunValidation { node_id, gate } => {
                 let running = self
                     .notebook
@@ -2193,6 +2334,21 @@ impl<'a> GatewayAgent<'a> {
             .filter(|node| node.kind.is_mutation())
             .filter_map(|node| node.target.as_ref().map(|target| target.path.clone()))
             .collect::<Vec<_>>();
+        let target_contents = mutation_target_paths
+            .iter()
+            .map(|path| {
+                let content = self
+                    .notebook
+                    .orchestration
+                    .evidence
+                    .files
+                    .values()
+                    .filter(|evidence| evidence.path == *path)
+                    .max_by_key(|evidence| &evidence.repository_fingerprint)
+                    .map_or_else(String::new, |evidence| evidence.captured_content.clone());
+                (path.clone(), content)
+            })
+            .collect::<Vec<_>>();
         let mapped = failures
             .iter()
             .filter_map(|failure| {
@@ -2230,8 +2386,31 @@ impl<'a> GatewayAgent<'a> {
             );
             let diagnostics = format!("{}\n{}", failure.command, failure.output);
             if category == crate::execution_graph::FailureCategory::ValidationFailure {
-                record.target_path =
-                    validation_failure_target_hint(&mutation_target_paths, &diagnostics);
+                record.validation_command = Some(failure.command.clone());
+                record.assertion_failures = parse_validation_assertion_failures(
+                    &failure.command,
+                    &failure.output,
+                    &target_contents,
+                );
+                record.target_path = validation_repair_target_hint(
+                    &record.assertion_failures,
+                    &mutation_target_paths,
+                )
+                .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics));
+                self.append_event_recoverable(
+                    "validation",
+                    json!({
+                        "event_type": "worker.validation_failure_parsed",
+                        "validation_gate": failure.id,
+                        "failing_tests": record.assertion_failures,
+                        "implicated_paths": record.assertion_failures.iter()
+                            .flat_map(|assertion| assertion.implicated_paths.iter())
+                            .collect::<BTreeSet<_>>(),
+                        "selected_repair_target": record.target_path,
+                        "diff_fingerprint": fingerprint,
+                    }),
+                    "structured validation failure parsing",
+                );
             }
             self.append_execution_domain_event(
                 crate::execution_graph::ExecutionDomainEvent::FailureRecorded {
@@ -2258,6 +2437,131 @@ impl<'a> GatewayAgent<'a> {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    pub(in crate::hosted) fn record_validation_repair_no_mutation(
+        &mut self,
+        failures: &[ValidationResult],
+        reason: &str,
+    ) -> Result<()> {
+        let gate_ids = failures
+            .iter()
+            .map(|failure| failure.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let snapshot = self.build_execution_snapshot()?;
+        let unresolved = snapshot
+            .failures
+            .unresolved()
+            .filter(|failure| {
+                failure.category == crate::execution_graph::FailureCategory::ValidationFailure
+                    && snapshot.graph.node(&failure.node_id).is_some_and(|node| {
+                        node.validation
+                            .as_ref()
+                            .is_some_and(|gate| gate_ids.contains(gate.gate_id.as_str()))
+                    })
+            })
+            .map(|failure| (failure.node_id.clone(), failure.id.clone()))
+            .collect::<Vec<_>>();
+        for (validation_node_id, failure_id) in unresolved {
+            let already_recorded = self
+                .notebook
+                .orchestration
+                .domain_events
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event,
+                        crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                            failure_id: existing_failure_id,
+                            ..
+                        } if existing_failure_id == &failure_id
+                    )
+                });
+            if already_recorded {
+                continue;
+            }
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                    sequence: self.next_domain_event_sequence(),
+                    validation_node_id: validation_node_id.clone(),
+                    failure_id: failure_id.clone(),
+                    result: crate::execution_graph::RepairResult::NoMutation {
+                        diagnosis: None,
+                        reason: reason.to_owned(),
+                    },
+                },
+            )?;
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_no_mutation",
+                    "validation_gate": validation_node_id,
+                    "failure_id": failure_id,
+                    "reason": reason,
+                    "diff_fingerprint": self.notebook.repository_fingerprint,
+                }),
+                "validation repair no mutation",
+            );
+        }
+        Ok(())
+    }
+
+    pub(in crate::hosted) fn record_validation_no_valid_repair(
+        &mut self,
+        diagnosis: crate::execution_graph::ValidationRepairDiagnosis,
+        reason: &str,
+    ) -> Result<()> {
+        let (validation_node_id, failure_id, selected_target, implicated_paths) =
+            match self.current_decision.as_ref() {
+                Some(ExecutionDecision::ExecuteTarget {
+                    action:
+                        crate::hosted_orchestrator::MutationAction::RepairTarget {
+                            target, failure, ..
+                        },
+                    ..
+                }) if failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+                {
+                    (
+                        failure.node_id.clone(),
+                        failure.id.clone(),
+                        target.path.clone(),
+                        failure
+                            .assertion_failures
+                            .iter()
+                            .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                            .collect::<BTreeSet<_>>(),
+                    )
+                }
+                _ => bail!("no-valid-repair requires an active validation repair decision"),
+            };
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: self.next_domain_event_sequence(),
+                validation_node_id: validation_node_id.clone(),
+                failure_id: failure_id.clone(),
+                result: crate::execution_graph::RepairResult::NoMutation {
+                    diagnosis: Some(diagnosis),
+                    reason: reason.to_owned(),
+                },
+            },
+        )?;
+        self.append_event_recoverable(
+            "validation",
+            json!({
+                "event_type": "worker.validation_repair_diagnosed",
+                "validation_gate": validation_node_id,
+                "failure_id": failure_id,
+                "selected_repair_target": selected_target,
+                "implicated_paths": implicated_paths,
+                "repair_diagnosis": diagnosis,
+                "result": "no_mutation",
+                "reason": reason,
+                "diff_fingerprint": self.notebook.repository_fingerprint,
+            }),
+            "validation repair diagnosis",
+        );
         Ok(())
     }
 

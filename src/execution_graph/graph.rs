@@ -16,6 +16,11 @@ pub struct ExecutionGraph {
     /// entries here.
     #[serde(default)]
     pub(crate) dependency_satisfaction_overrides: BTreeSet<ExecutionNodeId>,
+    /// Typed, auditable exceptions that allow review and draft publication
+    /// without fabricating validation success. Only `PartialReviewable` may be
+    /// authorized by these overrides.
+    #[serde(default)]
+    pub(crate) dependency_overrides: Vec<DependencyOverride>,
     /// An explicit draft-recovery publication may satisfy only the publication
     /// node's direct dependency without fabricating review or completion
     /// success. The authorizing domain event is the sole writer.
@@ -34,6 +39,7 @@ impl Default for ExecutionGraph {
             created_from_repository_fingerprint: String::new(),
             revision: 0,
             dependency_satisfaction_overrides: BTreeSet::new(),
+            dependency_overrides: Vec::new(),
             recovery_publication_dependency_override: false,
         }
     }

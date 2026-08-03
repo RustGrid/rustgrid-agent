@@ -629,6 +629,24 @@ impl<'a> GatewayAgent<'a> {
                 );
                 Ok(output)
             }
+            "record_no_valid_repair" => {
+                let diagnosis = match required_tool_string(object, "diagnosis", 64)? {
+                    "source_defect" => {
+                        crate::execution_graph::ValidationRepairDiagnosis::SourceDefect
+                    }
+                    "test_expectation_defect" => {
+                        crate::execution_graph::ValidationRepairDiagnosis::TestExpectationDefect
+                    }
+                    "both" => crate::execution_graph::ValidationRepairDiagnosis::Both,
+                    "inconclusive" => {
+                        crate::execution_graph::ValidationRepairDiagnosis::Inconclusive
+                    }
+                    _ => bail!("validation repair diagnosis is unsupported"),
+                };
+                let reason = required_tool_string(object, "reason", 8_000)?;
+                self.record_validation_no_valid_repair(diagnosis, reason)?;
+                Ok("recorded typed no-valid-repair result".into())
+            }
             "rewrite_small_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;

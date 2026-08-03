@@ -28,9 +28,25 @@ pub struct TargetExecutionContext {
     pub accepted_intent_hash: String,
     #[serde(default)]
     pub nearby_context: Vec<FileExcerpt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_repair: Option<ValidationRepairContext>,
     #[serde(default)]
     pub allowed_tools: Vec<ToolKind>,
     pub remaining_node_budget: NodeBudgetRemaining,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairContext {
+    pub focused_validation_command: String,
+    #[serde(default)]
+    pub assertion_failures: Vec<ValidationAssertionFailure>,
+    #[serde(default)]
+    pub implicated_targets: Vec<FileExcerpt>,
+    pub selected_target: String,
+    pub repository_fingerprint: String,
+    pub accepted_implementation_intent: String,
+    #[serde(default)]
+    pub existing_diff_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -53,6 +69,75 @@ pub enum MutationResult {
     BlockingFailure {
         failure: FailureRecord,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairDiagnosis {
+    SourceDefect,
+    TestExpectationDefect,
+    Both,
+    Inconclusive,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationAssertionFailure {
+    pub test_file: String,
+    pub test_name: String,
+    pub source_location: String,
+    pub assertion_kind: String,
+    pub expected: String,
+    pub received: String,
+    #[serde(default)]
+    pub implicated_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis: Option<ValidationRepairDiagnosis>,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub proposed_repair: String,
+    #[serde(default)]
+    pub expected_validation_effect: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RepairResult {
+    MutationProduced {
+        selected_target: String,
+    },
+    NoMutation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnosis: Option<ValidationRepairDiagnosis>,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationStatus {
+    #[default]
+    Planned,
+    Running,
+    Applied,
+    FailedRecoverable,
+    FailedBlocking,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationStatus {
+    #[default]
+    Pending,
+    Passed,
+    FailedCode,
+    FailedInfrastructure,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetState {
+    pub mutation_status: MutationStatus,
+    pub validation_status: ValidationStatus,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
@@ -154,6 +239,10 @@ pub struct FailureRecord {
     pub attempt: u32,
     pub repository_fingerprint: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_command: Option<String>,
+    #[serde(default)]
+    pub assertion_failures: Vec<ValidationAssertionFailure>,
     #[serde(default)]
     pub resolved_repository_fingerprint: Option<String>,
 }

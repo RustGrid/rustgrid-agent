@@ -137,6 +137,20 @@ pub enum ExecutionDomainEvent {
         failure_id: FailureId,
         fingerprint: String,
     },
+    ValidationRepairStarted {
+        sequence: u64,
+        validation_node_id: ExecutionNodeId,
+        failure_id: FailureId,
+        selected_target: String,
+        #[serde(default)]
+        implicated_paths: Vec<String>,
+    },
+    ValidationRepairCompleted {
+        sequence: u64,
+        validation_node_id: ExecutionNodeId,
+        failure_id: FailureId,
+        result: RepairResult,
+    },
     ValidationSuperseded {
         sequence: u64,
         node_id: ExecutionNodeId,
@@ -155,6 +169,13 @@ pub enum ExecutionDomainEvent {
         sequence: u64,
         node_id: ExecutionNodeId,
         evidence_ids: Vec<String>,
+    },
+    IncompleteDiffReviewRequested {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+        reason: IncompleteReason,
+        #[serde(default)]
+        dependency_overrides: Vec<DependencyOverride>,
     },
     CompletionEvaluated {
         sequence: u64,
@@ -241,9 +262,12 @@ impl ExecutionDomainEvent {
             Self::ValidationEvidenceRecorded { .. } => "validation_evidence_recorded",
             Self::ValidationPassed { .. } => "validation_passed",
             Self::ValidationFailed { .. } => "validation_failed",
+            Self::ValidationRepairStarted { .. } => "validation_repair_started",
+            Self::ValidationRepairCompleted { .. } => "validation_repair_completed",
             Self::ValidationSuperseded { .. } => "validation_superseded",
             Self::FinalizationInvalidated { .. } => "finalization_invalidated",
             Self::DiffReviewed { .. } => "diff_reviewed",
+            Self::IncompleteDiffReviewRequested { .. } => "incomplete_diff_review_requested",
             Self::CompletionEvaluated { .. } => "completion_evaluated",
             Self::RecoveryPublicationRequested { .. } => "recovery_publication_requested",
             Self::PublicationStarted { .. } => "publication_started",
@@ -280,9 +304,12 @@ impl ExecutionDomainEvent {
             | Self::ValidationEvidenceRecorded { sequence, .. }
             | Self::ValidationPassed { sequence, .. }
             | Self::ValidationFailed { sequence, .. }
+            | Self::ValidationRepairStarted { sequence, .. }
+            | Self::ValidationRepairCompleted { sequence, .. }
             | Self::ValidationSuperseded { sequence, .. }
             | Self::FinalizationInvalidated { sequence, .. }
             | Self::DiffReviewed { sequence, .. }
+            | Self::IncompleteDiffReviewRequested { sequence, .. }
             | Self::CompletionEvaluated { sequence, .. }
             | Self::RecoveryPublicationRequested { sequence, .. }
             | Self::PublicationStarted { sequence, .. }
@@ -313,6 +340,7 @@ impl ExecutionDomainEvent {
             | Self::ValidationFailed { node_id, .. }
             | Self::ValidationSuperseded { node_id, .. }
             | Self::DiffReviewed { node_id, .. }
+            | Self::IncompleteDiffReviewRequested { node_id, .. }
             | Self::CompletionEvaluated { node_id, .. }
             | Self::RecoveryPublicationRequested { node_id, .. }
             | Self::PublicationStarted { node_id, .. }
@@ -320,6 +348,14 @@ impl ExecutionDomainEvent {
             | Self::BranchPushed { node_id, .. }
             | Self::PullRequestCreated { node_id, .. } => Some(node_id),
             Self::FailureRecorded { failure, .. } => Some(&failure.node_id),
+            Self::ValidationRepairCompleted {
+                validation_node_id,
+                ..
+            }
+            | Self::ValidationRepairStarted {
+                validation_node_id,
+                ..
+            } => Some(validation_node_id),
             _ => None,
         }
     }
@@ -464,17 +500,10 @@ impl ExecutionGraph {
             }
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {
                 self.set_node_status(&failure.node_id, failure.category.node_status())?;
-                if failure.category == FailureCategory::ValidationFailure
-                    && let Some(target_id) = failure.target_path.as_deref().and_then(|path| {
-                        self.unique_mutation_node_for_target_path(path)
-                            .map(|node| node.id.clone())
-                    })
-                    && self
-                        .node(&target_id)
-                        .is_some_and(|node| node.status.is_success())
-                {
-                    self.set_node_status(&target_id, ExecutionNodeStatus::FailedRecoverable)?;
-                }
+                // Validation correctness is owned by the validation node. A
+                // failed assertion may schedule repair for an already-applied
+                // target, but it must never erase that target's verified
+                // mutation result.
             }
             ExecutionDomainEvent::FailureRecovered { node_id, .. } => {
                 let reset_validation_evidence = self
@@ -543,6 +572,18 @@ impl ExecutionGraph {
                 };
                 self.set_node_status(node_id, status)?;
             }
+            ExecutionDomainEvent::ValidationRepairCompleted { .. } => {
+                // The result remains an append-only reconciliation fact. A
+                // no-mutation result intentionally leaves the failed
+                // validation node and every applied mutation node unchanged.
+                self.revision = self.revision.saturating_add(1);
+            }
+            ExecutionDomainEvent::ValidationRepairStarted { .. } => {
+                // Validation repair is separate work. The selected mutation
+                // target remains Applied until a new verified mutation event
+                // replaces its repository evidence.
+                self.revision = self.revision.saturating_add(1);
+            }
             ExecutionDomainEvent::ValidationSuperseded {
                 node_id,
                 evidence_id,
@@ -558,6 +599,7 @@ impl ExecutionGraph {
             }
             ExecutionDomainEvent::FinalizationInvalidated { .. } => {
                 self.recovery_publication_dependency_override = false;
+                self.dependency_overrides.clear();
                 for node in &mut self.nodes {
                     if node.kind.is_validation()
                         || matches!(
@@ -586,6 +628,22 @@ impl ExecutionGraph {
                 for evidence_id in evidence_ids {
                     if !node.evidence_ids.contains(evidence_id) {
                         node.evidence_ids.push(evidence_id.clone());
+                    }
+                }
+                self.revision = self.revision.saturating_add(1);
+                self.refresh_readiness();
+            }
+            ExecutionDomainEvent::IncompleteDiffReviewRequested {
+                node_id,
+                dependency_overrides,
+                ..
+            } => {
+                for override_ in dependency_overrides {
+                    if override_.dependent_node == *node_id
+                        && override_.allowed_outcome == MissionOutcome::PartialReviewable
+                        && !self.dependency_overrides.contains(override_)
+                    {
+                        self.dependency_overrides.push(override_.clone());
                     }
                 }
                 self.revision = self.revision.saturating_add(1);
@@ -658,8 +716,10 @@ impl ExecutionGraph {
                 ..
             } => {
                 let mut changed = !self.dependency_satisfaction_overrides.is_empty()
+                    || !self.dependency_overrides.is_empty()
                     || self.recovery_publication_dependency_override;
                 self.dependency_satisfaction_overrides.clear();
+                self.dependency_overrides.clear();
                 self.recovery_publication_dependency_override = false;
                 for node in &mut self.nodes {
                     if node.kind.is_mutation() {
@@ -726,7 +786,12 @@ impl ExecutionGraph {
             | ExecutionDomainEvent::ValidationPassed { .. }
             | ExecutionDomainEvent::ValidationFailed { .. }
             | ExecutionDomainEvent::ValidationSuperseded { .. } => node.kind.is_validation(),
+            ExecutionDomainEvent::ValidationRepairCompleted { .. } => node.kind.is_validation(),
+            ExecutionDomainEvent::ValidationRepairStarted { .. } => node.kind.is_validation(),
             ExecutionDomainEvent::DiffReviewed { .. } => node.kind == ExecutionNodeKind::DiffReview,
+            ExecutionDomainEvent::IncompleteDiffReviewRequested { .. } => {
+                node.kind == ExecutionNodeKind::DiffReview
+            }
             ExecutionDomainEvent::CompletionEvaluated { .. } => {
                 node.kind == ExecutionNodeKind::CompletionEvaluation
             }

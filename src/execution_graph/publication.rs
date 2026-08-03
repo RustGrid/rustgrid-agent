@@ -65,6 +65,21 @@ pub enum MissionOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompleteReason {
+    ValidationRepairProducedNoMutation,
+    ValidationInfrastructureFailure,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DependencyOverride {
+    pub dependent_node: ExecutionNodeId,
+    pub unsatisfied_dependency: ExecutionNodeId,
+    pub reason: String,
+    pub allowed_outcome: MissionOutcome,
+}
+
 impl MissionOutcome {
     pub const fn publication_mode(self) -> Option<PublicationMode> {
         match self {

@@ -121,6 +121,7 @@ pub fn build_execution_graph(
         created_from_repository_fingerprint: repository_fingerprint.into(),
         revision: 1,
         dependency_satisfaction_overrides: BTreeSet::new(),
+        dependency_overrides: Vec::new(),
         recovery_publication_dependency_override: false,
     };
     graph.refresh_readiness();
@@ -209,6 +210,11 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
             node.budget = NodeBudget {
                 max_model_calls: if node.kind.is_mutation() {
                     distributed_calls.clamp(1, 2)
+                } else if node.kind.is_validation() && mission.max_target_repair_rounds > 0 {
+                    // Validation execution itself is deterministic, but a
+                    // failed gate owns its bounded diagnosis/repair call. Do
+                    // not charge that call back to an already-applied target.
+                    distributed_calls.max(1)
                 } else {
                     distributed_calls
                 },
@@ -218,7 +224,9 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
                     count,
                     position,
                 )),
-                max_repair_attempts: if node.kind.is_mutation() || node.kind.is_validation() {
+                max_repair_attempts: if node.kind.is_validation() {
+                    mission.max_target_repair_rounds
+                } else if node.kind.is_mutation() {
                     mission.max_target_repair_rounds.min(1)
                 } else {
                     0

@@ -87,6 +87,7 @@ pub(super) fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "insert_before_symbol"
                 | "apply_patch"
                 | "replace_file"
+                | "record_no_valid_repair"
                 | "apply_unified_diff"
                 | "rewrite_small_file"
                 | "delete_file"
@@ -151,6 +152,7 @@ pub(super) const fn execution_decision_name(decision: &ExecutionDecision) -> &'s
         ExecutionDecision::RepairTarget { .. } => "repair_target",
         ExecutionDecision::RunValidation { .. } => "run_validation",
         ExecutionDecision::ReviewDiff { .. } => "review_diff",
+        ExecutionDecision::ReviewIncompleteDiff { .. } => "review_incomplete_diff",
         ExecutionDecision::EvaluateCompletion { .. } => "evaluate_completion",
         ExecutionDecision::Publish { .. } => "publish",
         ExecutionDecision::Finish { .. } => "finish",
@@ -477,6 +479,24 @@ pub(super) fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "record_no_valid_repair",
+            "description": "Record that bounded validation diagnosis found no safe source or test mutation. This is a typed terminal repair result, not a free-form answer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "diagnosis": {
+                        "type": "string",
+                        "enum": ["source_defect", "test_expectation_defect", "both", "inconclusive"]
+                    },
+                    "reason": {"type": "string"}
+                },
+                "required": ["diagnosis", "reason"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
             "name": "delete_file",
             "description": "Delete one regular repository file.",
             "parameters": {
@@ -741,6 +761,12 @@ pub(super) fn hosted_tools_for_action(
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
             ..
         }) if mutation_failure_requires_replacement(failure) => Some(&["replace_file"][..]),
+        Some(ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+            ..
+        }) if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+            Some(&["apply_patch", "replace_file", "record_no_valid_repair"][..])
+        }
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { .. }
@@ -1027,6 +1053,18 @@ pub(super) fn hosted_agent_instructions_for_decision(
             "Repair exactly `{}` with one forced `replace_file` call. Use the exact current target content and mutation_repair diagnostic in the authoritative input. The rejected patch was not applied. Return the complete replacement file, preserve unrelated behavior, and do not emit another patch or inspect another path.",
             target.path
         ),
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    target, failure, ..
+                },
+            ..
+        }) if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+            format!(
+                "Diagnose the structured validation assertion failures against the bounded implicated target contents. Classify source_defect, test_expectation_defect, both, or inconclusive. Repair exactly the selected target `{}` with one admitted mutation tool when safe. Otherwise invoke record_no_valid_repair with the diagnosis and concrete evidence-based reason. Do not emit a free-form answer, edit an unlisted path, blindly change a test expectation, or run validation.",
+                target.path
+            )
+        }
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::MutateTarget { target, .. }

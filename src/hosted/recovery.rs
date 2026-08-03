@@ -37,6 +37,137 @@ pub(super) fn validation_failure_target_hint(
     matching_paths.into_iter().next()
 }
 
+pub(super) fn parse_validation_assertion_failures(
+    command: &str,
+    output: &str,
+    target_contents: &[(String, String)],
+) -> Vec<crate::execution_graph::ValidationAssertionFailure> {
+    let lines = output.lines().collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("AssertionError:") {
+            continue;
+        }
+        let end = lines[index + 1..]
+            .iter()
+            .position(|candidate| candidate.contains("AssertionError:"))
+            .map_or(lines.len(), |offset| index + 1 + offset);
+        let block = &lines[index..end];
+        let expected = block
+            .iter()
+            .find_map(|candidate| candidate.trim().strip_prefix("Expected:"))
+            .map_or_else(String::new, |value| {
+                value.trim().trim_matches('"').to_owned()
+            });
+        let received = block
+            .iter()
+            .find_map(|candidate| candidate.trim().strip_prefix("Received:"))
+            .map_or_else(String::new, |value| {
+                value.trim().trim_matches('"').to_owned()
+            });
+        let source_location = block
+            .iter()
+            .find(|candidate| candidate.contains('❯'))
+            .map_or_else(String::new, |value| {
+                value.trim().trim_start_matches('❯').trim().to_owned()
+            });
+        let test_file = target_contents
+            .iter()
+            .find(|(path, _)| {
+                source_location.contains(path.as_str()) || command.contains(path.as_str())
+            })
+            .map_or_else(String::new, |(path, _)| path.clone());
+        let test_name = lines[..index]
+            .iter()
+            .rev()
+            .find(|candidate| {
+                let candidate = candidate.trim();
+                candidate.contains(" > ") || candidate.starts_with('×')
+            })
+            .map_or_else(String::new, |value| {
+                value
+                    .trim()
+                    .trim_start_matches('×')
+                    .trim_start_matches('❯')
+                    .trim()
+                    .to_owned()
+            });
+        let assertion = line
+            .split_once("AssertionError:")
+            .map_or(line.trim(), |(_, message)| message.trim());
+        let assertion_kind = if assertion.contains("to contain") {
+            "contains"
+        } else if assertion.contains("to be") || assertion.contains("to equal") {
+            "equality"
+        } else {
+            "assertion"
+        }
+        .to_owned();
+        let mut implicated_paths = target_contents
+            .iter()
+            .filter(|(path, content)| {
+                path == &test_file
+                    || (!expected.is_empty() && content.contains(&expected))
+                    || (!received.is_empty() && content.contains(&received))
+                    || assertion
+                        .split(|character: char| !character.is_alphanumeric() && character != '-')
+                        .filter(|token| token.len() >= 4)
+                        .any(|token| content.contains(token))
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        if implicated_paths.is_empty() && !test_file.is_empty() {
+            implicated_paths.insert(test_file.clone());
+        }
+        failures.push(crate::execution_graph::ValidationAssertionFailure {
+            test_file,
+            test_name,
+            source_location,
+            assertion_kind,
+            expected,
+            received,
+            implicated_paths: implicated_paths.into_iter().collect(),
+            diagnosis: None,
+            evidence: assertion.to_owned(),
+            proposed_repair: String::new(),
+            expected_validation_effect: String::new(),
+        });
+    }
+    failures
+}
+
+pub(super) fn validation_repair_target_hint(
+    assertions: &[crate::execution_graph::ValidationAssertionFailure],
+    mutation_target_paths: &[String],
+) -> Option<String> {
+    let mut scores = BTreeMap::<String, usize>::new();
+    for assertion in assertions {
+        for path in assertion
+            .implicated_paths
+            .iter()
+            .filter(|path| mutation_target_paths.contains(path))
+        {
+            let source_preference = usize::from(!path.to_ascii_lowercase().contains("test"));
+            let provider_preference = usize::from(
+                path.to_ascii_lowercase().contains("provider")
+                    && format!("{} {}", assertion.test_name, assertion.evidence)
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .any(|token| token.contains("root") || token.contains("class")),
+            ) * 2;
+            *scores.entry(path.clone()).or_default() += 2 + source_preference + provider_preference;
+        }
+    }
+    scores
+        .into_iter()
+        .max_by(|(left_path, left_score), (right_path, right_score)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| right_path.cmp(left_path))
+        })
+        .map(|(path, _)| path)
+}
+
 pub(super) fn committed_head_for_publication(
     repo: &Repo,
     base_sha: &str,
@@ -72,11 +203,14 @@ pub(super) fn authorize_recovery_publication(
     if snapshot.cancellation.is_some() {
         bail!("recovery publication is forbidden after cancellation was requested");
     }
-    let partial_infrastructure = snapshot.has_partial_reviewable_guardrail()
-        && snapshot
-            .failures
-            .unresolved()
-            .all(|failure| failure.category == FailureCategory::InfrastructureFailure)
+    let partial_validation = (snapshot.has_partial_reviewable_guardrail()
+        || snapshot.has_incomplete_diff_review_request())
+        && snapshot.failures.unresolved().all(|failure| {
+            matches!(
+                failure.category,
+                FailureCategory::ValidationFailure | FailureCategory::InfrastructureFailure
+            )
+        })
         && snapshot
             .graph
             .nodes
@@ -96,7 +230,7 @@ pub(super) fn authorize_recovery_publication(
                 }
             )
         }))
-        && !partial_infrastructure
+        && !partial_validation
     {
         bail!("recovery publication is forbidden after an infrastructure failure");
     }
@@ -113,7 +247,7 @@ pub(super) fn authorize_recovery_publication(
         .execution_policy
         .quality_gates
         .iter()
-        .filter(|gate| gate.required)
+        .filter(|gate| gate.required && !recovery_bootstrap_command(&gate.command))
         .map(|gate| gate.id.clone())
         .collect::<BTreeSet<_>>();
     if required_gate_ids.is_empty() {
@@ -157,6 +291,23 @@ pub(super) fn authorize_recovery_publication(
         validation_evidence_ids,
         already_requested: snapshot.publication.recovery_requested,
     })
+}
+
+fn recovery_bootstrap_command(command: &str) -> bool {
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    [
+        "npm ci",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "bun install",
+    ]
+    .iter()
+    .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
 }
 
 pub(super) fn is_hosted_orchestration_invariant_error(error: &anyhow::Error) -> bool {
@@ -230,10 +381,16 @@ pub(super) fn recovery_completion_evaluation(
     };
     evaluation.evaluation_source = EvaluationSource::OrchestratorFallback;
     evaluation.confidence = 1.0;
+    let validation_partial = snapshot.has_incomplete_diff_review_request();
     push_unique(
         &mut evaluation.remaining_implementation_work,
-        "Resume from the persisted execution graph and resolve the internal orchestration invariant."
-            .into(),
+        if validation_partial {
+            "Resume from validation repair, reconcile the recorded assertion failures, and rerun the pending gates."
+                .into()
+        } else {
+            "Resume from the persisted execution graph and resolve the internal orchestration invariant."
+                .into()
+        },
     );
     for node in snapshot
         .remaining_required_nodes()
@@ -248,11 +405,62 @@ pub(super) fn recovery_completion_evaluation(
             ),
         );
     }
-    evaluation.summary = format!(
-        "RustGrid preserved the current validated repository changes in a draft recovery pull request after an internal orchestration invariant failed: {}",
-        truncate_text(&original_error.to_string(), 1_000)
-    );
+    evaluation.summary = if validation_partial {
+        "RustGrid preserved the applied repository diff in a draft recovery pull request after focused validation failed and bounded repair produced no safe mutation."
+            .into()
+    } else {
+        format!(
+            "RustGrid preserved the current validated repository changes in a draft recovery pull request after an internal orchestration invariant failed: {}",
+            truncate_text(&original_error.to_string(), 1_000)
+        )
+    };
     evaluation
+}
+
+fn incomplete_validation_results(agent: &GatewayAgent<'_>) -> Vec<ValidationResult> {
+    agent
+        .notebook
+        .required_gates
+        .iter()
+        .filter(|gate| gate.required)
+        .map(|gate| {
+            let evidence = agent
+                .notebook
+                .validation_evidence
+                .iter()
+                .rev()
+                .find(|evidence| evidence.gate_id == gate.gate_id);
+            let status = match gate.status {
+                ValidationStatus::Passed => "passed",
+                ValidationStatus::FailedCode => "failed",
+                ValidationStatus::FailedInfrastructure => "infrastructure_failed",
+                ValidationStatus::TimedOut => "timed_out",
+                ValidationStatus::Cancelled => "cancelled",
+                ValidationStatus::Skipped => "skipped",
+                ValidationStatus::Superseded => "superseded",
+                ValidationStatus::Pending | ValidationStatus::Ready | ValidationStatus::Running => {
+                    "pending"
+                }
+            };
+            ValidationResult {
+                id: gate.gate_id.clone(),
+                command: gate.command.clone(),
+                status: status.into(),
+                output: evidence.map_or_else(
+                    || "required validation gate has not run".into(),
+                    |evidence| {
+                        truncate_text(
+                            &format!(
+                                "stdout: {}\nstderr: {}",
+                                evidence.stdout_summary, evidence.stderr_summary
+                            ),
+                            16_000,
+                        )
+                    },
+                ),
+            }
+        })
+        .collect()
 }
 
 pub(super) struct RecoveryPublicationContext<'a> {
@@ -283,6 +491,7 @@ pub(super) fn recovery_publication_no_op(
 ) -> Option<RecoveryPublicationResult> {
     if startup_mode != StartupMode::RecoveryPublicationRun
         && !snapshot.has_partial_reviewable_guardrail()
+        && !snapshot.has_incomplete_diff_review_request()
     {
         Some(RecoveryPublicationResult::NotApplicable)
     } else if !snapshot.current_repository.has_changes() {
@@ -402,6 +611,7 @@ pub(super) fn attempt_safe_recovery_publication_with(
     let snapshot = agent.build_execution_snapshot()?;
     if startup_mode != StartupMode::RecoveryPublicationRun
         && !snapshot.has_partial_reviewable_guardrail()
+        && !snapshot.has_incomplete_diff_review_request()
     {
         agent.append_event_recoverable(
             "progress",
@@ -494,7 +704,11 @@ pub(super) fn attempt_safe_recovery_publication_with(
         }),
         "recovery publication evaluation",
     );
-    let validation = agent.restored_validation_results()?;
+    let validation = if snapshot.has_incomplete_diff_review_request() {
+        incomplete_validation_results(agent)
+    } else {
+        agent.restored_validation_results()?
+    };
     let mut implementation = agent.reconstruct_implementation_outcome()?;
     implementation.budget_exhausted = true;
     let completeness = recovery_completion_evaluation(
