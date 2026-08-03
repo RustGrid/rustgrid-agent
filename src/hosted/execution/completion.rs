@@ -10,7 +10,7 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<CompletionEvaluation> {
         let unrecovered =
             self.reconcile_write_failures(implementation, validation, changed_paths)?;
-        let fallback = completion_fallback(
+        let mut fallback = completion_fallback(
             implementation,
             self.impact_map.as_ref(),
             self.implementation_plan.as_ref(),
@@ -19,6 +19,20 @@ impl<'a> GatewayAgent<'a> {
             &self.notebook.acceptance_criteria,
             validation,
             project_verification_policy(self.manifest),
+        );
+        let criterion_evidence = build_deterministic_criterion_evidence(
+            self.implementation_plan.as_ref(),
+            self.notebook.orchestration.graph.as_ref(),
+            &self.notebook.acceptance_criteria,
+            changed_paths,
+            validation,
+        );
+        apply_deterministic_criterion_evidence(
+            &mut fallback,
+            &criterion_evidence,
+            implementation,
+            &unrecovered,
+            validation,
         );
         let decision = self.reconcile_active_phase(
             "diff review finished; independent completion evaluation started",
@@ -33,6 +47,28 @@ impl<'a> GatewayAgent<'a> {
             );
         }
         if changed_paths.is_empty() {
+            self.record_completion_evidence_events(&criterion_evidence, &fallback, "no_diff");
+            return Ok(fallback);
+        }
+        self.record_completion_evidence_events(
+            &criterion_evidence,
+            &fallback,
+            "deterministic_evidence",
+        );
+        if matches!(
+            fallback.status,
+            CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview
+        ) {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.completion_model_call_skipped",
+                    "reason": "deterministic_evidence_authoritative",
+                    "completion_status": fallback.status,
+                    "provider_contacted": false,
+                }),
+                "completion evaluator deterministic skip",
+            );
             return Ok(fallback);
         }
         if self
@@ -45,13 +81,28 @@ impl<'a> GatewayAgent<'a> {
             return Ok(fallback);
         }
 
-        let diff = match completion_review_diff(
-            &self.repo.root,
-            changed_paths,
-            &self.manifest.github.base_sha,
-        ) {
-            Ok(diff) => diff,
-            Err(_) => return Ok(fallback),
+        let diff_summary = changed_paths
+            .iter()
+            .map(|path| format!("modified: {path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let evidence_packet = CompletionEvidencePacket {
+            acceptance_criteria: self.notebook.acceptance_criteria.clone(),
+            criterion_evidence,
+            validation_gate_statuses: validation
+                .iter()
+                .map(|gate| CompletionValidationGateStatus {
+                    gate_id: gate.id.clone(),
+                    command: gate.command.clone(),
+                    status: gate.status.clone(),
+                })
+                .collect(),
+            unresolved_failures: unrecovered
+                .iter()
+                .map(|failure| format!("{}:{}", failure.tool, failure.error_code))
+                .collect(),
+            publication_intent: "publish_reviewable_pull_request".into(),
+            diff_summary: truncate_text(&diff_summary, 16 * 1024),
         };
         let prompt = format!(
             "Independently evaluate whether this repository diff fully implements the ticket. \
@@ -61,29 +112,16 @@ uncertain or incomplete. An unrecovered edit failure blocks complete. A broad ta
 diff needs explicit architectural evidence. Classify human, design, accessibility, visual, \
 product-approval, and deployment-environment checks as external review rather than missing source \
 implementation. Apply the supplied browser-test policy exactly. Return only one JSON object matching the requested \
-schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\n\nProject verification policy:\n{}\n\nImpact map:\n{}\n\nImplementation plan:\n{}\n\nWorker notebook:\n{}\n\nImplementation declaration:\n{}\n\nBudget exhausted: {}\n\nChanged paths:\n{}\n\nGenuinely unresolved intended changes:\n{}\n\nReconciled intended changes:\n{}\n\nTechnical validation:\n{}\n\nRepository diff:\n{}",
+schema. Deterministic satisfied evidence is authoritative and cannot be downgraded.\n\nTicket title:\n{}\n\nCompact completion evidence packet:\n{}",
             self.manifest.ticket_title,
-            self.manifest.run.input_prompt,
-            serde_json::to_string(&project_verification_policy(self.manifest))
-                .unwrap_or_else(|_| "{}".into()),
-            serde_json::to_string(&self.impact_map).unwrap_or_else(|_| "null".into()),
-            serde_json::to_string(&self.implementation_plan).unwrap_or_else(|_| "null".into()),
-            serde_json::to_string(&self.notebook).unwrap_or_else(|_| "null".into()),
-            serde_json::to_string(&implementation.explicit_declaration)
-                .unwrap_or_else(|_| "null".into()),
-            implementation.budget_exhausted,
-            changed_paths.join("\n"),
-            serde_json::to_string(&unrecovered).unwrap_or_else(|_| "[]".into()),
-            serde_json::to_string(&self.notebook.intended_changes).unwrap_or_else(|_| "[]".into()),
-            serde_json::to_string(validation).unwrap_or_else(|_| "[]".into()),
-            truncate_text(&diff, 96 * 1024),
+            serde_json::to_string(&evidence_packet).unwrap_or_else(|_| "{}".into()),
         );
         let mut request = json!({
             "model": self.manifest.ai_gateway.model,
             "input": [{"role": "user", "content": prompt}],
             "instructions": completion_evaluator_instructions(),
-            "max_output_tokens": self.manifest.ai_gateway.maximum_output_tokens.min(8_192),
-            "reasoning": {"effort": "medium"},
+            "max_output_tokens": self.manifest.ai_gateway.maximum_output_tokens.min(3_072),
+            "reasoning": {"effort": "low"},
             "store": false,
             "stream": false,
             "metadata": provider_request_metadata(
@@ -110,6 +148,18 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             let reservation = cost_admitted
                 .then(|| self.reserve_graph_model_call(&request))
                 .flatten();
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.completion_model_call_admission_evaluated",
+                    "admitted": reservation.is_some(),
+                    "estimated_cost_micros": self.cost_guard.estimated_cost_micros,
+                    "hard_limit_micros": self.cost_guard.hard_limit_micros,
+                    "completion_calls_consumed": self.phases.phase_calls(ExecutionPhase::CompletionEvaluation),
+                    "provider_contacted": false,
+                }),
+                "completion model call admission",
+            );
             let Some(reservation) = reservation else {
                 self.append_event_recoverable(
                     "progress",
@@ -123,6 +173,16 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
                         "resumable": true,
                     }),
                     "completion evaluation model cost preflight",
+                );
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.completion_model_call_skipped",
+                        "reason": "admission_rejected",
+                        "provider_contacted": false,
+                        "completion_calls_consumed": self.phases.phase_calls(ExecutionPhase::CompletionEvaluation),
+                    }),
+                    "completion model call admission rejection",
                 );
                 break;
             };
@@ -264,6 +324,47 @@ schema.\n\nTicket title:\n{}\n\nTicket description and acceptance criteria:\n{}\
             }
         }
         Ok(fallback)
+    }
+
+    fn record_completion_evidence_events(
+        &self,
+        evidence: &[CriterionEvidence],
+        evaluation: &CompletionEvaluation,
+        source: &str,
+    ) {
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.completion_evidence_built",
+                "criterion_count": evidence.len(),
+                "source": source,
+            }),
+            "completion evidence construction",
+        );
+        for (criterion_evidence, criterion) in evidence.iter().zip(&evaluation.criteria) {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.completion_criterion_resolved",
+                    "criterion_id": criterion_evidence.criterion_id,
+                    "status": criterion.status,
+                    "verification_type": criterion.verification_type,
+                    "evidence": criterion_evidence,
+                }),
+                "completion criterion resolution",
+            );
+            if criterion.status == CriterionStatus::ExternalReviewRequired {
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.external_review_requirement_recorded",
+                        "criterion_id": criterion_evidence.criterion_id,
+                        "requirements": criterion_evidence.external_evidence_requirements,
+                    }),
+                    "external review requirement",
+                );
+            }
+        }
     }
 
     pub(in crate::hosted) fn record_completion_evaluated(
@@ -461,6 +562,191 @@ pub(in crate::hosted) fn validate_completion_evaluation(
         bail!("review-pending completion lacks its external review contract");
     }
     Ok(evaluation)
+}
+
+pub(in crate::hosted) fn build_deterministic_criterion_evidence(
+    implementation_plan: Option<&ImplementationPlan>,
+    graph: Option<&crate::execution_graph::ExecutionGraph>,
+    ticket_criteria: &[String],
+    changed_paths: &[String],
+    validation: &[ValidationResult],
+) -> Vec<CriterionEvidence> {
+    let changed = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let diff_review_completed = graph.is_some_and(|graph| {
+        graph.nodes().any(|node| {
+            node.kind == crate::execution_graph::ExecutionNodeKind::DiffReview
+                && node.status.is_success()
+        })
+    });
+    ticket_criteria
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| {
+            let criterion_id = format!("ac-{}", index + 1);
+            let verification_type = verification_type_for_criterion(criterion);
+            let planned_changes = implementation_plan
+                .into_iter()
+                .flat_map(|plan| &plan.planned_changes)
+                .filter(|change| {
+                    change.acceptance_criteria.iter().any(|mapped| {
+                        mapped.trim() == criterion.trim() || mapped.trim() == criterion_id
+                    })
+                })
+                .collect::<Vec<_>>();
+            let planned_paths = planned_changes
+                .iter()
+                .flat_map(|change| &change.targets)
+                .map(|target| target.path.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut applied_change_ids = BTreeSet::new();
+            let mut verified_target_ids = BTreeSet::new();
+            if let Some(graph) = graph {
+                for change in &planned_changes {
+                    let nodes = graph
+                        .nodes()
+                        .filter(|node| {
+                            node.kind.is_mutation()
+                                && node.target.as_ref().is_some_and(|target| {
+                                    target.change_id == change.change_id
+                                        || (change.change_id.is_empty()
+                                            && change
+                                                .targets
+                                                .iter()
+                                                .any(|planned| planned.path == target.path))
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    let all_targets_verified = !nodes.is_empty()
+                        && nodes.iter().all(|node| node.status.is_success())
+                        && change
+                            .targets
+                            .iter()
+                            .all(|target| changed.contains(target.path.as_str()));
+                    if all_targets_verified {
+                        if !change.change_id.is_empty() {
+                            applied_change_ids.insert(change.change_id.clone());
+                        }
+                        verified_target_ids
+                            .extend(nodes.into_iter().map(|node| node.id.to_string()));
+                    }
+                }
+            }
+            let relevant_validation_gate_ids = validation
+                .iter()
+                .filter(|gate| validation_gate_is_relevant(criterion, verification_type, gate))
+                .map(|gate| gate.id.clone())
+                .collect::<BTreeSet<_>>();
+            CriterionEvidence {
+                criterion_id,
+                applied_change_ids: applied_change_ids.into_iter().collect(),
+                changed_paths: planned_paths
+                    .into_iter()
+                    .filter(|path| changed.contains(*path))
+                    .map(str::to_owned)
+                    .collect(),
+                verified_target_ids: verified_target_ids.into_iter().collect(),
+                relevant_validation_gate_ids: relevant_validation_gate_ids.into_iter().collect(),
+                diff_review_findings: if diff_review_completed {
+                    vec!["diff_review_completed_without_blocking_findings".into()]
+                } else {
+                    Vec::new()
+                },
+                external_evidence_requirements: if verification_type.requires_external_review() {
+                    vec![criterion.clone()]
+                } else {
+                    Vec::new()
+                },
+            }
+        })
+        .collect()
+}
+
+fn validation_gate_is_relevant(
+    criterion: &str,
+    verification_type: VerificationType,
+    gate: &ValidationResult,
+) -> bool {
+    let criterion = criterion.to_ascii_lowercase();
+    let gate_text = format!("{} {}", gate.id, gate.command).to_ascii_lowercase();
+    if criterion.contains("build")
+        || criterion.contains("typecheck")
+        || criterion.contains("type check")
+    {
+        return gate_text.contains("build") || gate_text.contains("type");
+    }
+    if criterion.contains("regression") {
+        return gate_text.contains("test");
+    }
+    if matches!(verification_type, VerificationType::AutomatedTest) {
+        return gate_text.contains("test")
+            || gate_text.contains("vitest")
+            || gate_text.contains("cargo")
+            || gate_text.contains("npm");
+    }
+    true
+}
+
+fn apply_deterministic_criterion_evidence(
+    evaluation: &mut CompletionEvaluation,
+    evidence: &[CriterionEvidence],
+    implementation: &ImplementationOutcome,
+    unrecovered: &[ToolFailureRecord],
+    validation: &[ValidationResult],
+) {
+    for (criterion, deterministic) in evaluation.criteria.iter_mut().zip(evidence) {
+        if criterion.verification_type.requires_external_review() {
+            criterion.status = CriterionStatus::ExternalReviewRequired;
+            criterion.required_next_action = Some(criterion.criterion.clone());
+            criterion.missing_evidence =
+                vec!["External review evidence has not been recorded.".into()];
+            continue;
+        }
+        let proved = !implementation.budget_exhausted
+            && unrecovered.is_empty()
+            && !deterministic.applied_change_ids.is_empty()
+            && !deterministic.changed_paths.is_empty()
+            && !deterministic.verified_target_ids.is_empty()
+            && !deterministic.relevant_validation_gate_ids.is_empty()
+            && deterministic
+                .relevant_validation_gate_ids
+                .iter()
+                .all(|gate_id| {
+                    validation
+                        .iter()
+                        .any(|gate| gate.id == *gate_id && gate.status == "passed")
+                })
+            && !deterministic.diff_review_findings.is_empty();
+        if proved {
+            criterion.status = CriterionStatus::Satisfied;
+            criterion.evidence = deterministic
+                .changed_paths
+                .iter()
+                .map(|path| CompletionEvidence {
+                    path: path.clone(),
+                    description: format!(
+                        "Applied changes {} verified by targets {} and reviewed in the final diff.",
+                        deterministic.applied_change_ids.join(", "),
+                        deterministic.verified_target_ids.join(", ")
+                    ),
+                })
+                .collect();
+            criterion.validation_evidence = validation
+                .iter()
+                .filter(|gate| {
+                    deterministic
+                        .relevant_validation_gate_ids
+                        .contains(&gate.id)
+                })
+                .map(|gate| gate.command.clone())
+                .collect();
+            criterion.missing_evidence.clear();
+            criterion.required_next_action = None;
+        }
+    }
+    finalize_completion_dimensions(evaluation, implementation, unrecovered);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -689,6 +975,26 @@ pub(in crate::hosted) fn reconcile_model_completion_evaluation(
                 && candidate.criterion == expected.criterion
         }) {
             let mut candidate = candidate.clone();
+            // Repository/graph evidence is authoritative for implementation-
+            // owned criteria. The optional model may add interpretation, but
+            // it cannot erase or downgrade deterministic proof.
+            if expected.status == CriterionStatus::Satisfied
+                && !expected.verification_type.requires_external_review()
+            {
+                candidate.status = CriterionStatus::Satisfied;
+                candidate.verification_type = expected.verification_type;
+                for evidence in &expected.evidence {
+                    if !candidate
+                        .evidence
+                        .iter()
+                        .any(|item| item.path == evidence.path)
+                    {
+                        candidate.evidence.push(evidence.clone());
+                    }
+                }
+                candidate.missing_evidence.clear();
+                candidate.required_next_action = None;
+            }
             if candidate.status == CriterionStatus::Satisfied {
                 for validation in &expected.validation_evidence {
                     push_unique(&mut candidate.validation_evidence, validation.clone());
@@ -831,16 +1137,23 @@ pub(in crate::hosted) fn verification_type_for_criterion(criterion: &str) -> Ver
         || normalized.contains("production environment")
     {
         VerificationType::DeploymentEnvironment
-    } else if normalized.contains("manual")
-        || normalized.contains("navigation")
-        || normalized.contains("page reload")
-        || normalized.contains("browser verification")
-    {
+    } else if normalized.contains("manual") || normalized.contains("browser verification") {
         VerificationType::ManualQa
     } else if normalized.contains("test")
         || normalized.contains("coverage")
         || normalized.contains("build")
         || normalized.contains("lint")
+        || normalized.contains("selection")
+        || normalized.contains("cycling")
+        || normalized.contains("cycle")
+        || normalized.contains("persistence")
+        || normalized.contains("persist")
+        || normalized.contains("restoration")
+        || normalized.contains("restore")
+        || normalized.contains("fallback")
+        || normalized.contains("page reload")
+        || normalized.contains("refresh")
+        || normalized.contains("regression")
     {
         VerificationType::AutomatedTest
     } else {

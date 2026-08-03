@@ -372,6 +372,12 @@ fn minimum_viable_node_cost(node: &ExecutionNode) -> u64 {
         ExecutionNodeKind::Planning => {
             u64::from(node.budget.max_model_calls).saturating_mul(130_000)
         }
+        // One compact 3,072-token structured completion request, including a
+        // bounded evidence packet, must fit whenever the node advertises a
+        // callable profile.
+        ExecutionNodeKind::CompletionEvaluation => {
+            u64::from(node.budget.max_model_calls).saturating_mul(100_000)
+        }
         _ => 0,
     }
 }

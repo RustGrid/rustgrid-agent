@@ -201,6 +201,21 @@
     }
 
     #[test]
+    fn completion_node_rejects_a_budget_that_cannot_fund_its_compact_profile() {
+        let mut graph = graph();
+        let completion = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == ExecutionNodeKind::CompletionEvaluation)
+            .expect("completion node");
+        completion.budget.max_model_calls = 1;
+        completion.budget.max_cost_micros = 99_999;
+        let error = graph.validate_invariants().unwrap_err();
+        assert!(error.message.contains("budget_configuration_invalid"));
+        assert!(error.message.contains("minimum_viable_node_cost=100000"));
+    }
+
+    #[test]
     fn policy_overrides_do_not_change_the_classification() {
         let input = ComplexityInput {
             planned_target_count: 5,

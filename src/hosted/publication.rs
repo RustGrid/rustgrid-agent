@@ -142,8 +142,9 @@ pub(super) fn find_or_create_hosted_pull_request<P: GitHubPublisher>(
     validation: &[ValidationResult],
     completeness: &CompletionEvaluation,
     draft: bool,
+    incomplete_title: bool,
 ) -> Result<crate::github::PullRequest> {
-    let title = hosted_pull_request_title(manifest, draft);
+    let title = hosted_pull_request_title(manifest, incomplete_title);
     let body = hosted_pull_request_body(manifest, validation, completeness);
     if let Some(pull) = github
         .find_open_pull_request(repo_config, &manifest.github.branch)

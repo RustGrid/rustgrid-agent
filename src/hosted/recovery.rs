@@ -551,6 +551,7 @@ pub(super) fn attempt_safe_recovery_publication(
                 validation,
                 completeness,
                 true,
+                true,
             )
         },
     ) {
@@ -844,6 +845,36 @@ pub(super) fn attempt_safe_recovery_publication_with(
         remaining_work: agent.notebook.remaining_work_v2.clone(),
         validation_evidence: agent.notebook.validation_evidence.clone(),
         notebook_revision: agent.notebook.revision,
+        discovery_calls: agent.phases.phase_calls(ExecutionPhase::Discovery),
+        planning_calls: agent.phases.phase_calls(ExecutionPhase::Planning),
+        initial_target_mutation_calls: agent
+            .notebook
+            .orchestration
+            .budget
+            .model_call_breakdown
+            .initial_target_mutation_calls,
+        target_mutation_repair_calls: agent
+            .notebook
+            .orchestration
+            .budget
+            .model_call_breakdown
+            .target_mutation_repair_calls,
+        validation_diagnosis_calls: agent
+            .notebook
+            .orchestration
+            .budget
+            .model_call_breakdown
+            .validation_diagnosis_calls,
+        validation_repair_mutation_calls: agent
+            .notebook
+            .orchestration
+            .budget
+            .model_call_breakdown
+            .validation_repair_mutation_calls,
+        diff_review_calls: agent.phases.phase_calls(ExecutionPhase::DiffReview),
+        completion_evaluation_calls: agent
+            .phases
+            .phase_calls(ExecutionPhase::CompletionEvaluation),
     };
     agent.append_event_recoverable(
         "progress",

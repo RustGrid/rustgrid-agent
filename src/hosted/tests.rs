@@ -5941,6 +5941,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         &validation,
         &completeness,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(pull.number, 226);
@@ -5989,6 +5990,15 @@ it("defines every semantic token for light-blue without conflating primary and i
             remaining_work: Vec::new(),
             validation_evidence: Vec::new(),
             notebook_revision: 18,
+            discovery_calls: performance.phase_calls(ExecutionPhase::Discovery),
+            planning_calls: performance.phase_calls(ExecutionPhase::Planning),
+            initial_target_mutation_calls: 5,
+            target_mutation_repair_calls: 0,
+            validation_diagnosis_calls: 0,
+            validation_repair_mutation_calls: 0,
+            diff_review_calls: performance.phase_calls(ExecutionPhase::DiffReview),
+            completion_evaluation_calls: performance
+                .phase_calls(ExecutionPhase::CompletionEvaluation),
         },
     };
     assert!(hosted_result_can_succeed(&result));
@@ -7008,6 +7018,7 @@ fn validated_useful_partial_is_publishable_as_a_draft() {
         &[test_passed_validation("npm test && npm run build")],
         &completion,
         true,
+        true,
     )
     .unwrap();
     assert_eq!(pull.number, 227);
@@ -7059,6 +7070,7 @@ fn existing_non_draft_pull_request_is_confirmed_draft_before_recovery_returns() 
         &manifest,
         &[test_passed_validation("cargo test")],
         &test_completion_evaluation(CompletionStatus::Partial),
+        true,
         true,
     )
     .unwrap();
@@ -7121,6 +7133,7 @@ fn ambiguous_create_fallback_confirms_recovered_pull_request_is_draft() {
         &manifest,
         &[test_passed_validation("cargo test")],
         &test_completion_evaluation(CompletionStatus::Partial),
+        true,
         true,
     )
     .unwrap();
@@ -7793,9 +7806,10 @@ fn browser_e2e_policy_controls_implementation_completeness() {
         optional.implementation_completeness,
         ImplementationCompleteness::Complete
     );
+    assert_eq!(optional.status, CompletionStatus::Complete);
     assert_eq!(
-        optional.status,
-        CompletionStatus::CompletePendingExternalReview
+        optional.criteria[0].verification_type,
+        VerificationType::AutomatedTest
     );
 
     let mandatory = completion_fallback(
@@ -7851,6 +7865,292 @@ fn review_pending_pull_request_is_not_marked_implementation_incomplete() {
     assert!(!body.contains("INCOMPLETE — continue implementation"));
     assert!(!title.starts_with("[INCOMPLETE]"));
     assert!(!requires_implementation_continuation(completeness.status));
+}
+
+#[test]
+fn behavioral_verification_types_are_automated_and_approval_types_are_external() {
+    for criterion in [
+        "Theme selection works",
+        "Theme cycling wraps around",
+        "Selection persists after page reload",
+        "Stored selection is restored",
+        "Invalid storage uses the fallback",
+        "Regression coverage remains green",
+        "The application build succeeds",
+    ] {
+        assert_eq!(
+            verification_type_for_criterion(criterion),
+            VerificationType::AutomatedTest,
+            "{criterion}"
+        );
+    }
+    assert_eq!(
+        verification_type_for_criterion("Product owner approval is recorded"),
+        VerificationType::ProductApproval
+    );
+    assert_eq!(
+        verification_type_for_criterion("Complete a visual review"),
+        VerificationType::VisualReview
+    );
+}
+
+#[test]
+fn model_interpretation_cannot_downgrade_deterministic_satisfied_evidence() {
+    let implementation = ImplementationOutcome {
+        summary: "complete".into(),
+        budget_exhausted: false,
+        explicit_declaration: Some(ImplementationDeclaration {
+            implementation_status: "complete".into(),
+            completed_work: vec![],
+            remaining_work: vec![],
+            known_risks: vec![],
+            changed_paths: vec!["src/theme.ts".into()],
+            criteria_evidence: vec![],
+        }),
+    };
+    let mut deterministic = test_completion_evaluation(CompletionStatus::Complete);
+    deterministic.criteria = vec![CriterionEvaluation {
+        criterion_id: "ac-1".into(),
+        criterion: "Theme selection works".into(),
+        verification_type: VerificationType::AutomatedTest,
+        status: CriterionStatus::Satisfied,
+        evidence: vec![CompletionEvidence {
+            path: "src/theme.ts".into(),
+            description: "Applied and diff-reviewed target".into(),
+        }],
+        validation_evidence: vec!["npm test".into()],
+        missing_evidence: vec![],
+        required_next_action: None,
+    }];
+    let mut model = deterministic.clone();
+    model.criteria[0].status = CriterionStatus::Uncertain;
+    model.criteria[0].evidence.clear();
+    model.criteria[0].missing_evidence = vec!["Model could not infer behavior".into()];
+
+    let reconciled =
+        reconcile_model_completion_evaluation(model, deterministic, &implementation, &[]);
+    assert_eq!(reconciled.criteria[0].status, CriterionStatus::Satisfied);
+    assert_eq!(reconciled.criteria[0].evidence[0].path, "src/theme.ts");
+    assert!(reconciled.criteria[0].missing_evidence.is_empty());
+    assert_eq!(reconciled.status, CompletionStatus::Complete);
+}
+
+#[test]
+fn canonical_terminal_mapping_is_exhaustive_for_healthy_results() {
+    let cases = [
+        (CompletionStatus::Complete, "completed", "completed", false),
+        (
+            CompletionStatus::CompletePendingExternalReview,
+            "awaiting_external_review",
+            "external_review_required",
+            true,
+        ),
+        (
+            CompletionStatus::Partial,
+            "partial_result",
+            "partial_reviewable",
+            true,
+        ),
+        (
+            CompletionStatus::Blocked,
+            "blocked",
+            "blocked_resumable",
+            true,
+        ),
+        (
+            CompletionStatus::Incomplete,
+            "partial_result",
+            "incomplete",
+            true,
+        ),
+        (
+            CompletionStatus::Uncertain,
+            "partial_result",
+            "uncertain",
+            true,
+        ),
+    ];
+    for (outcome, status, reason, draft) in cases {
+        let result = HostedResult {
+            summary: "summary".into(),
+            branch: "rustgrid/test".into(),
+            commit: "a".repeat(40),
+            pull_request: PullRequestResult {
+                number: 31,
+                url: "https://github.example/pull/31".into(),
+            },
+            validation: vec![],
+            completeness: test_completion_evaluation(outcome),
+            terminal_telemetry: TerminalTelemetry::default(),
+        };
+        let terminal = canonical_terminal_result(&result, "2026-08-03T12:00:00Z");
+        assert_eq!(completion_request_status(terminal.outcome), status);
+        assert_eq!(terminal.reason_code, reason);
+        assert_eq!(terminal.publication.draft, draft);
+        assert_eq!(terminal.outcome, outcome);
+        assert_eq!(terminal.process_health, "healthy");
+    }
+}
+
+#[test]
+fn compact_completion_packet_contains_no_validation_output_or_notebook_payload() {
+    let packet = CompletionEvidencePacket {
+        acceptance_criteria: vec!["Selection persists".into()],
+        criterion_evidence: vec![CriterionEvidence {
+            criterion_id: "ac-1".into(),
+            changed_paths: vec!["src/theme.ts".into()],
+            ..CriterionEvidence::default()
+        }],
+        validation_gate_statuses: vec![CompletionValidationGateStatus {
+            gate_id: "focused".into(),
+            command: "npm test".into(),
+            status: "passed".into(),
+        }],
+        unresolved_failures: vec![],
+        publication_intent: "publish_reviewable_pull_request".into(),
+        diff_summary: "modified: src/theme.ts".into(),
+    };
+    let serialized = serde_json::to_string(&packet).unwrap();
+    assert!(!serialized.contains("command output"));
+    assert!(!serialized.contains("worker_notebook"));
+    assert!(!serialized.contains("input_prompt"));
+    assert!(serialized.len() < 3_072);
+}
+
+#[test]
+fn compact_completion_request_fits_the_small_mission_node_budget() {
+    let packet = CompletionEvidencePacket {
+        acceptance_criteria: (1..=8)
+            .map(|index| format!("Acceptance criterion {index}"))
+            .collect(),
+        criterion_evidence: (1..=8)
+            .map(|index| CriterionEvidence {
+                criterion_id: format!("ac-{index}"),
+                applied_change_ids: vec![format!("change-{index}")],
+                changed_paths: vec![format!("src/target-{index}.tsx")],
+                verified_target_ids: vec![format!("source-{index}")],
+                relevant_validation_gate_ids: vec!["focused".into(), "suite".into()],
+                diff_review_findings: vec![
+                    "diff_review_completed_without_blocking_findings".into(),
+                ],
+                external_evidence_requirements: vec![],
+            })
+            .collect(),
+        validation_gate_statuses: vec![
+            CompletionValidationGateStatus {
+                gate_id: "focused".into(),
+                command: "npx vitest run tests/theme-provider.test.tsx".into(),
+                status: "passed".into(),
+            },
+            CompletionValidationGateStatus {
+                gate_id: "suite".into(),
+                command: "npm test".into(),
+                status: "passed".into(),
+            },
+            CompletionValidationGateStatus {
+                gate_id: "build".into(),
+                command: "npm run build".into(),
+                status: "passed".into(),
+            },
+        ],
+        unresolved_failures: vec![],
+        publication_intent: "publish_reviewable_pull_request".into(),
+        diff_summary: (1..=8)
+            .map(|index| format!("modified: src/target-{index}.tsx"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let request = json!({
+        "model": "gpt-5.6",
+        "input": [{"role": "user", "content": serde_json::to_string(&packet).unwrap()}],
+        "instructions": completion_evaluator_instructions(),
+        "max_output_tokens": 3_072,
+        "reasoning": {"effort": "low"},
+    });
+    let estimate = estimate_model_call_request_cost(&request);
+    assert!(estimate.estimated_request_cost <= 300_000, "{estimate:?}");
+}
+
+#[test]
+fn deterministic_criterion_evidence_joins_plan_graph_diff_and_relevant_gates() {
+    use crate::execution_graph::{
+        ExecutionNodeKind, ExecutionNodeStatus, MissionBudget, MissionComplexity,
+        PlannedTarget as GraphTarget, ValidationGateSpec,
+        ValidationGateType as GraphValidationGateType, build_execution_graph,
+    };
+    let target = GraphTarget {
+        change_id: "change-theme-provider".into(),
+        path: "src/theme-provider.tsx".into(),
+        role: "production".into(),
+        intent: "persist and restore theme selection".into(),
+        acceptance_criteria_ids: vec!["ac-1".into()],
+        new_file: false,
+    };
+    let mut graph = build_execution_graph(
+        "completion-evidence",
+        MissionComplexity::Small,
+        "tree-1",
+        std::slice::from_ref(&target),
+        &[ValidationGateSpec {
+            gate_id: "focused".into(),
+            gate_type: GraphValidationGateType::FocusedTest,
+            command: "npm test -- theme-provider".into(),
+            working_directory: String::new(),
+            required: true,
+            ..ValidationGateSpec::default()
+        }],
+        &MissionBudget::for_complexity(MissionComplexity::Small),
+    );
+    for node in &mut graph.nodes {
+        if node.kind.is_mutation() {
+            node.status = ExecutionNodeStatus::Applied;
+        } else if node.kind == ExecutionNodeKind::DiffReview {
+            node.status = ExecutionNodeStatus::Completed;
+        }
+    }
+    let plan = ImplementationPlan {
+        implementation_status: "ready".into(),
+        planned_changes: vec![PlannedChange {
+            change_id: target.change_id,
+            parent_change_id: None,
+            path: target.path.clone(),
+            targets: vec![PlannedTarget {
+                path: target.path.clone(),
+                role: target.role,
+                new_file: false,
+                status: IntendedChangeStatus::Applied,
+            }],
+            change: target.intent,
+            reason: "Acceptance behavior".into(),
+            status: IntendedChangeStatus::Applied,
+            acceptance_criteria: vec!["ac-1".into()],
+            test_coverage: vec!["focused".into()],
+        }],
+        planned_new_files: vec![],
+        planned_test_changes: vec![],
+        remaining_unknowns: vec![],
+        blocking_unknowns: vec![],
+    };
+    let evidence = build_deterministic_criterion_evidence(
+        Some(&plan),
+        Some(&graph),
+        &["Selection persists and is restored after refresh".into()],
+        &["src/theme-provider.tsx".into()],
+        &[test_passed_validation("npm test -- theme-provider")],
+    );
+
+    assert_eq!(evidence[0].criterion_id, "ac-1");
+    assert_eq!(evidence[0].applied_change_ids, ["change-theme-provider"]);
+    assert_eq!(evidence[0].changed_paths, ["src/theme-provider.tsx"]);
+    assert_eq!(evidence[0].verified_target_ids.len(), 1);
+    assert_eq!(
+        evidence[0].relevant_validation_gate_ids,
+        ["npm-test----theme-provider"]
+    );
+    assert_eq!(
+        evidence[0].diff_review_findings,
+        ["diff_review_completed_without_blocking_findings"]
+    );
 }
 
 #[test]
@@ -9782,6 +10082,7 @@ fn duplicate_publication_requests_reconcile_the_existing_pull_request() {
         &manifest,
         &[],
         &test_completion_evaluation(CompletionStatus::Partial),
+        true,
         true,
     )
     .unwrap();

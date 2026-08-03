@@ -298,12 +298,42 @@ pub(super) struct TerminalTelemetry {
     pub(super) remaining_work: Vec<RemainingWorkItem>,
     pub(super) validation_evidence: Vec<ValidationEvidence>,
     pub(super) notebook_revision: u64,
+    pub(super) discovery_calls: usize,
+    pub(super) planning_calls: usize,
+    pub(super) initial_target_mutation_calls: u32,
+    pub(super) target_mutation_repair_calls: u32,
+    pub(super) validation_diagnosis_calls: u32,
+    pub(super) validation_repair_mutation_calls: u32,
+    pub(super) diff_review_calls: usize,
+    pub(super) completion_evaluation_calls: usize,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct PullRequestResult {
     pub(super) number: u64,
     pub(super) url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct CanonicalTerminalResult {
+    pub(super) outcome: CompletionStatus,
+    pub(super) process_health: &'static str,
+    pub(super) reason_code: &'static str,
+    pub(super) publication: CanonicalPublicationResult,
+    pub(super) completion_evaluation: CompletionEvaluation,
+    pub(super) remaining_work: Vec<RemainingWorkItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct CanonicalPublicationResult {
+    pub(super) status: &'static str,
+    pub(super) branch: String,
+    pub(super) commit_sha: String,
+    pub(super) pull_request_number: u64,
+    pub(super) pull_request_url: String,
+    pub(super) draft: bool,
+    pub(super) mode: &'static str,
+    pub(super) completed_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -459,6 +489,37 @@ impl CriterionStatus {
 pub(super) struct CompletionEvidence {
     pub(super) path: String,
     pub(super) description: String,
+}
+
+/// Compact, machine-owned evidence used to decide one acceptance criterion.
+/// This deliberately contains identifiers and summaries rather than source,
+/// notebook, or command output payloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(super) struct CriterionEvidence {
+    pub(super) criterion_id: String,
+    pub(super) applied_change_ids: Vec<String>,
+    pub(super) changed_paths: Vec<String>,
+    pub(super) verified_target_ids: Vec<String>,
+    pub(super) relevant_validation_gate_ids: Vec<String>,
+    pub(super) diff_review_findings: Vec<String>,
+    pub(super) external_evidence_requirements: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct CompletionEvidencePacket {
+    pub(super) acceptance_criteria: Vec<String>,
+    pub(super) criterion_evidence: Vec<CriterionEvidence>,
+    pub(super) validation_gate_statuses: Vec<CompletionValidationGateStatus>,
+    pub(super) unresolved_failures: Vec<String>,
+    pub(super) publication_intent: String,
+    pub(super) diff_summary: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct CompletionValidationGateStatus {
+    pub(super) gate_id: String,
+    pub(super) command: String,
+    pub(super) status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

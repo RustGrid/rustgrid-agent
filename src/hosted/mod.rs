@@ -385,6 +385,7 @@ fn report_successful_hosted_result(
     terminal_at: &str,
     result: &HostedResult,
 ) -> Result<()> {
+    let terminal = canonical_terminal_result(result, terminal_at);
     send_execution_telemetry(
         api,
         execution_id,
@@ -396,14 +397,18 @@ fn report_successful_hosted_result(
     if let Err(error) = api.append_event(
         "result",
         json!({
-            "status": completion_request_status(result.completeness.status),
-            "mission_outcome": result.completeness.status,
-            "process_health": "healthy",
-            "branch": result.branch,
-            "head_sha": result.commit,
-            "pull_request_number": result.pull_request.number,
-            "pull_request_url": result.pull_request.url,
-            "implementation_completeness": result.completeness,
+            "event_type": "worker.terminal_domain_result_persisted",
+            "canonical_terminal_result": terminal,
+            // Compatibility fields are projections of the same canonical
+            // value rather than an independently classified outcome.
+            "status": completion_request_status(terminal.outcome),
+            "mission_outcome": terminal.outcome,
+            "process_health": terminal.process_health,
+            "branch": terminal.publication.branch,
+            "head_sha": terminal.publication.commit_sha,
+            "pull_request_number": terminal.publication.pull_request_number,
+            "pull_request_url": terminal.publication.pull_request_url,
+            "implementation_completeness": terminal.completion_evaluation,
             "technical_validation": result.validation,
             "terminal_telemetry": result.terminal_telemetry
         }),
@@ -413,20 +418,20 @@ fn report_successful_hosted_result(
         );
     }
     let completion = CompletionRequest {
-        status: completion_request_status(result.completeness.status).into(),
-        mission_outcome: Some(result.completeness.status),
-        process_health: Some("healthy".into()),
-        completion_evaluation: Some(result.completeness.clone()),
+        status: completion_request_status(terminal.outcome).into(),
+        mission_outcome: Some(terminal.outcome),
+        process_health: Some(terminal.process_health.into()),
+        completion_evaluation: Some(terminal.completion_evaluation.clone()),
         output_summary: Some(truncate_text(&result.summary, 16_000)),
         failure_code: None,
         failure_message: None,
-        head_branch: Some(result.branch.clone()),
-        head_sha: Some(result.commit.clone()),
+        head_branch: Some(terminal.publication.branch.clone()),
+        head_sha: Some(terminal.publication.commit_sha.clone()),
         pull_request_number: Some(
-            i64::try_from(result.pull_request.number)
+            i64::try_from(terminal.publication.pull_request_number)
                 .context("pull request number is too large")?,
         ),
-        pull_request_url: Some(result.pull_request.url.clone()),
+        pull_request_url: Some(terminal.publication.pull_request_url.clone()),
     };
     if let Err(error) = api.complete(&completion) {
         // RunFinished is the canonical terminal result. A best-effort API
@@ -441,7 +446,51 @@ fn report_successful_hosted_result(
             result.pull_request.number, result.pull_request.url
         );
     }
+    if let Err(error) = api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.workflow_exit_code_resolved",
+            "exit_code": 0,
+            "mission_outcome": terminal.outcome,
+            "process_health": terminal.process_health,
+            "reason_code": terminal.reason_code,
+        }),
+    ) {
+        eprintln!("[warning] workflow exit telemetry delivery failed: {error:#}");
+    }
     Ok(())
+}
+
+fn canonical_terminal_result(result: &HostedResult, terminal_at: &str) -> CanonicalTerminalResult {
+    CanonicalTerminalResult {
+        outcome: result.completeness.status,
+        process_health: "healthy",
+        reason_code: terminal_reason_code(result.completeness.status),
+        publication: CanonicalPublicationResult {
+            status: "pull_request_created",
+            branch: result.branch.clone(),
+            commit_sha: result.commit.clone(),
+            pull_request_number: result.pull_request.number,
+            pull_request_url: result.pull_request.url.clone(),
+            draft: result.completeness.status == CompletionStatus::CompletePendingExternalReview
+                || requires_implementation_continuation(result.completeness.status),
+            mode: "pull_request",
+            completed_at: terminal_at.into(),
+        },
+        completion_evaluation: result.completeness.clone(),
+        remaining_work: result.terminal_telemetry.remaining_work.clone(),
+    }
+}
+
+const fn terminal_reason_code(status: CompletionStatus) -> &'static str {
+    match status {
+        CompletionStatus::Complete => "completed",
+        CompletionStatus::CompletePendingExternalReview => "external_review_required",
+        CompletionStatus::Partial => "partial_reviewable",
+        CompletionStatus::Blocked => "blocked_resumable",
+        CompletionStatus::Incomplete => "incomplete",
+        CompletionStatus::Uncertain => "uncertain",
+    }
 }
 
 fn hosted_result_can_succeed(result: &HostedResult) -> bool {
@@ -1431,12 +1480,15 @@ fn run_hosted_execution(
             let github =
                 GitHubClient::new(publication_token.expose(), &manifest.github.web_base_url)?;
             let partial = requires_implementation_continuation(completeness.status);
+            let draft =
+                partial || completeness.status == CompletionStatus::CompletePendingExternalReview;
             let created = find_or_create_hosted_pull_request(
                 &github,
                 &repo_config,
                 manifest,
                 &validation,
                 &completeness,
+                draft,
                 partial,
             )?;
             drop(github);
@@ -1447,7 +1499,7 @@ fn run_hosted_execution(
                     node_id: publication_node,
                     url: created.html_url.clone(),
                     number: Some(created.number),
-                    draft: partial,
+                    draft,
                 },
             )?;
             agent.persist_orchestration_checkpoint("pull_request_created", true)?;
@@ -1472,8 +1524,10 @@ fn run_hosted_execution(
             "result",
             json!({
                 "event_type": "worker.domain_run_finished",
-                "mission_outcome": agent.completion_outcome,
+                "mission_outcome": completeness.status,
+                "graph_outcome": agent.completion_outcome,
                 "process_health": "healthy",
+                "reason_code": terminal_reason_code(completeness.status),
                 "publication": agent.notebook.orchestration.publication,
                 "remaining_work": agent.notebook.remaining_work_v2,
                 "notebook": agent.notebook,
@@ -1493,6 +1547,36 @@ fn run_hosted_execution(
             remaining_work: agent.notebook.remaining_work_v2.clone(),
             validation_evidence: agent.notebook.validation_evidence.clone(),
             notebook_revision: agent.notebook.revision,
+            discovery_calls: agent.phases.phase_calls(ExecutionPhase::Discovery),
+            planning_calls: agent.phases.phase_calls(ExecutionPhase::Planning),
+            initial_target_mutation_calls: agent
+                .notebook
+                .orchestration
+                .budget
+                .model_call_breakdown
+                .initial_target_mutation_calls,
+            target_mutation_repair_calls: agent
+                .notebook
+                .orchestration
+                .budget
+                .model_call_breakdown
+                .target_mutation_repair_calls,
+            validation_diagnosis_calls: agent
+                .notebook
+                .orchestration
+                .budget
+                .model_call_breakdown
+                .validation_diagnosis_calls,
+            validation_repair_mutation_calls: agent
+                .notebook
+                .orchestration
+                .budget
+                .model_call_breakdown
+                .validation_repair_mutation_calls,
+            diff_review_calls: agent.phases.phase_calls(ExecutionPhase::DiffReview),
+            completion_evaluation_calls: agent
+                .phases
+                .phase_calls(ExecutionPhase::CompletionEvaluation),
         };
         Ok(HostedResult {
             summary: implementation.summary,
