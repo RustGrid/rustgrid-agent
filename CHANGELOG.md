@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.33 - 2026-08-03
+
+### Changed
+
+- Model every planned repository mutation with an explicit typed operation for
+  modification, creation, deletion, rename, or move, and reject missing or
+  ambiguous operation contracts during planning.
+- Prepare target context from a deterministic operation-aware state probe so
+  absent create targets and already-applied deletions or relocations are valid
+  states rather than generic inspection failures.
+- Bind provider mutation tools to the accepted operation and persist
+  fingerprint-bound creation intent and created-target evidence for recovery.
+- Emit structured target-probe, creation, conflict, and verification telemetry
+  with stable operation-aware fields.
+
+### Fixed
+
+- Allow new files to proceed from an absent path through atomic creation,
+  deterministic verification, validation, review, and publication without
+  attempting to read the nonexistent target as an existing file.
+- Prevent create, rename, and move operations from overwriting destinations
+  that appear concurrently, including an OS-level no-clobber rename boundary.
+- Reconcile matching create and relocation results as `AlreadyApplied` only
+  when persisted intent evidence proves the expected content.
+- Preserve previously applied graph nodes and reviewable repository changes
+  when a later target conflicts, routing the incomplete diff to draft review
+  instead of reporting orchestration initialization failure.
+
 ## 1.4.32 - 2026-08-03
 
 ### Changed
