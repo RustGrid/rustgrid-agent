@@ -291,12 +291,12 @@ pub(super) fn unsuccessful_completion(
         } else {
             "failed".into()
         },
+        canonical_terminal_result_id: None,
+        terminal_revision: None,
+        terminal_authority: None,
+        canonical_terminal_result: None,
         mission_outcome: None,
-        process_health: Some(if cancelled {
-            "cancelled".into()
-        } else {
-            "failed".into()
-        }),
+        process_health: Some(if cancelled { "healthy" } else { "failed" }.into()),
         completion_evaluation: None,
         output_summary: None,
         failure_code: (!cancelled).then_some(failure_code),

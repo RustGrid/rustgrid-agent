@@ -6155,10 +6155,20 @@ it("defines every semantic token for light-blue without conflating primary and i
                 .phase_calls(ExecutionPhase::CompletionEvaluation),
         },
     };
-    assert!(hosted_result_can_succeed(&result));
+    assert_eq!(
+        resolve_published_terminal_result(
+            manifest.execution.execution_id,
+            &result,
+            "2026-08-01T10:05:00Z"
+        )
+        .process_exit_code(),
+        0
+    );
 
     let execution_id = manifest.execution.execution_id;
     let Some((api_root, result_requests, result_server)) = request_sequence_server(vec![
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
         ("200 OK", json!({})),
         ("200 OK", json!({})),
         ("200 OK", json!({})),
@@ -6166,7 +6176,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         return;
     };
     let api = test_api_client(api_root, execution_id);
-    report_successful_hosted_result(
+    report_hosted_result(
         &api,
         execution_id,
         "2026-08-01T10:00:00Z",
@@ -6176,8 +6186,10 @@ it("defines every semantic token for light-blue without conflating primary and i
     .unwrap();
 
     let telemetry_request = result_requests.recv().unwrap();
+    let resolved_event_request = result_requests.recv().unwrap();
     let result_event_request = result_requests.recv().unwrap();
     let completion_request = result_requests.recv().unwrap();
+    let exit_event_request = result_requests.recv().unwrap();
     result_server.join().unwrap();
 
     assert!(telemetry_request.starts_with(&format!(
@@ -6191,14 +6203,29 @@ it("defines every semantic token for light-blue without conflating primary and i
         "succeeded"
     );
 
+    let resolved_event_body: Value =
+        serde_json::from_str(resolved_event_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        resolved_event_body["data"]["event_type"],
+        "worker.canonical_terminal_result_resolved"
+    );
+
     assert!(result_event_request.starts_with(&format!(
         "POST /api/v1/executions/{execution_id}/worker-events HTTP/1.1"
     )));
     let result_event_body: Value =
         serde_json::from_str(result_event_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(result_event_body["event_type"], "result");
+    assert_eq!(
+        result_event_body["data"]["event_type"],
+        "worker.canonical_terminal_result_persisted"
+    );
     assert_eq!(result_event_body["data"]["status"], "completed");
     assert_eq!(result_event_body["data"]["mission_outcome"], "complete");
+    assert_eq!(
+        result_event_body["data"]["canonical_terminal_result_id"],
+        resolved_event_body["data"]["canonical_terminal_result_id"]
+    );
     assert_eq!(result_event_body["data"]["head_sha"], commit);
     assert_eq!(result_event_body["data"]["pull_request_number"], 226);
     assert_eq!(
@@ -6225,6 +6252,14 @@ it("defines every semantic token for light-blue without conflating primary and i
         serde_json::from_str(completion_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(completion_body["status"], "completed");
     assert_eq!(completion_body["mission_outcome"], "complete");
+    assert_eq!(
+        completion_body["canonical_terminal_result_id"],
+        resolved_event_body["data"]["canonical_terminal_result_id"]
+    );
+    assert_eq!(
+        completion_body["canonical_terminal_result"]["terminal_result_id"],
+        resolved_event_body["data"]["canonical_terminal_result_id"]
+    );
     assert_eq!(completion_body["process_health"], "healthy");
     assert_eq!(
         completion_body["completion_evaluation"]["status"],
@@ -6241,14 +6276,17 @@ it("defines every semantic token for light-blue without conflating primary and i
         completion_body["output_summary"],
         "Implemented all five light-blue theme targets."
     );
+    assert!(exit_event_request.contains("worker.process_exit_code_resolved"));
 }
 
 #[test]
 fn successful_run_remains_successful_when_terminal_callback_transport_fails() {
     let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_0020);
-    let Some((api_root, requests, server)) =
-        request_sequence_server(vec![("200 OK", json!({})), ("200 OK", json!({}))])
-    else {
+    let Some((api_root, requests, server)) = request_sequence_server(vec![
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+    ]) else {
         return;
     };
     let api = test_api_client(api_root, execution_id);
@@ -6270,7 +6308,7 @@ fn successful_run_remains_successful_when_terminal_callback_transport_fails() {
         terminal_telemetry: TerminalTelemetry::default(),
     };
 
-    report_successful_hosted_result(
+    report_hosted_result(
         &api,
         execution_id,
         "2026-08-01T10:00:00Z",
@@ -6281,9 +6319,10 @@ fn successful_run_remains_successful_when_terminal_callback_transport_fails() {
 
     server.join().unwrap();
     let delivered = requests.try_iter().collect::<Vec<_>>();
-    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered.len(), 3);
     assert!(delivered[0].contains("/telemetry/batch"));
     assert!(delivered[1].contains("/worker-events"));
+    assert!(delivered[2].contains("worker.canonical_terminal_result_persisted"));
 }
 
 #[test]
@@ -6607,7 +6646,14 @@ fn partial_and_blocked_domain_outcomes_are_healthy_even_with_incomplete_gates() 
             completeness: test_completion_evaluation(status),
             terminal_telemetry: TerminalTelemetry::default(),
         };
-        assert!(hosted_result_can_succeed(&result));
+        let terminal =
+            resolve_published_terminal_result(Uuid::nil(), &result, "2026-08-03T12:00:00Z");
+        assert_eq!(
+            terminal.mission_outcome,
+            CanonicalMissionOutcome::PartialReviewable
+        );
+        assert_eq!(terminal.process_health, ProcessHealth::Healthy);
+        assert_eq!(terminal.process_exit_code(), 0);
     }
     let mut complete = HostedResult {
         summary: "Complete.".into(),
@@ -6626,9 +6672,17 @@ fn partial_and_blocked_domain_outcomes_are_healthy_even_with_incomplete_gates() 
         completeness: test_completion_evaluation(CompletionStatus::Complete),
         terminal_telemetry: TerminalTelemetry::default(),
     };
-    assert!(!hosted_result_can_succeed(&complete));
+    assert_eq!(
+        resolve_published_terminal_result(Uuid::nil(), &complete, "2026-08-03T12:00:00Z")
+            .mission_outcome,
+        CanonicalMissionOutcome::PartialReviewable
+    );
     complete.completeness.status = CompletionStatus::Uncertain;
-    assert!(!hosted_result_can_succeed(&complete));
+    assert_eq!(
+        resolve_published_terminal_result(Uuid::nil(), &complete, "2026-08-03T12:00:00Z")
+            .process_exit_code(),
+        0
+    );
 }
 
 #[test]
@@ -6675,7 +6729,13 @@ fn model_budget_handoff_preserves_work_without_claiming_completion() {
         completeness: result,
         terminal_telemetry: TerminalTelemetry::default(),
     };
-    assert!(!hosted_result_can_succeed(&hosted_result));
+    let terminal =
+        resolve_published_terminal_result(Uuid::nil(), &hosted_result, "2026-08-03T12:00:00Z");
+    assert_eq!(
+        terminal.mission_outcome,
+        CanonicalMissionOutcome::PartialReviewable
+    );
+    assert_eq!(terminal.process_exit_code(), 0);
 }
 
 #[test]
@@ -7720,7 +7780,11 @@ fn complete_evaluation_requires_concrete_evidence_for_every_applicable_criterion
         completeness: evaluation.clone(),
         terminal_telemetry: TerminalTelemetry::default(),
     };
-    assert!(hosted_result_can_succeed(&hosted_result));
+    assert_eq!(
+        resolve_published_terminal_result(Uuid::nil(), &hosted_result, "2026-08-03T12:00:00Z")
+            .mission_outcome,
+        CanonicalMissionOutcome::Complete
+    );
     let mut missing_evidence = evaluation;
     missing_evidence.criteria[0].evidence.clear();
     assert!(
@@ -8098,39 +8162,50 @@ fn model_interpretation_cannot_downgrade_deterministic_satisfied_evidence() {
 #[test]
 fn canonical_terminal_mapping_is_exhaustive_for_healthy_results() {
     let cases = [
-        (CompletionStatus::Complete, "completed", "completed", false),
+        (
+            CompletionStatus::Complete,
+            CanonicalMissionOutcome::Complete,
+            "completed",
+            "completed",
+            false,
+        ),
         (
             CompletionStatus::CompletePendingExternalReview,
+            CanonicalMissionOutcome::CompletePendingExternalReview,
             "awaiting_external_review",
             "external_review_required",
             true,
         ),
         (
             CompletionStatus::Partial,
+            CanonicalMissionOutcome::PartialReviewable,
             "partial_result",
             "partial_reviewable",
             true,
         ),
         (
             CompletionStatus::Blocked,
-            "blocked",
-            "blocked_resumable",
+            CanonicalMissionOutcome::PartialReviewable,
+            "partial_result",
+            "partial_reviewable",
             true,
         ),
         (
             CompletionStatus::Incomplete,
+            CanonicalMissionOutcome::PartialReviewable,
             "partial_result",
-            "incomplete",
+            "partial_reviewable",
             true,
         ),
         (
             CompletionStatus::Uncertain,
+            CanonicalMissionOutcome::PartialReviewable,
             "partial_result",
-            "uncertain",
+            "partial_reviewable",
             true,
         ),
     ];
-    for (outcome, status, reason, draft) in cases {
+    for (completion_status, mission_outcome, status, reason, draft) in cases {
         let result = HostedResult {
             summary: "summary".into(),
             branch: "rustgrid/test".into(),
@@ -8140,15 +8215,18 @@ fn canonical_terminal_mapping_is_exhaustive_for_healthy_results() {
                 url: "https://github.example/pull/31".into(),
             },
             validation: vec![],
-            completeness: test_completion_evaluation(outcome),
+            completeness: test_completion_evaluation(completion_status),
             terminal_telemetry: TerminalTelemetry::default(),
         };
-        let terminal = canonical_terminal_result(&result, "2026-08-03T12:00:00Z");
-        assert_eq!(completion_request_status(terminal.outcome), status);
+        let terminal =
+            resolve_published_terminal_result(Uuid::nil(), &result, "2026-08-03T12:00:00Z");
+        assert_eq!(terminal.completion_request_status(), status);
         assert_eq!(terminal.reason_code, reason);
         assert_eq!(terminal.publication.draft, draft);
-        assert_eq!(terminal.outcome, outcome);
-        assert_eq!(terminal.process_health, "healthy");
+        assert_eq!(terminal.mission_outcome, mission_outcome);
+        assert_eq!(terminal.process_health, ProcessHealth::Healthy);
+        assert_eq!(terminal.process_exit_code(), 0);
+        assert_ne!(terminal.completion.status, CompletionStatus::Uncertain);
     }
 }
 
@@ -10052,6 +10130,10 @@ fn ai_gateway_and_completion_use_execution_bearer_and_idempotency_keys() {
     completion_client
         .complete(&CompletionRequest {
             status: "failed".into(),
+            canonical_terminal_result_id: None,
+            terminal_revision: None,
+            terminal_authority: None,
+            canonical_terminal_result: None,
             mission_outcome: None,
             process_health: Some("failed".into()),
             completion_evaluation: None,
@@ -10105,6 +10187,10 @@ fn duplicate_partial_completions_have_the_same_idempotency_identity() {
     let execution_id = Uuid::from_u128(0x50505050_5050_4050_8050_505050505050);
     let completion = CompletionRequest {
         status: "partial_result".into(),
+        canonical_terminal_result_id: None,
+        terminal_revision: None,
+        terminal_authority: None,
+        canonical_terminal_result: None,
         mission_outcome: Some(CompletionStatus::Partial),
         process_health: Some("healthy".into()),
         completion_evaluation: None,

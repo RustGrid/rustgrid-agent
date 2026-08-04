@@ -61,6 +61,7 @@ mod provider_protocol;
 mod publication;
 mod recovery;
 mod telemetry;
+mod terminal;
 mod tools;
 
 use authentication::*;
@@ -76,6 +77,7 @@ use provider_protocol::*;
 use publication::*;
 use recovery::*;
 use telemetry::*;
+use terminal::*;
 use tools::*;
 
 use graph_bridge::{
@@ -194,6 +196,10 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
             );
             let _ = api.complete(&CompletionRequest {
                 status: "failed".into(),
+                canonical_terminal_result_id: None,
+                terminal_revision: None,
+                terminal_authority: None,
+                canonical_terminal_result: None,
                 mission_outcome: None,
                 process_health: Some("failed".into()),
                 completion_evaluation: None,
@@ -227,65 +233,7 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
     supervisor.stop();
     let terminal_at = now_rfc3339();
     match result {
-        Ok(result) if hosted_result_can_succeed(&result) => {
-            report_successful_hosted_result(&api, execution_id, &started_at, &terminal_at, &result)
-        }
-        Ok(result) => {
-            send_execution_telemetry(
-                &api,
-                execution_id,
-                &started_at,
-                Some(&terminal_at),
-                ExecutionStatus::NeedsContinuation,
-                2,
-            );
-            api.append_event(
-                "result",
-                json!({
-                    "status": completion_request_status(result.completeness.status),
-                    "mission_outcome": result.completeness.status,
-                    "process_health": "healthy",
-                    "branch": result.branch,
-                    "head_sha": result.commit,
-                    "pull_request_number": result.pull_request.number,
-                    "pull_request_url": result.pull_request.url,
-                    "implementation_completeness": result.completeness,
-                    "technical_validation": result.validation,
-                    "terminal_telemetry": result.terminal_telemetry,
-                    "resumable": requires_implementation_continuation(
-                        result.completeness.status
-                    )
-                }),
-            )?;
-            api.complete(&CompletionRequest {
-                status: completion_request_status(result.completeness.status).into(),
-                mission_outcome: Some(result.completeness.status),
-                process_health: Some("healthy".into()),
-                completion_evaluation: Some(result.completeness.clone()),
-                output_summary: Some(truncate_text(
-                    &format!("{}\n\n{}", result.summary, result.completeness.summary),
-                    16_000,
-                )),
-                failure_code: None,
-                failure_message: None,
-                head_branch: Some(result.branch.clone()),
-                head_sha: Some(result.commit.clone()),
-                pull_request_number: Some(
-                    i64::try_from(result.pull_request.number)
-                        .context("pull request number is too large")?,
-                ),
-                pull_request_url: Some(result.pull_request.url.clone()),
-            })
-            .context("could not report resumable partial hosted execution")?;
-            println!(
-                "[invalid] Execution {execution_id} published work but produced an invalid terminal result in pull request #{} at {}",
-                result.pull_request.number, result.pull_request.url
-            );
-            Err(anyhow!(
-                "hosted execution produced invalid terminal mission outcome `{}`",
-                result.completeness.status.as_str()
-            ))
-        }
+        Ok(result) => report_hosted_result(&api, execution_id, &started_at, &terminal_at, &result),
         Err(error) if !may_publish_hosted_terminal_state(&error) => {
             eprintln!("[warning] {error}; skipped stale hosted terminal updates");
             Err(error)
@@ -307,13 +255,58 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
                 2,
             );
             let diagnostics = failure_diagnostics(&error, false);
-            api.append_event("result", blocked_result_event_payload(failure, diagnostics))?;
             let completion_evaluation = blocked_completion_evaluation(failure);
-            api.complete(&CompletionRequest {
-                status: "blocked".into(),
-                mission_outcome: Some(CompletionStatus::Blocked),
-                process_health: Some("healthy".into()),
-                completion_evaluation: Some(completion_evaluation),
+            let terminal = resolve_blocked_terminal_result(
+                execution_id,
+                &failure.code,
+                failure.remaining_work.clone(),
+                &failure.resume_phase,
+                completion_evaluation.clone(),
+                &terminal_at,
+            );
+            api.append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.canonical_terminal_result_resolved",
+                    "canonical_terminal_result_id": terminal.terminal_result_id,
+                    "mission_outcome": terminal.mission_outcome,
+                    "process_health": terminal.process_health,
+                    "domain_execution_status": terminal.execution_status,
+                    "publication_status": terminal.publication.status,
+                    "authority": terminal.finality.authority,
+                }),
+            )?;
+            let mut blocked_payload = blocked_result_event_payload(failure, diagnostics);
+            if let Some(payload) = blocked_payload.as_object_mut() {
+                payload.insert(
+                    "event_type".into(),
+                    json!("worker.canonical_terminal_result_persisted"),
+                );
+                payload.insert(
+                    "canonical_terminal_result_id".into(),
+                    json!(terminal.terminal_result_id),
+                );
+                payload.insert("canonical_terminal_result".into(), json!(terminal));
+                payload.insert("mission_outcome".into(), json!(terminal.mission_outcome));
+                payload.insert("process_health".into(), json!(terminal.process_health));
+                payload.insert("terminal_finality".into(), json!(terminal.finality));
+                payload.insert(
+                    "resumable".into(),
+                    json!(terminal.resumability.is_resumable()),
+                );
+                payload.insert("ui_status".into(), json!(terminal.ui_status()));
+            }
+            api.append_event("result", blocked_payload)
+                .context("could not persist canonical blocked terminal result")?;
+            let completion = CompletionRequest {
+                status: terminal.completion_request_status().into(),
+                canonical_terminal_result_id: Some(terminal.terminal_result_id),
+                terminal_revision: Some(terminal.finality.terminal_revision),
+                terminal_authority: Some("worker_domain".into()),
+                canonical_terminal_result: Some(serde_json::to_value(&terminal)?),
+                mission_outcome: Some(terminal.compatibility_completion_status()),
+                process_health: Some(terminal.process_health.as_str().into()),
+                completion_evaluation: Some(terminal.completion.clone()),
                 output_summary: Some(failure.message.clone()),
                 failure_code: Some(failure.code.clone()),
                 failure_message: Some(failure.message.clone()),
@@ -321,8 +314,37 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
                 head_sha: None,
                 pull_request_number: None,
                 pull_request_url: None,
-            })
-            .context("could not report structured blocked hosted execution")?;
+            };
+            if let Err(error) = api.complete(&completion) {
+                eprintln!(
+                    "[warning] blocked execution {execution_id} was persisted, but its terminal callback remains pending: {error:#}"
+                );
+                let _ = api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "worker.infrastructure_terminal_did_not_override_domain",
+                        "canonical_terminal_result_id": terminal.terminal_result_id,
+                        "mission_outcome": terminal.mission_outcome,
+                        "canonical_process_health": terminal.process_health,
+                        "observed_process_health": ProcessHealth::Degraded,
+                        "reconciliation_decision": InfrastructureReconciliationDecision::DomainResultPreserved,
+                        "anomaly_code": "terminal_callback_transport_failed",
+                        "authority": terminal.finality.authority,
+                    }),
+                );
+            }
+            let _ = api.append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.process_exit_code_resolved",
+                    "canonical_terminal_result_id": terminal.terminal_result_id,
+                    "exit_code": terminal.process_exit_code(),
+                    "mission_outcome": terminal.mission_outcome,
+                    "process_health": terminal.process_health,
+                    "reason_code": terminal.reason_code,
+                    "authority": terminal.finality.authority,
+                }),
+            );
             println!(
                 "[blocked] Execution {execution_id} preserved implementation state without running validation or creating a pull request"
             );
@@ -348,15 +370,45 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
             );
             let (code, message) = safe_failure(&error, cancelled);
             let diagnostics = failure_diagnostics(&error, cancelled);
-            let _ = api.append_event(
+            let terminal = resolve_unsuccessful_terminal_result(
+                execution_id,
+                cancelled,
+                &code,
+                &message,
+                &terminal_at,
+            );
+            api.append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.canonical_terminal_result_resolved",
+                    "canonical_terminal_result_id": terminal.terminal_result_id,
+                    "mission_outcome": terminal.mission_outcome,
+                    "process_health": terminal.process_health,
+                    "domain_execution_status": terminal.execution_status,
+                    "publication_status": terminal.publication.status,
+                    "authority": terminal.finality.authority,
+                }),
+            )?;
+            api.append_event(
                 "result",
                 json!({
-                    "status": if cancelled { "cancelled" } else { "failed" },
+                    "event_type": "worker.canonical_terminal_result_persisted",
+                    "canonical_terminal_result_id": terminal.terminal_result_id,
+                    "canonical_terminal_result": terminal,
+                    "status": terminal.completion_request_status(),
+                    "mission_outcome": terminal.mission_outcome,
+                    "process_health": terminal.process_health,
                     "code": code,
                     "failure": diagnostics,
+                    "terminal_finality": terminal.finality,
                 }),
-            );
-            let completion = unsuccessful_completion(cancelled, code, message);
+            )
+            .context("could not persist unsuccessful canonical hosted terminal result")?;
+            let mut completion = unsuccessful_completion(cancelled, code, message);
+            completion.canonical_terminal_result_id = Some(terminal.terminal_result_id);
+            completion.terminal_revision = Some(terminal.finality.terminal_revision);
+            completion.terminal_authority = Some("worker_domain".into());
+            completion.canonical_terminal_result = Some(serde_json::to_value(&terminal)?);
             if let Err(completion_error) = api.complete(&completion)
                 && completion_error
                     .downcast_ref::<HostedHttpError>()
@@ -366,6 +418,18 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
                     "[warning] could not report hosted execution failure: {completion_error:#}"
                 );
             }
+            let _ = api.append_event(
+                "progress",
+                json!({
+                    "event_type": "worker.process_exit_code_resolved",
+                    "canonical_terminal_result_id": terminal.terminal_result_id,
+                    "exit_code": terminal.process_exit_code(),
+                    "mission_outcome": terminal.mission_outcome,
+                    "process_health": terminal.process_health,
+                    "reason_code": terminal.reason_code,
+                    "authority": terminal.finality.authority,
+                }),
+            );
             if cancelled {
                 println!(
                     "[cancelled] Execution {execution_id} preserved its checkpoint and ended normally"
@@ -378,60 +442,106 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
     }
 }
 
-fn report_successful_hosted_result(
+fn report_hosted_result(
     api: &HostedApiClient,
     execution_id: Uuid,
     started_at: &str,
     terminal_at: &str,
     result: &HostedResult,
 ) -> Result<()> {
-    let terminal = canonical_terminal_result(result, terminal_at);
+    let terminal = resolve_published_terminal_result(execution_id, result, terminal_at);
+    let telemetry_status = match terminal.execution_status {
+        DomainExecutionStatus::Completed | DomainExecutionStatus::AwaitingExternalReview => {
+            ExecutionStatus::Succeeded
+        }
+        DomainExecutionStatus::NeedsContinuation | DomainExecutionStatus::Blocked => {
+            ExecutionStatus::NeedsContinuation
+        }
+        DomainExecutionStatus::Cancelled => ExecutionStatus::Cancelled,
+        DomainExecutionStatus::Failed => ExecutionStatus::Failed,
+    };
     send_execution_telemetry(
         api,
         execution_id,
         started_at,
         Some(terminal_at),
-        ExecutionStatus::Succeeded,
+        telemetry_status,
         2,
     );
-    if let Err(error) = api.append_event(
+    api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.canonical_terminal_result_resolved",
+            "canonical_terminal_result_id": terminal.terminal_result_id,
+            "mission_outcome": terminal.mission_outcome,
+            "process_health": terminal.process_health,
+            "domain_execution_status": terminal.execution_status,
+            "publication_status": terminal.publication.status,
+            "authority": terminal.finality.authority,
+        }),
+    )?;
+    if result.completeness.status != terminal.completion.status {
+        api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.terminal_outcome_conflict_detected",
+                "canonical_terminal_result_id": terminal.terminal_result_id,
+                "completion_model_outcome": result.completeness.status,
+                "canonical_completion_outcome": terminal.completion.status,
+                "mission_outcome": terminal.mission_outcome,
+                "publication_status": terminal.publication.status,
+                "resolution": "canonical_deterministic_evidence_preserved",
+                "authority": terminal.finality.authority,
+            }),
+        )?;
+    }
+    api.append_event(
         "result",
         json!({
-            "event_type": "worker.terminal_domain_result_persisted",
+            "event_type": "worker.canonical_terminal_result_persisted",
+            "canonical_terminal_result_id": terminal.terminal_result_id,
             "canonical_terminal_result": terminal,
             // Compatibility fields are projections of the same canonical
             // value rather than an independently classified outcome.
-            "status": completion_request_status(terminal.outcome),
-            "mission_outcome": terminal.outcome,
+            "status": terminal.completion_request_status(),
+            "mission_outcome": terminal.mission_outcome,
             "process_health": terminal.process_health,
             "branch": terminal.publication.branch,
             "head_sha": terminal.publication.commit_sha,
             "pull_request_number": terminal.publication.pull_request_number,
             "pull_request_url": terminal.publication.pull_request_url,
-            "implementation_completeness": terminal.completion_evaluation,
+            "implementation_completeness": terminal.completion,
+            "remaining_work": terminal.remaining_work,
+            "resumability": terminal.resumability,
+            "resumable": terminal.resumability.is_resumable(),
+            "terminal_finality": terminal.finality,
+            "ui_status": terminal.ui_status(),
             "technical_validation": result.validation,
             "terminal_telemetry": result.terminal_telemetry
         }),
-    ) {
-        eprintln!(
-            "[warning] hosted result-event delivery failed before terminal completion: {error:#}"
-        );
-    }
+    )
+    .context("could not persist canonical hosted terminal result")?;
     let completion = CompletionRequest {
-        status: completion_request_status(terminal.outcome).into(),
-        mission_outcome: Some(terminal.outcome),
-        process_health: Some(terminal.process_health.into()),
-        completion_evaluation: Some(terminal.completion_evaluation.clone()),
+        status: terminal.completion_request_status().into(),
+        canonical_terminal_result_id: Some(terminal.terminal_result_id),
+        terminal_revision: Some(terminal.finality.terminal_revision),
+        terminal_authority: Some("worker_domain".into()),
+        canonical_terminal_result: Some(serde_json::to_value(&terminal)?),
+        mission_outcome: Some(terminal.compatibility_completion_status()),
+        process_health: Some(terminal.process_health.as_str().into()),
+        completion_evaluation: Some(terminal.completion.clone()),
         output_summary: Some(truncate_text(&result.summary, 16_000)),
         failure_code: None,
         failure_message: None,
-        head_branch: Some(terminal.publication.branch.clone()),
-        head_sha: Some(terminal.publication.commit_sha.clone()),
-        pull_request_number: Some(
-            i64::try_from(terminal.publication.pull_request_number)
-                .context("pull request number is too large")?,
-        ),
-        pull_request_url: Some(terminal.publication.pull_request_url.clone()),
+        head_branch: terminal.publication.branch.clone(),
+        head_sha: terminal.publication.commit_sha.clone(),
+        pull_request_number: terminal
+            .publication
+            .pull_request_number
+            .map(i64::try_from)
+            .transpose()
+            .context("pull request number is too large")?,
+        pull_request_url: terminal.publication.pull_request_url.clone(),
     };
     if let Err(error) = api.complete(&completion) {
         // RunFinished is the canonical terminal result. A best-effort API
@@ -439,6 +549,24 @@ fn report_successful_hosted_result(
         // path merely because delivery was temporarily unavailable.
         eprintln!(
             "[warning] hosted execution {execution_id} finished successfully, but the terminal callback remains pending: {error:#}"
+        );
+        let mut observed = terminal.clone();
+        record_noncritical_post_publication_failure(
+            &mut observed,
+            "terminal_callback_transport_failed",
+        );
+        let _ = api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.infrastructure_terminal_did_not_override_domain",
+                "canonical_terminal_result_id": terminal.terminal_result_id,
+                "mission_outcome": terminal.mission_outcome,
+                "canonical_process_health": terminal.process_health,
+                "observed_process_health": observed.process_health,
+                "reconciliation_decision": InfrastructureReconciliationDecision::DomainResultPreserved,
+                "anomaly_code": "terminal_callback_transport_failed",
+                "authority": terminal.finality.authority,
+            }),
         );
     } else {
         println!(
@@ -449,37 +577,18 @@ fn report_successful_hosted_result(
     if let Err(error) = api.append_event(
         "progress",
         json!({
-            "event_type": "worker.workflow_exit_code_resolved",
-            "exit_code": 0,
-            "mission_outcome": terminal.outcome,
+            "event_type": "worker.process_exit_code_resolved",
+            "canonical_terminal_result_id": terminal.terminal_result_id,
+            "exit_code": terminal.process_exit_code(),
+            "mission_outcome": terminal.mission_outcome,
             "process_health": terminal.process_health,
             "reason_code": terminal.reason_code,
+            "authority": terminal.finality.authority,
         }),
     ) {
-        eprintln!("[warning] workflow exit telemetry delivery failed: {error:#}");
+        eprintln!("[warning] process-exit telemetry delivery failed: {error:#}");
     }
     Ok(())
-}
-
-fn canonical_terminal_result(result: &HostedResult, terminal_at: &str) -> CanonicalTerminalResult {
-    CanonicalTerminalResult {
-        outcome: result.completeness.status,
-        process_health: "healthy",
-        reason_code: terminal_reason_code(result.completeness.status),
-        publication: CanonicalPublicationResult {
-            status: "pull_request_created",
-            branch: result.branch.clone(),
-            commit_sha: result.commit.clone(),
-            pull_request_number: result.pull_request.number,
-            pull_request_url: result.pull_request.url.clone(),
-            draft: result.completeness.status == CompletionStatus::CompletePendingExternalReview
-                || requires_implementation_continuation(result.completeness.status),
-            mode: "pull_request",
-            completed_at: terminal_at.into(),
-        },
-        completion_evaluation: result.completeness.clone(),
-        remaining_work: result.terminal_telemetry.remaining_work.clone(),
-    }
 }
 
 const fn terminal_reason_code(status: CompletionStatus) -> &'static str {
@@ -490,28 +599,6 @@ const fn terminal_reason_code(status: CompletionStatus) -> &'static str {
         CompletionStatus::Blocked => "blocked_resumable",
         CompletionStatus::Incomplete => "incomplete",
         CompletionStatus::Uncertain => "uncertain",
-    }
-}
-
-fn hosted_result_can_succeed(result: &HostedResult) -> bool {
-    match result.completeness.status {
-        CompletionStatus::Complete | CompletionStatus::CompletePendingExternalReview => result
-            .validation
-            .iter()
-            .all(|validation| validation.status == "passed"),
-        CompletionStatus::Partial | CompletionStatus::Blocked => true,
-        CompletionStatus::Incomplete | CompletionStatus::Uncertain => false,
-    }
-}
-
-const fn completion_request_status(status: CompletionStatus) -> &'static str {
-    match status {
-        CompletionStatus::Complete => "completed",
-        CompletionStatus::CompletePendingExternalReview => "awaiting_external_review",
-        CompletionStatus::Partial | CompletionStatus::Incomplete | CompletionStatus::Uncertain => {
-            "partial_result"
-        }
-        CompletionStatus::Blocked => "blocked",
     }
 }
 
@@ -556,16 +643,60 @@ fn report_emergency_failure_with_api(api: &HostedApiClient, execution_id: Uuid) 
             "could not confirm ownership before reporting an emergency hosted execution failure",
         );
     }
-    let _ = api.append_event(
+    let observed_at = now_rfc3339();
+    let infrastructure = InfrastructureTerminalMetadata {
+        provider: "github_actions".into(),
+        workflow_run_id: env::var("GITHUB_RUN_ID").ok(),
+        workflow_job_id: env::var("GITHUB_JOB").ok(),
+        workflow_status: "completed".into(),
+        workflow_conclusion: Some("failure".into()),
+        runner_name: env::var("RUNNER_NAME").ok(),
+        observed_at: observed_at.clone(),
+    };
+    let reconciliation = reconcile_infrastructure_terminal(None, infrastructure);
+    api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.infrastructure_terminal_observed",
+            "workflow_conclusion": reconciliation.infrastructure.workflow_conclusion,
+            "workflow_run_id": reconciliation.infrastructure.workflow_run_id,
+            "workflow_job_id": reconciliation.infrastructure.workflow_job_id,
+            "observed_at": reconciliation.infrastructure.observed_at,
+        }),
+    )?;
+    api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.infrastructure_terminal_reconciled",
+            "reconciliation_decision": reconciliation.decision,
+            "anomaly_code": reconciliation.anomaly_code,
+            "authority": TerminalAuthority::InfrastructureFallback,
+        }),
+    )?;
+    let terminal = resolve_infrastructure_fallback_terminal_result(
+        execution_id,
+        "github_actions_step_failed",
+        "The GitHub Actions job failed before the normal execution callback completed.",
+        &observed_at,
+    );
+    api.append_event(
         "result",
         json!({
+            "event_type": "worker.canonical_terminal_result_persisted",
+            "canonical_terminal_result_id": terminal.terminal_result_id,
+            "canonical_terminal_result": terminal,
             "status": "failed",
             "code": "github_actions_step_failed",
-            "emergency_callback": true
+            "emergency_callback": true,
+            "authority": TerminalAuthority::InfrastructureFallback,
         }),
-    );
+    )?;
     let completion = CompletionRequest {
         status: "failed".into(),
+        canonical_terminal_result_id: Some(terminal.terminal_result_id),
+        terminal_revision: Some(terminal.finality.terminal_revision),
+        terminal_authority: Some("infrastructure_fallback".into()),
+        canonical_terminal_result: Some(serde_json::to_value(&terminal)?),
         mission_outcome: None,
         process_health: Some("failed".into()),
         completion_evaluation: None,
@@ -1298,6 +1429,11 @@ fn run_hosted_execution(
                     "result",
                     json!({
                         "status": "implementation_evaluated",
+                        "canonical_terminal_result_id": canonical_terminal_result_id(
+                            manifest.execution.execution_id
+                        ),
+                        "mission_outcome": agent.completion_outcome,
+                        "graph_outcome": agent.completion_outcome,
                         "implementation_completeness": completeness,
                         "technical_validation": {
                             "status": if validation_passed { "passed" } else { "failed" },
@@ -1526,7 +1662,10 @@ fn run_hosted_execution(
             "result",
             json!({
                 "event_type": "worker.domain_run_finished",
-                "mission_outcome": completeness.status,
+                "canonical_terminal_result_id": canonical_terminal_result_id(
+                    manifest.execution.execution_id
+                ),
+                "mission_outcome": agent.completion_outcome,
                 "graph_outcome": agent.completion_outcome,
                 "process_health": "healthy",
                 "reason_code": terminal_reason_code(completeness.status),

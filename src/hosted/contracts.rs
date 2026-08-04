@@ -252,6 +252,14 @@ pub(super) struct HostedSandboxPolicy {
 pub(super) struct CompletionRequest {
     pub(super) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) canonical_terminal_result_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_authority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) canonical_terminal_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mission_outcome: Option<CompletionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) process_health: Option<String>,
@@ -312,28 +320,6 @@ pub(super) struct TerminalTelemetry {
 pub(super) struct PullRequestResult {
     pub(super) number: u64,
     pub(super) url: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(super) struct CanonicalTerminalResult {
-    pub(super) outcome: CompletionStatus,
-    pub(super) process_health: &'static str,
-    pub(super) reason_code: &'static str,
-    pub(super) publication: CanonicalPublicationResult,
-    pub(super) completion_evaluation: CompletionEvaluation,
-    pub(super) remaining_work: Vec<RemainingWorkItem>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(super) struct CanonicalPublicationResult {
-    pub(super) status: &'static str,
-    pub(super) branch: String,
-    pub(super) commit_sha: String,
-    pub(super) pull_request_number: u64,
-    pub(super) pull_request_url: String,
-    pub(super) draft: bool,
-    pub(super) mode: &'static str,
-    pub(super) completed_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -963,6 +949,10 @@ mod tests {
     fn completion_request_serialization_contract_is_stable() {
         let request = CompletionRequest {
             status: "partial_result".into(),
+            canonical_terminal_result_id: None,
+            terminal_revision: None,
+            terminal_authority: None,
+            canonical_terminal_result: None,
             mission_outcome: Some(CompletionStatus::Partial),
             process_health: Some("healthy".into()),
             completion_evaluation: None,
