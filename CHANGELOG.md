@@ -5,6 +5,32 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.35 - 2026-08-04
+
+### Changed
+
+- Enforce mutation fallback strategies as executable, typed tool policies with
+  an exact provider tool surface and tool choice for each target lifecycle.
+- Select bounded patching or whole-file replacement from generic repository
+  evidence, target size, operation kind, and prior typed application failures.
+- Persist replay-safe mutation allowances, repair attempts, rejected responses,
+  and verification evidence so recovery preserves the same policy and budgets.
+- Explicitly pin patched transitive packages used by the container's npm
+  runtime.
+
+### Fixed
+
+- Reject provider responses that violate the selected mutation policy before
+  they can affect the repository, including mixed, missing, or disallowed tool
+  calls and fallback escalation without recorded typed evidence.
+- Keep mutation preparation, application, repair accounting, target
+  verification, and audit events consistent across modifications, creations,
+  deletions, renames, and moves without ticket-specific handling.
+- Preserve healthy blocked, partial-reviewable, cancellation, and terminal
+  outcomes when mutation work cannot safely continue.
+- Resolve fixable high-severity vulnerabilities in the container's bundled
+  `brace-expansion` and `ip-address` packages.
+
 ## 1.4.34 - 2026-08-04
 
 ### Changed

@@ -12,12 +12,16 @@ RUN cargo build --locked --release
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
 ARG CODEX_VERSION=0.144.4
 ARG NPM_VERSION=12.0.1
-ARG NPM_BRACE_EXPANSION_VERSION=5.0.8
+ARG NPM_BRACE_EXPANSION_VERSION=5.0.9
+ARG NPM_IP_ADDRESS_VERSION=10.3.1
 ARG NPM_TAR_VERSION=7.5.22
+ARG NPM_UNDICI_VERSION=6.28.0
 RUN test -n "${CODEX_VERSION}" \
     && test -n "${NPM_VERSION}" \
     && test -n "${NPM_BRACE_EXPANSION_VERSION}" \
+    && test -n "${NPM_IP_ADDRESS_VERSION}" \
     && test -n "${NPM_TAR_VERSION}" \
+    && test -n "${NPM_UNDICI_VERSION}" \
     && apt-get update \
     && apt-get upgrade --no-install-recommends -y \
     && apt-get install --no-install-recommends -y ca-certificates git tini \
@@ -25,18 +29,30 @@ RUN test -n "${CODEX_VERSION}" \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
     && npm install --prefix /tmp/npm-security-patches --ignore-scripts --no-audit --no-fund \
       "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}" \
+      "ip-address@${NPM_IP_ADDRESS_VERSION}" \
       "tar@${NPM_TAR_VERSION}" \
+      "undici@${NPM_UNDICI_VERSION}" \
     && rm -rf \
       /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
+      /usr/local/lib/node_modules/npm/node_modules/ip-address \
       /usr/local/lib/node_modules/npm/node_modules/tar \
+      /usr/local/lib/node_modules/npm/node_modules/undici \
     && cp -a \
       /tmp/npm-security-patches/node_modules/brace-expansion \
       /usr/local/lib/node_modules/npm/node_modules/brace-expansion \
     && cp -a \
+      /tmp/npm-security-patches/node_modules/ip-address \
+      /usr/local/lib/node_modules/npm/node_modules/ip-address \
+    && cp -a \
       /tmp/npm-security-patches/node_modules/tar \
       /usr/local/lib/node_modules/npm/node_modules/tar \
+    && cp -a \
+      /tmp/npm-security-patches/node_modules/undici \
+      /usr/local/lib/node_modules/npm/node_modules/undici \
     && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/brace-expansion/package.json').version")" = "${NPM_BRACE_EXPANSION_VERSION}" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/ip-address/package.json').version")" = "${NPM_IP_ADDRESS_VERSION}" \
     && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/tar/package.json').version")" = "${NPM_TAR_VERSION}" \
+    && test "$(node -p "require('/usr/local/lib/node_modules/npm/node_modules/undici/package.json').version")" = "${NPM_UNDICI_VERSION}" \
     && rm -rf /tmp/npm-security-patches \
     && npm cache clean --force \
     && apt-get clean \
