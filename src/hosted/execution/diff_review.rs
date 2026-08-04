@@ -125,6 +125,16 @@ impl<'a> GatewayAgent<'a> {
             },
         )?;
         self.diff_reviewed = true;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.incomplete_diff_review_completed",
+                "reason": reason,
+                "changed_paths": changed_paths,
+                "diff_fingerprint": snapshot.current_repository.fingerprint,
+            }),
+            "incomplete diff review completed",
+        );
         self.persist_orchestration_checkpoint("incomplete_diff_review_completed", true)?;
         Ok(changed_paths)
     }

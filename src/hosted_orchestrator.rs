@@ -354,20 +354,65 @@ pub fn reconcile_execution(
         .unresolved()
         .find(|failure| failure.category == FailureCategory::ValidationFailure)
     {
+        let latest_repair = latest_validation_repair_result(snapshot, &failure.id);
         if matches!(
-            latest_validation_repair_result(snapshot, &failure.id),
-            Some(RepairResult::NoMutation { .. })
+            latest_repair,
+            Some(
+                RepairResult::MutationProduced { .. }
+                    | RepairResult::AlreadySatisfiesRepairIntent { .. }
+            )
         ) {
-            if !snapshot.current_repository.has_changes() {
-                return Ok(ExecutionDecision::StopForGuardrail {
-                    outcome: MissionOutcome::BlockedNoDiff,
-                    reason: GuardrailReason::BlockingFailure,
-                });
+            let validation_node = snapshot.graph.node(&failure.node_id).ok_or_else(|| {
+                OrchestrationInvariantError::for_node(
+                    "validation_repair_node_missing",
+                    failure.node_id.clone(),
+                    "resolved repair candidate refers to a missing validation node",
+                )
+            })?;
+            let gate = validation_node.validation.clone().ok_or_else(|| {
+                OrchestrationInvariantError::for_node(
+                    "validation_repair_gate_missing",
+                    failure.node_id.clone(),
+                    "resolved repair candidate refers to a node without a validation gate",
+                )
+            })?;
+            return Ok(ExecutionDecision::RunValidation {
+                node_id: validation_node.id.clone(),
+                gate,
+            });
+        }
+        let attempted_targets = attempted_validation_repair_targets(snapshot, &failure.id);
+        let candidates = validation_repair_candidates(snapshot, failure)?;
+        let next_target = candidates.iter().copied().find(|node| {
+            node.target
+                .as_ref()
+                .is_some_and(|target| !attempted_targets.contains(target.path.as_str()))
+        });
+        let validation_budget_exhausted =
+            snapshot.graph.node(&failure.node_id).is_some_and(|node| {
+                snapshot
+                    .budget
+                    .usage_for(&node.id)
+                    .validation_repair_attempts
+                    >= node.budget.max_repair_attempts.max(1)
+            });
+        if matches!(latest_repair, Some(RepairResult::NoMutation { .. }))
+            && (next_target.is_none() || validation_budget_exhausted)
+        {
+            match validation_repair_terminal_decision(snapshot, false) {
+                RepairTerminalDecision::ReviewIncompleteDiff { reason } => {
+                    return incomplete_diff_decision(snapshot, reason);
+                }
+                RepairTerminalDecision::FinishBlockedWithoutDiff { .. } => {
+                    return Ok(ExecutionDecision::StopForGuardrail {
+                        outcome: MissionOutcome::BlockedNoDiff,
+                        reason: GuardrailReason::BlockingFailure,
+                    });
+                }
+                RepairTerminalDecision::ContinueRepair
+                | RepairTerminalDecision::RerunValidation
+                | RepairTerminalDecision::FailProcess { .. } => {}
             }
-            return incomplete_diff_decision(
-                snapshot,
-                IncompleteReason::ValidationRepairProducedNoMutation,
-            );
         }
         if let Some(path) = failure.target_path.as_deref() {
             let matching_nodes = snapshot
@@ -392,7 +437,13 @@ pub fn reconcile_execution(
                 ));
             }
         }
-        let Some(target_node) = affected_mutation_node(snapshot, failure) else {
+        let Some(target_node) = next_target else {
+            if snapshot.current_repository.has_changes() {
+                return incomplete_diff_decision(
+                    snapshot,
+                    IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
+                );
+            }
             return Err(OrchestrationInvariantError::new(
                 "validation_failure_target_missing",
                 format!(
@@ -401,9 +452,15 @@ pub fn reconcile_execution(
                 ),
             ));
         };
-        if repair_budget_exhausted(snapshot, target_node) {
+        if validation_budget_exhausted || repair_budget_exhausted(snapshot, target_node) {
+            if snapshot.current_repository.has_changes() {
+                return incomplete_diff_decision(
+                    snapshot,
+                    IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
+                );
+            }
             return Ok(ExecutionDecision::StopForGuardrail {
-                outcome: guardrail_outcome(snapshot),
+                outcome: MissionOutcome::BlockedNoDiff,
                 reason: GuardrailReason::NodeBudgetExhausted,
             });
         }
@@ -480,6 +537,23 @@ pub fn reconcile_execution(
     ))
 }
 
+fn validation_repair_terminal_decision(
+    snapshot: &ExecutionSnapshot,
+    can_continue: bool,
+) -> RepairTerminalDecision {
+    if can_continue {
+        RepairTerminalDecision::ContinueRepair
+    } else if snapshot.current_repository.has_changes() {
+        RepairTerminalDecision::ReviewIncompleteDiff {
+            reason: IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
+        }
+    } else {
+        RepairTerminalDecision::FinishBlockedWithoutDiff {
+            reason: BlockedReason::ValidationRepairUnresolvedWithoutDiff,
+        }
+    }
+}
+
 fn all_required_mutations_applied(snapshot: &ExecutionSnapshot) -> bool {
     snapshot
         .graph
@@ -504,6 +578,82 @@ fn latest_validation_repair_result<'a>(
             } if repaired_failure_id == failure_id => Some(result),
             _ => None,
         })
+}
+
+pub(crate) fn attempted_validation_repair_targets(
+    snapshot: &ExecutionSnapshot,
+    failure_id: &FailureId,
+) -> BTreeSet<RepositoryPath> {
+    current_execution_epoch(&snapshot.events)
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionDomainEvent::ValidationRepairStarted {
+                failure_id: attempted_failure,
+                selected_target,
+                ..
+            } if attempted_failure == failure_id => Some(selected_target.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn validation_repair_candidates<'a>(
+    snapshot: &'a ExecutionSnapshot,
+    failure: &FailureRecord,
+) -> Result<Vec<&'a ExecutionNode>, OrchestrationInvariantError> {
+    let mut ranked_paths = Vec::new();
+    if let Some(path) = failure.target_path.as_ref() {
+        ranked_paths.push(path.clone());
+    }
+    for assertion in &failure.assertion_failures {
+        let test_repair_supported = matches!(
+            assertion.diagnosis,
+            Some(
+                ValidationRepairDiagnosis::TestExpectationDefect | ValidationRepairDiagnosis::Both
+            )
+        );
+        ranked_paths.extend(
+            assertion
+                .implicated_paths
+                .iter()
+                .filter(|path| test_repair_supported || path.as_str() != assertion.test_file)
+                .cloned(),
+        );
+        if test_repair_supported && !assertion.test_file.is_empty() {
+            ranked_paths.push(assertion.test_file.clone());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for path in ranked_paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let matching = snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind.is_mutation()
+                    && node
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.path == path)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(OrchestrationInvariantError::new(
+                "ambiguous_validation_failure_target",
+                format!(
+                    "validation failure `{}` matches {} mutation nodes for `{path}`; canonical node identity is required",
+                    failure.id,
+                    matching.len()
+                ),
+            ));
+        }
+        candidates.extend(matching);
+    }
+    Ok(candidates)
 }
 
 fn incomplete_diff_decision(
@@ -1003,6 +1153,7 @@ fn repair_target_decision(
         tools_for_target_operation(node.target.as_ref().expect("mutation node target"))?,
     )?;
     if failure.category == FailureCategory::ValidationFailure {
+        let correction_contracts = assertion_repair_contracts(failure);
         let implicated_paths = failure
             .assertion_failures
             .iter()
@@ -1019,7 +1170,51 @@ fn repair_target_decision(
             })
             .map(FileExcerpt::from)
             .collect();
+        let attempted_targets = attempted_validation_repair_targets(snapshot, &failure.id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let remaining_eligible_targets = validation_repair_candidates(snapshot, failure)?
+            .into_iter()
+            .filter_map(|node| node.target.as_ref().map(|target| target.path.clone()))
+            .filter(|path| !attempted_targets.contains(path))
+            .collect::<Vec<_>>();
+        let diagnosis = repair_diagnosis(failure);
+        let repair_intent_id = validation_repair_intent_id(failure);
+        let required_assertion_ids = correction_contracts
+            .iter()
+            .map(|contract| contract.assertion_id.clone())
+            .collect::<Vec<_>>();
+        let required_observable_change = correction_contracts
+            .iter()
+            .map(|contract| contract.required_observable_change.as_str())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let evidence_ids = snapshot
+            .graph
+            .node(&failure.node_id)
+            .map(|node| {
+                node.evidence_ids
+                    .iter()
+                    .cloned()
+                    .map(EvidenceId::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let repair_intent = ValidationRepairIntent {
+            repair_intent_id,
+            failed_validation_id: failure.id.to_string(),
+            target: target.target.path.clone(),
+            diagnosis,
+            expected_correction: ExpectedTargetState {
+                content_hash: None,
+                required_assertion_ids,
+                required_observable_change,
+            },
+            evidence_ids,
+        };
         target.validation_repair = Some(ValidationRepairContext {
+            repair_intent,
             focused_validation_command: failure.validation_command.clone().unwrap_or_default(),
             assertion_failures: failure.assertion_failures.clone(),
             implicated_targets,
@@ -1032,6 +1227,9 @@ fn repair_target_decision(
                 .iter()
                 .cloned()
                 .collect(),
+            correction_contracts,
+            attempted_targets,
+            remaining_eligible_targets,
         });
     }
     let context_prepared = snapshot.events.iter().rev().any(|event| {
@@ -1148,6 +1346,71 @@ fn repair_target_decision(
     })
 }
 
+fn validation_repair_intent_id(failure: &FailureRecord) -> IntentId {
+    format!(
+        "validation-repair:{}:{}",
+        failure.id, failure.repository_fingerprint
+    )
+}
+
+fn repair_diagnosis(failure: &FailureRecord) -> ValidationRepairDiagnosis {
+    let diagnoses = failure
+        .assertion_failures
+        .iter()
+        .filter_map(|assertion| assertion.diagnosis)
+        .collect::<BTreeSet<_>>();
+    if diagnoses.len() == 1 {
+        return *diagnoses
+            .iter()
+            .next()
+            .expect("single diagnosis must have one member");
+    }
+    if diagnoses.contains(&ValidationRepairDiagnosis::SourceDefect)
+        && diagnoses.contains(&ValidationRepairDiagnosis::TestExpectationDefect)
+    {
+        ValidationRepairDiagnosis::Both
+    } else {
+        ValidationRepairDiagnosis::Inconclusive
+    }
+}
+
+fn assertion_repair_contracts(failure: &FailureRecord) -> Vec<AssertionRepairContract> {
+    failure
+        .assertion_failures
+        .iter()
+        .enumerate()
+        .map(|(index, assertion)| {
+            let assertion_id = format!(
+                "{}:{}:{}:{}",
+                assertion.test_file,
+                assertion.source_line.unwrap_or_default(),
+                assertion.test_name,
+                index
+            );
+            let required_observable_change = if assertion.expected_validation_effect.is_empty() {
+                format!(
+                    "change the observed value from `{}` so it satisfies `{}` for `{}`",
+                    assertion.received, assertion.expected, assertion.test_name
+                )
+            } else {
+                assertion.expected_validation_effect.clone()
+            };
+            AssertionRepairContract {
+                assertion_id,
+                expected: (!assertion.expected.is_empty()).then(|| assertion.expected.clone()),
+                received: (!assertion.received.is_empty()).then(|| assertion.received.clone()),
+                source_location: (!assertion.source_location.is_empty()).then(|| SourceLocation {
+                    path: assertion.source_location.clone(),
+                    line: assertion.source_line,
+                    column: assertion.source_column,
+                }),
+                implicated_paths: assertion.implicated_paths.clone(),
+                required_observable_change,
+            }
+        })
+        .collect()
+}
+
 fn tools_for_target_operation(
     target: &crate::execution_graph::PlannedTarget,
 ) -> Result<Vec<ToolKind>, OrchestrationInvariantError> {
@@ -1201,20 +1464,6 @@ fn unresolved_failure_for_node<'a>(
                 "a recoverable node has no unresolved failure context",
             )
         })
-}
-
-fn affected_mutation_node<'a>(
-    snapshot: &'a ExecutionSnapshot,
-    failure: &FailureRecord,
-) -> Option<&'a ExecutionNode> {
-    let path = failure.target_path.as_deref()?;
-    snapshot.graph.nodes.iter().find(|node| {
-        node.kind.is_mutation()
-            && node
-                .target
-                .as_ref()
-                .is_some_and(|target| target.path == path)
-    })
 }
 
 fn effective_success_ids(snapshot: &ExecutionSnapshot) -> BTreeSet<ExecutionNodeId> {
@@ -1904,6 +2153,7 @@ mod tests {
             received: String::new(),
             implicated_paths: vec![
                 "src/components/theme/ThemeProvider.tsx".into(),
+                "src/components/theme/ThemeToggle.tsx".into(),
                 "tests/theme-provider.test.tsx".into(),
             ],
             ..ValidationAssertionFailure::default()
@@ -1950,14 +2200,68 @@ mod tests {
         ));
 
         state
-            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+            .append_event(ExecutionDomainEvent::ValidationRepairStarted {
                 sequence: 4,
+                validation_node_id: validation_node.clone(),
+                failure_id: failure.id.clone(),
+                repair_intent: ValidationRepairIntent::default(),
+                selected_target: "src/components/theme/ThemeProvider.tsx".into(),
+                implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
+                correction_contracts: Vec::new(),
+                requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+                repository_fingerprint_before: RepositoryFingerprint::new(
+                    "tree-after-four-mutations",
+                ),
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: 5,
+                validation_node_id: validation_node.clone(),
+                failure_id: failure.id.clone(),
+                result: RepairResult::NoMutation {
+                    diagnosis: Some(ValidationRepairDiagnosis::Inconclusive),
+                    reason: "no safe mutation".into(),
+                    outcome: ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                    unresolved: None,
+                },
+                attempt: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::PrepareTargetContext { ref target, .. },
+                ..
+            } if target.path == "src/components/theme/ThemeToggle.tsx"
+        ));
+        state
+            .append_event(ExecutionDomainEvent::ValidationRepairStarted {
+                sequence: 6,
+                validation_node_id: validation_node.clone(),
+                failure_id: failure.id.clone(),
+                repair_intent: ValidationRepairIntent::default(),
+                selected_target: "src/components/theme/ThemeToggle.tsx".into(),
+                implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
+                correction_contracts: Vec::new(),
+                requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+                repository_fingerprint_before: RepositoryFingerprint::new(
+                    "tree-after-four-mutations",
+                ),
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: 7,
                 validation_node_id: validation_node,
                 failure_id: failure.id,
                 result: RepairResult::NoMutation {
                     diagnosis: Some(ValidationRepairDiagnosis::Inconclusive),
-                    reason: "no safe mutation".into(),
+                    reason: "all implicated targets exhausted".into(),
+                    outcome: ValidationRepairMutationOutcome::NoValidRepair,
+                    unresolved: None,
                 },
+                attempt: None,
             })
             .unwrap();
         let (diff_node, reason) = match reconcile_execution(&state).unwrap() {
@@ -1973,7 +2277,7 @@ mod tests {
         );
         state
             .append_event(ExecutionDomainEvent::IncompleteDiffReviewRequested {
-                sequence: 5,
+                sequence: 8,
                 node_id: diff_node.clone(),
                 reason,
                 dependency_overrides: overrides,
@@ -1981,7 +2285,7 @@ mod tests {
             .unwrap();
         state
             .append_event(ExecutionDomainEvent::DiffReviewed {
-                sequence: 6,
+                sequence: 9,
                 node_id: diff_node,
                 evidence_ids: Vec::new(),
             })
@@ -1992,7 +2296,7 @@ mod tests {
         };
         state
             .append_event(ExecutionDomainEvent::CompletionEvaluated {
-                sequence: 7,
+                sequence: 10,
                 node_id: completion_node,
                 outcome: MissionOutcome::PartialReviewable,
             })
@@ -2030,6 +2334,26 @@ mod tests {
                 validation_status: ValidationStatus::FailedCode,
             })
         );
+        let test_target_id = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.target
+                    .as_ref()
+                    .is_some_and(|target| target.path == "tests/theme-provider.test.tsx")
+            })
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(
+            state.target_execution_state(&test_target_id),
+            Some(TargetExecutionState {
+                implementation_status: MutationStatus::Applied,
+                repair_status: RepairStatus::Exhausted,
+                validation_status: ValidationStatus::FailedCode,
+            })
+        );
 
         let publication_node = state
             .graph
@@ -2041,33 +2365,33 @@ mod tests {
             .clone();
         for event in [
             ExecutionDomainEvent::PublicationStarted {
-                sequence: 8,
+                sequence: 11,
                 node_id: publication_node.clone(),
                 mode: PublicationMode::Draft,
             },
             ExecutionDomainEvent::CommitCreated {
-                sequence: 9,
+                sequence: 12,
                 node_id: publication_node.clone(),
                 commit_sha: "attempt-30-commit".into(),
             },
             ExecutionDomainEvent::BranchPushed {
-                sequence: 10,
+                sequence: 13,
                 node_id: publication_node.clone(),
                 branch: "rustgrid/attempt-30".into(),
             },
             ExecutionDomainEvent::PullRequestCreated {
-                sequence: 11,
+                sequence: 14,
                 node_id: publication_node,
                 url: "https://example.test/pull/30".into(),
                 number: Some(30),
                 draft: true,
             },
             ExecutionDomainEvent::RunFinished {
-                sequence: 12,
+                sequence: 15,
                 outcome: MissionOutcome::PartialReviewable,
             },
             ExecutionDomainEvent::ExecutionResumed {
-                sequence: 13,
+                sequence: 16,
                 execution_attempt: 31,
                 previous_outcome: Some(MissionOutcome::PartialReviewable),
             },
@@ -2084,10 +2408,10 @@ mod tests {
         );
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
-            ExecutionDecision::ExecuteTarget {
-                action: MutationAction::PrepareTargetContext { ref target, .. },
+            ExecutionDecision::ReviewIncompleteDiff {
+                reason: IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
                 ..
-            } if target.path == "src/components/theme/ThemeProvider.tsx"
+            }
         ));
     }
 

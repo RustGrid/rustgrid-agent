@@ -505,10 +505,18 @@ pub(super) fn classify_hosted_mutation_preflight(
     snapshot: &crate::execution_graph::ExecutionSnapshot,
     current_node_id: Option<&crate::execution_graph::ExecutionNodeId>,
     attempted_path: &str,
+    active_validation_repair: bool,
 ) -> std::result::Result<
     Option<MutationPreflightError>,
     crate::hosted_orchestrator::OrchestrationInvariantError,
 > {
+    // Implementation idempotency is not proof that a failed assertion's
+    // correction intent is already satisfied. Repair uses its own evidence
+    // contract and must be allowed to inspect or mutate an implementation-
+    // complete target.
+    if active_validation_repair {
+        return Ok(None);
+    }
     let current_path_matches = current_node_id.is_some_and(|node_id| {
         snapshot
             .graph
@@ -2158,6 +2166,24 @@ impl<'a> GatewayAgent<'a> {
                                             (application.failure.as_str().to_owned(), None)
                                         },
                                     );
+                                let proposed_content_hash =
+                                    serde_json::from_str::<Value>(&arguments).ok().and_then(
+                                        |value| {
+                                            value
+                                                .get("content")
+                                                .and_then(Value::as_str)
+                                                .map(sha256_text)
+                                        },
+                                    );
+                                let validation_repair_no_change =
+                                    mutation_application.as_ref().is_some_and(|application| {
+                                        application.failure
+                                            == MutationApplicationFailure::MutationProducedNoChange
+                                    }) && self.record_active_validation_repair_no_change(
+                                        &error,
+                                        before_sha256.as_deref(),
+                                        proposed_content_hash.as_deref(),
+                                    )?;
                                 self.tool_usage.failed_writes =
                                     self.tool_usage.failed_writes.saturating_add(1);
                                 self.tool_usage.write_execution_failures =
@@ -2168,7 +2194,11 @@ impl<'a> GatewayAgent<'a> {
                                     change_id: change_id.clone().unwrap_or_default(),
                                     target: target.clone().unwrap_or_default(),
                                     tool: name.clone(),
-                                    status: WriteAttemptStatus::Failed,
+                                    status: if validation_repair_no_change {
+                                        WriteAttemptStatus::NoChange
+                                    } else {
+                                        WriteAttemptStatus::Failed
+                                    },
                                     error_code: Some(error_code.clone()),
                                     match_count,
                                     intended_change_sha256: intended_change_sha256.clone(),
@@ -2202,13 +2232,15 @@ impl<'a> GatewayAgent<'a> {
                                     recovery: None,
                                     intended_change_sha256: intended_change_sha256.clone(),
                                 });
-                                self.record_active_target_failure_with_code(
-                                    crate::execution_graph::FailureCategory::MutationConflict,
-                                    mutation_application
-                                        .as_ref()
-                                        .map(|application| application.failure.as_str()),
-                                    &error,
-                                )?;
+                                if !validation_repair_no_change {
+                                    self.record_active_target_failure_with_code(
+                                        crate::execution_graph::FailureCategory::MutationConflict,
+                                        mutation_application
+                                            .as_ref()
+                                            .map(|application| application.failure.as_str()),
+                                        &error,
+                                    )?;
+                                }
                                 self.reconcile_authoritative_target_state()?;
                                 self.reconcile_active_phase(
                                     "source-changing tool failure reconciled against repository state",

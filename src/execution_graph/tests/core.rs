@@ -1393,3 +1393,34 @@
             } if replayed == evidence
         ));
     }
+
+    #[test]
+    fn already_applied_repair_evidence_is_scoped_to_the_exact_repair_intent() {
+        let intent = ValidationRepairIntent {
+            repair_intent_id: "repair-validation-1".into(),
+            failed_validation_id: "validation-1".into(),
+            target: "src/lib.rs".into(),
+            diagnosis: ValidationRepairDiagnosis::SourceDefect,
+            expected_correction: ExpectedTargetState {
+                content_hash: Some("corrected-hash".into()),
+                required_assertion_ids: vec!["assertion-1".into()],
+                required_observable_change: "returns corrected value".into(),
+            },
+            evidence_ids: vec![EvidenceId::new("validation-evidence-1")],
+        };
+        let evidence = AlreadyAppliedRepairEvidence {
+            repair_intent_id: intent.repair_intent_id.clone(),
+            target_path: intent.target.clone(),
+            expected_state_hash: Some("corrected-hash".into()),
+            current_state_hash: "corrected-hash".into(),
+            satisfied_assertions: vec!["assertion-1".into()],
+            supporting_evidence_ids: vec![EvidenceId::new("validation-evidence-1")],
+        };
+        assert!(evidence.proves(&intent));
+        let mut wrong_intent = intent.clone();
+        wrong_intent.repair_intent_id = "repair-validation-2".into();
+        assert!(!evidence.proves(&wrong_intent));
+        let mut incomplete_evidence = evidence;
+        incomplete_evidence.satisfied_assertions.clear();
+        assert!(!incomplete_evidence.proves(&intent));
+    }

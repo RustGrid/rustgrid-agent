@@ -1294,7 +1294,16 @@ fn run_hosted_execution(
                 agent.deterministic_diff_review()?
             }
             ExecutionDecision::ReviewIncompleteDiff { reason, .. } => {
-                agent.deterministic_incomplete_diff_review(reason)?
+                agent.deterministic_incomplete_diff_review(reason).map_err(|error| {
+                    agent.categorized_execution_failure(
+                        "HostedLifecycleContractFailure",
+                        "repair_to_incomplete_review_not_supported",
+                        "The execution graph selected a legal repair-to-incomplete-review transition, but the hosted lifecycle wrapper rejected it.",
+                        Some(&error),
+                        false,
+                        "Fix the hosted lifecycle adapter; do not restart discovery or relabel this as initialization failure.",
+                    )
+                })?
             }
             ExecutionDecision::EvaluateCompletion { .. }
             | ExecutionDecision::Publish { .. }
@@ -1370,6 +1379,8 @@ fn run_hosted_execution(
                     let (failure_category, reason_code, failure_phase) = match reason {
                         crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMutation =>
                             ("validation_failure", "validation_failed_repair_incomplete", "repair"),
+                        crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMeaningfulMutation =>
+                            ("validation_repair_failure", "validation_repair_unresolved", "repair"),
                         crate::execution_graph::IncompleteReason::ValidationInfrastructureFailure =>
                             ("infrastructure_failure", "validation_infrastructure_incomplete", "validation"),
                         crate::execution_graph::IncompleteReason::TargetOperationConflict =>
@@ -1401,8 +1412,58 @@ fn run_hosted_execution(
                             format!("Run required gate `{}`: `{}`.", gate.gate_id, gate.command),
                         );
                     }
+                    let repair_attempts = crate::execution_graph::current_execution_epoch(
+                        &agent.notebook.orchestration.domain_events,
+                    )
+                    .iter()
+                    .filter_map(|event| {
+                        match event {
+                        crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                            attempt: Some(attempt),
+                            ..
+                        } => Some(format!(
+                            "{} via {} ({:?})",
+                            attempt.target_path,
+                            attempt.requested_tool_policy.as_str(),
+                            attempt.outcome
+                        )),
+                        _ => None,
+                    }
+                    })
+                    .collect::<Vec<_>>();
+                    let failing_assertions = agent
+                        .notebook
+                        .orchestration
+                        .failures
+                        .unresolved()
+                        .filter(|failure| {
+                            failure.category
+                                == crate::execution_graph::FailureCategory::ValidationFailure
+                        })
+                        .flat_map(|failure| failure.assertion_failures.iter())
+                        .map(|assertion| assertion.test_name.clone())
+                        .filter(|name| !name.is_empty())
+                        .collect::<BTreeSet<_>>();
+                    push_unique(
+                        &mut completeness.pending_external_review,
+                        format!(
+                            "Review unresolved validation repair after attempts [{}]; failing assertions [{}].",
+                            repair_attempts.join(", "),
+                            failing_assertions
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
                     completeness.summary = format!(
-                        "RustGrid preserved the applied repository diff for draft review after {reason:?}; required validation remains incomplete."
+                        "RustGrid preserved the applied repository diff for draft review after {reason:?}; required validation remains incomplete. Attempted repairs: [{}]. Failing assertions: [{}].",
+                        repair_attempts.join(", "),
+                        failing_assertions
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     agent.append_event_recoverable(
                         "result",
@@ -1419,6 +1480,9 @@ fn run_hosted_execution(
                             "failed_gates": validation.iter()
                                 .filter(|result| result.status != "passed")
                                 .collect::<Vec<_>>(),
+                            "attempted_repairs": repair_attempts,
+                            "failing_assertions": failing_assertions,
+                            "external_review_required": true,
                         }),
                         "partial-reviewable evaluation",
                     );

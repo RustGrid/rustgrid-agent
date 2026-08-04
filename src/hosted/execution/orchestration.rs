@@ -1452,14 +1452,20 @@ impl<'a> GatewayAgent<'a> {
             ExecutionDecision::ExecuteTarget {
                 action:
                     crate::hosted_orchestrator::MutationAction::RepairTarget {
-                        target, failure, ..
+                        target,
+                        failure,
+                        fallback_policy,
+                        ..
                     },
+                target: context,
                 ..
             } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+                let repair = context.validation_repair.clone().unwrap_or_default();
                 Some(ExecutionDomainEvent::ValidationRepairStarted {
                     sequence,
                     validation_node_id: failure.node_id.clone(),
                     failure_id: failure.id.clone(),
+                    repair_intent: repair.repair_intent,
                     selected_target: target.path.clone(),
                     implicated_paths: failure
                         .assertion_failures
@@ -1468,6 +1474,12 @@ impl<'a> GatewayAgent<'a> {
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect(),
+                    correction_contracts: repair.correction_contracts,
+                    requested_tool_policy: *fallback_policy,
+                    repository_fingerprint_before:
+                        crate::execution_graph::RepositoryFingerprint::new(
+                            repair.repository_fingerprint,
+                        ),
                 })
             }
             ExecutionDecision::ExecuteTarget { node_id, .. }
@@ -1546,6 +1558,100 @@ impl<'a> GatewayAgent<'a> {
         };
         if let Some(event) = event {
             self.append_execution_domain_event(event)?;
+        }
+        if let ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+            target,
+            ..
+        } = decision
+            && failure.category == crate::execution_graph::FailureCategory::ValidationFailure
+            && let Some(repair) = target.validation_repair.as_ref()
+        {
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_intent_created",
+                    "failed_validation_id": repair.repair_intent.failed_validation_id,
+                    "repair_intent_id": repair.repair_intent.repair_intent_id,
+                    "selected_target": repair.repair_intent.target,
+                    "assertion_ids": repair.repair_intent.expected_correction.required_assertion_ids,
+                    "remaining_eligible_targets": repair.remaining_eligible_targets,
+                }),
+                "validation repair intent created",
+            );
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_contract_built",
+                    "failed_validation_id": repair.repair_intent.failed_validation_id,
+                    "repair_intent_id": repair.repair_intent.repair_intent_id,
+                    "assertion_ids": repair.correction_contracts.iter()
+                        .map(|contract| contract.assertion_id.as_str())
+                        .collect::<Vec<_>>(),
+                    "contracts": repair.correction_contracts,
+                }),
+                "validation repair contract built",
+            );
+            if !repair.attempted_targets.is_empty() {
+                self.append_event_recoverable(
+                    "validation",
+                    json!({
+                        "event_type": "worker.validation_repair_next_target_selected",
+                        "failed_validation_id": repair.repair_intent.failed_validation_id,
+                        "repair_intent_id": repair.repair_intent.repair_intent_id,
+                        "selected_target": repair.selected_target,
+                        "previous_targets": repair.attempted_targets,
+                        "remaining_eligible_targets": repair.remaining_eligible_targets,
+                    }),
+                    "validation repair next target selected",
+                );
+            }
+        }
+        if matches!(
+            decision,
+            ExecutionDecision::ReviewIncompleteDiff {
+                reason: crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
+                ..
+            }
+        ) {
+            let snapshot = self.build_execution_snapshot()?;
+            let unresolved = snapshot
+                .failures
+                .unresolved()
+                .find(|failure| {
+                    failure.category
+                        == crate::execution_graph::FailureCategory::ValidationFailure
+                })
+                .cloned();
+            let attempts = snapshot
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                        attempt: Some(attempt),
+                        ..
+                    } => Some(attempt.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_target_exhausted",
+                    "failed_validation_id": unresolved.as_ref().map(|failure| failure.id.to_string()),
+                    "assertion_ids": unresolved.as_ref().into_iter()
+                        .flat_map(|failure| failure.assertion_failures.iter())
+                        .enumerate()
+                        .map(|(index, assertion)| format!("{}:{}:{}:{}", assertion.test_file, assertion.source_line.unwrap_or_default(), assertion.test_name, index))
+                        .collect::<Vec<_>>(),
+                    "attempted_targets": attempts.iter().map(|attempt| attempt.target_path.as_str()).collect::<Vec<_>>(),
+                    "repair_intent_id": attempts.last().map(|attempt| attempt.repair_intent_id.as_str()),
+                    "remaining_eligible_targets": [],
+                    "final_repair_decision": "review_incomplete_diff",
+                    "diff_fingerprint": self.notebook.repository_fingerprint,
+                }),
+                "validation repair targets exhausted",
+            );
         }
         Ok(())
     }
@@ -2717,22 +2823,64 @@ impl<'a> GatewayAgent<'a> {
             .map(|failure| (failure.node_id.clone(), failure.id.clone()))
             .collect::<Vec<_>>();
         for (validation_node_id, failure_id) in unresolved {
-            let already_recorded = self
+            let latest_started = self
                 .notebook
                 .orchestration
                 .domain_events
                 .iter()
-                .any(|event| {
+                .rev()
+                .find_map(|event| match event {
+                    crate::execution_graph::ExecutionDomainEvent::ValidationRepairStarted {
+                        sequence,
+                        failure_id: existing_failure_id,
+                        repair_intent,
+                        selected_target,
+                        requested_tool_policy,
+                        repository_fingerprint_before,
+                        ..
+                    } if existing_failure_id == &failure_id => Some((
+                        *sequence,
+                        repair_intent.clone(),
+                        selected_target.clone(),
+                        *requested_tool_policy,
+                        repository_fingerprint_before.clone(),
+                    )),
+                    _ => None,
+                });
+            let Some((
+                started_sequence,
+                repair_intent,
+                selected_target,
+                requested_tool_policy,
+                repository_fingerprint_before,
+            )) = latest_started
+            else {
+                continue;
+            };
+            let completed_after_start = self.notebook.orchestration.domain_events.iter().rev().any(
+                |event| {
                     matches!(
                         event,
                         crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                            sequence,
                             failure_id: existing_failure_id,
                             ..
-                        } if existing_failure_id == &failure_id
+                        } if existing_failure_id == &failure_id && *sequence > started_sequence
                     )
-                });
-            if already_recorded {
+                },
+            );
+            if completed_after_start {
                 continue;
+            }
+            let mut attempted_targets =
+                crate::hosted_orchestrator::attempted_validation_repair_targets(
+                    &snapshot,
+                    &failure_id,
+                )
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !attempted_targets.contains(&selected_target) {
+                attempted_targets.push(selected_target.clone());
             }
             self.append_execution_domain_event(
                 crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
@@ -2740,21 +2888,56 @@ impl<'a> GatewayAgent<'a> {
                     validation_node_id: validation_node_id.clone(),
                     failure_id: failure_id.clone(),
                     result: crate::execution_graph::RepairResult::NoMutation {
-                        diagnosis: None,
+                        diagnosis: Some(repair_intent.diagnosis),
                         reason: reason.to_owned(),
+                        outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                        unresolved: Some(crate::execution_graph::UnresolvedValidationRepair {
+                            validation_id: failure_id.to_string(),
+                            repair_intent_id: repair_intent.repair_intent_id.clone(),
+                            selected_target: selected_target.clone(),
+                            diagnosis: repair_intent.diagnosis,
+                            outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                            reason: reason.to_owned(),
+                            attempted_targets: attempted_targets.clone(),
+                        }),
                     },
+                    attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                        repair_intent_id: repair_intent.repair_intent_id.clone(),
+                        target_path: selected_target.clone(),
+                        diagnosis: repair_intent.diagnosis,
+                        requested_tool_policy,
+                        outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                        repository_fingerprint_before,
+                        repository_fingerprint_after: snapshot.current_repository.fingerprint.clone().into(),
+                    }),
                 },
             )?;
             self.append_event_recoverable(
                 "validation",
                 json!({
-                    "event_type": "worker.validation_repair_no_mutation",
+                    "event_type": "worker.validation_repair_no_change_detected",
                     "validation_gate": validation_node_id,
                     "failure_id": failure_id,
+                    "repair_intent_id": repair_intent.repair_intent_id,
+                    "selected_repair_target": selected_target,
+                    "attempted_targets": attempted_targets,
+                    "unresolved": true,
                     "reason": reason,
                     "diff_fingerprint": self.notebook.repository_fingerprint,
                 }),
-                "validation repair no mutation",
+                "validation repair no change",
+            );
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_unresolved",
+                    "validation_gate": validation_node_id,
+                    "failure_id": failure_id,
+                    "repair_intent_id": repair_intent.repair_intent_id,
+                    "selected_repair_target": selected_target,
+                    "outcome": "no_change_against_current_target",
+                }),
+                "validation repair unresolved",
             );
         }
         Ok(())
@@ -2765,30 +2948,52 @@ impl<'a> GatewayAgent<'a> {
         diagnosis: crate::execution_graph::ValidationRepairDiagnosis,
         reason: &str,
     ) -> Result<()> {
-        let (validation_node_id, failure_id, selected_target, implicated_paths) =
-            match self.current_decision.as_ref() {
-                Some(ExecutionDecision::ExecuteTarget {
-                    action:
-                        crate::hosted_orchestrator::MutationAction::RepairTarget {
-                            target, failure, ..
-                        },
-                    ..
-                }) if failure.category
-                    == crate::execution_graph::FailureCategory::ValidationFailure =>
-                {
-                    (
-                        failure.node_id.clone(),
-                        failure.id.clone(),
-                        target.path.clone(),
-                        failure
-                            .assertion_failures
-                            .iter()
-                            .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
-                            .collect::<BTreeSet<_>>(),
-                    )
-                }
-                _ => bail!("no-valid-repair requires an active validation repair decision"),
-            };
+        let (
+            validation_node_id,
+            failure_id,
+            repair_intent,
+            selected_target,
+            implicated_paths,
+            requested_tool_policy,
+            repository_fingerprint_before,
+        ) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        target,
+                        failure,
+                        fallback_policy,
+                        ..
+                    },
+                target: context,
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                (
+                    failure.node_id.clone(),
+                    failure.id.clone(),
+                    context
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_intent.clone())
+                        .unwrap_or_default(),
+                    target.path.clone(),
+                    failure
+                        .assertion_failures
+                        .iter()
+                        .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                        .collect::<BTreeSet<_>>(),
+                    *fallback_policy,
+                    context
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repository_fingerprint.clone().into())
+                        .unwrap_or_default(),
+                )
+            }
+            _ => bail!("no-valid-repair requires an active validation repair decision"),
+        };
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
                 sequence: self.next_domain_event_sequence(),
@@ -2797,7 +3002,31 @@ impl<'a> GatewayAgent<'a> {
                 result: crate::execution_graph::RepairResult::NoMutation {
                     diagnosis: Some(diagnosis),
                     reason: reason.to_owned(),
+                    outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoValidRepair,
+                    unresolved: Some(crate::execution_graph::UnresolvedValidationRepair {
+                        validation_id: failure_id.to_string(),
+                        repair_intent_id: repair_intent.repair_intent_id.clone(),
+                        selected_target: selected_target.clone(),
+                        diagnosis,
+                        outcome:
+                            crate::execution_graph::ValidationRepairMutationOutcome::NoValidRepair,
+                        reason: reason.to_owned(),
+                        attempted_targets: vec![selected_target.clone()],
+                    }),
                 },
+                attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                    repair_intent_id: repair_intent.repair_intent_id.clone(),
+                    target_path: selected_target.clone(),
+                    diagnosis,
+                    requested_tool_policy,
+                    outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoValidRepair,
+                    repository_fingerprint_before,
+                    repository_fingerprint_after: self
+                        .notebook
+                        .repository_fingerprint
+                        .clone()
+                        .into(),
+                }),
             },
         )?;
         self.append_event_recoverable(
@@ -2815,21 +3044,274 @@ impl<'a> GatewayAgent<'a> {
             }),
             "validation repair diagnosis",
         );
+        self.append_event_recoverable(
+            "validation",
+            json!({
+                "event_type": "worker.validation_repair_unresolved",
+                "failed_validation_id": failure_id,
+                "repair_intent_id": repair_intent.repair_intent_id,
+                "assertion_ids": repair_intent.expected_correction.required_assertion_ids,
+                "selected_target": selected_target,
+                "attempted_targets": [selected_target],
+                "current_content_hash": repo_file_sha256(&self.repo.root, &selected_target),
+                "proposed_content_hash": Value::Null,
+                "no_op_reason": reason,
+                "remaining_eligible_targets": [],
+                "final_repair_decision": "select_next_target_or_review_incomplete_diff",
+            }),
+            "validation repair unresolved",
+        );
         Ok(())
+    }
+
+    pub(in crate::hosted) fn record_validation_repair_intent_satisfied(
+        &mut self,
+        repair_intent_id: &str,
+        target_path: &str,
+        expected_state_hash: Option<&str>,
+        current_state_hash: &str,
+        satisfied_assertions: Vec<String>,
+        supporting_evidence_ids: Vec<String>,
+    ) -> Result<()> {
+        let (
+            validation_node_id,
+            failure_id,
+            repair_intent,
+            requested_tool_policy,
+            repository_fingerprint_before,
+        ) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        failure,
+                        fallback_policy,
+                        ..
+                    },
+                target,
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                let repair = target
+                    .validation_repair
+                    .as_ref()
+                    .context("active validation repair lacks its repair intent")?;
+                (
+                    failure.node_id.clone(),
+                    failure.id.clone(),
+                    repair.repair_intent.clone(),
+                    *fallback_policy,
+                    repair.repository_fingerprint.clone().into(),
+                )
+            }
+            _ => bail!("repair-intent satisfaction requires an active validation repair"),
+        };
+        let actual_hash = repo_file_sha256(&self.repo.root, target_path)
+            .context("repair-intent satisfaction target is not a readable repository file")?;
+        if actual_hash != current_state_hash {
+            bail!("repair-intent satisfaction current hash does not match repository state");
+        }
+        let evidence = crate::execution_graph::AlreadyAppliedRepairEvidence {
+            repair_intent_id: repair_intent_id.to_owned(),
+            target_path: target_path.to_owned(),
+            expected_state_hash: expected_state_hash.map(str::to_owned),
+            current_state_hash: current_state_hash.to_owned(),
+            satisfied_assertions,
+            supporting_evidence_ids: supporting_evidence_ids
+                .into_iter()
+                .map(crate::execution_graph::EvidenceId::new)
+                .collect(),
+        };
+        if !evidence.proves(&repair_intent) {
+            bail!(
+                "repair-intent satisfaction evidence does not prove the active assertion contract"
+            );
+        }
+        let repository_fingerprint_after =
+            repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: self.next_domain_event_sequence(),
+                validation_node_id: validation_node_id.clone(),
+                failure_id: failure_id.clone(),
+                result: crate::execution_graph::RepairResult::AlreadySatisfiesRepairIntent {
+                    evidence: evidence.clone(),
+                },
+                attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                    repair_intent_id: repair_intent.repair_intent_id.clone(),
+                    target_path: target_path.to_owned(),
+                    diagnosis: repair_intent.diagnosis,
+                    requested_tool_policy,
+                    outcome: crate::execution_graph::ValidationRepairMutationOutcome::AlreadySatisfiesRepairIntent,
+                    repository_fingerprint_before,
+                    repository_fingerprint_after: repository_fingerprint_after.clone().into(),
+                }),
+            },
+        )?;
+        self.append_event_recoverable(
+            "validation",
+            json!({
+                "event_type": "worker.validation_repair_intent_satisfied",
+                "failed_validation_id": failure_id,
+                "repair_intent_id": repair_intent.repair_intent_id,
+                "selected_target": target_path,
+                "current_content_hash": current_state_hash,
+                "expected_content_hash": expected_state_hash,
+                "satisfied_assertions": evidence.satisfied_assertions,
+                "supporting_evidence_ids": evidence.supporting_evidence_ids,
+                "final_repair_decision": "rerun_validation",
+                "repository_fingerprint": repository_fingerprint_after,
+            }),
+            "validation repair intent satisfied",
+        );
+        Ok(())
+    }
+
+    pub(in crate::hosted) fn record_active_validation_repair_no_change(
+        &mut self,
+        reason: &str,
+        current_content_hash: Option<&str>,
+        proposed_content_hash: Option<&str>,
+    ) -> Result<bool> {
+        let (
+            validation_node_id,
+            failure_id,
+            repair_intent,
+            selected_target,
+            requested_tool_policy,
+            repository_fingerprint_before,
+            assertion_ids,
+            remaining_eligible_targets,
+        ) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        target,
+                        failure,
+                        fallback_policy,
+                        ..
+                    },
+                target: context,
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                let repair = context.validation_repair.clone().unwrap_or_default();
+                (
+                    failure.node_id.clone(),
+                    failure.id.clone(),
+                    repair.repair_intent,
+                    target.path.clone(),
+                    *fallback_policy,
+                    repair.repository_fingerprint.into(),
+                    repair
+                        .correction_contracts
+                        .iter()
+                        .map(|contract| contract.assertion_id.clone())
+                        .collect::<Vec<_>>(),
+                    repair.remaining_eligible_targets,
+                )
+            }
+            _ => return Ok(false),
+        };
+        let snapshot = self.build_execution_snapshot()?;
+        let mut attempted_targets =
+            crate::hosted_orchestrator::attempted_validation_repair_targets(&snapshot, &failure_id)
+                .into_iter()
+                .collect::<Vec<_>>();
+        if !attempted_targets.contains(&selected_target) {
+            attempted_targets.push(selected_target.clone());
+        }
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: self.next_domain_event_sequence(),
+                validation_node_id: validation_node_id.clone(),
+                failure_id: failure_id.clone(),
+                result: crate::execution_graph::RepairResult::NoMutation {
+                    diagnosis: Some(repair_intent.diagnosis),
+                    reason: reason.to_owned(),
+                    outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                    unresolved: Some(crate::execution_graph::UnresolvedValidationRepair {
+                        validation_id: failure_id.to_string(),
+                        repair_intent_id: repair_intent.repair_intent_id.clone(),
+                        selected_target: selected_target.clone(),
+                        diagnosis: repair_intent.diagnosis,
+                        outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                        reason: reason.to_owned(),
+                        attempted_targets: attempted_targets.clone(),
+                    }),
+                },
+                attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                    repair_intent_id: repair_intent.repair_intent_id.clone(),
+                    target_path: selected_target.clone(),
+                    diagnosis: repair_intent.diagnosis,
+                    requested_tool_policy,
+                    outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
+                    repository_fingerprint_before,
+                    repository_fingerprint_after: snapshot.current_repository.fingerprint.clone().into(),
+                }),
+            },
+        )?;
+        self.append_event_recoverable(
+            "validation",
+            json!({
+                "event_type": "worker.validation_repair_no_change_detected",
+                "validation_gate": validation_node_id,
+                "failure_id": failure_id,
+                "repair_intent_id": repair_intent.repair_intent_id,
+                "selected_repair_target": selected_target,
+                "attempted_targets": attempted_targets,
+                "assertion_ids": assertion_ids,
+                "current_content_hash": current_content_hash,
+                "proposed_content_hash": proposed_content_hash,
+                "remaining_eligible_targets": remaining_eligible_targets,
+                "unresolved": true,
+                "reason": reason,
+                "final_repair_decision": "select_next_target_or_review_incomplete_diff",
+                "diff_fingerprint": self.notebook.repository_fingerprint,
+            }),
+            "validation repair no change",
+        );
+        Ok(true)
     }
 
     pub(in crate::hosted) fn record_active_target_applied(
         &mut self,
         target_path: &str,
     ) -> Result<()> {
-        let validation_recovery = match self.current_decision.as_ref() {
+        let validation_repair = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
-                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        failure,
+                        fallback_policy,
+                        ..
+                    },
+                target,
                 ..
             }) if failure.category
                 == crate::execution_graph::FailureCategory::ValidationFailure =>
             {
-                Some((failure.id.clone(), failure.node_id.clone()))
+                Some((
+                    failure.id.clone(),
+                    failure.node_id.clone(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_intent.repair_intent_id.clone())
+                        .unwrap_or_default(),
+                    *fallback_policy,
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repository_fingerprint.clone().into())
+                        .unwrap_or_default(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_intent.diagnosis)
+                        .unwrap_or_default(),
+                ))
             }
             Some(ExecutionDecision::RepairTarget {
                 failure_id,
@@ -2838,21 +3320,32 @@ impl<'a> GatewayAgent<'a> {
             }) if context.failure.category
                 == crate::execution_graph::FailureCategory::ValidationFailure =>
             {
-                Some((failure_id.clone(), context.failure.node_id.clone()))
+                Some((
+                    failure_id.clone(),
+                    context.failure.node_id.clone(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_intent.repair_intent_id.clone())
+                        .unwrap_or_default(),
+                    crate::execution_graph::MutationFallbackPolicy::NoSafeFallback,
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repository_fingerprint.clone().into())
+                        .unwrap_or_default(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_intent.diagnosis)
+                        .unwrap_or_default(),
+                ))
             }
             _ => None,
-        }
-        .or_else(|| {
-            self.notebook
-                .orchestration
-                .failures
-                .unresolved()
-                .find(|failure| {
-                    failure.category == crate::execution_graph::FailureCategory::ValidationFailure
-                        && failure.target_path.as_deref() == Some(target_path)
-                })
-                .map(|failure| (failure.id.clone(), failure.node_id.clone()))
-        });
+        };
         let node_id = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget { node_id, .. })
             | Some(ExecutionDecision::RepairTarget { node_id, .. }) => node_id.clone(),
@@ -2970,13 +3463,33 @@ impl<'a> GatewayAgent<'a> {
                 created_target_evidence,
             },
         )?;
-        if let Some((failure_id, validation_node_id)) = validation_recovery {
+        if let Some((
+            failure_id,
+            validation_node_id,
+            repair_intent_id,
+            requested_tool_policy,
+            repository_fingerprint_before,
+            diagnosis,
+        )) = validation_repair
+        {
             self.append_execution_domain_event(
-                crate::execution_graph::ExecutionDomainEvent::FailureRecovered {
+                crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
                     sequence: self.next_domain_event_sequence(),
-                    node_id: validation_node_id,
+                    validation_node_id,
                     failure_id,
-                    repository_fingerprint: fingerprint,
+                    result: crate::execution_graph::RepairResult::MutationProduced {
+                        selected_target: target_path.to_owned(),
+                        repair_intent_id: repair_intent_id.clone(),
+                    },
+                    attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                        repair_intent_id: repair_intent_id.clone(),
+                        target_path: target_path.to_owned(),
+                        diagnosis,
+                        requested_tool_policy,
+                        outcome: crate::execution_graph::ValidationRepairMutationOutcome::MutationApplied,
+                        repository_fingerprint_before,
+                        repository_fingerprint_after: fingerprint.into(),
+                    }),
                 },
             )?;
         }

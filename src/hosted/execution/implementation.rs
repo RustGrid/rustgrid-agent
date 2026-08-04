@@ -122,9 +122,62 @@ impl<'a> GatewayAgent<'a> {
             .as_ref()
             .and_then(ExecutionDecision::node_id)
             .cloned();
-        if let Some(already_applied) =
-            classify_hosted_mutation_preflight(&snapshot, current_node_id.as_ref(), path)?
-        {
+        let active_validation_repair = matches!(
+            self.current_decision.as_ref(),
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            }) if failure.category == crate::execution_graph::FailureCategory::ValidationFailure
+        );
+        if active_validation_repair {
+            let (repair, failure) = match self.current_decision.as_ref() {
+                Some(ExecutionDecision::ExecuteTarget {
+                    action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                    target,
+                    ..
+                }) => (
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .context("validation repair mutation lacks a correction contract")?,
+                    failure,
+                ),
+                _ => unreachable!("active validation repair was matched above"),
+            };
+            if repair.correction_contracts.is_empty()
+                || !repair.correction_contracts.iter().any(|contract| {
+                    contract
+                        .implicated_paths
+                        .iter()
+                        .any(|implicated| implicated == path)
+                })
+            {
+                bail!(
+                    "wrong_repair_target: `{path}` is not implicated by the active assertion correction contract"
+                );
+            }
+            let test_only_target = failure
+                .assertion_failures
+                .iter()
+                .any(|assertion| assertion.test_file == path);
+            if test_only_target
+                && !matches!(
+                    repair.repair_intent.diagnosis,
+                    crate::execution_graph::ValidationRepairDiagnosis::TestExpectationDefect
+                        | crate::execution_graph::ValidationRepairDiagnosis::Both
+                )
+            {
+                bail!(
+                    "test_repair_requires_specification_evidence: `{path}` is not eligible under the active repair diagnosis"
+                );
+            }
+        }
+        if let Some(already_applied) = classify_hosted_mutation_preflight(
+            &snapshot,
+            current_node_id.as_ref(),
+            path,
+            active_validation_repair,
+        )? {
             // Reconciliation is authoritative for selecting the next node. The
             // duplicate itself records no failure and consumes no repair work.
             self.record_active_target_applied(path)?;

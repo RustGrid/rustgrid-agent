@@ -91,6 +91,7 @@ pub(super) fn phase_permits_tool(phase: ExecutionPhase, name: &str) -> bool {
                 | "rename_file"
                 | "move_file"
                 | "record_no_valid_repair"
+                | "record_repair_intent_satisfied"
                 | "apply_unified_diff"
                 | "rewrite_small_file"
                 | "delete_file"
@@ -511,6 +512,25 @@ pub(super) fn hosted_tools() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "record_repair_intent_satisfied",
+            "description": "Record proof that the current target already satisfies the active validation-repair assertion contract.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repair_intent_id": {"type": "string"},
+                    "target_path": {"type": "string"},
+                    "expected_state_hash": {"type": "string"},
+                    "current_state_hash": {"type": "string"},
+                    "satisfied_assertions": {"type": "array", "items": {"type": "string"}},
+                    "supporting_evidence_ids": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["repair_intent_id", "target_path", "expected_state_hash", "current_state_hash", "satisfied_assertions", "supporting_evidence_ids"],
+                "additionalProperties": false
+            },
+            "strict": true
+        }),
+        json!({
+            "type": "function",
             "name": "delete_file",
             "description": "Delete one regular repository file.",
             "parameters": {
@@ -858,7 +878,12 @@ pub(super) fn hosted_tools_for_action(
                     target.target.effective_operation(),
                     crate::execution_graph::TargetOperation::ModifyExisting
                 ) {
-                    &["apply_patch", "replace_file", "record_no_valid_repair"][..]
+                    &[
+                        "apply_patch",
+                        "replace_file",
+                        "record_no_valid_repair",
+                        "record_repair_intent_satisfied",
+                    ][..]
                 } else {
                     operation_tools(&target.target)
                 },
@@ -1303,7 +1328,7 @@ pub(super) fn hosted_agent_instructions_for_decision(
             ..
         }) if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
             format!(
-                "Diagnose the structured validation assertion failures against the bounded implicated target contents. Classify source_defect, test_expectation_defect, both, or inconclusive. Repair exactly the selected target `{}` with one admitted mutation tool when safe. Otherwise invoke record_no_valid_repair with the diagnosis and concrete evidence-based reason. Do not emit a free-form answer, edit an unlisted path, blindly change a test expectation, or run validation.",
+                "Diagnose the structured validation assertion failures against the bounded implicated target contents. Classify source_defect, test_expectation_defect, both, or inconclusive. Repair exactly the selected target `{}` with one admitted mutation tool when safe. Invoke record_repair_intent_satisfied only with exact hashes plus assertion and evidence IDs that prove the active repair contract is already satisfied. Otherwise invoke record_no_valid_repair with the diagnosis and concrete evidence-based reason. Do not emit a free-form answer, edit an unlisted path, blindly change a test expectation, or run validation.",
                 target.path
             )
         }

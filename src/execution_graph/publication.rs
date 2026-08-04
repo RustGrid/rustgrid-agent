@@ -69,6 +69,7 @@ pub enum MissionOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum IncompleteReason {
     ValidationRepairProducedNoMutation,
+    ValidationRepairProducedNoMeaningfulMutation,
     ValidationInfrastructureFailure,
     TargetOperationConflict,
 }
