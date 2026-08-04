@@ -5,6 +5,35 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.34 - 2026-08-04
+
+### Changed
+
+- Resolve every hosted terminal state through one canonical record containing
+  mission outcome, process health, domain status, publication evidence,
+  completion evidence, resumability, finality, and a deterministic result ID.
+- Separate domain outcomes from worker health so healthy partial, externally
+  pending, resumable blocked, and expected cancellation results exit normally.
+- Reconcile workflow conclusions as infrastructure metadata and anomalies;
+  finalized worker-domain results remain authoritative unless an explicit
+  administrative override is applied.
+- Project terminal API, UI, telemetry, and compatibility fields from the same
+  canonical result and include its ID, revision, and authority in completion
+  callbacks for optimistic backend enforcement.
+
+### Fixed
+
+- Prevent a useful published draft or externally pending result from becoming
+  a generic process failure merely because work remains or a later workflow
+  conclusion reports failure.
+- Normalize ambiguous or contradictory completion evaluations using stronger
+  deterministic graph, validation, remaining-evidence, and publication facts.
+- Preserve branch, commit, pull-request, draft, and publication timestamps
+  through infrastructure reconciliation and post-publication failures.
+- Persist the canonical terminal result before resolving the process exit and
+  keep noncritical terminal-callback failures from reversing healthy domain
+  outcomes.
+
 ## 1.4.33 - 2026-08-03
 
 ### Changed
