@@ -1139,6 +1139,9 @@ impl HostedExecutionPolicy {
             || !self.sandbox.network_access
             || self.sandbox.writable_roots != ["."]
             || self.sandbox.approval_policy != "never"
+            || self
+                .mutation_replacement_max_bytes
+                .is_some_and(|bytes| bytes == 0 || bytes > MAX_MODEL_FILE_BYTES)
         {
             bail!("unsupported or incomplete hosted execution policy");
         }

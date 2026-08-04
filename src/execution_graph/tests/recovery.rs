@@ -214,6 +214,108 @@
     }
 
     #[test]
+    fn verified_repair_applies_target_supersedes_failure_and_replays() {
+        let graph = graph();
+        let node_id = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::SourceMutation)
+            .expect("source mutation")
+            .id
+            .clone();
+        let target_path = graph
+            .node(&node_id)
+            .and_then(|node| node.target.as_ref())
+            .expect("mutation target")
+            .path
+            .clone();
+        let mut snapshot = ExecutionSnapshot {
+            run_id: "verified-repair".into(),
+            current_repository: RepositorySnapshot {
+                fingerprint: "tree-1".into(),
+                source_tree_hash: "tree-1".into(),
+                ..RepositorySnapshot::default()
+            },
+            graph,
+            budget: BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Small)),
+            ..ExecutionSnapshot::default()
+        };
+        snapshot
+            .append_event(ExecutionDomainEvent::NodeStarted {
+                sequence: 1,
+                node_id: node_id.clone(),
+                attempt: 1,
+                started_at: "primary".into(),
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        let mut failure = FailureRecord::new(
+            "patch-failure",
+            node_id.clone(),
+            FailureCategory::MutationConflict,
+            1,
+            "tree-1",
+            "typed patch target rejection",
+        );
+        failure.code = Some(MutationApplicationFailure::InvalidPatchTarget.as_str().into());
+        failure.target_path = Some(target_path.clone());
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationRejected {
+                sequence: 2,
+                node_id: node_id.clone(),
+                failure,
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::NodeStarted {
+                sequence: 3,
+                node_id: node_id.clone(),
+                attempt: 2,
+                started_at: "forced-replacement".into(),
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::TargetMutationProduced {
+                sequence: 4,
+                node_id: node_id.clone(),
+                target_path: target_path.clone(),
+                expected_repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+                repository_fingerprint: RepositoryFingerprint::new("tree-2"),
+                before_content_hash: Some("before".into()),
+                after_content_hash: Some("after".into()),
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationApplied {
+                sequence: 5,
+                node_id: node_id.clone(),
+                target_path: target_path.clone(),
+                repository_fingerprint: "tree-2".into(),
+                evidence_id: "verified-repair-evidence".into(),
+                created_target_evidence: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            snapshot.graph.node(&node_id).map(|node| node.status),
+            Some(ExecutionNodeStatus::Applied)
+        );
+        assert_eq!(
+            snapshot
+                .failures
+                .get(&FailureId::new("patch-failure"))
+                .map(|failure| failure.status),
+            Some(FailureStatus::Superseded)
+        );
+        assert!(!snapshot.failures.has_unresolved());
+
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let replayed: ExecutionSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(replayed, snapshot);
+    }
+
+    #[test]
     fn success_events_cannot_bypass_graph_dependencies() {
         let graph = graph();
         let completion = graph
@@ -1184,6 +1286,37 @@
                 .count(),
             1
         );
+
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationRepairAllowanceRestored {
+                sequence: 2,
+                node_id: node_id.clone(),
+            })
+            .expect("provider-contract violation restores the allowance");
+        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 0);
+        assert!(mutation_repair_allowance_is_restored(
+            &snapshot.events,
+            &node_id
+        ));
+
+        let encoded = serde_json::to_vec(&snapshot).expect("serialize restored snapshot");
+        let mut resumed: ExecutionSnapshot =
+            serde_json::from_slice(&encoded).expect("resume restored snapshot");
+        assert!(mutation_repair_allowance_is_restored(
+            &resumed.events,
+            &node_id
+        ));
+        resumed
+            .append_event(ExecutionDomainEvent::MutationRepairAllowanceConsumed {
+                sequence: 3,
+                node_id: node_id.clone(),
+            })
+            .expect("compatible retry re-consumes the allowance after restart");
+        assert_eq!(resumed.budget.usage_for(&node_id).repair_attempts, 1);
+        assert!(!mutation_repair_allowance_is_restored(
+            &resumed.events,
+            &node_id
+        ));
     }
 
     #[test]

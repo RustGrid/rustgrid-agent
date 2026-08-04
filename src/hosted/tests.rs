@@ -355,7 +355,8 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
         action: crate::hosted_orchestrator::MutationAction::RepairTarget {
             node_id,
             target: context.target.clone(),
-            failure,
+            failure: Box::new(failure),
+            fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
         },
         target: context,
     };
@@ -404,7 +405,8 @@ fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
         action: crate::hosted_orchestrator::MutationAction::RepairTarget {
             node_id: node_id.clone(),
             target: target.clone(),
-            failure,
+            failure: Box::new(failure),
+            fallback_policy: MutationFallbackPolicy::NoSafeFallback,
         },
         target: crate::execution_graph::TargetExecutionContext {
             node_id,
@@ -430,6 +432,257 @@ fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
     assert_eq!(
         decision.budget_node_id().unwrap().as_str(),
         "validation-focused-000"
+    );
+}
+
+fn mutation_fallback_target(content: &str) -> crate::execution_graph::TargetExecutionContext {
+    let target = crate::execution_graph::PlannedTarget {
+        change_id: "generic-change".into(),
+        path: "src/generic_target.rs".into(),
+        role: "production".into(),
+        intent: "Apply the accepted repository-agnostic implementation intent.".into(),
+        acceptance_criteria_ids: vec!["criterion-1".into()],
+        operation: crate::execution_graph::TargetOperation::ModifyExisting,
+        new_file: false,
+    };
+    crate::execution_graph::TargetExecutionContext {
+        node_id: crate::execution_graph::ExecutionNodeId::new("source-generic"),
+        change_id: target.change_id.clone(),
+        intent: target.intent.clone(),
+        target,
+        current_file_content: Some(content.into()),
+        target_content_hash: Some(sha256_text(content)),
+        repository_fingerprint: "repository-fingerprint".into(),
+        allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
+        ..crate::execution_graph::TargetExecutionContext::default()
+    }
+}
+
+fn mutation_fallback_decision(
+    policy: MutationFallbackPolicy,
+    failure_category: MutationApplicationFailure,
+) -> ExecutionDecision {
+    let target = mutation_fallback_target("fn current() {}\n");
+    let node_id = target.node_id.clone();
+    let mut failure = crate::execution_graph::FailureRecord::new(
+        "mutation-failure",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        "repository-fingerprint",
+        "bounded mutation application failure",
+    );
+    failure.code = Some(failure_category.as_str().into());
+    failure.target_path = Some(target.target.path.clone());
+    ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id,
+            target: target.target.clone(),
+            failure: Box::new(failure),
+            fallback_policy: policy,
+        },
+        target,
+    }
+}
+
+#[test]
+fn patch_failures_select_forced_replacement_for_eligible_existing_targets() {
+    let target = mutation_fallback_target("small target\n");
+    for failure in [
+        MutationApplicationFailure::InvalidPatchTarget,
+        MutationApplicationFailure::InvalidPatchSyntax,
+        MutationApplicationFailure::PatchContextMismatch,
+        MutationApplicationFailure::PatchWouldModifyUnexpectedPath,
+    ] {
+        assert_eq!(
+            crate::hosted_orchestrator::select_fallback_with_threshold(
+                &crate::execution_graph::TargetOperation::ModifyExisting,
+                failure,
+                &target,
+                4_096,
+            ),
+            MutationFallbackPolicy::ForceReplaceFile
+        );
+    }
+}
+
+#[test]
+fn large_targets_use_one_bounded_patch_specific_recovery_policy() {
+    let target = mutation_fallback_target(&"x".repeat(4_097));
+    assert_eq!(
+        crate::hosted_orchestrator::select_fallback_with_threshold(
+            &crate::execution_graph::TargetOperation::ModifyExisting,
+            MutationApplicationFailure::InvalidPatchSyntax,
+            &target,
+            4_096,
+        ),
+        MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+    );
+    assert_eq!(
+        crate::hosted_orchestrator::select_fallback_with_threshold(
+            &crate::execution_graph::TargetOperation::ModifyExisting,
+            MutationApplicationFailure::PatchContextMismatch,
+            &target,
+            4_096,
+        ),
+        MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+    );
+}
+
+#[test]
+fn forced_replacement_request_is_exactly_bound_and_passes_preflight() {
+    let decision = mutation_fallback_decision(
+        MutationFallbackPolicy::ForceReplaceFile,
+        MutationApplicationFailure::InvalidPatchTarget,
+    );
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&decision), 16_384);
+    let target_context = match &decision {
+        ExecutionDecision::ExecuteTarget { target, .. } => target,
+        _ => unreachable!(),
+    };
+    let request = json!({
+        "input": [{
+            "role": "user",
+            "content": serde_json::to_string(&json!({
+                "target": target_context,
+                "fallback_policy": MutationFallbackPolicy::ForceReplaceFile,
+            })).unwrap(),
+        }],
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision)),
+        "tool_choice": profile.tool_choice(),
+    });
+    let preflight = mutation_repair_request_preflight(Some(&decision), &request)
+        .expect("forced replacement preflight");
+    assert!(preflight.passed());
+    assert!(preflight.required_content_present);
+    assert!(preflight.target_hash_present);
+    assert!(preflight.repository_fingerprint_present);
+    assert_eq!(request["tools"][0]["name"], "replace_file");
+    assert_eq!(request["tool_choice"]["name"], "replace_file");
+    assert_eq!(
+        request["tools"][0]["parameters"]["properties"]["path"]["enum"],
+        json!(["src/generic_target.rs"])
+    );
+}
+
+#[test]
+fn repair_preflight_requires_the_policy_in_the_actual_request_context() {
+    let decision = mutation_fallback_decision(
+        MutationFallbackPolicy::ForceReplaceFile,
+        MutationApplicationFailure::InvalidPatchTarget,
+    );
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&decision), 16_384);
+    let target_context = match &decision {
+        ExecutionDecision::ExecuteTarget { target, .. } => target,
+        _ => unreachable!(),
+    };
+    let request = json!({
+        "input": [{
+            "role": "user",
+            "content": serde_json::to_string(target_context).unwrap(),
+        }],
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision)),
+        "tool_choice": profile.tool_choice(),
+    });
+    let preflight = mutation_repair_request_preflight(Some(&decision), &request)
+        .expect("repair preflight result");
+    assert!(!preflight.passed());
+    assert!(!preflight.policy_present);
+    assert!(preflight.required_content_present);
+    assert!(preflight.target_hash_present);
+    assert!(preflight.repository_fingerprint_present);
+    assert!(preflight.tool_surface_matches_policy);
+    assert!(preflight.forced_tool_choice_matches_policy);
+}
+
+#[test]
+fn repair_preflight_rejects_missing_bound_context_before_provider_contact() {
+    let decision = mutation_fallback_decision(
+        MutationFallbackPolicy::ForceReplaceFile,
+        MutationApplicationFailure::InvalidPatchTarget,
+    );
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&decision), 16_384);
+    let request = json!({
+        "input": [{"role": "user", "content": "replace the file"}],
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision)),
+        "tool_choice": profile.tool_choice(),
+    });
+    let preflight = mutation_repair_request_preflight(Some(&decision), &request)
+        .expect("repair preflight result");
+    assert!(!preflight.passed());
+    assert!(!preflight.required_content_present);
+    assert!(!preflight.target_hash_present);
+    assert!(!preflight.repository_fingerprint_present);
+}
+
+#[test]
+fn incompatible_repair_tool_is_rejected_without_touching_repository_or_allowance() {
+    let decision = mutation_fallback_decision(
+        MutationFallbackPolicy::ForceReplaceFile,
+        MutationApplicationFailure::InvalidPatchTarget,
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("target.rs");
+    fs::write(&path, "unchanged\n").unwrap();
+    let before = fs::read(&path).unwrap();
+    let violation = mutation_tool_policy_violation(Some(&decision), "apply_patch")
+        .expect("apply_patch must violate forced replacement");
+    assert_eq!(
+        violation.active_policy,
+        MutationFallbackPolicy::ForceReplaceFile
+    );
+    assert_eq!(violation.expected_tools, ["replace_file"]);
+    assert_eq!(fs::read(path).unwrap(), before);
+
+    let node_id = crate::execution_graph::ExecutionNodeId::new("source-generic");
+    let mut budget =
+        crate::execution_graph::BudgetState::new(crate::execution_graph::MissionBudget::default());
+    budget.record_repair_attempt(node_id.clone());
+    budget.restore_repair_attempt(&node_id);
+    assert_eq!(budget.usage_for(&node_id).repair_attempts, 0);
+}
+
+#[test]
+fn fallback_policy_and_rejected_strategy_are_serializable_audit_evidence() {
+    let fingerprint = MutationStrategyFingerprint {
+        operation: crate::execution_graph::TargetOperation::ModifyExisting,
+        tool: "apply_patch".into(),
+        fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
+        payload_type: "unified_diff".into(),
+        failure_category: MutationApplicationFailure::InvalidPatchTarget,
+    };
+    let encoded = serde_json::to_value(&fingerprint).unwrap();
+    assert_eq!(encoded["tool"], "apply_patch");
+    assert_eq!(encoded["fallback_policy"], "force_replace_file");
+    assert_eq!(encoded["failure_category"], "invalid_patch_target");
+}
+
+#[test]
+fn target_attempt_accounting_separates_primary_repair_context_and_write_counts() {
+    assert_eq!(
+        target_attempt_accounting(2, 1, MutationFallbackPolicy::RebuildTargetContext, 1,),
+        TargetAttemptAccounting {
+            primary_mutation_calls: 1,
+            mutation_repair_calls: 1,
+            context_rebuilds: 1,
+            repository_write_attempts: 1,
+        }
+    );
+}
+
+#[test]
+fn repository_context_rebuild_resolution_survives_threshold_refinement() {
+    let target = mutation_fallback_target("small target\n");
+    assert_eq!(
+        crate::hosted_orchestrator::refine_fallback_for_replacement_threshold(
+            MutationFallbackPolicy::ForceReplaceFile,
+            &crate::execution_graph::TargetOperation::ModifyExisting,
+            MutationApplicationFailure::RepositoryChangedSinceContext,
+            &target,
+            4_096,
+        ),
+        MutationFallbackPolicy::ForceReplaceFile
     );
 }
 
@@ -1016,6 +1269,13 @@ fn production_failures_are_reduced_from_domain_events() {
     assert!(source.contains("ExecutionDomainEvent::FailureRecorded"));
     assert!(source.contains("ExecutionDomainEvent::FailureRecovered"));
     assert!(source.contains("ExecutionDomainEvent::FailureSuperseded"));
+}
+
+#[test]
+fn no_safe_fallback_still_emits_policy_selection_observability() {
+    let source = hosted_production_source();
+    assert!(source.contains("worker.mutation_fallback_policy_selected"));
+    assert!(!source.contains("if fallback_policy != MutationFallbackPolicy::NoSafeFallback"));
 }
 
 #[test]
@@ -2643,6 +2903,9 @@ fn test_manifest(execution_id: Uuid) -> HostedManifest {
             writable_roots: vec![".".into()],
             approval_policy: "never".into(),
         },
+        mutation_replacement_max_bytes: Some(
+            crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+        ),
     };
     let policy_hash = hex::encode(Sha256::digest(serde_json::to_vec(&policy).unwrap()));
     let base = format!("/api/v1/executions/{execution_id}");

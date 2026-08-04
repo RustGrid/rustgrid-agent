@@ -986,6 +986,19 @@ impl<'a> GatewayAgent<'a> {
     }
 
     fn current_model_call_purpose(&self) -> Option<crate::execution_graph::ModelCallPurpose> {
+        if self
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id)
+            .is_some_and(|node_id| {
+                crate::execution_graph::mutation_repair_allowance_is_restored(
+                    &self.notebook.orchestration.domain_events,
+                    node_id,
+                )
+            })
+        {
+            return None;
+        }
         match self.current_decision.as_ref()? {
             ExecutionDecision::ExecuteTarget {
                 action: crate::hosted_orchestrator::MutationAction::MutateTarget { .. },
@@ -994,8 +1007,30 @@ impl<'a> GatewayAgent<'a> {
             ExecutionDecision::ExecuteTarget {
                 action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
                 ..
+            } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
+                let diagnosed_without_mutation = self
+                    .notebook
+                    .orchestration
+                    .domain_events
+                    .iter()
+                    .rev()
+                    .any(|event| {
+                        matches!(
+                            event,
+                            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                                failure_id,
+                                result: crate::execution_graph::RepairResult::NoMutation { .. },
+                                ..
+                            } if failure_id == &failure.id
+                        )
+                    });
+                Some(if diagnosed_without_mutation {
+                    crate::execution_graph::ModelCallPurpose::ValidationDiagnosis
+                } else {
+                    crate::execution_graph::ModelCallPurpose::ValidationRepairMutation
+                })
             }
-            | ExecutionDecision::RepairTarget {
+            ExecutionDecision::RepairTarget {
                 context: crate::hosted_orchestrator::TargetRepairContext { failure, .. },
                 ..
             } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
@@ -1030,6 +1065,37 @@ impl<'a> GatewayAgent<'a> {
             }
             _ => None,
         }
+    }
+
+    pub(in crate::hosted) fn restore_mutation_repair_allowance(
+        &mut self,
+        node_id: &crate::execution_graph::ExecutionNodeId,
+    ) -> Result<()> {
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::MutationRepairAllowanceRestored {
+                sequence: self.next_domain_event_sequence(),
+                node_id: node_id.clone(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(in crate::hosted) fn consume_pending_mutation_repair_allowance(
+        &mut self,
+        node_id: &crate::execution_graph::ExecutionNodeId,
+    ) -> Result<()> {
+        if crate::execution_graph::mutation_repair_allowance_is_restored(
+            &self.notebook.orchestration.domain_events,
+            node_id,
+        ) {
+            self.append_execution_domain_event(
+                crate::execution_graph::ExecutionDomainEvent::MutationRepairAllowanceConsumed {
+                    sequence: self.next_domain_event_sequence(),
+                    node_id: node_id.clone(),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// A dispatched call is canonical budget usage even when no successful
@@ -1776,7 +1842,7 @@ impl<'a> GatewayAgent<'a> {
                     .retain(|path| path != &target.target.path);
             }
             context.instruction = if context.mutation_repair.is_some() {
-                "Repair only current_target from its exact current content. The rejected mutation was not applied. Follow mutation_repair.repair_strategy and do not repeat the rejected patch strategy.".into()
+                "Repair only current_target from its exact current content. The rejected mutation was not applied. Follow mutation_repair.fallback_policy as an executable tool constraint and do not repeat the rejected strategy.".into()
             } else {
                 "Mutate only current_target using the persisted evidence bundle. Do not rediscover the repository. Return exactly one target-bound mutation, or a concrete typed blocker; verification is deterministic and model-free.".into()
             };
@@ -1979,8 +2045,38 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<DecisionExecutionResult> {
         self.reconcile_repository_failure_supersession()?;
         let snapshot = self.build_execution_snapshot()?;
-        let decision = reconcile_execution(&snapshot)
+        let mut decision = reconcile_execution(&snapshot)
             .map_err(|error| anyhow!("hosted orchestration invariant failed: {error}"))?;
+        if let ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    failure,
+                    fallback_policy,
+                    ..
+                },
+            target,
+            ..
+        } = &mut decision
+            && failure.category == crate::execution_graph::FailureCategory::MutationConflict
+            && let Some(failure_category) = failure
+                .code
+                .as_deref()
+                .and_then(MutationApplicationFailure::from_code)
+        {
+            *fallback_policy = crate::hosted_orchestrator::refine_fallback_for_replacement_threshold(
+                *fallback_policy,
+                &target.target.effective_operation(),
+                failure_category,
+                target,
+                self.manifest
+                    .execution_policy
+                    .mutation_replacement_max_bytes
+                    .unwrap_or(
+                        crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+                    )
+                    .min(MAX_MODEL_FILE_BYTES),
+            );
+        }
         let decision_key = execution_decision_idempotency_key(&snapshot, &decision);
         if !orchestration_decision_is_new(
             self.notebook.last_orchestration_decision_key.as_deref(),
@@ -3288,11 +3384,37 @@ impl<'a> GatewayAgent<'a> {
             ),
             _ => return Ok(()),
         };
+        let repair = self
+            .current_decision
+            .as_ref()
+            .and_then(|decision| match decision {
+                ExecutionDecision::ExecuteTarget {
+                    action:
+                        crate::hosted_orchestrator::MutationAction::RepairTarget {
+                            failure,
+                            fallback_policy,
+                            ..
+                        },
+                    ..
+                } => Some((failure.clone(), *fallback_policy)),
+                _ => None,
+            });
+        let repair_diagnostic = repair.as_ref().and_then(|_| {
+            self.notebook
+                .mutation_diagnostics
+                .iter()
+                .rev()
+                .find(|diagnostic| diagnostic.target_path == target_path)
+                .cloned()
+        });
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
+        let event_fingerprint = fingerprint.clone();
+        let event_before_hash = before_content_hash.clone();
+        let event_after_hash = after_content_hash.clone();
         self.append_execution_domain_event(
             crate::execution_graph::ExecutionDomainEvent::TargetMutationProduced {
                 sequence: self.next_domain_event_sequence(),
-                node_id,
+                node_id: node_id.clone(),
                 target_path: target_path.to_owned(),
                 expected_repository_fingerprint: expected,
                 repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
@@ -3301,7 +3423,33 @@ impl<'a> GatewayAgent<'a> {
                 before_content_hash,
                 after_content_hash,
             },
-        )
+        )?;
+        if let Some((failure, fallback_policy)) = repair {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.mutation_repair_applied",
+                    "node_id": node_id,
+                    "target_path": target_path,
+                    "target_operation": self.current_decision.as_ref().and_then(|decision| match decision {
+                        ExecutionDecision::ExecuteTarget { target, .. } => Some(target.target.effective_operation()),
+                        _ => None,
+                    }),
+                    "original_tool": repair_diagnostic.as_ref().map(|diagnostic| &diagnostic.tool),
+                    "original_failure_category": failure.code,
+                    "selected_fallback_policy": fallback_policy,
+                    "permitted_tools": fallback_policy.permitted_tools(),
+                    "forced_tool_choice": fallback_policy.forced_tool(),
+                    "repair_call_number": repair_diagnostic.as_ref().map(|diagnostic| diagnostic.repair_attempt),
+                    "before_content_hash": event_before_hash,
+                    "after_content_hash": event_after_hash,
+                    "repository_fingerprint": event_fingerprint,
+                    "verification_result": "pending",
+                }),
+                "mutation repair application",
+            );
+        }
+        Ok(())
     }
 
     pub(in crate::hosted) fn record_active_target_mutation_intent(
@@ -3433,13 +3581,70 @@ impl<'a> GatewayAgent<'a> {
                 }),
                 "target mutation verification",
             );
-            self.record_active_target_failure(
+            self.record_active_target_failure_with_code(
                 crate::execution_graph::FailureCategory::MutationConflict,
+                Some(MutationApplicationFailure::MutationProducedNoChange.as_str()),
                 "MutationNotProduced: deterministic verification found no attributable target change",
             )?;
             return Ok(());
         }
         self.record_active_target_applied(&target_path)?;
+        let repair_mutation_id = format!(
+            "repair-{}",
+            sha256_text(&format!(
+                "{node_id}\0{target_path}\0{}",
+                produced.2.as_deref().unwrap_or_default()
+            ))
+        );
+        let repaired_diagnostic = self
+            .notebook
+            .mutation_diagnostics
+            .iter_mut()
+            .rev()
+            .find(|diagnostic| diagnostic.target_path == target_path);
+        let repaired_policy = repaired_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.fallback_policy);
+        let repaired_failure = repaired_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.failure_category);
+        let repaired_original_tool = repaired_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.tool.clone());
+        let repaired_call_number = repaired_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.repair_attempt);
+        if let Some(diagnostic) = repaired_diagnostic
+            && let Some(rejected) = diagnostic.rejected_mutation.as_mut()
+        {
+            rejected.status = crate::execution_graph::FailureStatus::Recovered;
+            rejected.superseded_by = Some(repair_mutation_id.clone());
+            rejected.resolved_repository_fingerprint = Some(
+                crate::execution_graph::RepositoryFingerprint::new(repository_fingerprint.clone()),
+            );
+        }
+        if let Some(policy) = repaired_policy {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.mutation_repair_verified",
+                    "node_id": node_id,
+                    "target_path": target_path,
+                    "target_operation": operation,
+                    "original_tool": repaired_original_tool,
+                    "original_failure_category": repaired_failure,
+                    "selected_fallback_policy": policy,
+                    "repair_mutation_id": repair_mutation_id,
+                    "repair_call_number": repaired_call_number,
+                    "before_content_hash": produced.1,
+                    "after_content_hash": produced.2,
+                    "repository_fingerprint": repository_fingerprint,
+                    "verification_result": "verified",
+                    "original_failure_status": "recovered",
+                }),
+                "mutation repair verification",
+            );
+        }
         self.append_event_recoverable(
             "progress",
             json!({

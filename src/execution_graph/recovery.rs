@@ -400,6 +400,225 @@ pub enum FailureStatus {
     Superseded,
 }
 
+/// A repository mutation failure classified before orchestration chooses the
+/// next bounded action. This value is persisted as data; callers must never
+/// recover it by parsing a human-readable diagnostic.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationApplicationFailure {
+    InvalidPatchTarget,
+    InvalidPatchSyntax,
+    PatchContextMismatch,
+    PatchWouldModifyUnexpectedPath,
+    ReplacementContentInvalid,
+    RepositoryChangedSinceContext,
+    MutationProducedNoChange,
+    CreateTargetAlreadyExists,
+    DeleteTargetMissing,
+    RenameDestinationConflict,
+}
+
+impl MutationApplicationFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPatchTarget => "invalid_patch_target",
+            Self::InvalidPatchSyntax => "invalid_patch_syntax",
+            Self::PatchContextMismatch => "patch_context_mismatch",
+            Self::PatchWouldModifyUnexpectedPath => "patch_would_modify_unexpected_path",
+            Self::ReplacementContentInvalid => "replacement_content_invalid",
+            Self::RepositoryChangedSinceContext => "repository_changed_since_context",
+            Self::MutationProducedNoChange => "mutation_produced_no_change",
+            Self::CreateTargetAlreadyExists => "create_target_already_exists",
+            Self::DeleteTargetMissing => "delete_target_missing",
+            Self::RenameDestinationConflict => "rename_destination_conflict",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "invalid_patch_target" => Self::InvalidPatchTarget,
+            "invalid_patch_syntax" => Self::InvalidPatchSyntax,
+            "patch_context_mismatch" => Self::PatchContextMismatch,
+            "patch_would_modify_unexpected_path" => Self::PatchWouldModifyUnexpectedPath,
+            "replacement_content_invalid" => Self::ReplacementContentInvalid,
+            "repository_changed_since_context" => Self::RepositoryChangedSinceContext,
+            "mutation_produced_no_change" => Self::MutationProducedNoChange,
+            "create_target_already_exists" => Self::CreateTargetAlreadyExists,
+            "delete_target_missing" => Self::DeleteTargetMissing,
+            "rename_destination_conflict" | "destination_already_exists" => {
+                Self::RenameDestinationConflict
+            }
+            _ => return None,
+        })
+    }
+
+    pub const fn uses_replacement_threshold(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidPatchTarget
+                | Self::InvalidPatchSyntax
+                | Self::PatchContextMismatch
+                | Self::PatchWouldModifyUnexpectedPath
+                | Self::ReplacementContentInvalid
+                | Self::MutationProducedNoChange
+        )
+    }
+}
+
+/// Executable policy for the next target-repair request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationFallbackPolicy {
+    ForceReplaceFile,
+    ForceCreateFile,
+    ForceDeleteFile,
+    ForceRename,
+    RebuildTargetContext,
+    RetryPatchWithNormalizedPayload,
+    #[default]
+    NoSafeFallback,
+}
+
+impl MutationFallbackPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForceReplaceFile => "force_replace_file",
+            Self::ForceCreateFile => "force_create_file",
+            Self::ForceDeleteFile => "force_delete_file",
+            Self::ForceRename => "force_rename",
+            Self::RebuildTargetContext => "rebuild_target_context",
+            Self::RetryPatchWithNormalizedPayload => "retry_patch_with_normalized_payload",
+            Self::NoSafeFallback => "no_safe_fallback",
+        }
+    }
+
+    pub const fn permitted_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::ForceReplaceFile => &["replace_file"],
+            Self::ForceCreateFile => &["create_file"],
+            Self::ForceDeleteFile => &["delete_file"],
+            Self::ForceRename => &["rename_file"],
+            Self::RetryPatchWithNormalizedPayload => &["apply_patch"],
+            Self::RebuildTargetContext | Self::NoSafeFallback => &[],
+        }
+    }
+
+    pub const fn forced_tool(self) -> Option<&'static str> {
+        match self.permitted_tools() {
+            [tool] => Some(tool),
+            _ => None,
+        }
+    }
+
+    pub const fn requires_provider_mutation(self) -> bool {
+        self.forced_tool().is_some()
+    }
+
+    pub const fn compatible_with(self, operation: &TargetOperation) -> bool {
+        matches!(
+            (self, operation),
+            (
+                Self::ForceReplaceFile | Self::RetryPatchWithNormalizedPayload,
+                TargetOperation::ModifyExisting
+            ) | (Self::ForceCreateFile, TargetOperation::CreateNew)
+                | (Self::ForceDeleteFile, TargetOperation::DeleteExisting)
+                | (
+                    Self::ForceRename,
+                    TargetOperation::Rename { .. } | TargetOperation::Move { .. }
+                )
+                | (Self::RebuildTargetContext | Self::NoSafeFallback, _)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetAttemptAccounting {
+    pub primary_mutation_calls: u32,
+    pub mutation_repair_calls: u32,
+    pub context_rebuilds: u32,
+    pub repository_write_attempts: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MutationStrategyFingerprint {
+    pub operation: TargetOperation,
+    pub tool: String,
+    pub fallback_policy: MutationFallbackPolicy,
+    pub payload_type: String,
+    pub failure_category: MutationApplicationFailure,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MutationDiagnostics {
+    pub message: String,
+    #[serde(default)]
+    pub normalized_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_check: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RejectedMutation {
+    pub tool: String,
+    pub payload_hash: String,
+    pub failure_category: MutationApplicationFailure,
+    pub failure_diagnostics: MutationDiagnostics,
+    pub repository_fingerprint: RepositoryFingerprint,
+    pub applied: bool,
+    #[serde(default)]
+    pub status: FailureStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_repository_fingerprint: Option<RepositoryFingerprint>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RepairRequestPreflight {
+    pub policy_present: bool,
+    pub policy_compatible_with_operation: bool,
+    pub exact_target_bound: bool,
+    pub required_content_present: bool,
+    pub target_hash_present: bool,
+    pub repository_fingerprint_present: bool,
+    pub tool_surface_matches_policy: bool,
+    pub forced_tool_choice_matches_policy: bool,
+}
+
+impl RepairRequestPreflight {
+    pub const fn passed(&self) -> bool {
+        self.policy_present
+            && self.policy_compatible_with_operation
+            && self.exact_target_bound
+            && self.required_content_present
+            && self.target_hash_present
+            && self.repository_fingerprint_present
+            && self.tool_surface_matches_policy
+            && self.forced_tool_choice_matches_policy
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MutationToolPolicyViolation {
+    pub node_id: ExecutionNodeId,
+    pub target_path: String,
+    pub active_policy: MutationFallbackPolicy,
+    pub expected_tools: Vec<String>,
+    pub received_tool: String,
+}
+
+impl fmt::Display for MutationToolPolicyViolation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "mutation_tool_policy_violation: policy {:?} permits {:?}, received `{}` for `{}`",
+            self.active_policy, self.expected_tools, self.received_tool, self.target_path
+        )
+    }
+}
+
+impl std::error::Error for MutationToolPolicyViolation {}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct FailureRecord {
     pub id: FailureId,

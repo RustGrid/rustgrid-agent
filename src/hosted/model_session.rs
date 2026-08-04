@@ -1057,6 +1057,98 @@ impl<'a> GatewayAgent<'a> {
                         .unwrap_or_default(),
                 ),
             )?;
+            if let Some((node_id, target, policy, failure_category)) = active_mutation_fallback(
+                self.current_decision.as_ref(),
+            )
+            .map(|(node_id, target, policy, failure)| {
+                (node_id.clone(), target.clone(), policy, failure)
+            }) {
+                let rejected = self
+                    .notebook
+                    .mutation_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| diagnostic.target_path == target.target.path);
+                let original_tool = rejected.map(|diagnostic| diagnostic.tool.clone());
+                let rejected_payload_hash = rejected
+                    .and_then(|diagnostic| diagnostic.rejected_mutation.as_ref())
+                    .map(|rejected| rejected.payload_hash.clone());
+                let repair_call_number = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .usage_for(&node_id)
+                    .repair_attempts;
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_repair_request_built",
+                        "node_id": node_id,
+                        "target_path": target.target.path,
+                        "target_operation": target.target.effective_operation(),
+                        "original_tool": original_tool,
+                        "original_failure_category": failure_category,
+                        "selected_fallback_policy": policy,
+                        "permitted_tools": policy.permitted_tools(),
+                        "forced_tool_choice": policy.forced_tool(),
+                        "repair_call_number": repair_call_number,
+                        "target_content_hash": target.target_content_hash,
+                        "repository_fingerprint": target.repository_fingerprint,
+                        "rejected_mutation_payload_hash": rejected_payload_hash,
+                    }),
+                    "mutation repair request built",
+                );
+                let preflight =
+                    mutation_repair_request_preflight(self.current_decision.as_ref(), &request)
+                        .expect("active mutation fallback has a repair preflight");
+                if !preflight.passed() {
+                    self.restore_mutation_repair_allowance(&node_id)?;
+                    self.checkpoint_notebook(false)?;
+                    bail!(
+                        "mutation_repair_request_preflight_failed: {}",
+                        serde_json::to_string(&preflight)?
+                    );
+                }
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_repair_request_preflight_passed",
+                        "node_id": node_id,
+                        "target_path": target.target.path,
+                        "target_operation": target.target.effective_operation(),
+                        "original_tool": original_tool,
+                        "original_failure_category": failure_category,
+                        "selected_fallback_policy": policy,
+                        "permitted_tools": policy.permitted_tools(),
+                        "forced_tool_choice": policy.forced_tool(),
+                        "preflight": preflight,
+                        "repair_call_number": repair_call_number,
+                        "target_content_hash": target.target_content_hash,
+                        "repository_fingerprint": target.repository_fingerprint,
+                        "rejected_mutation_payload_hash": rejected_payload_hash,
+                    }),
+                    "mutation repair request preflight",
+                );
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_tool_policy_enforced",
+                        "node_id": node_id,
+                        "target_path": target.target.path,
+                        "target_operation": target.target.effective_operation(),
+                        "original_tool": original_tool,
+                        "original_failure_category": failure_category,
+                        "selected_fallback_policy": policy,
+                        "permitted_tools": policy.permitted_tools(),
+                        "forced_tool_choice": policy.forced_tool(),
+                        "repair_call_number": repair_call_number,
+                        "target_content_hash": target.target_content_hash,
+                        "repository_fingerprint": target.repository_fingerprint,
+                        "rejected_mutation_payload_hash": rejected_payload_hash,
+                    }),
+                    "mutation tool policy enforcement",
+                );
+            }
             validate_provider_request_envelope(&request)?;
             let cost_admitted = constrain_request_to_cost_limit(&mut request, &self.cost_guard)?;
             if cost_admitted {
@@ -1423,6 +1515,130 @@ impl<'a> GatewayAgent<'a> {
                     _ => {}
                 }
             }
+            let policy_violation = if function_calls.is_empty() {
+                mutation_tool_policy_violation(self.current_decision.as_ref(), "<none>")
+            } else {
+                function_calls.iter().find_map(|(_, name, _)| {
+                    mutation_tool_policy_violation(self.current_decision.as_ref(), name)
+                })
+            };
+            if let Some(violation) = policy_violation {
+                let active_context = active_mutation_fallback(self.current_decision.as_ref()).map(
+                    |(_, target, _, failure)| {
+                        (
+                            target.target.effective_operation(),
+                            target.target_content_hash.clone(),
+                            target.repository_fingerprint.clone(),
+                            failure,
+                        )
+                    },
+                );
+                let diagnostic = self
+                    .notebook
+                    .mutation_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| diagnostic.target_path == violation.target_path)
+                    .cloned();
+                let repair_call_number = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .usage_for(&violation.node_id)
+                    .repair_attempts;
+                self.restore_mutation_repair_allowance(&violation.node_id)?;
+                let repeated_strategy = self
+                    .notebook
+                    .mutation_diagnostics
+                    .iter()
+                    .rev()
+                    .find(|diagnostic| diagnostic.target_path == violation.target_path)
+                    .is_some_and(|diagnostic| {
+                        diagnostic
+                            .strategy_fingerprint
+                            .as_ref()
+                            .is_some_and(|strategy| {
+                                strategy.tool == violation.received_tool
+                                    && strategy.fallback_policy == violation.active_policy
+                                    && strategy.failure_category == diagnostic.failure_category
+                            })
+                            && diagnostic.repository_fingerprint
+                                == self.notebook.repository_fingerprint
+                    });
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.mutation_tool_policy_violation",
+                        "node_id": violation.node_id,
+                        "target_path": violation.target_path,
+                        "target_operation": active_context.as_ref().map(|context| &context.0),
+                        "original_tool": diagnostic.as_ref().map(|diagnostic| &diagnostic.tool),
+                        "original_failure_category": active_context.as_ref().map(|context| context.3),
+                        "active_policy": violation.active_policy,
+                        "expected_tools": violation.expected_tools,
+                        "forced_tool_choice": violation.active_policy.forced_tool(),
+                        "received_tool": violation.received_tool,
+                        "repair_call_number": repair_call_number,
+                        "target_content_hash": active_context.as_ref().and_then(|context| context.1.as_deref()),
+                        "repository_fingerprint": active_context.as_ref().map(|context| context.2.as_str()),
+                        "repository_touched": false,
+                        "repository_write_attempt_consumed": false,
+                        "mutation_repair_allowance_consumed": false,
+                        "provider_contract_violation": true,
+                    }),
+                    "mutation tool policy violation",
+                );
+                if repeated_strategy {
+                    self.append_event_recoverable(
+                        "progress",
+                        json!({
+                            "event_type": "worker.repeated_mutation_strategy_rejected",
+                            "node_id": violation.node_id,
+                            "target_path": violation.target_path,
+                            "target_operation": active_context.as_ref().map(|context| &context.0),
+                            "original_tool": diagnostic.as_ref().map(|diagnostic| &diagnostic.tool),
+                            "original_failure_category": active_context.as_ref().map(|context| context.3),
+                            "received_tool": violation.received_tool,
+                            "active_policy": violation.active_policy,
+                            "permitted_tools": violation.active_policy.permitted_tools(),
+                            "forced_tool_choice": violation.active_policy.forced_tool(),
+                            "repair_call_number": repair_call_number,
+                            "target_content_hash": active_context.as_ref().and_then(|context| context.1.as_deref()),
+                            "repository_fingerprint": self.notebook.repository_fingerprint,
+                            "material_context_change": false,
+                        }),
+                        "repeated mutation strategy rejection",
+                    );
+                }
+                if function_calls.is_empty() {
+                    turn.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "RustGrid provider-contract guardrail: invoke exactly `{}` for `{}`; the rejected mutation was not applied.",
+                            violation.active_policy.forced_tool().unwrap_or("the forced repair tool"),
+                            violation.target_path
+                        )
+                    }));
+                } else {
+                    for (call_id, _, _) in &function_calls {
+                        turn.push(json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": serde_json::to_string(&json!({
+                                "ok": false,
+                                "error_code": "mutation_tool_policy_violation",
+                                "error": violation.to_string(),
+                                "repository_touched": false,
+                                "repair_allowance_consumed": false,
+                            }))?,
+                        }));
+                    }
+                }
+                turns.push_back(turn);
+                compact_hosted_turns(&mut turns);
+                self.checkpoint_notebook(false)?;
+                continue;
+            }
             if function_calls.is_empty() {
                 if summary.trim().is_empty() {
                     bail!("AI gateway returned neither tool calls nor a final message");
@@ -1507,6 +1723,14 @@ impl<'a> GatewayAgent<'a> {
                     budget_exhausted: false,
                     explicit_declaration: self.declaration.clone(),
                 });
+            }
+            if let Some((node_id, _, _, _)) = active_mutation_fallback(
+                self.current_decision.as_ref(),
+            )
+            .map(|(node_id, target, policy, failure)| {
+                (node_id.clone(), target.clone(), policy, failure)
+            }) {
+                self.consume_pending_mutation_repair_allowance(&node_id)?;
             }
             let mut mutation_preflight_halt = None;
             for (call_id, name, arguments) in function_calls {
@@ -1978,8 +2202,11 @@ impl<'a> GatewayAgent<'a> {
                                     recovery: None,
                                     intended_change_sha256: intended_change_sha256.clone(),
                                 });
-                                self.record_active_target_failure(
+                                self.record_active_target_failure_with_code(
                                     crate::execution_graph::FailureCategory::MutationConflict,
+                                    mutation_application
+                                        .as_ref()
+                                        .map(|application| application.failure.as_str()),
                                     &error,
                                 )?;
                                 self.reconcile_authoritative_target_state()?;
@@ -2198,7 +2425,45 @@ impl GatewayAgent<'_> {
             .raw_patch_sha256
             .clone()
             .or_else(|| Some(sha256_text(rejected_payload)));
-        let repair_strategy = application.failure.repair_strategy().to_owned();
+        let target_operation = self
+            .current_decision
+            .as_ref()
+            .and_then(|decision| match decision {
+                ExecutionDecision::ExecuteTarget { target, .. } => {
+                    Some(target.target.effective_operation())
+                }
+                ExecutionDecision::RepairTarget { context, .. } => {
+                    Some(context.target.target.effective_operation())
+                }
+                _ => None,
+            })
+            .unwrap_or(crate::execution_graph::TargetOperation::ModifyExisting);
+        let fallback_policy = self
+            .current_decision
+            .as_ref()
+            .and_then(|decision| match decision {
+                ExecutionDecision::ExecuteTarget { target, .. } => Some(target),
+                ExecutionDecision::RepairTarget { context, .. } => Some(&context.target),
+                _ => None,
+            })
+            .map_or(MutationFallbackPolicy::NoSafeFallback, |target| {
+                crate::hosted_orchestrator::select_fallback_with_threshold(
+                    &target_operation,
+                    application.failure,
+                    target,
+                    self.manifest
+                        .execution_policy
+                        .mutation_replacement_max_bytes
+                        .unwrap_or(
+                            crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+                        )
+                        .min(MAX_MODEL_FILE_BYTES),
+                )
+            });
+        let repair_strategy = fallback_policy.as_str().to_owned();
+        let payload_hash = raw_patch_hash
+            .clone()
+            .unwrap_or_else(|| sha256_text(rejected_payload));
         self.notebook
             .mutation_diagnostics
             .push(MutationDiagnosticArtifact {
@@ -2212,6 +2477,44 @@ impl GatewayAgent<'_> {
                 git_apply_check_result: application.git_apply_check.clone(),
                 failure_category: application.failure,
                 repair_strategy: repair_strategy.clone(),
+                fallback_policy,
+                rejected_mutation: Some(RejectedMutation {
+                    tool: tool.to_owned(),
+                    payload_hash: payload_hash.clone(),
+                    failure_category: application.failure,
+                    failure_diagnostics: MutationDiagnostics {
+                        message: truncate_text(&application.message, 4_000),
+                        normalized_paths: normalized_paths.clone(),
+                        application_check: application.git_apply_check.clone(),
+                    },
+                    repository_fingerprint: repository_fingerprint.clone().into(),
+                    applied: false,
+                    status: crate::execution_graph::FailureStatus::Active,
+                    superseded_by: None,
+                    resolved_repository_fingerprint: None,
+                }),
+                attempt_accounting: target_attempt_accounting(
+                    mutation_attempt,
+                    repair_attempt,
+                    fallback_policy,
+                    self.notebook
+                        .write_attempts
+                        .iter()
+                        .filter(|attempt| attempt.target == target_path)
+                        .count(),
+                ),
+                strategy_fingerprint: Some(MutationStrategyFingerprint {
+                    operation: target_operation,
+                    tool: tool.to_owned(),
+                    fallback_policy,
+                    payload_type: if matches!(tool, "apply_patch" | "apply_unified_diff") {
+                        "unified_diff"
+                    } else {
+                        "complete_content"
+                    }
+                    .into(),
+                    failure_category: application.failure,
+                }),
                 mutation_attempt,
                 repair_attempt,
             });
@@ -2237,26 +2540,48 @@ impl GatewayAgent<'_> {
             }),
             "mutation application failure",
         );
-        if application.failure.repair_strategy() == "replace_file" {
-            self.append_event_recoverable(
-                "progress",
-                json!({
-                    "event_type": "worker.mutation_fallback_selected",
-                    "node_id": node_id,
-                    "target": target_path,
-                    "mutation_tool": tool,
-                    "target_content_hash": application.target_content_hash,
-                    "repository_fingerprint": repository_fingerprint,
-                    "normalized_patch_paths": normalized_paths,
-                    "fallback": "replace_file",
-                    "failure_category": application.failure,
-                    "raw_patch_hash": raw_patch_hash,
-                    "mutation_attempt": mutation_attempt,
-                    "repair_attempt": repair_attempt,
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.mutation_fallback_policy_selected",
+                "node_id": node_id,
+                "target": target_path,
+                "target_operation": self.current_decision.as_ref().and_then(|decision| match decision {
+                    ExecutionDecision::ExecuteTarget { target, .. } => Some(target.target.effective_operation()),
+                    ExecutionDecision::RepairTarget { context, .. } => Some(context.target.target.effective_operation()),
+                    _ => None,
                 }),
-                "mutation fallback selection",
-            );
-        }
+                "mutation_tool": tool,
+                "target_content_hash": application.target_content_hash,
+                "repository_fingerprint": repository_fingerprint,
+                "normalized_patch_paths": normalized_paths,
+                "selected_fallback_policy": fallback_policy,
+                "permitted_tools": fallback_policy.permitted_tools(),
+                "forced_tool_choice": fallback_policy.forced_tool(),
+                "failure_category": application.failure,
+                "raw_patch_hash": raw_patch_hash,
+                "mutation_attempt": mutation_attempt,
+                "repair_attempt": repair_attempt,
+                "verification_result": "not_applied",
+            }),
+            "mutation fallback selection",
+        );
         Ok(())
+    }
+}
+
+pub(super) fn target_attempt_accounting(
+    total_node_attempts: u32,
+    mutation_repair_calls: u32,
+    fallback_policy: MutationFallbackPolicy,
+    repository_write_attempts: usize,
+) -> TargetAttemptAccounting {
+    TargetAttemptAccounting {
+        primary_mutation_calls: total_node_attempts.saturating_sub(mutation_repair_calls),
+        mutation_repair_calls,
+        context_rebuilds: u32::from(
+            fallback_policy == MutationFallbackPolicy::RebuildTargetContext,
+        ),
+        repository_write_attempts: u32::try_from(repository_write_attempts).unwrap_or(u32::MAX),
     }
 }

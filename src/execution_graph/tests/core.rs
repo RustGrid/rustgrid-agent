@@ -216,6 +216,21 @@
     }
 
     #[test]
+    fn mutation_node_cannot_advertise_repair_without_a_distinct_model_call() {
+        let mut graph = graph();
+        let mutation = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind.is_mutation())
+            .expect("mutation node");
+        mutation.budget.max_model_calls = 1;
+        mutation.budget.max_repair_attempts = 1;
+        let error = graph.validate_invariants().unwrap_err();
+        assert!(error.message.contains("budget_configuration_invalid"));
+        assert!(error.message.contains("cannot fund a primary attempt and a distinct repair"));
+    }
+
+    #[test]
     fn policy_overrides_do_not_change_the_classification() {
         let input = ComplexityInput {
             planned_target_count: 5,

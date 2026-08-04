@@ -674,12 +674,15 @@ impl ModelActionProfile {
     ) -> Self {
         match decision {
             Some(ExecutionDecision::ExecuteTarget {
-                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget {
+                        fallback_policy, ..
+                    },
                 ..
-            }) if mutation_failure_requires_replacement(failure) => Self {
+            }) if fallback_policy.requires_provider_mutation() => Self {
                 max_output_tokens: configured_max_output_tokens.min(4_096),
                 reasoning_effort: "medium",
-                forced_tool: Some("replace_file"),
+                forced_tool: fallback_policy.forced_tool(),
                 require_tool: true,
             },
             Some(ExecutionDecision::ExecuteTarget {
@@ -837,19 +840,14 @@ pub(super) fn hosted_tools_for_action(
             ..
         }) => Some(&[][..]),
         Some(ExecutionDecision::ExecuteTarget {
-            action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
-            target,
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    fallback_policy, ..
+                },
             ..
-        }) if mutation_failure_requires_replacement(failure) => Some(
-            if matches!(
-                target.target.effective_operation(),
-                crate::execution_graph::TargetOperation::ModifyExisting
-            ) {
-                &["replace_file"][..]
-            } else {
-                operation_tools(&target.target)
-            },
-        ),
+        }) if fallback_policy.requires_provider_mutation() => {
+            Some(fallback_policy.permitted_tools())
+        }
         Some(ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
             target,
@@ -901,6 +899,133 @@ pub(super) fn hosted_tools_for_action(
         }
     }
     selected
+}
+
+pub(super) fn active_mutation_fallback(
+    decision: Option<&ExecutionDecision>,
+) -> Option<(
+    &crate::execution_graph::ExecutionNodeId,
+    &crate::execution_graph::TargetExecutionContext,
+    MutationFallbackPolicy,
+    MutationApplicationFailure,
+)> {
+    match decision {
+        Some(ExecutionDecision::ExecuteTarget {
+            node_id,
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    failure,
+                    fallback_policy,
+                    ..
+                },
+            target,
+        }) if failure.category == crate::execution_graph::FailureCategory::MutationConflict => {
+            let failure_category = failure
+                .code
+                .as_deref()
+                .and_then(MutationApplicationFailure::from_code)
+                .unwrap_or(MutationApplicationFailure::InvalidPatchTarget);
+            Some((node_id, target, *fallback_policy, failure_category))
+        }
+        Some(ExecutionDecision::RepairTarget {
+            node_id, context, ..
+        }) if context.failure.category
+            == crate::execution_graph::FailureCategory::MutationConflict =>
+        {
+            let failure_category = context
+                .failure
+                .code
+                .as_deref()
+                .and_then(MutationApplicationFailure::from_code)
+                .unwrap_or(MutationApplicationFailure::InvalidPatchTarget);
+            Some((
+                node_id,
+                &context.target,
+                context.fallback_policy,
+                failure_category,
+            ))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn mutation_repair_request_preflight(
+    decision: Option<&ExecutionDecision>,
+    request: &Value,
+) -> Option<RepairRequestPreflight> {
+    let (_, target, policy, _) = active_mutation_fallback(decision)?;
+    let expected_tools = policy.permitted_tools();
+    let request_tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let exact_target_bound = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            !tools.is_empty()
+                && tools.iter().all(|tool| {
+                    tool.pointer("/parameters/properties/path/enum")
+                        .and_then(Value::as_array)
+                        .is_some_and(|values| {
+                            values.len() == 1
+                                && values[0].as_str() == Some(target.target.path.as_str())
+                        })
+                })
+        });
+    let forced_tool_choice = request.pointer("/tool_choice/name").and_then(Value::as_str);
+    let request_context = request
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let target_content_attached = target.current_file_content.as_ref().is_some_and(|content| {
+        serde_json::to_string(content).is_ok_and(|encoded| request_context.contains(&encoded))
+    });
+    let target_hash_attached = target
+        .target_content_hash
+        .as_ref()
+        .or(target.source_content_hash.as_ref())
+        .is_some_and(|hash| request_context.contains(hash));
+    Some(RepairRequestPreflight {
+        policy_present: policy != MutationFallbackPolicy::NoSafeFallback
+            && request_context.contains(policy.as_str()),
+        policy_compatible_with_operation: policy
+            .compatible_with(&target.target.effective_operation()),
+        exact_target_bound,
+        required_content_present: policy != MutationFallbackPolicy::ForceReplaceFile
+            || target_content_attached,
+        target_hash_present: matches!(policy, MutationFallbackPolicy::ForceCreateFile)
+            || target_hash_attached,
+        repository_fingerprint_present: !target.repository_fingerprint.is_empty()
+            && request_context.contains(target.repository_fingerprint.as_str()),
+        tool_surface_matches_policy: request_tools.as_slice() == expected_tools,
+        forced_tool_choice_matches_policy: forced_tool_choice == policy.forced_tool(),
+    })
+}
+
+pub(super) fn mutation_tool_policy_violation(
+    decision: Option<&ExecutionDecision>,
+    received_tool: &str,
+) -> Option<MutationToolPolicyViolation> {
+    let (node_id, target, policy, _) = active_mutation_fallback(decision)?;
+    (!policy.permitted_tools().contains(&received_tool)).then(|| MutationToolPolicyViolation {
+        node_id: node_id.clone(),
+        target_path: target.target.path.clone(),
+        active_policy: policy,
+        expected_tools: policy
+            .permitted_tools()
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect(),
+        received_tool: received_tool.to_owned(),
+    })
 }
 
 pub(super) fn discovery_action_permits_tool(
@@ -1146,12 +1271,29 @@ pub(super) fn hosted_agent_instructions_for_decision(
         Some(ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::RepairTarget {
-                    target, failure, ..
+                    target,
+                    failure,
+                    fallback_policy,
+                    ..
                 },
             ..
-        }) if mutation_failure_requires_replacement(failure) => format!(
-            "Repair exactly `{}` with one forced `replace_file` call. Use the exact current target content and mutation_repair diagnostic in the authoritative input. The rejected patch was not applied. Return the complete replacement file, preserve unrelated behavior, and do not emit another patch or inspect another path.",
-            target.path
+        }) if *fallback_policy == MutationFallbackPolicy::ForceReplaceFile => format!(
+            "Repair exactly `{}` under active fallback policy `force_replace_file` with one forced `replace_file` call. Use the exact current target content, content hash, repository fingerprint, accepted implementation intent, and rejected-mutation diagnostic in the authoritative input. The rejected patch was not applied. Return the complete desired file content, preserve unrelated behavior, and do not emit another patch or inspect another path. Original failure category: {:?}.",
+            target.path, failure.code
+        ),
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    target,
+                    fallback_policy,
+                    ..
+                },
+            ..
+        }) if fallback_policy.requires_provider_mutation() => format!(
+            "Repair exactly `{}` under active fallback policy `{:?}`. Invoke exactly the forced `{}` tool and no other mutation strategy. Use the exact current target context and rejected-mutation evidence; the rejected mutation was not applied.",
+            target.path,
+            fallback_policy,
+            fallback_policy.forced_tool().unwrap_or("none")
         ),
         Some(ExecutionDecision::ExecuteTarget {
             action:
@@ -1176,12 +1318,6 @@ pub(super) fn hosted_agent_instructions_for_decision(
         ),
         _ => hosted_agent_instructions(phase),
     }
-}
-
-pub(super) fn mutation_failure_requires_replacement(
-    failure: &crate::execution_graph::FailureRecord,
-) -> bool {
-    failure.category == crate::execution_graph::FailureCategory::MutationConflict
 }
 
 pub(super) fn hosted_agent_instructions(phase: ExecutionPhase) -> String {

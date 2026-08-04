@@ -6,45 +6,6 @@ use std::io::Write as _;
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 use std::os::unix::ffi::OsStrExt as _;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::hosted) enum MutationApplicationFailure {
-    InvalidPatchTarget,
-    InvalidPatchSyntax,
-    PatchContextMismatch,
-    PatchWouldModifyUnexpectedPath,
-    ReplacementContentInvalid,
-    RepositoryChangedSinceContext,
-    MutationProducedNoChange,
-}
-
-impl MutationApplicationFailure {
-    pub(in crate::hosted) const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidPatchTarget => "invalid_patch_target",
-            Self::InvalidPatchSyntax => "invalid_patch_syntax",
-            Self::PatchContextMismatch => "patch_context_mismatch",
-            Self::PatchWouldModifyUnexpectedPath => "patch_would_modify_unexpected_path",
-            Self::ReplacementContentInvalid => "replacement_content_invalid",
-            Self::RepositoryChangedSinceContext => "repository_changed_since_context",
-            Self::MutationProducedNoChange => "mutation_produced_no_change",
-        }
-    }
-
-    pub(in crate::hosted) const fn repair_strategy(self) -> &'static str {
-        match self {
-            Self::InvalidPatchTarget
-            | Self::InvalidPatchSyntax
-            | Self::PatchContextMismatch
-            | Self::PatchWouldModifyUnexpectedPath => "replace_file",
-            Self::RepositoryChangedSinceContext => "rebuild_target_context",
-            Self::ReplacementContentInvalid | Self::MutationProducedNoChange => {
-                "return_typed_blocker"
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(in crate::hosted) struct PatchTargetValidationError {
     pub(in crate::hosted) declared_target: String,
@@ -970,7 +931,10 @@ pub(in crate::hosted) fn create_repo_file_atomically(
     }
     let target = safe_repo_path(root, path, true)?;
     if target.exists() {
-        bail!("create_target_already_exists: create_file requires an absent target");
+        return Err(anyhow!(MutationApplicationError::new(
+            MutationApplicationFailure::CreateTargetAlreadyExists,
+            "create_file requires an absent target",
+        )));
     }
     let parent = target
         .parent()
@@ -994,7 +958,10 @@ pub(in crate::hosted) fn create_repo_file_atomically(
         file.sync_all()?;
         rename_no_replace(&temporary, &target).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow!("create_target_already_exists: target appeared during atomic creation")
+                anyhow!(MutationApplicationError::new(
+                    MutationApplicationFailure::CreateTargetAlreadyExists,
+                    "target appeared during atomic creation",
+                ))
             } else {
                 anyhow!(error).context(format!(
                     "could not atomically create repository file {path}"
@@ -1034,7 +1001,10 @@ pub(in crate::hosted) fn move_repo_file_atomically(
         bail!("expected_source_target_missing: source is not a regular file");
     }
     if destination.exists() {
-        bail!("destination_already_exists: move destination must be absent");
+        return Err(anyhow!(MutationApplicationError::new(
+            MutationApplicationFailure::RenameDestinationConflict,
+            "move destination must be absent",
+        )));
     }
     let content = fs::read_to_string(&source)
         .with_context(|| format!("could not read UTF-8 source file {source_path}"))?;
@@ -1063,7 +1033,10 @@ pub(in crate::hosted) fn move_repo_file_atomically(
     }
     rename_no_replace(&source, &destination).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            anyhow!("destination_already_exists: move destination appeared during relocation")
+            anyhow!(MutationApplicationError::new(
+                MutationApplicationFailure::RenameDestinationConflict,
+                "move destination appeared during relocation",
+            ))
         } else {
             anyhow!(error).context(format!(
                 "could not move repository file {source_path} to {destination_path}"
@@ -1170,7 +1143,10 @@ pub(in crate::hosted) fn delete_repo_file(
 ) -> Result<String> {
     let target = safe_repo_path(root, path, false)?;
     if !target.is_file() {
-        bail!("delete_file target is not a regular file");
+        return Err(anyhow!(MutationApplicationError::new(
+            MutationApplicationFailure::DeleteTargetMissing,
+            "delete_file target is not a regular file",
+        )));
     }
     let content = fs::read_to_string(&target)
         .with_context(|| format!("could not read UTF-8 repository file {path}"))?;

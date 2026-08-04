@@ -80,6 +80,8 @@ pub struct TargetRepairContext {
     pub failure: FailureRecord,
     pub target: TargetExecutionContext,
     pub next_repair_attempt: u32,
+    #[serde(default)]
+    pub fallback_policy: MutationFallbackPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -101,7 +103,9 @@ pub enum MutationAction {
     RepairTarget {
         node_id: ExecutionNodeId,
         target: MutationTarget,
-        failure: FailureRecord,
+        failure: Box<FailureRecord>,
+        #[serde(default)]
+        fallback_policy: MutationFallbackPolicy,
     },
 }
 
@@ -186,8 +190,8 @@ impl ExecutionDecision {
             Self::ExecuteTarget {
                 action: MutationAction::RepairTarget { failure, .. },
                 ..
-            }
-            | Self::RepairTarget {
+            } if failure.category == FailureCategory::ValidationFailure => Some(&failure.node_id),
+            Self::RepairTarget {
                 context: TargetRepairContext { failure, .. },
                 ..
             } if failure.category == FailureCategory::ValidationFailure => Some(&failure.node_id),
@@ -898,6 +902,90 @@ fn missing_plan_evidence_requirements(message: &str) -> Vec<MissingEvidenceRequi
         .collect()
 }
 
+pub const DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES: usize = 128 * 1024;
+
+pub fn select_fallback(
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    target: &TargetExecutionContext,
+) -> MutationFallbackPolicy {
+    select_fallback_with_threshold(
+        operation,
+        failure,
+        target,
+        DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+    )
+}
+
+pub fn select_fallback_with_threshold(
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    target: &TargetExecutionContext,
+    replacement_threshold_bytes: usize,
+) -> MutationFallbackPolicy {
+    let replacement_eligible = matches!(operation, TargetOperation::ModifyExisting)
+        && target
+            .current_file_content
+            .as_ref()
+            .is_some_and(|content| content.len() <= replacement_threshold_bytes);
+    match failure {
+        MutationApplicationFailure::RepositoryChangedSinceContext => {
+            MutationFallbackPolicy::RebuildTargetContext
+        }
+        MutationApplicationFailure::InvalidPatchTarget
+        | MutationApplicationFailure::InvalidPatchSyntax
+        | MutationApplicationFailure::PatchContextMismatch
+        | MutationApplicationFailure::PatchWouldModifyUnexpectedPath => {
+            if replacement_eligible {
+                MutationFallbackPolicy::ForceReplaceFile
+            } else if matches!(operation, TargetOperation::ModifyExisting) {
+                MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+            } else {
+                MutationFallbackPolicy::NoSafeFallback
+            }
+        }
+        MutationApplicationFailure::ReplacementContentInvalid => {
+            if replacement_eligible {
+                MutationFallbackPolicy::ForceReplaceFile
+            } else {
+                MutationFallbackPolicy::NoSafeFallback
+            }
+        }
+        MutationApplicationFailure::MutationProducedNoChange => match operation {
+            TargetOperation::ModifyExisting if replacement_eligible => {
+                MutationFallbackPolicy::ForceReplaceFile
+            }
+            TargetOperation::ModifyExisting => {
+                MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+            }
+            TargetOperation::CreateNew => MutationFallbackPolicy::ForceCreateFile,
+            TargetOperation::DeleteExisting => MutationFallbackPolicy::ForceDeleteFile,
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. } => {
+                MutationFallbackPolicy::ForceRename
+            }
+        },
+        MutationApplicationFailure::CreateTargetAlreadyExists
+        | MutationApplicationFailure::DeleteTargetMissing
+        | MutationApplicationFailure::RenameDestinationConflict => {
+            MutationFallbackPolicy::NoSafeFallback
+        }
+    }
+}
+
+pub fn refine_fallback_for_replacement_threshold(
+    selected_policy: MutationFallbackPolicy,
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    target: &TargetExecutionContext,
+    replacement_threshold_bytes: usize,
+) -> MutationFallbackPolicy {
+    if failure.uses_replacement_threshold() {
+        select_fallback_with_threshold(operation, failure, target, replacement_threshold_bytes)
+    } else {
+        selected_policy
+    }
+}
+
 fn repair_target_decision(
     snapshot: &ExecutionSnapshot,
     node: &ExecutionNode,
@@ -988,12 +1076,73 @@ fn repair_target_decision(
             "validation repair target exists but its current content or content hash is missing",
         ));
     }
+    let operation = target.target.effective_operation();
+    let typed_failure = failure
+        .code
+        .as_deref()
+        .and_then(MutationApplicationFailure::from_code);
+    let mut fallback_policy = typed_failure.map_or_else(
+        || {
+            if failure.category == FailureCategory::MutationConflict {
+                match operation {
+                    TargetOperation::ModifyExisting => MutationFallbackPolicy::ForceReplaceFile,
+                    TargetOperation::CreateNew => MutationFallbackPolicy::ForceCreateFile,
+                    TargetOperation::DeleteExisting => MutationFallbackPolicy::ForceDeleteFile,
+                    TargetOperation::Rename { .. } | TargetOperation::Move { .. } => {
+                        MutationFallbackPolicy::ForceRename
+                    }
+                }
+            } else {
+                MutationFallbackPolicy::NoSafeFallback
+            }
+        },
+        |failure| select_fallback(&operation, failure, &target),
+    );
+    if fallback_policy == MutationFallbackPolicy::RebuildTargetContext {
+        if !context_prepared {
+            target.allowed_tools.clear();
+            return Ok(ExecutionDecision::ExecuteTarget {
+                node_id: node.id.clone(),
+                action: MutationAction::PrepareTargetContext {
+                    node_id: node.id.clone(),
+                    target: target.target.clone(),
+                },
+                target,
+            });
+        }
+        fallback_policy = match operation {
+            TargetOperation::ModifyExisting
+                if target.current_file_content.as_ref().is_some_and(|content| {
+                    content.len() <= DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES
+                }) =>
+            {
+                MutationFallbackPolicy::ForceReplaceFile
+            }
+            TargetOperation::ModifyExisting => {
+                MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+            }
+            TargetOperation::CreateNew => MutationFallbackPolicy::ForceCreateFile,
+            TargetOperation::DeleteExisting => MutationFallbackPolicy::ForceDeleteFile,
+            TargetOperation::Rename { .. } | TargetOperation::Move { .. } => {
+                MutationFallbackPolicy::ForceRename
+            }
+        };
+    }
+    if fallback_policy == MutationFallbackPolicy::NoSafeFallback
+        && failure.category == FailureCategory::MutationConflict
+    {
+        return Ok(ExecutionDecision::StopForGuardrail {
+            outcome: guardrail_outcome(snapshot),
+            reason: GuardrailReason::NodeBudgetExhausted,
+        });
+    }
     Ok(ExecutionDecision::ExecuteTarget {
         node_id: node.id.clone(),
         action: MutationAction::RepairTarget {
             node_id: node.id.clone(),
             target: target.target.clone(),
-            failure: failure.clone(),
+            failure: Box::new(failure.clone()),
+            fallback_policy,
         },
         target,
     })

@@ -51,6 +51,14 @@ pub enum ExecutionDomainEvent {
         started_at: String,
         repository_fingerprint: String,
     },
+    MutationRepairAllowanceRestored {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+    },
+    MutationRepairAllowanceConsumed {
+        sequence: u64,
+        node_id: ExecutionNodeId,
+    },
     TargetContextPrepared {
         sequence: u64,
         node_id: ExecutionNodeId,
@@ -275,6 +283,12 @@ impl ExecutionDomainEvent {
             Self::PlanRepaired { .. } => "plan_repaired",
             Self::GraphCreated { .. } => "graph_created",
             Self::NodeStarted { .. } => "node_started",
+            Self::MutationRepairAllowanceRestored { .. } => {
+                "mutation_repair_allowance_restored"
+            }
+            Self::MutationRepairAllowanceConsumed { .. } => {
+                "mutation_repair_allowance_consumed"
+            }
             Self::TargetContextPrepared { .. } => "target_context_prepared",
             Self::TargetMutationIntentRecorded { .. } => "target_mutation_intent_recorded",
             Self::TargetMutationProduced { .. } => "target_mutation_produced",
@@ -318,6 +332,8 @@ impl ExecutionDomainEvent {
             | Self::PlanRepaired { sequence, .. }
             | Self::GraphCreated { sequence, .. }
             | Self::NodeStarted { sequence, .. }
+            | Self::MutationRepairAllowanceRestored { sequence, .. }
+            | Self::MutationRepairAllowanceConsumed { sequence, .. }
             | Self::TargetContextPrepared { sequence, .. }
             | Self::TargetMutationIntentRecorded { sequence, .. }
             | Self::TargetMutationProduced { sequence, .. }
@@ -354,6 +370,8 @@ impl ExecutionDomainEvent {
     pub fn node_id(&self) -> Option<&ExecutionNodeId> {
         match self {
             Self::NodeStarted { node_id, .. }
+            | Self::MutationRepairAllowanceRestored { node_id, .. }
+            | Self::MutationRepairAllowanceConsumed { node_id, .. }
             | Self::TargetContextPrepared { node_id, .. }
             | Self::TargetMutationIntentRecorded { node_id, .. }
             | Self::TargetMutationProduced { node_id, .. }
@@ -403,6 +421,23 @@ pub fn current_execution_epoch(events: &[ExecutionDomainEvent]) -> &[ExecutionDo
         .rposition(|event| matches!(event, ExecutionDomainEvent::ExecutionResumed { .. }))
         .map_or(0, |position| position.saturating_add(1));
     &events[start..]
+}
+
+pub fn mutation_repair_allowance_is_restored(
+    events: &[ExecutionDomainEvent],
+    node_id: &ExecutionNodeId,
+) -> bool {
+    events.iter().rev().find_map(|event| match event {
+        ExecutionDomainEvent::MutationRepairAllowanceRestored {
+            node_id: event_node_id,
+            ..
+        } if event_node_id == node_id => Some(true),
+        ExecutionDomainEvent::MutationRepairAllowanceConsumed {
+            node_id: event_node_id,
+            ..
+        } if event_node_id == node_id => Some(false),
+        _ => None,
+    }) == Some(true)
 }
 
 pub fn current_epoch_terminal_outcome(events: &[ExecutionDomainEvent]) -> Option<MissionOutcome> {
@@ -781,6 +816,8 @@ impl ExecutionGraph {
             }
             ExecutionDomainEvent::CommitCreated { .. }
             | ExecutionDomainEvent::BranchPushed { .. }
+            | ExecutionDomainEvent::MutationRepairAllowanceRestored { .. }
+            | ExecutionDomainEvent::MutationRepairAllowanceConsumed { .. }
             | ExecutionDomainEvent::RepositoryEvidenceRecorded { .. }
             | ExecutionDomainEvent::ComplexityClassified { .. }
             | ExecutionDomainEvent::PlanAccepted { .. }
@@ -806,6 +843,8 @@ impl ExecutionGraph {
         })?;
         let kind_matches = match event {
             ExecutionDomainEvent::MutationApplied { .. }
+            | ExecutionDomainEvent::MutationRepairAllowanceRestored { .. }
+            | ExecutionDomainEvent::MutationRepairAllowanceConsumed { .. }
             | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
             | ExecutionDomainEvent::MutationRejected { .. }
             | ExecutionDomainEvent::MutationSuperseded { .. } => node.kind.is_mutation(),

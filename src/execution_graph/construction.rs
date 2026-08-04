@@ -207,30 +207,34 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
         for (position, index) in indices.iter().copied().enumerate() {
             let node = &mut nodes[index];
             let distributed_calls = distribute_u32(call_total, count, position);
+            let max_model_calls = if node.kind.is_mutation() {
+                distributed_calls.clamp(1, 2)
+            } else if node.kind.is_validation() && mission.max_target_repair_rounds > 0 {
+                // Validation execution itself is deterministic, but a
+                // failed gate owns its bounded diagnosis/repair call. Do
+                // not charge that call back to an already-applied target.
+                distributed_calls.max(1)
+            } else {
+                distributed_calls
+            };
+            let max_repair_attempts = if node.kind.is_validation() {
+                mission.max_target_repair_rounds
+            } else if node.kind.is_mutation() && max_model_calls >= 2 {
+                mission.max_target_repair_rounds.min(1)
+            } else {
+                // A nominal repair allowance is unsafe when the node cannot
+                // afford a distinct call after its primary mutation.
+                0
+            };
             node.budget = NodeBudget {
-                max_model_calls: if node.kind.is_mutation() {
-                    distributed_calls.clamp(1, 2)
-                } else if node.kind.is_validation() && mission.max_target_repair_rounds > 0 {
-                    // Validation execution itself is deterministic, but a
-                    // failed gate owns its bounded diagnosis/repair call. Do
-                    // not charge that call back to an already-applied target.
-                    distributed_calls.max(1)
-                } else {
-                    distributed_calls
-                },
+                max_model_calls,
                 max_cost_micros: distribute_u64(cost_total, count, position),
                 max_duration: Duration::from_millis(distribute_u64(
                     duration_total,
                     count,
                     position,
                 )),
-                max_repair_attempts: if node.kind.is_validation() {
-                    mission.max_target_repair_rounds
-                } else if node.kind.is_mutation() {
-                    mission.max_target_repair_rounds.min(1)
-                } else {
-                    0
-                },
+                max_repair_attempts,
             };
         }
     }

@@ -415,6 +415,11 @@ impl BudgetState {
         usage.repair_attempts = usage.repair_attempts.saturating_add(1);
     }
 
+    pub fn restore_repair_attempt(&mut self, node_id: &ExecutionNodeId) {
+        let usage = self.node_usage.entry(node_id.clone()).or_default();
+        usage.repair_attempts = usage.repair_attempts.saturating_sub(1);
+    }
+
     pub fn record_validation_repair_attempt(&mut self, node_id: ExecutionNodeId) {
         let usage = self.node_usage.entry(node_id).or_default();
         usage.validation_repair_attempts = usage.validation_repair_attempts.saturating_add(1);
@@ -436,6 +441,24 @@ impl BudgetState {
             }
         };
         *counter = counter.saturating_add(1);
+    }
+
+    pub fn restore_model_call_purpose(&mut self, purpose: ModelCallPurpose) {
+        let counter = match purpose {
+            ModelCallPurpose::InitialTargetMutation => {
+                &mut self.model_call_breakdown.initial_target_mutation_calls
+            }
+            ModelCallPurpose::TargetMutationRepair => {
+                &mut self.model_call_breakdown.target_mutation_repair_calls
+            }
+            ModelCallPurpose::ValidationDiagnosis => {
+                &mut self.model_call_breakdown.validation_diagnosis_calls
+            }
+            ModelCallPurpose::ValidationRepairMutation => {
+                &mut self.model_call_breakdown.validation_repair_mutation_calls
+            }
+        };
+        *counter = counter.saturating_sub(1);
     }
 
     pub fn record_progress(&mut self, event: ProgressEvent) {

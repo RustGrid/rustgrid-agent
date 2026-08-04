@@ -28,6 +28,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     command,
     config::{DEFAULT_INSTANCE_URL, RepoConfig},
+    execution_graph::{
+        MutationApplicationFailure, MutationDiagnostics, MutationFallbackPolicy,
+        MutationStrategyFingerprint, MutationToolPolicyViolation, RejectedMutation,
+        RepairRequestPreflight, TargetAttemptAccounting,
+    },
     git::{RemoteBranchMoved, Repo, read_repo_instructions},
     github::{GitHubClient, PullRequest},
     hosted_orchestrator::{

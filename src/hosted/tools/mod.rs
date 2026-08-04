@@ -1184,6 +1184,12 @@ impl<'a> GatewayAgent<'a> {
         arguments: &serde_json::Map<String, Value>,
     ) -> Result<()> {
         let phase = self.phases.active();
+        if is_source_mutation_tool(name)
+            && let Some(violation) =
+                mutation_tool_policy_violation(self.current_decision.as_ref(), name)
+        {
+            return Err(anyhow!(violation));
+        }
         if !phase_permits_tool(phase, name) {
             bail!(
                 "tool `{name}` is not permitted during phase `{}`",

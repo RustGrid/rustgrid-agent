@@ -540,6 +540,28 @@ impl ExecutionSnapshot {
                 )));
             }
         }
+        match &event {
+            ExecutionDomainEvent::MutationRepairAllowanceRestored { node_id, .. } => {
+                if self.budget.usage_for(node_id).repair_attempts == 0 {
+                    return Err(GraphInvariantError::new(format!(
+                        "node `{node_id}` cannot restore an unconsumed mutation repair allowance"
+                    )));
+                }
+            }
+            ExecutionDomainEvent::MutationRepairAllowanceConsumed { node_id, .. } => {
+                let node = self.graph.node(node_id).ok_or_else(|| {
+                    GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
+                })?;
+                if self.budget.usage_for(node_id).repair_attempts >= node.budget.max_repair_attempts
+                {
+                    return Err(GraphInvariantError::new(format!(
+                        "node `{node_id}` cannot consume mutation repair allowance beyond its {}-attempt budget",
+                        node.budget.max_repair_attempts
+                    )));
+                }
+            }
+            _ => {}
+        }
         if let ExecutionDomainEvent::ValidationRepairStarted {
             validation_node_id,
             ..
@@ -572,6 +594,21 @@ impl ExecutionSnapshot {
                     .expect("a target repair start always refers to a node")
                     .clone(),
             );
+        }
+        match &event {
+            ExecutionDomainEvent::MutationRepairAllowanceRestored { node_id, .. } => {
+                self.budget.restore_repair_attempt(node_id);
+                self.budget.restore_model_call_purpose(
+                    ModelCallPurpose::TargetMutationRepair,
+                );
+            }
+            ExecutionDomainEvent::MutationRepairAllowanceConsumed { node_id, .. } => {
+                self.budget.record_repair_attempt(node_id.clone());
+                self.budget.record_model_call_purpose(
+                    ModelCallPurpose::TargetMutationRepair,
+                );
+            }
+            _ => {}
         }
         if let ExecutionDomainEvent::ValidationRepairStarted {
             validation_node_id,

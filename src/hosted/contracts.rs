@@ -208,6 +208,8 @@ pub(super) struct HostedExecutionPolicy {
     pub(super) quality_gates: Vec<HostedQualityGate>,
     pub(super) timeout_seconds: i64,
     pub(super) sandbox: HostedSandboxPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) mutation_replacement_max_bytes: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -765,6 +767,14 @@ pub(super) struct MutationDiagnosticArtifact {
     pub(super) git_apply_check_result: Option<String>,
     pub(super) failure_category: MutationApplicationFailure,
     pub(super) repair_strategy: String,
+    #[serde(default)]
+    pub(super) fallback_policy: MutationFallbackPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) rejected_mutation: Option<RejectedMutation>,
+    #[serde(default)]
+    pub(super) attempt_accounting: TargetAttemptAccounting,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) strategy_fingerprint: Option<MutationStrategyFingerprint>,
     pub(super) mutation_attempt: u32,
     pub(super) repair_attempt: u32,
 }

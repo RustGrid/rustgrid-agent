@@ -51,6 +51,15 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
+            if node.kind.is_mutation()
+                && node.budget.max_repair_attempts > 0
+                && node.budget.max_model_calls < 2
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "budget_configuration_invalid: mutation node `{}` reserves {} repair attempt(s) but max_model_calls={} cannot fund a primary attempt and a distinct repair",
+                    node.id, node.budget.max_repair_attempts, node.budget.max_model_calls,
+                )));
+            }
             if node.kind.is_validation() && node.validation.is_none() {
                 return Err(GraphInvariantError::new(format!(
                     "validation node `{}` has no gate specification",
