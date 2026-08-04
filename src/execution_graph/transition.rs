@@ -175,15 +175,25 @@ pub enum ExecutionDomainEvent {
         sequence: u64,
         validation_node_id: ExecutionNodeId,
         failure_id: FailureId,
+        #[serde(default)]
+        repair_intent: ValidationRepairIntent,
         selected_target: String,
         #[serde(default)]
         implicated_paths: Vec<String>,
+        #[serde(default)]
+        correction_contracts: Vec<AssertionRepairContract>,
+        #[serde(default)]
+        requested_tool_policy: MutationToolPolicy,
+        #[serde(default)]
+        repository_fingerprint_before: RepositoryFingerprint,
     },
     ValidationRepairCompleted {
         sequence: u64,
         validation_node_id: ExecutionNodeId,
         failure_id: FailureId,
         result: RepairResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<ValidationRepairAttempt>,
     },
     ValidationSuperseded {
         sequence: u64,

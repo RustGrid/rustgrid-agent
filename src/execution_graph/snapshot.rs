@@ -144,7 +144,8 @@ impl ExecutionSnapshot {
         reason: IncompleteReason,
     ) -> Vec<DependencyOverride> {
         let reason = match reason {
-            IncompleteReason::ValidationRepairProducedNoMutation => {
+            IncompleteReason::ValidationRepairProducedNoMutation
+            | IncompleteReason::ValidationRepairProducedNoMeaningfulMutation => {
                 "draft publication after failed code validation and no valid repair mutation"
             }
             IncompleteReason::ValidationInfrastructureFailure => {
@@ -216,6 +217,61 @@ impl ExecutionSnapshot {
         Some(TargetState {
             mutation_status,
             validation_status,
+        })
+    }
+
+    /// Returns implementation, repair, and validation state independently.
+    /// A completed implementation therefore remains `Applied` while a later
+    /// validation failure and its repair are still unresolved.
+    pub fn target_execution_state(
+        &self,
+        node_id: &ExecutionNodeId,
+    ) -> Option<TargetExecutionState> {
+        let state = self.target_state(node_id)?;
+        let target = self.graph.node(node_id)?.target.as_ref()?;
+        let validation_failure = self.failures.unresolved().find(|failure| {
+            failure.category == FailureCategory::ValidationFailure
+                && (failure.target_path.as_deref() == Some(target.path.as_str())
+                    || failure.assertion_failures.iter().any(|assertion| {
+                        assertion.test_file == target.path
+                            || assertion.implicated_paths.contains(&target.path)
+                    }))
+        });
+        let repair_status = validation_failure.map_or(RepairStatus::NotRequired, |failure| {
+            let latest = current_execution_epoch(&self.events)
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    ExecutionDomainEvent::ValidationRepairCompleted {
+                        failure_id, result, ..
+                    } if failure_id == &failure.id => Some(result),
+                    _ => None,
+                });
+            match latest {
+                Some(RepairResult::MutationProduced { .. }) => RepairStatus::CandidateApplied,
+                Some(RepairResult::AlreadySatisfiesRepairIntent { .. }) => {
+                    RepairStatus::AlreadySatisfied
+                }
+                Some(RepairResult::NoMutation { .. }) => {
+                    let exhausted = self.graph.node(&failure.node_id).is_some_and(|validation| {
+                        self.budget
+                            .usage_for(&validation.id)
+                            .validation_repair_attempts
+                            >= validation.budget.max_repair_attempts.max(1)
+                    });
+                    if exhausted {
+                        RepairStatus::Exhausted
+                    } else {
+                        RepairStatus::Unresolved
+                    }
+                }
+                None => RepairStatus::Pending,
+            }
+        });
+        Some(TargetExecutionState {
+            implementation_status: state.mutation_status,
+            repair_status,
+            validation_status: state.validation_status,
         })
     }
 
@@ -581,6 +637,34 @@ impl ExecutionSnapshot {
                 return Err(GraphInvariantError::new(format!(
                     "validation node `{validation_node_id}` cannot start another bounded repair"
                 )));
+            }
+        }
+        if let ExecutionDomainEvent::ValidationRepairCompleted {
+            failure_id,
+            result: RepairResult::AlreadySatisfiesRepairIntent { evidence },
+            ..
+        } = &event
+        {
+            let repair_intent = current_execution_epoch(&self.events)
+                .iter()
+                .rev()
+                .find_map(|prior| match prior {
+                    ExecutionDomainEvent::ValidationRepairStarted {
+                        failure_id: started_failure,
+                        repair_intent,
+                        ..
+                    } if started_failure == failure_id => Some(repair_intent),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    GraphInvariantError::new(
+                        "already-satisfied validation repair lacks an active repair intent",
+                    )
+                })?;
+            if !evidence.proves(repair_intent) {
+                return Err(GraphInvariantError::new(
+                    "already-satisfied validation repair evidence does not prove the active assertion contract",
+                ));
             }
         }
 

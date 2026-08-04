@@ -423,7 +423,12 @@ fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>(),
-        vec!["apply_patch", "replace_file", "record_no_valid_repair"]
+        vec![
+            "apply_patch",
+            "replace_file",
+            "record_no_valid_repair",
+            "record_repair_intent_satisfied",
+        ]
     );
     assert!(
         hosted_agent_instructions_for_decision(ExecutionPhase::Repair, Some(&decision))
@@ -7376,7 +7381,7 @@ fn production_preflight_classifies_duplicate_without_change_id_and_advances() {
     // The production adapter receives only the attempted path here. It
     // must derive identity from the graph, never from model `change_id`.
     let duplicate =
-        classify_hosted_mutation_preflight(&snapshot, Some(&mutation_nodes[1]), paths[0])
+        classify_hosted_mutation_preflight(&snapshot, Some(&mutation_nodes[1]), paths[0], false)
             .unwrap()
             .expect("the first canonical node is already applied");
     assert_eq!(duplicate.code, "target_already_applied");
@@ -7384,6 +7389,12 @@ fn production_preflight_classifies_duplicate_without_change_id_and_advances() {
     assert_eq!(duplicate.target, paths[0]);
     assert_eq!(duplicate.repair_strategy, "continue_next_target");
     assert!(duplicate.message.contains(paths[1]));
+    assert!(
+        classify_hosted_mutation_preflight(&snapshot, Some(&mutation_nodes[0]), paths[0], true,)
+            .unwrap()
+            .is_none(),
+        "implementation AlreadyApplied must not satisfy a validation repair intent"
+    );
     assert!(matches!(
         classify_mutation_request(&snapshot, &mutation_nodes[0]).unwrap(),
         Some(MutationResult::AlreadyApplied { .. })

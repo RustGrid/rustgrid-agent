@@ -187,6 +187,7 @@ pub struct TargetExecutionContext {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValidationRepairContext {
+    pub repair_intent: ValidationRepairIntent,
     pub focused_validation_command: String,
     #[serde(default)]
     pub assertion_failures: Vec<ValidationAssertionFailure>,
@@ -197,6 +198,111 @@ pub struct ValidationRepairContext {
     pub accepted_implementation_intent: String,
     #[serde(default)]
     pub existing_diff_paths: Vec<String>,
+    #[serde(default)]
+    pub correction_contracts: Vec<AssertionRepairContract>,
+    #[serde(default)]
+    pub attempted_targets: Vec<RepositoryPath>,
+    #[serde(default)]
+    pub remaining_eligible_targets: Vec<RepositoryPath>,
+}
+
+pub type IntentId = String;
+pub type ChangeId = String;
+pub type ValidationId = String;
+pub type ValidationAssertionId = String;
+pub type MutationToolPolicy = MutationFallbackPolicy;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ExpectedTargetState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    #[serde(default)]
+    pub required_assertion_ids: Vec<ValidationAssertionId>,
+    #[serde(default)]
+    pub required_observable_change: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ImplementationIntent {
+    pub intent_id: IntentId,
+    pub change_id: ChangeId,
+    pub target: RepositoryPath,
+    pub expected_state: ExpectedTargetState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairIntent {
+    pub repair_intent_id: IntentId,
+    pub failed_validation_id: ValidationId,
+    pub target: RepositoryPath,
+    pub diagnosis: ValidationRepairDiagnosis,
+    pub expected_correction: ExpectedTargetState,
+    #[serde(default)]
+    pub evidence_ids: Vec<EvidenceId>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SourceLocation {
+    pub path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AssertionRepairContract {
+    pub assertion_id: ValidationAssertionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<SourceLocation>,
+    #[serde(default)]
+    pub implicated_paths: Vec<RepositoryPath>,
+    pub required_observable_change: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AlreadyAppliedRepairEvidence {
+    pub repair_intent_id: IntentId,
+    pub target_path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_state_hash: Option<ContentHash>,
+    pub current_state_hash: ContentHash,
+    #[serde(default)]
+    pub satisfied_assertions: Vec<ValidationAssertionId>,
+    #[serde(default)]
+    pub supporting_evidence_ids: Vec<EvidenceId>,
+}
+
+impl AlreadyAppliedRepairEvidence {
+    pub fn proves(&self, intent: &ValidationRepairIntent) -> bool {
+        self.repair_intent_id == intent.repair_intent_id
+            && self.target_path == intent.target
+            && !self.current_state_hash.is_empty()
+            && !intent.expected_correction.required_assertion_ids.is_empty()
+            && !self.satisfied_assertions.is_empty()
+            && !self.supporting_evidence_ids.is_empty()
+            && intent
+                .expected_correction
+                .required_assertion_ids
+                .iter()
+                .all(|assertion| self.satisfied_assertions.contains(assertion))
+            && self
+                .supporting_evidence_ids
+                .iter()
+                .all(|evidence| intent.evidence_ids.contains(evidence))
+            && intent
+                .expected_correction
+                .content_hash
+                .as_ref()
+                .is_none_or(|expected| expected == &self.current_state_hash)
+            && self.expected_state_hash.as_ref().is_none_or(|expected| {
+                expected == &self.current_state_hash
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -221,13 +327,49 @@ pub enum MutationResult {
     },
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationRepairDiagnosis {
     SourceDefect,
     TestExpectationDefect,
     Both,
+    #[default]
     Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairMutationOutcome {
+    MutationApplied,
+    AlreadySatisfiesRepairIntent,
+    NoChangeAgainstCurrentTarget,
+    MutationRejected,
+    #[default]
+    NoValidRepair,
+    WrongRepairTarget,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairAttempt {
+    pub repair_intent_id: IntentId,
+    pub target_path: RepositoryPath,
+    pub diagnosis: ValidationRepairDiagnosis,
+    pub requested_tool_policy: MutationToolPolicy,
+    pub outcome: ValidationRepairMutationOutcome,
+    pub repository_fingerprint_before: RepositoryFingerprint,
+    pub repository_fingerprint_after: RepositoryFingerprint,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct UnresolvedValidationRepair {
+    pub validation_id: ValidationId,
+    pub repair_intent_id: IntentId,
+    pub selected_target: RepositoryPath,
+    pub diagnosis: ValidationRepairDiagnosis,
+    pub outcome: ValidationRepairMutationOutcome,
+    pub reason: String,
+    #[serde(default)]
+    pub attempted_targets: Vec<RepositoryPath>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
@@ -274,11 +416,20 @@ pub struct ValidationAssertionFailure {
 pub enum RepairResult {
     MutationProduced {
         selected_target: String,
+        #[serde(default)]
+        repair_intent_id: IntentId,
+    },
+    AlreadySatisfiesRepairIntent {
+        evidence: AlreadyAppliedRepairEvidence,
     },
     NoMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diagnosis: Option<ValidationRepairDiagnosis>,
         reason: String,
+        #[serde(default)]
+        outcome: ValidationRepairMutationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unresolved: Option<UnresolvedValidationRepair>,
     },
 }
 
@@ -307,6 +458,49 @@ pub enum ValidationStatus {
 pub struct TargetState {
     pub mutation_status: MutationStatus,
     pub validation_status: ValidationStatus,
+}
+
+pub type ImplementationStatus = MutationStatus;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairStatus {
+    #[default]
+    NotRequired,
+    Pending,
+    CandidateApplied,
+    AlreadySatisfied,
+    Unresolved,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetExecutionState {
+    pub implementation_status: ImplementationStatus,
+    pub repair_status: RepairStatus,
+    pub validation_status: ValidationStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReason {
+    ValidationRepairUnresolvedWithoutDiff,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessFailureReason {
+    HostedLifecycleContractFailure,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum RepairTerminalDecision {
+    ContinueRepair,
+    RerunValidation,
+    ReviewIncompleteDiff { reason: IncompleteReason },
+    FinishBlockedWithoutDiff { reason: BlockedReason },
+    FailProcess { reason: ProcessFailureReason },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]

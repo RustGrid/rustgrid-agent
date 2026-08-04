@@ -679,6 +679,40 @@ impl<'a> GatewayAgent<'a> {
                 self.record_validation_no_valid_repair(diagnosis, reason)?;
                 Ok("recorded typed no-valid-repair result".into())
             }
+            "record_repair_intent_satisfied" => {
+                let repair_intent_id = required_tool_string(object, "repair_intent_id", 512)?;
+                let target_path = required_tool_string(object, "target_path", 4_096)?;
+                let expected_state_hash = required_tool_string(object, "expected_state_hash", 256)?;
+                let current_state_hash = required_tool_string(object, "current_state_hash", 256)?;
+                let string_array = |field: &str| -> Result<Vec<String>> {
+                    object
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .context(format!(
+                            "tool argument `{field}` is missing or not an array"
+                        ))?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .filter(|value| !value.is_empty() && value.len() <= 512)
+                                .map(str::to_owned)
+                                .context(format!(
+                                    "tool argument `{field}` contains an invalid string"
+                                ))
+                        })
+                        .collect()
+                };
+                self.record_validation_repair_intent_satisfied(
+                    repair_intent_id,
+                    target_path,
+                    (!expected_state_hash.is_empty()).then_some(expected_state_hash),
+                    current_state_hash,
+                    string_array("satisfied_assertions")?,
+                    string_array("supporting_evidence_ids")?,
+                )?;
+                Ok("recorded evidence-backed repair satisfaction candidate".into())
+            }
             "rewrite_small_file" => {
                 self.tool_usage.writes = self.tool_usage.writes.saturating_add(1);
                 let path = required_tool_string(object, "path", 4_096)?;
