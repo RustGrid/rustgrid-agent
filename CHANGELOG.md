@@ -5,6 +5,29 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.36 - 2026-08-04
+
+### Changed
+
+- Separate implementation intent from validation-repair intent and require
+  assertion-bound evidence before a repair can satisfy a failing validation.
+- Persist typed repair attempts, no-change results, target progression,
+  independent target state, and terminal repair decisions for deterministic
+  recovery.
+- Emit structured repair lifecycle telemetry and include unresolved repair
+  evidence in draft partial-result summaries.
+
+### Fixed
+
+- Keep failed validation authoritative until a passing rerun instead of
+  treating an earlier applied implementation as proof of a later repair.
+- Prevent identical or no-change repair output from counting as a successful
+  repository write or prematurely ending repair target progression.
+- Route exhausted repair with a useful diff through incomplete review and
+  healthy draft partial publication rather than initialization failure.
+- Preserve the typed hosted lifecycle contract when repair orchestration falls
+  back after an unresolved validation failure.
+
 ## 1.4.35 - 2026-08-04
 
 ### Changed
