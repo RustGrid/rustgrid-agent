@@ -5,6 +5,31 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.37 - 2026-08-05
+
+### Changed
+
+- Persist one canonical worker-domain terminal result before callback delivery,
+  including typed completion, remaining-work, publication, health, and finality
+  evidence with a deterministic result identity.
+- Deliver terminal acknowledgements through a durable outbox with deterministic
+  idempotency, bounded retry, exact-envelope replay, and restart recovery that
+  never reruns an already-finalized mission.
+- Separate callback transport health from the mission outcome and emit stable
+  lifecycle telemetry for acknowledgement, retry, missing-callback, and
+  projection-repair states.
+
+### Fixed
+
+- Prevent callback timeouts, workflow conclusions, runner disappearance, and
+  stale reconciliation from replacing a finalized healthy or reviewable result.
+- Preserve externally pending review as a healthy terminal outcome and use typed
+  evidence precedence when legacy completion fields disagree.
+- Validate callback identity, terminal revision, authority, compatibility status,
+  and process exit evidence before accepting an acknowledgement.
+- Recover the exact persisted callback after worker restart while suppressing
+  stale terminal writes and duplicate mission execution.
+
 ## 1.4.36 - 2026-08-04
 
 ### Changed
