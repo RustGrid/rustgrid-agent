@@ -6,6 +6,7 @@ pub enum ExecutionNodeKind {
     #[default]
     SourceMutation,
     TestMutation,
+    ValidationRepairSession,
     ValidationFocused,
     ValidationSuite,
     ValidationBuild,
@@ -20,7 +21,9 @@ impl ExecutionNodeKind {
         match self {
             Self::Discovery => HostedExecutionStage::Discovery,
             Self::Planning => HostedExecutionStage::Planning,
-            Self::SourceMutation | Self::TestMutation => HostedExecutionStage::Implementation,
+            Self::SourceMutation | Self::TestMutation | Self::ValidationRepairSession => {
+                HostedExecutionStage::Implementation
+            }
             Self::ValidationFocused
             | Self::ValidationSuite
             | Self::ValidationBuild
@@ -51,6 +54,7 @@ impl ExecutionNodeKind {
                 | Self::Planning
                 | Self::SourceMutation
                 | Self::TestMutation
+                | Self::ValidationRepairSession
                 | Self::DiffReview
                 | Self::CompletionEvaluation
         )

@@ -210,7 +210,128 @@ pub type IntentId = String;
 pub type ChangeId = String;
 pub type ValidationId = String;
 pub type ValidationAssertionId = String;
+pub type RepairSessionId = String;
+pub type ModelCallId = String;
 pub type MutationToolPolicy = MutationFallbackPolicy;
+
+/// Deterministic work owned by a validation gate. None of these counters may
+/// be used to admit a model-backed repository mutation.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationGateBudget {
+    pub command_runs: u32,
+    pub parsing_calls: u32,
+    pub diagnosis_calls: u32,
+}
+
+/// The independently admitted envelope for one bounded validation-repair
+/// session. Verification and command reruns are deterministic and therefore
+/// do not consume `max_model_calls`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairBudget {
+    pub max_model_calls: u32,
+    pub max_target_attempts: u32,
+    pub max_repository_writes: u32,
+    pub max_context_rebuilds: u32,
+    pub max_cost_micros: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairBudgetInputs {
+    pub failed_assertion_count: u32,
+    pub implicated_target_count: u32,
+    pub originating_gate_required: bool,
+    pub implicated_target_bytes: u64,
+}
+
+impl ValidationRepairBudget {
+    pub const MINIMUM_MODEL_CALLS: u32 = 2;
+
+    pub fn validate(&self, multi_target: bool) -> Result<(), GraphInvariantError> {
+        let required_targets = if multi_target {
+            self.max_target_attempts
+        } else {
+            1
+        };
+        let minimum_calls = Self::MINIMUM_MODEL_CALLS.max(1_u32.saturating_add(required_targets));
+        if self.max_model_calls < minimum_calls
+            || self.max_target_attempts < required_targets
+            || self.max_repository_writes < required_targets
+            || self.max_context_rebuilds == 0
+            || self.max_cost_micros == 0
+        {
+            return Err(GraphInvariantError::new(
+                "validation repair budget cannot execute diagnosis, mutation, and deterministic verification",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn as_node_budget(&self) -> NodeBudget {
+        NodeBudget {
+            max_model_calls: self.max_model_calls,
+            max_cost_micros: self.max_cost_micros,
+            max_duration: Duration::from_secs(10 * 60),
+            max_repair_attempts: self.max_target_attempts,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairSessionStatus {
+    #[default]
+    Active,
+    ReadyForRerun,
+    ValidationPassed,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairStopReason {
+    NoEligibleTargets,
+    RepairBudgetExhausted,
+    MissionBudgetExhausted,
+    AdmissionPolicyMisconfigured,
+    NoSafeRepair,
+    ValidationPassed,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationFailureRevision {
+    pub validation_id: ValidationId,
+    pub revision: u64,
+    pub repository_fingerprint: RepositoryFingerprint,
+    #[serde(default)]
+    pub assertion_ids: Vec<ValidationAssertionId>,
+    /// RFC 3339 when supplied by an adapter; replayed legacy events use a
+    /// stable sequence-derived value instead of consulting wall-clock time.
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairSession {
+    pub session_id: RepairSessionId,
+    pub failed_validation_id: ValidationId,
+    pub originating_gate_id: ExecutionNodeId,
+    pub budget: ValidationRepairBudget,
+    pub status: ValidationRepairSessionStatus,
+    #[serde(default)]
+    pub attempted_targets: Vec<ValidationRepairAttempt>,
+    pub current_assertion_set_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<ValidationRepairStopReason>,
+    #[serde(default)]
+    pub reallocated_model_calls: u32,
+    #[serde(default)]
+    pub reallocated_cost_micros: u64,
+    #[serde(default)]
+    pub repository_writes_consumed: u32,
+    #[serde(default)]
+    pub context_rebuilds_consumed: u32,
+    #[serde(default)]
+    pub budget_inputs: ValidationRepairBudgetInputs,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ExpectedTargetState {
@@ -344,20 +465,41 @@ pub enum ValidationRepairMutationOutcome {
     AlreadySatisfiesRepairIntent,
     NoChangeAgainstCurrentTarget,
     MutationRejected,
+    AdmissionRejected,
     #[default]
     NoValidRepair,
     WrongRepairTarget,
 }
 
+impl ValidationRepairMutationOutcome {
+    pub const fn consumes_repository_write_allowance(self) -> bool {
+        matches!(
+            self,
+            Self::MutationApplied
+                | Self::NoChangeAgainstCurrentTarget
+                | Self::MutationRejected
+                | Self::WrongRepairTarget
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValidationRepairAttempt {
+    #[serde(default)]
+    pub attempt_number: u32,
     pub repair_intent_id: IntentId,
     pub target_path: RepositoryPath,
+    #[serde(default)]
+    pub failure_revision: u64,
     pub diagnosis: ValidationRepairDiagnosis,
     pub requested_tool_policy: MutationToolPolicy,
     pub outcome: ValidationRepairMutationOutcome,
     pub repository_fingerprint_before: RepositoryFingerprint,
     pub repository_fingerprint_after: RepositoryFingerprint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_call_id: Option<ModelCallId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_rejection_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -573,6 +715,7 @@ impl FailureCategory {
                     | ExecutionNodeKind::Planning
                     | ExecutionNodeKind::SourceMutation
                     | ExecutionNodeKind::TestMutation
+                    | ExecutionNodeKind::ValidationRepairSession
                     | ExecutionNodeKind::ValidationFocused
                     | ExecutionNodeKind::ValidationSuite
                     | ExecutionNodeKind::ValidationBuild

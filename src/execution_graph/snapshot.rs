@@ -144,6 +144,9 @@ impl ExecutionSnapshot {
         reason: IncompleteReason,
     ) -> Vec<DependencyOverride> {
         let reason = match reason {
+            IncompleteReason::ValidationRerunPending => {
+                "draft publication with an applied repair whose validation rerun is still pending"
+            }
             IncompleteReason::ValidationRepairProducedNoMutation
             | IncompleteReason::ValidationRepairProducedNoMeaningfulMutation => {
                 "draft publication after failed code validation and no valid repair mutation"
@@ -253,12 +256,17 @@ impl ExecutionSnapshot {
                     RepairStatus::AlreadySatisfied
                 }
                 Some(RepairResult::NoMutation { .. }) => {
-                    let exhausted = self.graph.node(&failure.node_id).is_some_and(|validation| {
-                        self.budget
-                            .usage_for(&validation.id)
-                            .validation_repair_attempts
-                            >= validation.budget.max_repair_attempts.max(1)
-                    });
+                    let exhausted = self
+                        .budget
+                        .repair_session_for_failure(&failure.id)
+                        .is_some_and(|session| {
+                            let owner = ExecutionNodeId::new(session.session_id.clone());
+                            session.attempted_targets.len()
+                                >= usize::try_from(session.budget.max_target_attempts)
+                                    .unwrap_or(usize::MAX)
+                                || self.budget.usage_for(&owner).validation_repair_attempts
+                                    >= session.budget.max_target_attempts
+                        });
                     if exhausted {
                         RepairStatus::Exhausted
                     } else {
@@ -392,8 +400,49 @@ impl ExecutionSnapshot {
             .map(|(evidence_id, _)| evidence_id.clone())
             .collect::<Vec<_>>();
         if evidence_ids.is_empty() {
+            let stale_after_repair = self
+                .budget
+                .validation_repair_sessions
+                .values()
+                .filter(|session| {
+                    matches!(
+                        session.status,
+                        ValidationRepairSessionStatus::ReadyForRerun
+                            | ValidationRepairSessionStatus::Stopped
+                    ) && session.attempted_targets.iter().any(|attempt| {
+                        attempt.outcome == ValidationRepairMutationOutcome::MutationApplied
+                            && attempt.repository_fingerprint_after.as_str()
+                                == self.current_repository.fingerprint
+                            && attempt.repository_fingerprint_before
+                                != attempt.repository_fingerprint_after
+                    })
+                })
+                .flat_map(|session| {
+                    self.evidence.validations.iter().filter_map(|(evidence_id, evidence)| {
+                        (evidence.node_id == session.originating_gate_id
+                            && graph_gate_ids.contains(&evidence.gate_id)
+                            && (evidence.status == ValidationEvidenceStatus::Failed
+                                || self.events.iter().any(|event| {
+                                    matches!(
+                                        event,
+                                        ExecutionDomainEvent::ValidationEvidenceRecorded {
+                                            evidence: recorded,
+                                            ..
+                                        } if recorded.evidence_id == *evidence_id
+                                            && recorded.status == ValidationEvidenceStatus::Failed
+                                    )
+                                }))
+                            && evidence.repository_fingerprint
+                                != self.current_repository.fingerprint)
+                            .then_some(evidence_id.clone())
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            if !stale_after_repair.is_empty() {
+                return Ok(stale_after_repair.into_iter().collect());
+            }
             return Err(GraphInvariantError::new(
-                "partial recovery publication requires a current validation process observation",
+                "partial recovery publication requires a current validation observation or an explicit stale-after-repair observation with a pending rerun",
             ));
         }
         Ok(evidence_ids)
@@ -548,7 +597,7 @@ impl ExecutionSnapshot {
 
     fn append_event_in_place(
         &mut self,
-        event: ExecutionDomainEvent,
+        mut event: ExecutionDomainEvent,
     ) -> Result<(), GraphInvariantError> {
         let terminal_outcome = self.terminal_outcome();
         let resumes_partial_terminal = matches!(
@@ -572,6 +621,22 @@ impl ExecutionSnapshot {
                 event.sequence(),
                 previous.sequence()
             )));
+        }
+        if let ExecutionDomainEvent::ValidationRepairCompleted {
+            failure_id,
+            attempt: Some(attempt),
+            ..
+        } = &mut event
+            && let Some(session) = self.budget.repair_session_for_failure(failure_id)
+        {
+            if attempt.attempt_number == 0 {
+                attempt.attempt_number = u32::try_from(session.attempted_targets.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(1);
+            }
+            if attempt.failure_revision == 0 {
+                attempt.failure_revision = session.current_assertion_set_revision;
+            }
         }
 
         self.graph
@@ -620,24 +685,72 @@ impl ExecutionSnapshot {
         }
         if let ExecutionDomainEvent::ValidationRepairStarted {
             validation_node_id,
+            failure_id,
+            implicated_paths,
+            correction_contracts,
             ..
         } = &event
         {
-            let node = self.graph.node(validation_node_id).ok_or_else(|| {
+            let validation_node = self.graph.node(validation_node_id).ok_or_else(|| {
                 GraphInvariantError::new(format!(
                     "validation repair refers to unknown node `{validation_node_id}`"
                 ))
             })?;
-            if self
+            let failure = self.failures.get(failure_id).cloned().ok_or_else(|| {
+                GraphInvariantError::new(format!(
+                    "validation repair refers to unknown failure `{failure_id}`"
+                ))
+            })?;
+            let implicated_targets = implicated_paths
+                .iter()
+                .chain(
+                    correction_contracts
+                        .iter()
+                        .flat_map(|contract| contract.implicated_paths.iter()),
+                )
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let implicated_target_bytes = self
+                .evidence
+                .files
+                .values()
+                .filter(|evidence| {
+                    implicated_targets.contains(&evidence.path)
+                        && evidence.repository_fingerprint
+                            == self.current_repository.fingerprint
+                })
+                .map(|evidence| u64::try_from(evidence.captured_content.len()).unwrap_or(u64::MAX))
+                .fold(0_u64, u64::saturating_add);
+            let budget_inputs = ValidationRepairBudgetInputs {
+                failed_assertion_count: u32::try_from(failure.assertion_failures.len())
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                implicated_target_count: u32::try_from(implicated_targets.len())
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+                originating_gate_required: validation_node.required,
+                implicated_target_bytes,
+            };
+            let session = self
                 .budget
-                .usage_for(validation_node_id)
-                .validation_repair_attempts
-                >= node.budget.max_repair_attempts.max(1)
+                .ensure_validation_repair_session(&failure, budget_inputs)?
+                .clone();
+            let session_owner = ExecutionNodeId::new(session.session_id.clone());
+            if session.attempted_targets.len()
+                >= usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX)
+                || self
+                    .budget
+                    .usage_for(&session_owner)
+                    .validation_repair_attempts
+                    >= session.budget.max_target_attempts
             {
                 return Err(GraphInvariantError::new(format!(
-                    "validation node `{validation_node_id}` cannot start another bounded repair"
+                    "validation repair session `{}` cannot start another bounded target attempt",
+                    session.session_id
                 )));
             }
+            self.budget
+                .record_validation_repair_context_rebuild(failure_id)?;
         }
         if let ExecutionDomainEvent::ValidationRepairCompleted {
             failure_id,
@@ -668,9 +781,49 @@ impl ExecutionSnapshot {
             }
         }
 
+        if let ExecutionDomainEvent::ValidationRepairStarted { failure_id, .. } = &event {
+            let session = self
+                .budget
+                .repair_session_for_failure(failure_id)
+                .cloned()
+                .ok_or_else(|| {
+                    GraphInvariantError::new(
+                        "validation repair start did not materialize its repair session",
+                    )
+                })?;
+            let session_node_id = ExecutionNodeId::new(session.session_id.clone());
+            if let Some(node) = self.graph.node_mut(&session_node_id) {
+                node.status = ExecutionNodeStatus::Running;
+                node.budget = session.budget.as_node_budget();
+            } else {
+                self.graph.nodes.push(ExecutionNode {
+                    id: session_node_id,
+                    kind: ExecutionNodeKind::ValidationRepairSession,
+                    // Ownership is represented by the session's typed
+                    // originating gate. A failed gate cannot satisfy a graph
+                    // edge, so making it a dependency would deadlock repair.
+                    dependencies: Vec::new(),
+                    status: ExecutionNodeStatus::Running,
+                    required: false,
+                    budget: session.budget.as_node_budget(),
+                    ..ExecutionNode::default()
+                });
+            }
+            self.graph.revision = self.graph.revision.saturating_add(1);
+        }
+
         let dependency_satisfaction = self.dependency_satisfaction_ids();
         self.graph
             .apply_domain_event_with_dependency_satisfaction(&event, &dependency_satisfaction)?;
+        if let ExecutionDomainEvent::ValidationRepairCompleted { failure_id, .. } = &event
+            && let Some(session) = self.budget.repair_session_for_failure(failure_id)
+        {
+            let session_node_id = ExecutionNodeId::new(session.session_id.clone());
+            if let Some(node) = self.graph.node_mut(&session_node_id) {
+                node.status = ExecutionNodeStatus::Skipped;
+                self.graph.revision = self.graph.revision.saturating_add(1);
+            }
+        }
         if repair_started {
             self.budget.record_repair_attempt(
                 event
@@ -694,13 +847,9 @@ impl ExecutionSnapshot {
             }
             _ => {}
         }
-        if let ExecutionDomainEvent::ValidationRepairStarted {
-            validation_node_id,
-            ..
-        } = &event
-        {
-            self.budget
-                .record_validation_repair_attempt(validation_node_id.clone());
+        if let ExecutionDomainEvent::ValidationRepairStarted { failure_id, .. } = &event {
+            let owner = ExecutionNodeId::new(BudgetState::repair_session_id(failure_id));
+            self.budget.record_validation_repair_attempt(owner);
         }
         match &event {
             ExecutionDomainEvent::RepositoryEvidenceRecorded {
@@ -765,9 +914,15 @@ impl ExecutionSnapshot {
                         .as_ref()
                         .is_none_or(|node_id| retained.contains(node_id))
                 });
-                self.budget
-                    .node_usage
-                    .retain(|node_id, _| retained.contains(node_id));
+                let repair_session_ids = self
+                    .budget
+                    .validation_repair_sessions
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                self.budget.node_usage.retain(|node_id, _| {
+                    retained.contains(node_id) || repair_session_ids.contains(node_id.as_str())
+                });
                 self.budget.progress_events.retain(|progress| {
                     progress
                         .node_id
@@ -890,16 +1045,96 @@ impl ExecutionSnapshot {
             ExecutionDomainEvent::ValidationEvidenceRecorded { evidence, .. } => {
                 self.evidence.record_validation(evidence.clone());
             }
-            ExecutionDomainEvent::ValidationFailed { node_id, .. } => {
+            ExecutionDomainEvent::ValidationFailed {
+                sequence,
+                node_id,
+                failure_id,
+                ..
+            } => {
                 self.materialize_unresolved_failure_status(node_id, false)?;
+                if let Some(failure) = self.failures.get(failure_id).cloned() {
+                    let revision = self
+                        .budget
+                        .create_validation_failure_revision(&failure, *sequence);
+                    self.budget
+                        .continue_validation_repair_session(&failure, revision.revision);
+                    if let Some(session) = self
+                        .budget
+                        .repair_session_for_failure_mut(failure_id)
+                    {
+                        session.current_assertion_set_revision = revision.revision;
+                        session.status = ValidationRepairSessionStatus::Active;
+                        session.stop_reason = None;
+                    }
+                }
             }
             ExecutionDomainEvent::ValidationPassed {
                 sequence, node_id, ..
-            } => self.budget.record_progress_kind(
-                *sequence,
-                ProgressEventKind::ValidationPassed,
-                Some(node_id.clone()),
-            ),
+            } => {
+                self.budget.record_progress_kind(
+                    *sequence,
+                    ProgressEventKind::ValidationPassed,
+                    Some(node_id.clone()),
+                );
+                for session in self
+                    .budget
+                    .validation_repair_sessions
+                    .values_mut()
+                    .filter(|session| &session.originating_gate_id == node_id)
+                {
+                    session.status = ValidationRepairSessionStatus::ValidationPassed;
+                    session.stop_reason = Some(ValidationRepairStopReason::ValidationPassed);
+                }
+            }
+            ExecutionDomainEvent::ValidationRepairCompleted {
+                failure_id,
+                result,
+                attempt,
+                ..
+            } => {
+                let admission_rejection_reason = attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.admission_rejection_reason.as_deref());
+                if let Some(attempt) = attempt.clone() {
+                    if attempt.outcome.consumes_repository_write_allowance() {
+                        self.budget
+                            .record_validation_repair_repository_write(failure_id)?;
+                    }
+                    self.budget
+                        .record_validation_repair_attempt_for_failure(failure_id, attempt)?;
+                }
+                if let Some(session) = self.budget.repair_session_for_failure_mut(failure_id) {
+                    match result {
+                        RepairResult::MutationProduced { .. }
+                        | RepairResult::AlreadySatisfiesRepairIntent { .. } => {
+                            session.status = ValidationRepairSessionStatus::ReadyForRerun;
+                        }
+                        RepairResult::NoMutation { outcome, .. } => {
+                            session.status = ValidationRepairSessionStatus::Stopped;
+                            session.stop_reason = Some(match outcome {
+                                ValidationRepairMutationOutcome::AdmissionRejected => {
+                                    if admission_rejection_reason
+                                        == Some("mission_model_call_budget_exhausted")
+                                    {
+                                        ValidationRepairStopReason::MissionBudgetExhausted
+                                    } else if admission_rejection_reason
+                                        == Some("repair_session_model_call_budget_exhausted")
+                                    {
+                                        ValidationRepairStopReason::RepairBudgetExhausted
+                                    } else {
+                                        ValidationRepairStopReason::AdmissionPolicyMisconfigured
+                                    }
+                                }
+                                ValidationRepairMutationOutcome::NoValidRepair
+                                | ValidationRepairMutationOutcome::WrongRepairTarget => {
+                                    ValidationRepairStopReason::NoSafeRepair
+                                }
+                                _ => ValidationRepairStopReason::RepairBudgetExhausted,
+                            });
+                        }
+                    }
+                }
+            }
             ExecutionDomainEvent::ValidationSuperseded { evidence_id, .. } => {
                 if let Some(evidence) = self.evidence.validations.get_mut(evidence_id) {
                     evidence.status = ValidationEvidenceStatus::Superseded;

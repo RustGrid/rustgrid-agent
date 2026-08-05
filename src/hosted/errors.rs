@@ -227,7 +227,7 @@ impl<'a> GatewayAgent<'a> {
                 "event_type": "worker.phase_budget_warning",
                 "phase": phase,
                 "calls_used": self.phases.phase_calls(phase),
-                "calls_limit": self.phases.phase_limit(phase),
+                "calls_limit": self.effective_phase_model_call_limit(),
                 "total_calls_used": self.phases.total_calls(),
                 "total_calls_limit": self.phases.total_limit(),
             }),
@@ -242,10 +242,7 @@ impl<'a> GatewayAgent<'a> {
         recoverable: bool,
         recommended_action: &str,
     ) -> anyhow::Error {
-        let category = underlying.map_or(
-            "orchestration_initialization_failed",
-            hosted_failure_category,
-        );
+        let category = underlying.map_or("orchestration_execution_failed", hosted_failure_category);
         self.categorized_execution_failure(
             category,
             code,
@@ -304,7 +301,7 @@ impl<'a> GatewayAgent<'a> {
                 .total_limit()
                 .saturating_sub(self.phases.total_calls()),
             phase_calls_used: self.phases.phase_calls(phase),
-            phase_calls_limit: self.phases.phase_limit(phase),
+            phase_calls_limit: self.effective_phase_model_call_limit(),
             last_successful_action: self.last_successful_action.clone(),
             usage: self.tool_usage.clone(),
             estimated_cost_micros: self.cost_guard.estimated_cost_micros,
@@ -454,7 +451,7 @@ impl<'a> GatewayAgent<'a> {
                 .total_limit()
                 .saturating_sub(self.phases.total_calls()),
             phase_calls_used: self.phases.phase_calls(phase),
-            phase_calls_limit: self.phases.phase_limit(phase),
+            phase_calls_limit: self.effective_phase_model_call_limit(),
             last_successful_action: self.last_successful_action.clone(),
             usage: self.tool_usage.clone(),
             estimated_cost_micros: self.cost_guard.estimated_cost_micros,

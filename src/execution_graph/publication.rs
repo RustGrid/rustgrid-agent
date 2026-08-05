@@ -68,10 +68,23 @@ pub enum MissionOutcome {
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IncompleteReason {
+    ValidationRerunPending,
     ValidationRepairProducedNoMutation,
     ValidationRepairProducedNoMeaningfulMutation,
     ValidationInfrastructureFailure,
     TargetOperationConflict,
+}
+
+impl IncompleteReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ValidationRerunPending => "validation_rerun_pending",
+            Self::ValidationRepairProducedNoMutation => "validation_failed_repair_incomplete",
+            Self::ValidationRepairProducedNoMeaningfulMutation => "validation_repair_unresolved",
+            Self::ValidationInfrastructureFailure => "validation_infrastructure_incomplete",
+            Self::TargetOperationConflict => "target_operation_conflict",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

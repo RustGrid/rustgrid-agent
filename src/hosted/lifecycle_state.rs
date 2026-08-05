@@ -446,6 +446,8 @@ pub(super) struct WorkerNotebook {
     #[serde(default)]
     pub(super) last_orchestration_decision_key: Option<String>,
     #[serde(default)]
+    pub(super) phase_persistence_failure_code: Option<String>,
+    #[serde(default)]
     pub(super) finalization_revalidation: Option<FinalizationRevalidation>,
     #[serde(default)]
     pub(super) completion_artifact: Option<PersistedCompletionArtifact>,
@@ -1131,6 +1133,7 @@ pub(super) fn new_worker_notebook(
         last_orchestration_decision_key: None,
         finalization_revalidation: None,
         completion_artifact: None,
+        phase_persistence_failure_code: None,
         orchestration: HostedOrchestrationCheckpoint::bootstrap(manifest, &repository_fingerprint),
     };
     if let Some(partial_run) = partial_run {

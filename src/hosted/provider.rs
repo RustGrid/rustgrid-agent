@@ -122,8 +122,61 @@ pub(super) enum PhaseDecision {
 pub(super) struct DecisionExecutionResult {
     pub(super) decision: ExecutionDecision,
     pub(super) phase_decision: PhaseDecision,
-    pub(super) persistence_error: Option<String>,
+    pub(super) persistence_error: Option<PhasePersistenceFailure>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PhasePersistenceFailureKind {
+    Contract,
+    Persistence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct PhasePersistenceFailure {
+    pub(super) kind: PhasePersistenceFailureKind,
+    pub(super) from_phase: ExecutionPhase,
+    pub(super) phase: ExecutionPhase,
+    pub(super) safe_error: String,
+}
+
+impl PhasePersistenceFailure {
+    pub(super) const fn category(&self) -> &'static str {
+        match self.kind {
+            PhasePersistenceFailureKind::Contract => "OrchestrationContractFailure",
+            PhasePersistenceFailureKind::Persistence => "OrchestrationPersistenceFailure",
+        }
+    }
+
+    pub(super) const fn code(&self) -> &'static str {
+        match self.kind {
+            PhasePersistenceFailureKind::Contract => "phase_transition_event_invalid",
+            PhasePersistenceFailureKind::Persistence => "phase_transition_persistence_failed",
+        }
+    }
+
+    pub(super) const fn process_health(&self) -> &'static str {
+        match self.kind {
+            PhasePersistenceFailureKind::Contract => "failed",
+            PhasePersistenceFailureKind::Persistence => "degraded",
+        }
+    }
+}
+
+impl std::fmt::Display for PhasePersistenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} while persisting `{}` to `{}`: {}",
+            self.code(),
+            self.from_phase.as_str(),
+            self.phase.as_str(),
+            self.safe_error
+        )
+    }
+}
+
+impl std::error::Error for PhasePersistenceFailure {}
 
 pub(super) const fn execution_decision_name(decision: &ExecutionDecision) -> &'static str {
     match decision {
@@ -215,6 +268,103 @@ pub(super) fn legal_phase_transition(from: ExecutionPhase, to: ExecutionPhase) -
             )
             | (ExecutionPhase::Publication, ExecutionPhase::Validation)
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct PhaseTransitionPreflight {
+    pub(super) schema_valid: bool,
+    pub(super) transition_allowed: bool,
+    pub(super) required_fields_present: bool,
+    pub(super) graph_revision_matches: bool,
+    pub(super) notebook_revision_matches: bool,
+}
+
+impl PhaseTransitionPreflight {
+    pub(super) const fn passed(self) -> bool {
+        self.schema_valid
+            && self.transition_allowed
+            && self.required_fields_present
+            && self.graph_revision_matches
+            && self.notebook_revision_matches
+    }
+}
+
+/// Validates the worker event against the same local phase table that guards
+/// lifecycle mutation. This prevents a deterministic contract mismatch from
+/// being discovered only after the backend returns HTTP 400.
+pub(super) fn preflight_phase_transition(
+    payload: &Value,
+    from: ExecutionPhase,
+    to: ExecutionPhase,
+    graph_revision: u64,
+    notebook_revision: u64,
+) -> PhaseTransitionPreflight {
+    let decision = payload.get("decision").and_then(Value::as_str);
+    let schema_valid = payload.is_object()
+        && payload.get("event_type").and_then(Value::as_str) == Some("worker.phase_transition")
+        && serde_json::from_value::<ExecutionPhase>(
+            payload.get("from_phase").cloned().unwrap_or(Value::Null),
+        )
+        .ok()
+            == Some(from)
+        && serde_json::from_value::<ExecutionPhase>(
+            payload.get("phase").cloned().unwrap_or(Value::Null),
+        )
+        .ok()
+            == Some(to)
+        && payload
+            .get("transition_payload_version")
+            .and_then(Value::as_u64)
+            == Some(1);
+    let required_fields_present = [
+        "decision",
+        "reason_code",
+        "source",
+        "source_tree_hash",
+        "occurred_at",
+    ]
+    .iter()
+    .all(|field| {
+        payload
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    });
+    PhaseTransitionPreflight {
+        schema_valid,
+        transition_allowed: legal_phase_transition(from, to)
+            && !matches!((from, to), (ExecutionPhase::Repair, ExecutionPhase::DiffReview)
+                if decision != Some("review_incomplete_diff")),
+        required_fields_present,
+        graph_revision_matches: payload.get("graph_revision").and_then(Value::as_u64)
+            == Some(graph_revision),
+        notebook_revision_matches: payload.get("notebook_revision").and_then(Value::as_u64)
+            == Some(notebook_revision),
+    }
+}
+
+pub(in crate::hosted) fn validation_rerun_completed_event(
+    session: &crate::execution_graph::ValidationRepairSession,
+    gate_id: &crate::execution_graph::ExecutionNodeId,
+    evidence: &crate::execution_graph::ValidationEvidenceRecord,
+    status: &str,
+    command_runs: u32,
+    local_model_calls_remaining: u32,
+    mission_model_calls_remaining: u32,
+) -> Value {
+    json!({
+        "event_type": "worker.validation_rerun_completed",
+        "repair_session_id": session.session_id,
+        "originating_validation_gate": gate_id,
+        "failure_revision": session.current_assertion_set_revision,
+        "repository_fingerprint": evidence.repository_fingerprint,
+        "validation_evidence_id": evidence.evidence_id,
+        "status": status,
+        "command_runs": command_runs,
+        "model_calls_consumed": 0,
+        "local_model_calls_remaining": local_model_calls_remaining,
+        "mission_model_calls_remaining": mission_model_calls_remaining,
+    })
 }
 
 pub(super) fn hosted_tools() -> Vec<Value> {

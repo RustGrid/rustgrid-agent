@@ -388,14 +388,20 @@ pub fn reconcile_execution(
                 .as_ref()
                 .is_some_and(|target| !attempted_targets.contains(target.path.as_str()))
         });
-        let validation_budget_exhausted =
-            snapshot.graph.node(&failure.node_id).is_some_and(|node| {
+        let validation_budget_exhausted = validation_repair_session_exhausted(snapshot, failure);
+        let mission_repair_calls_remaining =
+            snapshot.budget.mission.max_model_calls.saturating_sub(
                 snapshot
                     .budget
-                    .usage_for(&node.id)
-                    .validation_repair_attempts
-                    >= node.budget.max_repair_attempts.max(1)
-            });
+                    .total_model_calls
+                    .saturating_add(snapshot.budget.total_model_calls_reserved),
+            );
+        let mission_repair_cost_remaining = snapshot.budget.mission.max_cost_micros.saturating_sub(
+            snapshot
+                .budget
+                .total_cost_micros
+                .saturating_add(snapshot.budget.total_cost_micros_reserved),
+        );
         if matches!(latest_repair, Some(RepairResult::NoMutation { .. }))
             && (next_target.is_none() || validation_budget_exhausted)
         {
@@ -452,7 +458,11 @@ pub fn reconcile_execution(
                 ),
             ));
         };
-        if validation_budget_exhausted || repair_budget_exhausted(snapshot, target_node) {
+        if validation_budget_exhausted
+            || repair_budget_exhausted(snapshot, target_node)
+            || mission_repair_calls_remaining < ValidationRepairBudget::MINIMUM_MODEL_CALLS
+            || mission_repair_cost_remaining == 0
+        {
             if snapshot.current_repository.has_changes() {
                 return incomplete_diff_decision(
                     snapshot,
@@ -877,6 +887,11 @@ fn decision_for_node(
                 gate,
             })
         }
+        ExecutionNodeKind::ValidationRepairSession => Err(OrchestrationInvariantError::for_node(
+            "repair_session_selected_as_runnable",
+            node.id.clone(),
+            "validation repair sessions are reconciled before ordinary runnable nodes",
+        )),
         ExecutionNodeKind::DiffReview => Ok(ExecutionDecision::ReviewDiff {
             node_id: node.id.clone(),
         }),
@@ -1580,13 +1595,8 @@ fn repair_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -
                         .as_ref()
                         .is_some_and(|target| assertion.implicated_paths.contains(&target.path))
                 }))
-    }) && let Some(validation_node) = snapshot.graph.node(&validation_failure.node_id)
-    {
-        return snapshot
-            .budget
-            .usage_for(&validation_node.id)
-            .validation_repair_attempts
-            >= validation_node.budget.max_repair_attempts.max(1);
+    }) {
+        return validation_repair_session_exhausted(snapshot, validation_failure);
     }
     let repair_pending = node.status == ExecutionNodeStatus::FailedRecoverable
         || snapshot.failures.unresolved().any(|failure| {
@@ -1598,6 +1608,26 @@ fn repair_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -
         });
     repair_pending
         && snapshot.budget.usage_for(&node.id).repair_attempts >= node.budget.max_repair_attempts
+}
+
+fn validation_repair_session_exhausted(
+    snapshot: &ExecutionSnapshot,
+    failure: &FailureRecord,
+) -> bool {
+    let Some(session) = snapshot.budget.repair_session_for_failure(&failure.id) else {
+        return false;
+    };
+    let owner = ExecutionNodeId::new(session.session_id.clone());
+    let usage = snapshot.budget.usage_for(&owner);
+    session.attempted_targets.len()
+        >= usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX)
+        || usage.validation_repair_attempts >= session.budget.max_target_attempts
+        || usage
+            .model_calls_consumed
+            .saturating_add(usage.model_calls_reserved)
+            >= session.budget.max_model_calls
+        || usage.cost_micros.saturating_add(usage.cost_micros_reserved)
+            >= session.budget.max_cost_micros
 }
 
 /// Classifies a duplicate mutation deterministically before invoking a tool.
@@ -2172,7 +2202,6 @@ mod tests {
                 fingerprint: validation_fingerprint,
             })
             .unwrap();
-
         assert!(
             state
                 .graph
@@ -2214,6 +2243,14 @@ mod tests {
                 ),
             })
             .unwrap();
+        let repair_session_id = ExecutionNodeId::new(
+            crate::execution_graph::BudgetState::repair_session_id(&failure.id),
+        );
+        assert_eq!(
+            state.graph.node(&repair_session_id).map(|node| node.status),
+            Some(ExecutionNodeStatus::Running),
+            "repair ownership must be visible as a graph node"
+        );
         state
             .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
                 sequence: 5,
@@ -2228,6 +2265,10 @@ mod tests {
                 attempt: None,
             })
             .unwrap();
+        assert_eq!(
+            state.graph.node(&repair_session_id).map(|node| node.status),
+            Some(ExecutionNodeStatus::Skipped),
+        );
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
             ExecutionDecision::ExecuteTarget {

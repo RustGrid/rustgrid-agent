@@ -1399,14 +1399,16 @@ fn run_hosted_execution(
                     agent.evaluate_completion(&implementation, &validation, &review_paths)?;
                 if let Some(reason) = incomplete_review_reason {
                     let (failure_category, reason_code, failure_phase) = match reason {
+                        crate::execution_graph::IncompleteReason::ValidationRerunPending =>
+                            ("validation_pending", reason.code(), "validation"),
                         crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMutation =>
-                            ("validation_failure", "validation_failed_repair_incomplete", "repair"),
+                            ("validation_failure", reason.code(), "repair"),
                         crate::execution_graph::IncompleteReason::ValidationRepairProducedNoMeaningfulMutation =>
-                            ("validation_repair_failure", "validation_repair_unresolved", "repair"),
+                            ("validation_repair_failure", reason.code(), "repair"),
                         crate::execution_graph::IncompleteReason::ValidationInfrastructureFailure =>
-                            ("infrastructure_failure", "validation_infrastructure_incomplete", "validation"),
+                            ("infrastructure_failure", reason.code(), "validation"),
                         crate::execution_graph::IncompleteReason::TargetOperationConflict =>
-                            ("mutation_conflict", "target_operation_conflict", "implementation"),
+                            ("mutation_conflict", reason.code(), "implementation"),
                     };
                     completeness.status = CompletionStatus::Partial;
                     completeness.implementation_completeness = ImplementationCompleteness::Partial;
@@ -1758,8 +1760,17 @@ fn run_hosted_execution(
                 ),
                 "mission_outcome": agent.completion_outcome,
                 "graph_outcome": agent.completion_outcome,
-                "process_health": "healthy",
-                "reason_code": terminal_reason_code(completeness.status),
+                "process_health": if agent.phase_persistence_failure.is_some()
+                    || agent.notebook.phase_persistence_failure_code.is_some()
+                {
+                    "degraded"
+                } else {
+                    "healthy"
+                },
+                "reason_code": agent.phase_persistence_failure.as_ref()
+                    .map(PhasePersistenceFailure::code)
+                    .or(agent.notebook.phase_persistence_failure_code.as_deref())
+                    .unwrap_or_else(|| terminal_reason_code(completeness.status)),
                 "publication": agent.notebook.orchestration.publication,
                 "remaining_work": agent.notebook.remaining_work_v2,
                 "notebook": agent.notebook,
@@ -1767,6 +1778,11 @@ fn run_hosted_execution(
             "terminal domain result",
         );
         let terminal_telemetry = TerminalTelemetry {
+            phase_persistence_failure_code: agent
+                .phase_persistence_failure
+                .as_ref()
+                .map(|failure| failure.code().to_owned())
+                .or_else(|| agent.notebook.phase_persistence_failure_code.clone()),
             model_calls_used: agent.phases.total_calls(),
             input_tokens: agent.cost_guard.input_tokens,
             output_tokens: agent.cost_guard.output_tokens,

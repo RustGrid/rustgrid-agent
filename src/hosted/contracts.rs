@@ -310,6 +310,8 @@ pub(super) struct HostedResult {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(super) struct TerminalTelemetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) phase_persistence_failure_code: Option<String>,
     pub(super) model_calls_used: usize,
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,

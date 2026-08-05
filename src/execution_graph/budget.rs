@@ -113,6 +113,14 @@ pub struct ModelCallReservation {
     pub estimated_cost_micros: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationRepairReallocation {
+    pub session_id: RepairSessionId,
+    pub model_calls: u32,
+    pub cost_micros: u64,
+    pub budget: ValidationRepairBudget,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BudgetState {
     pub mission: MissionBudget,
@@ -126,12 +134,23 @@ pub struct BudgetState {
     pub elapsed: Duration,
     #[serde(default)]
     pub node_usage: BTreeMap<ExecutionNodeId, NodeBudgetUsage>,
+    /// Deterministic validation work is accounted independently from model
+    /// call admission so a command rerun can never consume repair capacity.
+    #[serde(default)]
+    pub validation_gate_usage: BTreeMap<ExecutionNodeId, ValidationGateBudget>,
     #[serde(default)]
     pub progress_events: Vec<ProgressEvent>,
     #[serde(default)]
     pub model_call_breakdown: ModelCallBreakdown,
     pub progress_score: u64,
     pub progress_window: ProgressWindow,
+    /// Model-backed validation repair uses a synthetic, persisted budget
+    /// owner rather than borrowing the failed gate's deterministic budget.
+    #[serde(default)]
+    pub validation_repair_sessions: BTreeMap<RepairSessionId, ValidationRepairSession>,
+    #[serde(default)]
+    pub validation_failure_revisions:
+        BTreeMap<ValidationId, Vec<ValidationFailureRevision>>,
 }
 
 impl Default for BudgetState {
@@ -150,10 +169,375 @@ impl BudgetState {
             total_cost_micros: 0,
             elapsed: Duration::ZERO,
             node_usage: BTreeMap::new(),
+            validation_gate_usage: BTreeMap::new(),
             progress_events: Vec::new(),
             model_call_breakdown: ModelCallBreakdown::default(),
             progress_score: 0,
             progress_window: ProgressWindow::default(),
+            validation_repair_sessions: BTreeMap::new(),
+            validation_failure_revisions: BTreeMap::new(),
+        }
+    }
+
+    pub fn record_validation_command_run(&mut self, node_id: ExecutionNodeId) {
+        let usage = self.validation_gate_usage.entry(node_id).or_default();
+        usage.command_runs = usage.command_runs.saturating_add(1);
+    }
+
+    pub fn record_validation_parsing_call(&mut self, node_id: ExecutionNodeId) {
+        let usage = self.validation_gate_usage.entry(node_id).or_default();
+        usage.parsing_calls = usage.parsing_calls.saturating_add(1);
+    }
+
+    pub fn record_validation_diagnosis_call(&mut self, node_id: ExecutionNodeId) {
+        let usage = self.validation_gate_usage.entry(node_id).or_default();
+        usage.diagnosis_calls = usage.diagnosis_calls.saturating_add(1);
+    }
+
+    pub fn repair_session_id(failure_id: &FailureId) -> RepairSessionId {
+        format!("validation-repair-session:{failure_id}")
+    }
+
+    pub fn repair_session_for_failure(
+        &self,
+        failure_id: &FailureId,
+    ) -> Option<&ValidationRepairSession> {
+        self.validation_repair_sessions
+            .get(&Self::repair_session_id(failure_id))
+            .or_else(|| {
+                self.validation_repair_sessions
+                    .values()
+                    .find(|session| session.failed_validation_id == failure_id.to_string())
+            })
+    }
+
+    pub fn repair_session_for_failure_mut(
+        &mut self,
+        failure_id: &FailureId,
+    ) -> Option<&mut ValidationRepairSession> {
+        let direct = Self::repair_session_id(failure_id);
+        let key = if self.validation_repair_sessions.contains_key(&direct) {
+            direct
+        } else {
+            self.validation_repair_sessions
+                .iter()
+                .find(|(_, session)| session.failed_validation_id == failure_id.to_string())
+                .map(|(key, _)| key.clone())?
+        };
+        self.validation_repair_sessions.get_mut(&key)
+    }
+
+    pub fn repair_budget_owner(
+        &self,
+        failure_id: &FailureId,
+    ) -> Option<(ExecutionNodeId, NodeBudget)> {
+        let session = self.repair_session_for_failure(failure_id)?;
+        Some((
+            ExecutionNodeId::new(session.session_id.clone()),
+            session.budget.as_node_budget(),
+        ))
+    }
+
+    pub fn create_validation_failure_revision(
+        &mut self,
+        failure: &FailureRecord,
+        sequence: u64,
+    ) -> ValidationFailureRevision {
+        let revisions = self
+            .validation_failure_revisions
+            .entry(failure.node_id.to_string())
+            .or_default();
+        let revision = revisions.last().map_or(1, |prior| prior.revision.saturating_add(1));
+        let assertion_ids = failure
+            .assertion_failures
+            .iter()
+            .enumerate()
+            .map(|(index, assertion)| {
+                format!(
+                    "{}:{}:{}:{}",
+                    assertion.test_file,
+                    assertion.source_line.unwrap_or_default(),
+                    assertion.test_name,
+                    index
+                )
+            })
+            .collect();
+        let created = ValidationFailureRevision {
+            validation_id: failure.node_id.to_string(),
+            revision,
+            repository_fingerprint: RepositoryFingerprint::new(
+                failure.repository_fingerprint.clone(),
+            ),
+            assertion_ids,
+            created_at: format!("event-sequence:{sequence}"),
+        };
+        revisions.push(created.clone());
+        created
+    }
+
+    pub fn current_validation_failure_revision(
+        &self,
+        validation_id: &str,
+        repository_fingerprint: &str,
+    ) -> Option<&ValidationFailureRevision> {
+        self.validation_failure_revisions
+            .get(validation_id)?
+            .iter()
+            .rev()
+            .find(|revision| {
+                revision.repository_fingerprint.as_str() == repository_fingerprint
+            })
+    }
+
+    pub fn ensure_validation_repair_session(
+        &mut self,
+        failure: &FailureRecord,
+        inputs: ValidationRepairBudgetInputs,
+    ) -> Result<&ValidationRepairSession, GraphInvariantError> {
+        let session_id = Self::repair_session_id(&failure.id);
+        let existing_session_id = self
+            .validation_repair_sessions
+            .iter()
+            .find(|(_, session)| {
+                session.originating_gate_id == failure.node_id
+                    && session.failed_validation_id == failure.id.to_string()
+            })
+            .map(|(key, _)| key.clone());
+        let session_id = existing_session_id.unwrap_or(session_id);
+        if !self.validation_repair_sessions.contains_key(&session_id) {
+            let mission_calls_remaining = self
+                .mission
+                .max_model_calls
+                .saturating_sub(self.total_model_calls.saturating_add(self.total_model_calls_reserved));
+            let mission_cost_remaining = self
+                .mission
+                .max_cost_micros
+                .saturating_sub(self.total_cost_micros.saturating_add(self.total_cost_micros_reserved));
+            let assertion_bound = inputs.failed_assertion_count.max(1);
+            let implicated_bound = inputs.implicated_target_count.max(1);
+            let policy_bound = self.mission.max_target_repair_rounds.max(1);
+            let target_attempts = implicated_bound
+                .min(policy_bound)
+                .min(if inputs.originating_gate_required {
+                    policy_bound
+                } else {
+                    1
+                });
+            let diagnosis_calls = 1_u32.saturating_add(assertion_bound.saturating_sub(1) / 4);
+            let desired_calls = diagnosis_calls.saturating_add(target_attempts);
+            let size_context_rebuilds = u32::try_from(
+                inputs
+                    .implicated_target_bytes
+                    .saturating_add(256 * 1024 - 1)
+                    / (256 * 1024),
+            )
+            .unwrap_or(u32::MAX)
+            .max(1)
+            .min(target_attempts);
+            let budget = ValidationRepairBudget {
+                max_model_calls: desired_calls.min(mission_calls_remaining),
+                max_target_attempts: target_attempts,
+                max_repository_writes: target_attempts,
+                max_context_rebuilds: target_attempts.saturating_add(size_context_rebuilds),
+                max_cost_micros: mission_cost_remaining,
+            };
+            budget.validate(target_attempts > 1).map_err(|_| {
+                GraphInvariantError::new(
+                    "validation repair admission policy is misconfigured or lacks the minimum mission capacity",
+                )
+            })?;
+            let current_revision = self
+                .current_validation_failure_revision(
+                    failure.node_id.as_str(),
+                    &failure.repository_fingerprint,
+                )
+                .map_or(0, |revision| revision.revision);
+            self.validation_repair_sessions.insert(
+                session_id.clone(),
+                ValidationRepairSession {
+                    session_id: session_id.clone(),
+                    failed_validation_id: failure.id.to_string(),
+                    originating_gate_id: failure.node_id.clone(),
+                    budget,
+                    status: ValidationRepairSessionStatus::Active,
+                    attempted_targets: Vec::new(),
+                    current_assertion_set_revision: current_revision,
+                    stop_reason: None,
+                    reallocated_model_calls: 0,
+                    reallocated_cost_micros: 0,
+                    repository_writes_consumed: 0,
+                    context_rebuilds_consumed: 0,
+                    budget_inputs: inputs,
+                },
+            );
+        }
+        if let Some(session) = self.validation_repair_sessions.get_mut(&session_id) {
+            session.status = ValidationRepairSessionStatus::Active;
+            session.stop_reason = None;
+        }
+        self.validation_repair_sessions
+            .get(&session_id)
+            .ok_or_else(|| GraphInvariantError::new("validation repair session was not materialized"))
+    }
+
+    pub fn record_validation_repair_attempt_for_failure(
+        &mut self,
+        failure_id: &FailureId,
+        mut attempt: ValidationRepairAttempt,
+    ) -> Result<(), GraphInvariantError> {
+        let session = self.repair_session_for_failure_mut(failure_id).ok_or_else(|| {
+            GraphInvariantError::new("validation repair attempt has no materialized session")
+        })?;
+        if attempt.attempt_number == 0 {
+            attempt.attempt_number = u32::try_from(session.attempted_targets.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+        }
+        if attempt.failure_revision == 0 {
+            attempt.failure_revision = session.current_assertion_set_revision;
+        }
+        session.attempted_targets.push(attempt);
+        Ok(())
+    }
+
+    pub fn record_validation_repair_context_rebuild(
+        &mut self,
+        failure_id: &FailureId,
+    ) -> Result<(), GraphInvariantError> {
+        let session = self.repair_session_for_failure_mut(failure_id).ok_or_else(|| {
+            GraphInvariantError::new("validation repair context rebuild has no session")
+        })?;
+        if session.context_rebuilds_consumed >= session.budget.max_context_rebuilds {
+            return Err(GraphInvariantError::new(
+                "validation repair context rebuild budget is exhausted",
+            ));
+        }
+        session.context_rebuilds_consumed = session.context_rebuilds_consumed.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn record_validation_repair_repository_write(
+        &mut self,
+        failure_id: &FailureId,
+    ) -> Result<(), GraphInvariantError> {
+        let session = self.repair_session_for_failure_mut(failure_id).ok_or_else(|| {
+            GraphInvariantError::new("validation repair repository write has no session")
+        })?;
+        if session.repository_writes_consumed >= session.budget.max_repository_writes {
+            return Err(GraphInvariantError::new(
+                "validation repair repository-write budget is exhausted",
+            ));
+        }
+        session.repository_writes_consumed = session.repository_writes_consumed.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn reallocate_validation_repair_capacity(
+        &mut self,
+        failure_id: &FailureId,
+        requested_model_calls: u32,
+        requested_cost_micros: u64,
+    ) -> Result<ValidationRepairReallocation, GraphInvariantError> {
+        let progress_allows_reallocation = self.progress_events.last().is_none_or(|progress| {
+            self.total_model_calls
+                .saturating_sub(progress.model_calls_at_event)
+                < self.progress_window.max_model_calls_without_progress
+        });
+        if !progress_allows_reallocation {
+            return Err(GraphInvariantError::new(
+                "validation repair reallocation is blocked by the progress window",
+            ));
+        }
+        let session = self.repair_session_for_failure(failure_id).cloned().ok_or_else(|| {
+            GraphInvariantError::new("validation repair reallocation has no session")
+        })?;
+        if session.attempted_targets.len()
+            >= usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX)
+        {
+            return Err(GraphInvariantError::new(
+                "validation repair reallocation cannot exceed the per-target attempt policy",
+            ));
+        }
+        let owner = ExecutionNodeId::new(session.session_id.clone());
+        let usage = self.usage_for(&owner);
+        let mission_calls_remaining = self.mission.max_model_calls.saturating_sub(
+            self.total_model_calls
+                .saturating_add(self.total_model_calls_reserved),
+        );
+        let mission_cost_remaining = self.mission.max_cost_micros.saturating_sub(
+            self.total_cost_micros
+                .saturating_add(self.total_cost_micros_reserved),
+        );
+        let local_calls_remaining = session.budget.max_model_calls.saturating_sub(
+            usage
+                .model_calls_consumed
+                .saturating_add(usage.model_calls_reserved),
+        );
+        let local_cost_remaining = session.budget.max_cost_micros.saturating_sub(
+            usage
+                .cost_micros
+                .saturating_add(usage.cost_micros_reserved),
+        );
+        let model_calls = requested_model_calls.min(
+            mission_calls_remaining.saturating_sub(local_calls_remaining),
+        );
+        let cost_micros = requested_cost_micros.min(
+            mission_cost_remaining.saturating_sub(local_cost_remaining),
+        );
+        if model_calls == 0 && cost_micros == 0 {
+            return Err(GraphInvariantError::new(
+                "validation repair reallocation has no mission capacity available",
+            ));
+        }
+        let session = self
+            .repair_session_for_failure_mut(failure_id)
+            .expect("validated repair session remains present");
+        session.budget.max_model_calls =
+            session.budget.max_model_calls.saturating_add(model_calls);
+        session.budget.max_cost_micros =
+            session.budget.max_cost_micros.saturating_add(cost_micros);
+        session.reallocated_model_calls =
+            session.reallocated_model_calls.saturating_add(model_calls);
+        session.reallocated_cost_micros =
+            session.reallocated_cost_micros.saturating_add(cost_micros);
+        Ok(ValidationRepairReallocation {
+            session_id: session.session_id.clone(),
+            model_calls,
+            cost_micros,
+            budget: session.budget.clone(),
+        })
+    }
+
+    pub fn continue_validation_repair_session(
+        &mut self,
+        failure: &FailureRecord,
+        failure_revision: u64,
+    ) {
+        let direct_key = Self::repair_session_id(&failure.id);
+        if self.validation_repair_sessions.contains_key(&direct_key) {
+            if let Some(session) = self.validation_repair_sessions.get_mut(&direct_key) {
+                session.current_assertion_set_revision = failure_revision;
+                session.status = ValidationRepairSessionStatus::Active;
+                session.stop_reason = None;
+            }
+            return;
+        }
+        let prior_key = self
+            .validation_repair_sessions
+            .iter()
+            .find(|(_, session)| {
+                session.originating_gate_id == failure.node_id
+                    && session.status == ValidationRepairSessionStatus::ReadyForRerun
+            })
+            .map(|(key, _)| key.clone());
+        let Some(prior_key) = prior_key else {
+            return;
+        };
+        if let Some(session) = self.validation_repair_sessions.get_mut(&prior_key) {
+            session.failed_validation_id = failure.id.to_string();
+            session.current_assertion_set_revision = failure_revision;
+            session.status = ValidationRepairSessionStatus::Active;
+            session.stop_reason = None;
         }
     }
 
@@ -198,20 +582,59 @@ impl BudgetState {
                 "mission reservation totals do not match per-node reservations",
             ));
         }
-        for (node_id, usage) in &self.node_usage {
-            let node = graph.node(node_id).ok_or_else(|| {
+        for session in self.validation_repair_sessions.values() {
+            let gate = graph.node(&session.originating_gate_id).ok_or_else(|| {
                 GraphInvariantError::new(format!(
-                    "budget usage refers to unknown execution node `{node_id}`"
+                    "validation repair session `{}` refers to unknown gate `{}`",
+                    session.session_id, session.originating_gate_id
                 ))
             })?;
+            if !gate.kind.is_validation() {
+                return Err(GraphInvariantError::new(format!(
+                    "validation repair session `{}` does not originate from a validation gate",
+                    session.session_id
+                )));
+            }
+            session
+                .budget
+                .validate(session.budget.max_target_attempts > 1)?;
+            if session.attempted_targets.len()
+                > usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX)
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "validation repair session `{}` persisted more attempts than its target budget",
+                    session.session_id
+                )));
+            }
+            if session.repository_writes_consumed > session.budget.max_repository_writes
+                || session.context_rebuilds_consumed > session.budget.max_context_rebuilds
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "validation repair session `{}` exceeded its repository-write or context-rebuild budget",
+                    session.session_id
+                )));
+            }
+        }
+        for (node_id, usage) in &self.node_usage {
+            let owned_budget;
+            let budget = if let Some(node) = graph.node(node_id) {
+                &node.budget
+            } else if let Some(session) = self.validation_repair_sessions.get(node_id.as_str()) {
+                owned_budget = session.budget.as_node_budget();
+                &owned_budget
+            } else {
+                return Err(GraphInvariantError::new(format!(
+                    "budget usage refers to unknown execution node or repair session `{node_id}`"
+                )));
+            };
             if usage
                 .model_calls_consumed
                 .saturating_add(usage.model_calls_reserved)
-                > node.budget.max_model_calls
+                > budget.max_model_calls
                 || usage
                     .cost_micros
                     .saturating_add(usage.cost_micros_reserved)
-                    > node.budget.max_cost_micros
+                    > budget.max_cost_micros
             {
                 return Err(GraphInvariantError::new(format!(
                     "node `{node_id}` reservations exceed its signed budget"

@@ -589,6 +589,9 @@ pub(super) fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
     if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
         return failure.category;
     }
+    if let Some(failure) = error.downcast_ref::<PhasePersistenceFailure>() {
+        return failure.category();
+    }
     if error
         .downcast_ref::<HostedHttpError>()
         .is_some_and(|failure| failure.provider_contacted() == Some(true))
@@ -597,7 +600,7 @@ pub(super) fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
     } else if is_hosted_orchestration_invariant_error(error) {
         "execution_graph_initialization_failed"
     } else {
-        "orchestration_initialization_failed"
+        "orchestration_execution_failed"
     }
 }
 
@@ -647,9 +650,27 @@ pub(super) fn recovery_completion_evaluation(
     evaluation.evaluation_source = EvaluationSource::OrchestratorFallback;
     evaluation.confidence = 1.0;
     let validation_partial = snapshot.has_incomplete_diff_review_request();
+    let validation_stale_after_repair =
+        snapshot
+            .budget
+            .validation_repair_sessions
+            .values()
+            .any(|session| {
+                session.status
+                    == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+                    && session.attempted_targets.iter().any(|attempt| {
+                        attempt.outcome
+                        == crate::execution_graph::ValidationRepairMutationOutcome::MutationApplied
+                        && attempt.repository_fingerprint_after.as_str()
+                            == snapshot.current_repository.fingerprint
+                    })
+            });
     push_unique(
         &mut evaluation.remaining_implementation_work,
-        if validation_partial {
+        if validation_stale_after_repair {
+            "Validation is stale after the applied repair and must be rerun before merge; the rerun was prevented by the recorded orchestration limitation."
+                .into()
+        } else if validation_partial {
             "Resume from validation repair, reconcile the recorded assertion failures, and rerun the pending gates."
                 .into()
         } else {
@@ -670,7 +691,10 @@ pub(super) fn recovery_completion_evaluation(
             ),
         );
     }
-    evaluation.summary = if validation_partial {
+    evaluation.summary = if validation_stale_after_repair {
+        "RustGrid preserved the applied repository diff in a draft recovery pull request. Focused validation failed before the repair; the repair was applied, but validation is stale afterward and must be rerun before merge."
+            .into()
+    } else if validation_partial {
         "RustGrid preserved the applied repository diff in a draft recovery pull request after focused validation failed and bounded repair produced no safe mutation."
             .into()
     } else {
@@ -956,6 +980,14 @@ pub(super) fn attempt_safe_recovery_publication_with(
             return Ok((RecoveryPublicationResult::NotApplicable, None));
         }
     };
+    let recovery_reason_code = snapshot
+        .budget
+        .validation_repair_sessions
+        .values()
+        .any(|session| {
+            session.status == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+        })
+        .then(|| crate::execution_graph::IncompleteReason::ValidationRerunPending.code());
     agent.append_event_recoverable(
         "progress",
         json!({
@@ -967,6 +999,7 @@ pub(super) fn attempt_safe_recovery_publication_with(
             "branch_state": "persisted",
             "selected_next_decision": "publish_recovery_draft",
             "result": "applicable",
+            "reason_code": recovery_reason_code,
         }),
         "recovery publication evaluation",
     );
@@ -1004,6 +1037,7 @@ pub(super) fn attempt_safe_recovery_publication_with(
             "publication_mode": "draft_recovery",
             "changed_paths": authorization.changed_paths,
             "validation_evidence_ids": authorization.validation_evidence_ids,
+            "reason_code": recovery_reason_code,
             "original_failure": truncate_text(&original_error.to_string(), 2_000),
         }),
         "recovery publication start",
@@ -1098,6 +1132,11 @@ pub(super) fn attempt_safe_recovery_publication_with(
     agent.persist_orchestration_checkpoint("recovery_run_finished", true)?;
 
     let terminal_telemetry = TerminalTelemetry {
+        phase_persistence_failure_code: agent
+            .phase_persistence_failure
+            .as_ref()
+            .map(|failure| failure.code().to_owned())
+            .or_else(|| agent.notebook.phase_persistence_failure_code.clone()),
         model_calls_used: agent.phases.total_calls(),
         input_tokens: agent.cost_guard.input_tokens,
         output_tokens: agent.cost_guard.output_tokens,
@@ -1412,6 +1451,23 @@ pub(super) fn run_graph_validation_sequence(
             node_remaining.min(mission_remaining)
         };
         agent.ensure_active_or_checkpoint_cancellation()?;
+        let rerun_session = agent
+            .notebook
+            .orchestration
+            .budget
+            .validation_repair_sessions
+            .values()
+            .find(|session| {
+                session.originating_gate_id == node_id
+                    && session.status
+                        == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+            })
+            .cloned();
+        agent
+            .notebook
+            .orchestration
+            .budget
+            .record_validation_command_run(node_id.clone());
         let validation_started = Instant::now();
         let mut validation_ledger = agent.notebook.validation_evidence.clone();
         let mut required_gate_projection = agent.notebook.required_gates.clone();
@@ -1479,6 +1535,11 @@ pub(super) fn run_graph_validation_sequence(
             fallback_attempt,
             validation_started.elapsed(),
         );
+        agent
+            .notebook
+            .orchestration
+            .budget
+            .record_validation_parsing_call(node_id.clone());
         if !agent
             .notebook
             .orchestration
@@ -1537,12 +1598,69 @@ pub(super) fn run_graph_validation_sequence(
                 agent.append_execution_domain_event(
                     crate::execution_graph::ExecutionDomainEvent::ValidationPassed {
                         sequence: agent.next_domain_event_sequence(),
-                        node_id,
-                        evidence_id: evidence.evidence_id,
-                        fingerprint: evidence.fingerprint,
+                        node_id: node_id.clone(),
+                        evidence_id: evidence.evidence_id.clone(),
+                        fingerprint: evidence.fingerprint.clone(),
                     },
                 )?;
             }
+        }
+        if let Some(session) = rerun_session {
+            let status = match evidence.status {
+                crate::execution_graph::ValidationEvidenceStatus::Passed => "passed",
+                crate::execution_graph::ValidationEvidenceStatus::Failed => "failed",
+                crate::execution_graph::ValidationEvidenceStatus::TimedOut => "timed_out",
+                crate::execution_graph::ValidationEvidenceStatus::Cancelled => "cancelled",
+                crate::execution_graph::ValidationEvidenceStatus::Running => "running",
+                crate::execution_graph::ValidationEvidenceStatus::Superseded => "superseded",
+            };
+            let command_runs = agent
+                .notebook
+                .orchestration
+                .budget
+                .validation_gate_usage
+                .get(&node_id)
+                .map_or(0, |usage| usage.command_runs);
+            let owner = crate::execution_graph::ExecutionNodeId::new(session.session_id.clone());
+            let usage = agent.notebook.orchestration.budget.usage_for(&owner);
+            let local_model_calls_remaining = session.budget.max_model_calls.saturating_sub(
+                usage
+                    .model_calls_consumed
+                    .saturating_add(usage.model_calls_reserved),
+            );
+            let mission_model_calls_remaining = agent
+                .notebook
+                .orchestration
+                .budget
+                .mission
+                .max_model_calls
+                .saturating_sub(
+                    agent
+                        .notebook
+                        .orchestration
+                        .budget
+                        .total_model_calls
+                        .saturating_add(
+                            agent
+                                .notebook
+                                .orchestration
+                                .budget
+                                .total_model_calls_reserved,
+                        ),
+                );
+            agent.append_event_recoverable(
+                "validation",
+                validation_rerun_completed_event(
+                    &session,
+                    &node_id,
+                    &evidence,
+                    status,
+                    command_runs,
+                    local_model_calls_remaining,
+                    mission_model_calls_remaining,
+                ),
+                "validation repair rerun completion",
+            );
         }
         agent.checkpoint_validation_ledger()?;
         agent.ensure_active_or_checkpoint_cancellation()?;

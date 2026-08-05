@@ -224,7 +224,7 @@ impl<'a> GatewayAgent<'a> {
             )?;
         }
         if let Some(error) = persistence_error.as_ref() {
-            self.notebook.impact_map_artifact.safe_error = Some(error.clone());
+            self.notebook.impact_map_artifact.safe_error = Some(error.safe_error.clone());
             self.notebook.impact_map_artifact.failure_layer =
                 Some(ArtifactFailureLayer::ArtifactPersistence);
         }

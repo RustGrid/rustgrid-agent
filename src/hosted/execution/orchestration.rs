@@ -44,6 +44,20 @@ fn target_context_already_prepared(
     })
 }
 
+pub(in crate::hosted) fn bind_validation_repair_model_call(
+    event: &mut crate::execution_graph::ExecutionDomainEvent,
+    active_model_call_id: Option<&str>,
+) {
+    if let crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+        attempt: Some(attempt),
+        ..
+    } = event
+        && attempt.model_call_id.is_none()
+    {
+        attempt.model_call_id = active_model_call_id.map(str::to_owned);
+    }
+}
+
 impl<'a> GatewayAgent<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::hosted) fn new(
@@ -321,6 +335,8 @@ impl<'a> GatewayAgent<'a> {
             last_source_progress_call: 0,
             current_decision: None,
             completion_outcome,
+            active_model_call_id: None,
+            phase_persistence_failure: None,
         };
         if resume_reason.is_some() {
             agent.persist_orchestration_checkpoint("execution_resumed", false)?;
@@ -862,7 +878,30 @@ impl<'a> GatewayAgent<'a> {
         &mut self,
         request: &Value,
     ) -> Option<crate::execution_graph::ModelCallReservation> {
-        let node_id = self
+        let validation_repair_failure_id = self.current_decision.as_ref().and_then(|decision| {
+            match decision {
+                ExecutionDecision::ExecuteTarget {
+                    action:
+                        crate::hosted_orchestrator::MutationAction::RepairTarget {
+                            failure,
+                            ..
+                        },
+                    ..
+                } if failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+                {
+                    Some(failure.id.clone())
+                }
+                ExecutionDecision::RepairTarget { context, .. }
+                    if context.failure.category
+                        == crate::execution_graph::FailureCategory::ValidationFailure =>
+                {
+                    Some(context.failure.id.clone())
+                }
+                _ => None,
+            }
+        });
+        let graph_node_id = self
             .current_decision
             .as_ref()
             .and_then(ExecutionDecision::budget_node_id)
@@ -883,16 +922,25 @@ impl<'a> GatewayAgent<'a> {
                     })
                     .map(|node| node.id.clone())
             })?;
-        let node_budget = self
-            .notebook
-            .orchestration
-            .graph
-            .as_ref()
-            .and_then(|graph| graph.node(&node_id))
-            .map(|node| node.budget.clone())?;
+        let (node_id, mut node_budget) =
+            if let Some(failure_id) = validation_repair_failure_id.as_ref() {
+                self.notebook
+                    .orchestration
+                    .budget
+                    .repair_budget_owner(failure_id)?
+            } else {
+                let node_budget = self
+                    .notebook
+                    .orchestration
+                    .graph
+                    .as_ref()
+                    .and_then(|graph| graph.node(&graph_node_id))
+                    .map(|node| node.budget.clone())?;
+                (graph_node_id, node_budget)
+            };
         let estimate = estimate_model_call_request_cost(request);
         let estimated_cost_micros = estimate.estimated_request_cost;
-        let admission = self
+        let mut admission = self
             .notebook
             .orchestration
             .budget
@@ -903,6 +951,83 @@ impl<'a> GatewayAgent<'a> {
                 estimated_cost_micros,
                 Duration::ZERO,
             );
+        if !admission.admitted
+            && admission.rejection_reason == Some("node_model_call_budget_exhausted")
+            && let Some(failure_id) = validation_repair_failure_id.as_ref()
+        {
+            let mission_calls_remaining = self
+                .notebook
+                .orchestration
+                .budget
+                .mission
+                .max_model_calls
+                .saturating_sub(
+                    self.notebook
+                        .orchestration
+                        .budget
+                        .total_model_calls
+                        .saturating_add(
+                            self.notebook
+                                .orchestration
+                                .budget
+                                .total_model_calls_reserved,
+                        ),
+                );
+            if mission_calls_remaining > 0 {
+                let reallocated = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .reallocate_validation_repair_capacity(failure_id, 1, 0)
+                    .ok();
+                if let Some(reallocated) = reallocated {
+                    let repaired_budget = reallocated.budget;
+                    if let Some(graph) = self.notebook.orchestration.graph.as_mut()
+                        && let Some(node) =
+                            graph.node_mut(&crate::execution_graph::ExecutionNodeId::new(
+                                reallocated.session_id.clone(),
+                            ))
+                    {
+                        node.budget = repaired_budget.as_node_budget();
+                        graph.revision = graph.revision.saturating_add(1);
+                        self.notebook.orchestration.graph_revision = graph.revision;
+                    }
+                    node_budget = repaired_budget.as_node_budget();
+                    admission = self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .evaluate_model_call_admission(
+                            &node_id,
+                            &node_budget,
+                            1,
+                            estimated_cost_micros,
+                            Duration::ZERO,
+                        );
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.validation_repair_budget_reallocated",
+                            "repair_session_id": reallocated.session_id,
+                            "originating_validation_gate": self.notebook.orchestration.budget
+                                .repair_session_for_failure(failure_id)
+                                .map(|session| session.originating_gate_id.as_str()),
+                            "failure_revision": self.notebook.orchestration.budget
+                                .repair_session_for_failure(failure_id)
+                                .map(|session| session.current_assertion_set_revision),
+                            "source": "remaining_mission_model_calls",
+                            "reallocated_model_calls": reallocated.model_calls,
+                            "reallocated_cost_micros": reallocated.cost_micros,
+                            "mission_model_calls_remaining": mission_calls_remaining.saturating_sub(reallocated.model_calls),
+                            "local_model_calls_remaining": repaired_budget.max_model_calls.saturating_sub(
+                                admission.consumed_calls.saturating_add(admission.reserved_calls)
+                            ),
+                        }),
+                        "validation repair budget reallocation",
+                    );
+                }
+            }
+        }
         let reservation = if admission.admitted {
             self.notebook
                 .orchestration
@@ -926,6 +1051,147 @@ impl<'a> GatewayAgent<'a> {
             return None;
         }
         reservation
+    }
+
+    pub(in crate::hosted) fn effective_phase_model_call_limit(&self) -> usize {
+        let phase = self.phases.active();
+        let legacy_limit = self.phases.phase_limit(phase);
+        if phase != ExecutionPhase::Repair {
+            return legacy_limit;
+        }
+        let failure_id = self.current_decision.as_ref().and_then(|decision| match decision {
+            ExecutionDecision::ExecuteTarget {
+                action:
+                    crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            } if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                Some(&failure.id)
+            }
+            ExecutionDecision::RepairTarget { context, .. }
+                if context.failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                Some(&context.failure.id)
+            }
+            _ => None,
+        });
+        let Some(failure_id) = failure_id else {
+            return legacy_limit;
+        };
+        let Some((owner, budget)) = self
+            .notebook
+            .orchestration
+            .budget
+            .repair_budget_owner(failure_id)
+        else {
+            return legacy_limit;
+        };
+        let remaining = self
+            .notebook
+            .orchestration
+            .budget
+            .remaining_for(&owner, &budget)
+            .model_calls_remaining;
+        legacy_limit.max(
+            self.phases
+                .phase_calls(phase)
+                .saturating_add(usize::try_from(remaining).unwrap_or(usize::MAX)),
+        )
+    }
+
+    pub(in crate::hosted) fn record_validation_repair_admission_rejection(
+        &mut self,
+        reason: &str,
+    ) -> Result<bool> {
+        let repair = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                target,
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                target.validation_repair.as_ref().map(|context| {
+                    (
+                        failure.id.clone(),
+                        failure.node_id.clone(),
+                        context.repair_intent.clone(),
+                        context.selected_target.clone(),
+                        context.repository_fingerprint.clone(),
+                    )
+                })
+            }
+            Some(ExecutionDecision::RepairTarget { context, .. })
+                if context.failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                context.target.validation_repair.as_ref().map(|repair| {
+                    (
+                        context.failure.id.clone(),
+                        context.failure.node_id.clone(),
+                        repair.repair_intent.clone(),
+                        repair.selected_target.clone(),
+                        repair.repository_fingerprint.clone(),
+                    )
+                })
+            }
+            _ => None,
+        };
+        let Some((failure_id, validation_node_id, repair_intent, selected_target, fingerprint)) =
+            repair
+        else {
+            return Ok(false);
+        };
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: self.next_domain_event_sequence(),
+                validation_node_id: validation_node_id.clone(),
+                failure_id: failure_id.clone(),
+                result: crate::execution_graph::RepairResult::NoMutation {
+                    diagnosis: Some(repair_intent.diagnosis),
+                    reason: reason.to_owned(),
+                    outcome:
+                        crate::execution_graph::ValidationRepairMutationOutcome::AdmissionRejected,
+                    unresolved: Some(crate::execution_graph::UnresolvedValidationRepair {
+                        validation_id: validation_node_id.to_string(),
+                        repair_intent_id: repair_intent.repair_intent_id.clone(),
+                        selected_target: selected_target.clone(),
+                        diagnosis: repair_intent.diagnosis,
+                        outcome: crate::execution_graph::ValidationRepairMutationOutcome::AdmissionRejected,
+                        reason: reason.to_owned(),
+                        attempted_targets: vec![selected_target.clone()],
+                    }),
+                },
+                attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                    repair_intent_id: repair_intent.repair_intent_id,
+                    target_path: selected_target.clone(),
+                    diagnosis: repair_intent.diagnosis,
+                    requested_tool_policy:
+                        crate::execution_graph::MutationFallbackPolicy::NoSafeFallback,
+                    outcome:
+                        crate::execution_graph::ValidationRepairMutationOutcome::AdmissionRejected,
+                    repository_fingerprint_before: fingerprint.clone().into(),
+                    repository_fingerprint_after: fingerprint.into(),
+                    admission_rejection_reason: Some(reason.to_owned()),
+                    ..Default::default()
+                }),
+            },
+        )?;
+        self.append_event_recoverable(
+            "validation",
+            json!({
+                "event_type": "worker.validation_repair_attempt_recorded",
+                "repair_session_id": crate::execution_graph::BudgetState::repair_session_id(&failure_id),
+                "originating_validation_gate": validation_node_id,
+                "target": selected_target,
+                "attempt_outcome": "admission_rejected",
+                "reason_code": reason,
+            }),
+            "validation repair admission rejection",
+        );
+        Ok(true)
     }
 
     pub(in crate::hosted) fn observe_model_cost(
@@ -1237,6 +1503,47 @@ impl<'a> GatewayAgent<'a> {
                     == crate::execution_graph::FailureCategory::ValidationFailure =>
                 {
                     let repair = target.validation_repair.as_ref();
+                    if let Some(session) = self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .repair_session_for_failure(&failure.id)
+                        .cloned()
+                    {
+                        let owner = crate::execution_graph::ExecutionNodeId::new(
+                            session.session_id.clone(),
+                        );
+                        let usage = self.notebook.orchestration.budget.usage_for(&owner);
+                        self.append_event_recoverable(
+                            "validation",
+                            json!({
+                                "event_type": "worker.validation_repair_session_created",
+                                "repair_session_id": session.session_id,
+                                "originating_validation_gate": session.originating_gate_id,
+                                "failed_validation_id": session.failed_validation_id,
+                                "failure_revision": session.current_assertion_set_revision,
+                                "repository_fingerprint": target.repository_fingerprint,
+                            }),
+                            "validation repair session",
+                        );
+                        self.append_event_recoverable(
+                            "validation",
+                            json!({
+                                "event_type": "worker.validation_repair_budget_resolved",
+                                "repair_session_id": session.session_id,
+                                "budget": session.budget,
+                                "local_model_calls_remaining": session.budget.max_model_calls.saturating_sub(
+                                    usage.model_calls_consumed.saturating_add(usage.model_calls_reserved)
+                                ),
+                                "mission_model_calls_remaining": self.notebook.orchestration.budget.mission.max_model_calls.saturating_sub(
+                                    self.notebook.orchestration.budget.total_model_calls.saturating_add(
+                                        self.notebook.orchestration.budget.total_model_calls_reserved
+                                    )
+                                ),
+                            }),
+                            "validation repair budget",
+                        );
+                    }
                     self.append_event_recoverable(
                         "validation",
                         json!({
@@ -1291,6 +1598,36 @@ impl<'a> GatewayAgent<'a> {
                         "validation repair target selection",
                     );
                 }
+                ExecutionDecision::RunValidation { node_id, gate } => {
+                    let sessions = self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .validation_repair_sessions
+                        .values()
+                        .filter(|session| {
+                            &session.originating_gate_id == node_id
+                                && session.status
+                                    == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for session in sessions {
+                        self.append_event_recoverable(
+                            "validation",
+                            json!({
+                                "event_type": "worker.validation_rerun_scheduled",
+                                "repair_session_id": session.session_id,
+                                "originating_validation_gate": node_id,
+                                "failure_revision": session.current_assertion_set_revision,
+                                "command": gate.command,
+                                "repository_fingerprint": self.notebook.repository_fingerprint,
+                                "model_calls_consumed": 0,
+                            }),
+                            "validation rerun scheduling",
+                        );
+                    }
+                }
                 ExecutionDecision::Publish {
                     mode:
                         crate::execution_graph::PublicationMode::Draft
@@ -1341,8 +1678,10 @@ impl<'a> GatewayAgent<'a> {
                 );
                 let event = json!({
                     "event_type": "worker.phase_transition",
+                    "transition_payload_version": 1,
                     "from_phase": previous,
                     "phase": phase,
+                    "decision": execution_decision_name(&decision),
                     "from_state": canonical_running_state(previous),
                     "to_state": canonical_running_state(phase),
                     "reason_code": "phase_reconciled",
@@ -1352,6 +1691,7 @@ impl<'a> GatewayAgent<'a> {
                         ExecutionPhase::Publication => "publication",
                         _ => "orchestrator",
                     },
+                    "graph_revision": self.notebook.orchestration.graph_revision,
                     "notebook_revision": self.notebook.revision,
                     "source_tree_hash": self.notebook.repository_fingerprint,
                     "occurred_at": now_rfc3339(),
@@ -1361,22 +1701,80 @@ impl<'a> GatewayAgent<'a> {
                         self.notebook.impact_map_artifact.artifact_sha256.as_deref()
                     ),
                 });
-                let persistence_error = self
-                    .api
-                    .append_event("progress", event)
-                    .err()
-                    .map(|error| truncate_text(&format!("{error:#}"), 2_000));
-                if let Some(error) = persistence_error.as_deref() {
+                let preflight = preflight_phase_transition(
+                    &event,
+                    previous,
+                    phase,
+                    self.notebook.orchestration.graph_revision,
+                    self.notebook.revision,
+                );
+                if !preflight.passed() {
+                    self.append_event_recoverable(
+                        "progress",
+                        json!({
+                            "event_type": "worker.phase_transition_contract_rejected",
+                            "category": "OrchestrationContractFailure",
+                            "code": "phase_transition_event_invalid",
+                            "from_phase": previous,
+                            "phase": phase,
+                            "preflight": preflight,
+                        }),
+                        "phase-transition contract rejection",
+                    );
+                    bail!(
+                        "phase_transition_event_invalid: local phase-transition preflight rejected `{}` to `{}`",
+                        previous.as_str(),
+                        phase.as_str()
+                    );
+                }
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.phase_transition_preflight_passed",
+                        "from_phase": previous,
+                        "phase": phase,
+                        "decision": execution_decision_name(&decision),
+                        "graph_revision": self.notebook.orchestration.graph_revision,
+                        "notebook_revision": self.notebook.revision,
+                        "transition_payload_version": 1,
+                    }),
+                    "phase-transition preflight",
+                );
+                let persistence_result = self.api.append_event("progress", event);
+                let contract_rejected = persistence_result.as_ref().err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<HostedHttpError>()
+                        .is_some_and(|http| http.status == reqwest::StatusCode::BAD_REQUEST)
+                });
+                let persistence_error =
+                    persistence_result
+                        .err()
+                        .map(|error| PhasePersistenceFailure {
+                            kind: if contract_rejected {
+                                PhasePersistenceFailureKind::Contract
+                            } else {
+                                PhasePersistenceFailureKind::Persistence
+                            },
+                            from_phase: previous,
+                            phase,
+                            safe_error: truncate_text(&format!("{error:#}"), 2_000),
+                        });
+                if let Some(error) = persistence_error.as_ref() {
+                    self.phase_persistence_failure = Some(error.clone());
+                    self.notebook.phase_persistence_failure_code = Some(error.code().to_owned());
                     eprintln!("[warning] phase transition could not be persisted: {error}");
                     self.append_event_recoverable(
                         "progress",
                         json!({
                             "event_type": "worker.phase_persistence_failed",
+                            "category": error.category(),
+                            "code": error.code(),
                             "from_phase": previous,
                             "phase": phase,
-                            "recoverable": true,
-                            "action": "retry_or_continue",
-                            "safe_error": error,
+                            "process_health": error.process_health(),
+                            "recoverable": !contract_rejected,
+                            "action": if contract_rejected { "safe_terminal_result" } else { "retry_or_continue" },
+                            "safe_error": error.safe_error,
                             "checkpoint": self.notebook_checkpoint_metadata(
                                 self.notebook.impact_map_artifact.artifact_sha256.as_deref()
                             ),
@@ -1497,6 +1895,36 @@ impl<'a> GatewayAgent<'a> {
                 })
             }
             ExecutionDecision::RunValidation { node_id, gate } => {
+                let repaired_failures = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .validation_repair_sessions
+                    .values()
+                    .filter(|session| {
+                        &session.originating_gate_id == node_id
+                            && session.status
+                                == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+                    })
+                    .map(|session| crate::execution_graph::FailureId::new(
+                        session.failed_validation_id.clone(),
+                    ))
+                    .filter(|failure_id| {
+                        self.notebook
+                            .orchestration
+                            .failures
+                            .get(failure_id)
+                            .is_some_and(crate::execution_graph::FailureRecord::is_unresolved)
+                    })
+                    .collect::<Vec<_>>();
+                for failure_id in repaired_failures {
+                    self.append_execution_domain_event(ExecutionDomainEvent::FailureRecovered {
+                        sequence: self.next_domain_event_sequence(),
+                        node_id: node_id.clone(),
+                        failure_id,
+                        repository_fingerprint: repository_fingerprint.clone(),
+                    })?;
+                }
                 let running = self
                     .notebook
                     .orchestration
@@ -1507,7 +1935,7 @@ impl<'a> GatewayAgent<'a> {
                         node.status == crate::execution_graph::ExecutionNodeStatus::Running
                     });
                 (!running).then_some(ExecutionDomainEvent::ValidationStarted {
-                    sequence,
+                    sequence: self.next_domain_event_sequence(),
                     node_id: node_id.clone(),
                     fingerprint: gate.fingerprint(&repository_fingerprint),
                 })
@@ -1859,8 +2287,7 @@ impl<'a> GatewayAgent<'a> {
         let mut context = implementation_start_context_from_notebook(
             &self.notebook,
             repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?,
-            self.phases
-                .phase_limit(self.phases.active())
+            self.effective_phase_model_call_limit()
                 .saturating_sub(self.phases.phase_calls(self.phases.active())),
             self.guided_first_write_recovery_issued,
             self.phases.implementation_repair_calls(),
@@ -2360,8 +2787,9 @@ impl<'a> GatewayAgent<'a> {
 
     pub(in crate::hosted) fn append_execution_domain_event(
         &mut self,
-        event: crate::execution_graph::ExecutionDomainEvent,
+        mut event: crate::execution_graph::ExecutionDomainEvent,
     ) -> Result<()> {
+        bind_validation_repair_model_call(&mut event, self.active_model_call_id.as_deref());
         let mut snapshot = self.build_execution_snapshot()?;
         snapshot
             .append_event(event)
@@ -2697,6 +3125,10 @@ impl<'a> GatewayAgent<'a> {
             );
             let diagnostics = format!("{}\n{}", failure.command, failure.output);
             if category == crate::execution_graph::FailureCategory::ValidationFailure {
+                self.notebook
+                    .orchestration
+                    .budget
+                    .record_validation_diagnosis_call(node_id.clone());
                 record.validation_command = Some(failure.command.clone());
                 record.assertion_failures = parse_validation_assertion_failures(
                     &failure.command,
@@ -2771,6 +3203,12 @@ impl<'a> GatewayAgent<'a> {
                     "structured validation failure parsing",
                 );
             }
+            let implicated_targets = record
+                .assertion_failures
+                .iter()
+                .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let selected_target = record.target_path.clone();
             self.append_execution_domain_event(
                 crate::execution_graph::ExecutionDomainEvent::FailureRecorded {
                     sequence: self.next_domain_event_sequence(),
@@ -2790,11 +3228,90 @@ impl<'a> GatewayAgent<'a> {
             self.append_execution_domain_event(
                 crate::execution_graph::ExecutionDomainEvent::ValidationFailed {
                     sequence: self.next_domain_event_sequence(),
-                    node_id,
-                    failure_id,
+                    node_id: node_id.clone(),
+                    failure_id: failure_id.clone(),
                     fingerprint: validation_fingerprint,
                 },
             )?;
+            if let Some(revision) = self
+                .notebook
+                .orchestration
+                .budget
+                .current_validation_failure_revision(node_id.as_str(), &fingerprint)
+                .cloned()
+            {
+                let prior_assertions = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .validation_failure_revisions
+                    .get(node_id.as_str())
+                    .and_then(|revisions| revisions.iter().rev().nth(1))
+                    .map(|revision| {
+                        revision
+                            .assertion_ids
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let current_assertions = revision
+                    .assertion_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if revision.revision > 1 {
+                    let session = self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .validation_repair_sessions
+                        .values()
+                        .find(|session| session.originating_gate_id == node_id)
+                        .cloned();
+                    self.append_event_recoverable(
+                        "validation",
+                        json!({
+                            "event_type": "worker.validation_assertion_set_recomputed",
+                            "repair_session_id": session.as_ref().map(|session| session.session_id.as_str()),
+                            "originating_validation_gate": node_id,
+                            "failure_revision": revision.revision,
+                            "repository_fingerprint": revision.repository_fingerprint,
+                            "assertion_ids": revision.assertion_ids,
+                            "added_assertion_ids": current_assertions.difference(&prior_assertions).collect::<Vec<_>>(),
+                            "removed_assertion_ids": prior_assertions.difference(&current_assertions).collect::<Vec<_>>(),
+                            "implicated_targets": implicated_targets,
+                            "target": selected_target,
+                            "local_model_calls_remaining": session.as_ref().map(|session| {
+                                let owner = crate::execution_graph::ExecutionNodeId::new(session.session_id.clone());
+                                let usage = self.notebook.orchestration.budget.usage_for(&owner);
+                                session.budget.max_model_calls.saturating_sub(
+                                    usage.model_calls_consumed.saturating_add(usage.model_calls_reserved)
+                                )
+                            }),
+                            "mission_model_calls_remaining": self.notebook.orchestration.budget.mission.max_model_calls.saturating_sub(
+                                self.notebook.orchestration.budget.total_model_calls.saturating_add(
+                                    self.notebook.orchestration.budget.total_model_calls_reserved
+                                )
+                            ),
+                            "model_calls_consumed": 0,
+                        }),
+                        "validation assertion-set recomputation",
+                    );
+                }
+                self.append_event_recoverable(
+                    "validation",
+                    json!({
+                        "event_type": "worker.validation_failure_revision_created",
+                        "validation_id": revision.validation_id,
+                        "failure_id": failure_id,
+                        "failure_revision": revision.revision,
+                        "repository_fingerprint": revision.repository_fingerprint,
+                        "assertion_ids": revision.assertion_ids,
+                    }),
+                    "validation failure revision",
+                );
+            }
         }
         Ok(())
     }
@@ -2909,6 +3426,7 @@ impl<'a> GatewayAgent<'a> {
                         outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
                         repository_fingerprint_before,
                         repository_fingerprint_after: snapshot.current_repository.fingerprint.clone().into(),
+                        ..Default::default()
                     }),
                 },
             )?;
@@ -2988,7 +3506,11 @@ impl<'a> GatewayAgent<'a> {
                     context
                         .validation_repair
                         .as_ref()
-                        .map(|repair| repair.repository_fingerprint.clone().into())
+                        .map(|repair| {
+                            crate::execution_graph::RepositoryFingerprint::new(
+                                repair.repository_fingerprint.clone(),
+                            )
+                        })
                         .unwrap_or_default(),
                 )
             }
@@ -3026,6 +3548,7 @@ impl<'a> GatewayAgent<'a> {
                         .repository_fingerprint
                         .clone()
                         .into(),
+                    ..Default::default()
                 }),
             },
         )?;
@@ -3145,6 +3668,7 @@ impl<'a> GatewayAgent<'a> {
                     outcome: crate::execution_graph::ValidationRepairMutationOutcome::AlreadySatisfiesRepairIntent,
                     repository_fingerprint_before,
                     repository_fingerprint_after: repository_fingerprint_after.clone().into(),
+                    ..Default::default()
                 }),
             },
         )?;
@@ -3249,6 +3773,7 @@ impl<'a> GatewayAgent<'a> {
                     outcome: crate::execution_graph::ValidationRepairMutationOutcome::NoChangeAgainstCurrentTarget,
                     repository_fingerprint_before,
                     repository_fingerprint_after: snapshot.current_repository.fingerprint.clone().into(),
+                    ..Default::default()
                 }),
             },
         )?;
@@ -3304,7 +3829,11 @@ impl<'a> GatewayAgent<'a> {
                     target
                         .validation_repair
                         .as_ref()
-                        .map(|repair| repair.repository_fingerprint.clone().into())
+                        .map(|repair| {
+                            crate::execution_graph::RepositoryFingerprint::new(
+                                repair.repository_fingerprint.clone(),
+                            )
+                        })
                         .unwrap_or_default(),
                     target
                         .validation_repair
@@ -3472,11 +4001,31 @@ impl<'a> GatewayAgent<'a> {
             diagnosis,
         )) = validation_repair
         {
+            let session = self
+                .notebook
+                .orchestration
+                .budget
+                .repair_session_for_failure(&failure_id)
+                .cloned();
+            if let Some(session) = session.as_ref() {
+                self.append_event_recoverable(
+                    "validation",
+                    json!({
+                        "event_type": "worker.validation_failure_revision_staled",
+                        "repair_session_id": session.session_id,
+                        "originating_validation_gate": validation_node_id,
+                        "failure_revision": session.current_assertion_set_revision,
+                        "repository_fingerprint_before": repository_fingerprint_before,
+                        "repository_fingerprint_after": fingerprint,
+                    }),
+                    "validation failure revision invalidation",
+                );
+            }
             self.append_execution_domain_event(
                 crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
                     sequence: self.next_domain_event_sequence(),
-                    validation_node_id,
-                    failure_id,
+                    validation_node_id: validation_node_id.clone(),
+                    failure_id: failure_id.clone(),
                     result: crate::execution_graph::RepairResult::MutationProduced {
                         selected_target: target_path.to_owned(),
                         repair_intent_id: repair_intent_id.clone(),
@@ -3487,11 +4036,26 @@ impl<'a> GatewayAgent<'a> {
                         diagnosis,
                         requested_tool_policy,
                         outcome: crate::execution_graph::ValidationRepairMutationOutcome::MutationApplied,
-                        repository_fingerprint_before,
-                        repository_fingerprint_after: fingerprint.into(),
+                        repository_fingerprint_before: repository_fingerprint_before.clone(),
+                        repository_fingerprint_after: fingerprint.clone().into(),
+                        ..Default::default()
                     }),
                 },
             )?;
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.validation_repair_attempt_recorded",
+                    "repair_session_id": session.as_ref().map(|session| session.session_id.as_str()),
+                    "originating_validation_gate": validation_node_id,
+                    "failure_revision": session.as_ref().map(|session| session.current_assertion_set_revision),
+                    "target": target_path,
+                    "attempt_outcome": "mutation_applied",
+                    "repository_fingerprint_before": repository_fingerprint_before,
+                    "repository_fingerprint_after": fingerprint,
+                }),
+                "validation repair attempt",
+            );
         }
         Ok(())
     }

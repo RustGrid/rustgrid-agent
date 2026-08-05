@@ -1205,8 +1205,41 @@ fn provider_not_contacted_is_never_reported_as_ai_gateway_failure() {
     ));
     assert_eq!(
         hosted_failure_category(&error),
-        "orchestration_initialization_failed"
+        "orchestration_execution_failed"
     );
+}
+
+#[test]
+fn late_phase_persistence_failures_never_use_initialization_taxonomy() {
+    for (kind, category, code, health) in [
+        (
+            PhasePersistenceFailureKind::Persistence,
+            "OrchestrationPersistenceFailure",
+            "phase_transition_persistence_failed",
+            "degraded",
+        ),
+        (
+            PhasePersistenceFailureKind::Contract,
+            "OrchestrationContractFailure",
+            "phase_transition_event_invalid",
+            "failed",
+        ),
+    ] {
+        let failure = PhasePersistenceFailure {
+            kind,
+            from_phase: ExecutionPhase::Repair,
+            phase: ExecutionPhase::DiffReview,
+            safe_error: "bounded diagnostic".into(),
+        };
+        assert_eq!(failure.category(), category);
+        assert_eq!(failure.code(), code);
+        assert_eq!(failure.process_health(), health);
+        assert_ne!(failure.category(), "orchestration_initialization_failed");
+        assert_eq!(
+            hosted_failure_category(&anyhow::Error::new(failure)),
+            category
+        );
+    }
 }
 
 #[test]
@@ -6428,6 +6461,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         validation,
         completeness,
         terminal_telemetry: TerminalTelemetry {
+            phase_persistence_failure_code: None,
             model_calls_used: performance.total_calls(),
             input_tokens: 48_000,
             output_tokens: 8_000,
@@ -7574,6 +7608,102 @@ fn lifecycle_transition_table_rejects_skipping_validation() {
 }
 
 #[test]
+fn phase_transition_preflight_accepts_repair_to_incomplete_diff_review_contract() {
+    let payload = json!({
+        "event_type": "worker.phase_transition",
+        "transition_payload_version": 1,
+        "from_phase": "repair",
+        "phase": "diff_review",
+        "decision": "review_incomplete_diff",
+        "reason_code": "phase_reconciled",
+        "source": "orchestrator",
+        "source_tree_hash": "tree-2",
+        "occurred_at": "2026-08-05T00:00:00Z",
+        "graph_revision": 12,
+        "notebook_revision": 18,
+    });
+    let preflight = preflight_phase_transition(
+        &payload,
+        ExecutionPhase::Repair,
+        ExecutionPhase::DiffReview,
+        12,
+        18,
+    );
+    assert!(preflight.passed());
+
+    let mut invalid = payload;
+    invalid.as_object_mut().unwrap().remove("decision");
+    let rejected = preflight_phase_transition(
+        &invalid,
+        ExecutionPhase::Repair,
+        ExecutionPhase::DiffReview,
+        12,
+        18,
+    );
+    assert!(!rejected.passed());
+    assert!(!rejected.required_fields_present);
+}
+
+#[test]
+fn validation_repair_attempt_binds_the_active_semantic_model_call() {
+    let mut event = crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+        sequence: 1,
+        validation_node_id: crate::execution_graph::ExecutionNodeId::new("validation-focused"),
+        failure_id: crate::execution_graph::FailureId::new("failure-1"),
+        result: crate::execution_graph::RepairResult::NoMutation {
+            diagnosis: None,
+            reason: "admission rejected".into(),
+            outcome: crate::execution_graph::ValidationRepairMutationOutcome::AdmissionRejected,
+            unresolved: None,
+        },
+        attempt: Some(crate::execution_graph::ValidationRepairAttempt::default()),
+    };
+    bind_validation_repair_model_call(&mut event, Some("semantic-model-call-7"));
+    assert!(matches!(
+        event,
+        crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted {
+            attempt: Some(crate::execution_graph::ValidationRepairAttempt {
+                model_call_id: Some(ref model_call_id),
+                ..
+            }),
+            ..
+        } if model_call_id == "semantic-model-call-7"
+    ));
+}
+
+#[test]
+fn validation_rerun_telemetry_is_session_revision_and_budget_bound() {
+    let session = crate::execution_graph::ValidationRepairSession {
+        session_id: "repair-session-1".into(),
+        originating_gate_id: crate::execution_graph::ExecutionNodeId::new("validation-focused"),
+        current_assertion_set_revision: 3,
+        ..crate::execution_graph::ValidationRepairSession::default()
+    };
+    let evidence = crate::execution_graph::ValidationEvidenceRecord {
+        evidence_id: "validation-evidence-2".into(),
+        repository_fingerprint: "tree-2".into(),
+        ..crate::execution_graph::ValidationEvidenceRecord::default()
+    };
+    let event = validation_rerun_completed_event(
+        &session,
+        &session.originating_gate_id,
+        &evidence,
+        "failed",
+        2,
+        1,
+        4,
+    );
+    assert_eq!(event["event_type"], "worker.validation_rerun_completed");
+    assert_eq!(event["repair_session_id"], "repair-session-1");
+    assert_eq!(event["failure_revision"], 3);
+    assert_eq!(event["repository_fingerprint"], "tree-2");
+    assert_eq!(event["command_runs"], 2);
+    assert_eq!(event["model_calls_consumed"], 0);
+    assert_eq!(event["local_model_calls_remaining"], 1);
+    assert_eq!(event["mission_model_calls_remaining"], 4);
+}
+
+#[test]
 fn production_preflight_classifies_duplicate_without_change_id_and_advances() {
     use crate::execution_graph::{
         ExecutionNodeStatus, ExecutionSnapshot, MissionBudget, MissionComplexity, MutationResult,
@@ -8180,6 +8310,7 @@ fn resumed_notebook_skips_completed_discovery_and_planning() {
         last_orchestration_decision_key: None,
         finalization_revalidation: None,
         completion_artifact: None,
+        phase_persistence_failure_code: None,
         orchestration: HostedOrchestrationCheckpoint::default(),
     };
     let (impact_map, plan, phase) = notebook_orchestration_state(&notebook);
@@ -9218,6 +9349,7 @@ fn test_discovery_notebook(phase: ExecutionPhase) -> WorkerNotebook {
         last_orchestration_decision_key: None,
         finalization_revalidation: None,
         completion_artifact: None,
+        phase_persistence_failure_code: None,
         orchestration: HostedOrchestrationCheckpoint::default(),
     }
 }
@@ -10703,6 +10835,72 @@ fn notebook_events_use_stable_idempotency_keys() {
     )));
     assert!(request.contains("idempotency-key:"));
     assert!(request.contains("\"notebook_revision\":7"));
+}
+
+#[test]
+fn worker_event_persistence_retry_reuses_identical_body_and_idempotency_key() {
+    let execution_id = Uuid::from_u128(0x45454545_4545_4545_8545_454545454546);
+    let Some((base, requests, server)) = request_sequence_server(vec![
+        (
+            "503 Service Unavailable",
+            json!({"code": "temporary_failure"}),
+        ),
+        ("200 OK", json!({})),
+    ]) else {
+        return;
+    };
+    let client = test_api_client(base, execution_id);
+    client
+        .append_event(
+            "progress",
+            json!({
+                "event_type": "worker.phase_transition",
+                "from_phase": "repair",
+                "phase": "diff_review",
+                "decision": "review_incomplete_diff",
+                "reason_code": "validation_rerun_pending",
+            }),
+        )
+        .unwrap();
+    server.join().unwrap();
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    let identity = |request: &str| {
+        request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("idempotency-key:"))
+            .map(str::to_owned)
+            .expect("idempotency key")
+    };
+    let body = |request: &str| request.split_once("\r\n\r\n").unwrap().1.to_owned();
+    assert_eq!(identity(&requests[0]), identity(&requests[1]));
+    assert_eq!(body(&requests[0]), body(&requests[1]));
+}
+
+#[test]
+fn worker_event_contract_rejection_is_permanent_and_not_retried() {
+    let execution_id = Uuid::from_u128(0x45454545_4545_4545_8545_454545454547);
+    let Some((base, request, server)) = one_request_server(
+        "400 Bad Request",
+        json!({"code": "worker_event_contract_invalid", "message": "invalid transition"}),
+    ) else {
+        return;
+    };
+    let client = test_api_client(base, execution_id);
+    let error = client
+        .append_event(
+            "progress",
+            json!({"event_type": "worker.phase_transition", "phase": "diff_review"}),
+        )
+        .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(request.try_iter().count(), 1);
+    let http = error
+        .downcast_ref::<HostedHttpError>()
+        .expect("structured control-plane rejection");
+    assert_eq!(http.status, StatusCode::BAD_REQUEST);
+    assert_eq!(http.code, "worker_event_contract_invalid");
+    assert!(!http.retryable_gateway_transport_failure());
 }
 
 #[test]

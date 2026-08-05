@@ -821,7 +821,7 @@ pub(super) fn resolve_published_terminal_result(
     };
     let draft = mission_outcome != CanonicalMissionOutcome::Complete;
     let publication = CanonicalPublicationResult::published(result, completed_at, draft);
-    let (reason_code, execution_status, resumability) = match mission_outcome {
+    let (default_reason_code, execution_status, resumability) = match mission_outcome {
         CanonicalMissionOutcome::Complete => (
             "completed",
             DomainExecutionStatus::Completed,
@@ -841,11 +841,24 @@ pub(super) fn resolve_published_terminal_result(
         ),
         _ => unreachable!("published terminal resolution has three legal outcomes"),
     };
+    let reason_code = result
+        .terminal_telemetry
+        .phase_persistence_failure_code
+        .as_deref()
+        .unwrap_or(default_reason_code);
     let terminal_result_id = terminal_result_id(execution_id);
     CanonicalTerminalResult {
         terminal_result_id,
         mission_outcome,
-        process_health: ProcessHealth::Healthy,
+        process_health: if result
+            .terminal_telemetry
+            .phase_persistence_failure_code
+            .is_some()
+        {
+            ProcessHealth::Degraded
+        } else {
+            ProcessHealth::Healthy
+        },
         reason_code: reason_code.into(),
         execution_status,
         publication,
@@ -1477,6 +1490,22 @@ mod tests {
         assert_eq!(canonical.process_health, ProcessHealth::Degraded);
         assert_eq!(canonical.mission_outcome, outcome);
         assert_eq!(canonical.publication, publication);
+        assert_eq!(canonical.process_exit_code(), 0);
+    }
+
+    #[test]
+    fn phase_persistence_degradation_is_preserved_in_the_canonical_terminal_result() {
+        let mut result = published(completion(CompletionStatus::Partial));
+        result.terminal_telemetry.phase_persistence_failure_code =
+            Some("phase_transition_persistence_failed".into());
+        let canonical =
+            resolve_published_terminal_result(Uuid::nil(), &result, "2026-08-04T00:00:00Z");
+        assert_eq!(canonical.process_health, ProcessHealth::Degraded);
+        assert_eq!(
+            canonical.mission_outcome,
+            CanonicalMissionOutcome::PartialReviewable
+        );
+        assert_eq!(canonical.reason_code, "phase_transition_persistence_failed");
         assert_eq!(canonical.process_exit_code(), 0);
     }
 

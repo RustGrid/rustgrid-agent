@@ -32,12 +32,23 @@
 
         let mut budget = BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Small));
         budget.record_validation_repair_attempt(validation.id.clone());
+        budget.record_validation_command_run(validation.id.clone());
+        budget.record_validation_parsing_call(validation.id.clone());
+        budget.record_validation_diagnosis_call(validation.id.clone());
         budget.record_model_call_purpose(ModelCallPurpose::ValidationDiagnosis);
         budget.record_model_call_purpose(ModelCallPurpose::ValidationRepairMutation);
 
         assert_eq!(budget.usage_for(&validation.id).validation_repair_attempts, 1);
         assert_eq!(budget.usage_for(&validation.id).repair_attempts, 0);
         assert_eq!(budget.usage_for(&mutation.id).repair_attempts, 0);
+        assert_eq!(
+            budget.validation_gate_usage.get(&validation.id),
+            Some(&ValidationGateBudget {
+                command_runs: 1,
+                parsing_calls: 1,
+                diagnosis_calls: 1,
+            })
+        );
         assert_eq!(budget.model_call_breakdown.validation_diagnosis_calls, 1);
         assert_eq!(
             budget
@@ -46,6 +57,329 @@
             1
         );
         assert_eq!(budget.model_call_breakdown.target_mutation_repair_calls, 0);
+    }
+
+    #[test]
+    fn validation_repair_budget_rejects_an_impossible_legal_sequence() {
+        let impossible = ValidationRepairBudget {
+            max_model_calls: 1,
+            max_target_attempts: 1,
+            max_repository_writes: 1,
+            max_context_rebuilds: 1,
+            max_cost_micros: 100,
+        };
+        assert!(impossible.validate(false).is_err());
+
+        let multi_target = ValidationRepairBudget {
+            max_model_calls: 3,
+            max_target_attempts: 2,
+            max_repository_writes: 2,
+            max_context_rebuilds: 2,
+            max_cost_micros: 100,
+        };
+        assert!(multi_target.validate(true).is_ok());
+    }
+
+    #[test]
+    fn one_call_validation_gate_materializes_an_independent_multi_call_repair_session() {
+        let gate_id = ExecutionNodeId::new("validation-focused");
+        let mut failure = FailureRecord::new(
+            "failure-1",
+            gate_id.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-1",
+            "two assertions failed",
+        );
+        failure.assertion_failures = vec![ValidationAssertionFailure {
+            test_file: "tests/a.rs".into(),
+            test_name: "a".into(),
+            implicated_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            ..ValidationAssertionFailure::default()
+        }];
+        let mut budget = BudgetState::new(MissionBudget {
+            max_model_calls: 8,
+            max_cost_micros: 10_000,
+            max_duration: Duration::from_secs(600),
+            max_target_repair_rounds: 2,
+        });
+        budget.create_validation_failure_revision(&failure, 3);
+        let session = budget
+            .ensure_validation_repair_session(
+                &failure,
+                ValidationRepairBudgetInputs {
+                    failed_assertion_count: 2,
+                    implicated_target_count: 2,
+                    originating_gate_required: true,
+                    implicated_target_bytes: 600 * 1024,
+                },
+            )
+            .expect("viable repair session")
+            .clone();
+        assert_eq!(session.budget.max_model_calls, 3);
+        assert_eq!(session.budget.max_target_attempts, 2);
+        assert_eq!(session.budget.max_context_rebuilds, 4);
+        assert_eq!(budget.usage_for(&gate_id).model_calls_consumed, 0);
+
+        let (owner, repair_budget) = budget
+            .repair_budget_owner(&failure.id)
+            .expect("repair budget owner");
+        let first = budget
+            .reserve_model_call(&owner, &repair_budget, 100, Duration::ZERO)
+            .expect("first repair call");
+        budget.consume_model_call_reservation(&first, 80, Duration::from_millis(1));
+        let second = budget
+            .reserve_model_call(&owner, &repair_budget, 100, Duration::ZERO)
+            .expect("second repair call");
+        budget.consume_model_call_reservation(&second, 80, Duration::from_millis(1));
+        assert_eq!(budget.usage_for(&owner).model_calls_consumed, 2);
+        assert_eq!(budget.usage_for(&gate_id).model_calls_consumed, 0);
+    }
+
+    #[test]
+    fn validation_failure_revisions_are_fingerprint_bound_and_recomputed() {
+        let gate_id = ExecutionNodeId::new("validation-focused");
+        let mut first = FailureRecord::new(
+            "failure-1",
+            gate_id.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-1",
+            "a and b failed",
+        );
+        first.assertion_failures = vec![
+            ValidationAssertionFailure {
+                test_file: "tests/a.rs".into(),
+                test_name: "a".into(),
+                ..ValidationAssertionFailure::default()
+            },
+            ValidationAssertionFailure {
+                test_file: "tests/b.rs".into(),
+                test_name: "b".into(),
+                ..ValidationAssertionFailure::default()
+            },
+        ];
+        let mut budget = BudgetState::new(MissionBudget::default());
+        let revision_one = budget.create_validation_failure_revision(&first, 3);
+        assert_eq!(revision_one.assertion_ids.len(), 2);
+        assert!(
+            budget
+                .current_validation_failure_revision(gate_id.as_str(), "tree-2")
+                .is_none(),
+            "a repository mutation makes the old assertion revision stale"
+        );
+
+        let mut second = FailureRecord::new(
+            "failure-2",
+            gate_id.clone(),
+            FailureCategory::ValidationFailure,
+            2,
+            "tree-2",
+            "only b still fails",
+        );
+        second.assertion_failures = vec![ValidationAssertionFailure {
+            test_file: "tests/b.rs".into(),
+            test_name: "b".into(),
+            ..ValidationAssertionFailure::default()
+        }];
+        let revision_two = budget.create_validation_failure_revision(&second, 8);
+        assert_eq!(revision_two.revision, 2);
+        assert_eq!(revision_two.assertion_ids.len(), 1);
+        assert_eq!(
+            budget
+                .current_validation_failure_revision(gate_id.as_str(), "tree-2")
+                .map(|revision| revision.assertion_ids.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn repair_reallocation_and_attempt_history_remain_bounded_and_auditable() {
+        let gate_id = ExecutionNodeId::new("validation-focused");
+        let mut failure = FailureRecord::new(
+            "failure-reallocation",
+            gate_id,
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-1",
+            "repairable assertion",
+        );
+        failure.assertion_failures = vec![ValidationAssertionFailure {
+            test_file: "tests/a.rs".into(),
+            test_name: "a".into(),
+            implicated_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+            ..ValidationAssertionFailure::default()
+        }];
+        let mut budget = BudgetState::new(MissionBudget {
+            max_model_calls: 8,
+            max_cost_micros: 10_000,
+            max_duration: Duration::from_secs(600),
+            max_target_repair_rounds: 2,
+        });
+        budget.create_validation_failure_revision(&failure, 1);
+        let session = budget
+            .ensure_validation_repair_session(
+                &failure,
+                ValidationRepairBudgetInputs {
+                    failed_assertion_count: 1,
+                    implicated_target_count: 2,
+                    originating_gate_required: true,
+                    implicated_target_bytes: 1,
+                },
+            )
+            .unwrap()
+            .clone();
+        let owner = ExecutionNodeId::new(session.session_id.clone());
+        for _ in 0..session.budget.max_model_calls {
+            let reservation = budget
+                .reserve_model_call(&owner, &session.budget.as_node_budget(), 100, Duration::ZERO)
+                .unwrap();
+            budget.consume_model_call_reservation(&reservation, 100, Duration::ZERO);
+        }
+        let reallocated = budget
+            .reallocate_validation_repair_capacity(&failure.id, 1, 0)
+            .expect("remaining mission capacity is available");
+        assert_eq!(reallocated.model_calls, 1);
+        assert_eq!(reallocated.cost_micros, 0);
+        for _ in 0..session.budget.max_context_rebuilds {
+            budget
+                .record_validation_repair_context_rebuild(&failure.id)
+                .unwrap();
+        }
+        assert!(
+            budget
+                .record_validation_repair_context_rebuild(&failure.id)
+                .is_err()
+        );
+        for _ in 0..session.budget.max_repository_writes {
+            budget
+                .record_validation_repair_repository_write(&failure.id)
+                .unwrap();
+        }
+        assert!(
+            budget
+                .record_validation_repair_repository_write(&failure.id)
+                .is_err()
+        );
+
+        for (outcome, target, model_call_id) in [
+            (
+                ValidationRepairMutationOutcome::MutationApplied,
+                "src/a.rs",
+                Some("semantic-call-1".into()),
+            ),
+            (
+                ValidationRepairMutationOutcome::AdmissionRejected,
+                "src/b.rs",
+                None,
+            ),
+        ] {
+            budget
+                .record_validation_repair_attempt_for_failure(
+                    &failure.id,
+                    ValidationRepairAttempt {
+                        target_path: target.into(),
+                        outcome,
+                        model_call_id,
+                        admission_rejection_reason: (outcome
+                            == ValidationRepairMutationOutcome::AdmissionRejected)
+                            .then(|| "node_model_call_budget_exhausted".into()),
+                        ..ValidationRepairAttempt::default()
+                    },
+                )
+                .unwrap();
+        }
+        let persisted = budget.repair_session_for_failure(&failure.id).unwrap();
+        assert_eq!(persisted.attempted_targets.len(), 2);
+        assert_eq!(persisted.attempted_targets[0].attempt_number, 1);
+        assert_eq!(
+            persisted.attempted_targets[0].model_call_id.as_deref(),
+            Some("semantic-call-1")
+        );
+        assert_eq!(
+            persisted.attempted_targets[1]
+                .admission_rejection_reason
+                .as_deref(),
+            Some("node_model_call_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn partial_recovery_accepts_explicit_stale_after_applied_repair_observation() {
+        let (mut snapshot, _, evidence_ids) = recovery_publication_snapshot();
+        let validation_node = snapshot
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_validation())
+            .expect("validation node")
+            .id
+            .clone();
+        for evidence in snapshot.evidence.validations.values_mut() {
+            evidence.repository_fingerprint = "tree-before-repair".into();
+            evidence.status = ValidationEvidenceStatus::Failed;
+        }
+        for node in snapshot
+            .graph
+            .nodes
+            .iter_mut()
+            .filter(|node| node.kind.is_validation())
+        {
+            node.status = ExecutionNodeStatus::FailedRecoverable;
+        }
+        snapshot.current_repository.fingerprint = "tree-after-repair".into();
+        snapshot.current_repository.source_tree_hash = "tree-after-repair".into();
+        let failure = FailureRecord::new(
+            "failure-before-repair",
+            validation_node.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-before-repair",
+            "focused validation failed",
+        );
+        snapshot.failures.record(failure.clone());
+        snapshot.events.push(ExecutionDomainEvent::IncompleteDiffReviewRequested {
+            sequence: 1,
+            node_id: ExecutionNodeId::new("diff-review"),
+            reason: IncompleteReason::ValidationRepairProducedNoMeaningfulMutation,
+            dependency_overrides: Vec::new(),
+        });
+        let session_id = BudgetState::repair_session_id(&failure.id);
+        snapshot.budget.validation_repair_sessions.insert(
+            session_id.clone(),
+            ValidationRepairSession {
+                session_id,
+                failed_validation_id: failure.id.to_string(),
+                originating_gate_id: validation_node,
+                budget: ValidationRepairBudget {
+                    max_model_calls: 2,
+                    max_target_attempts: 1,
+                    max_repository_writes: 1,
+                    max_context_rebuilds: 1,
+                    max_cost_micros: 1_000,
+                },
+                status: ValidationRepairSessionStatus::ReadyForRerun,
+                attempted_targets: vec![ValidationRepairAttempt {
+                    target_path: "src/theme.ts".into(),
+                    outcome: ValidationRepairMutationOutcome::MutationApplied,
+                    repository_fingerprint_before: RepositoryFingerprint::new(
+                        "tree-before-repair",
+                    ),
+                    repository_fingerprint_after: RepositoryFingerprint::new(
+                        "tree-after-repair",
+                    ),
+                    ..ValidationRepairAttempt::default()
+                }],
+                current_assertion_set_revision: 1,
+                ..ValidationRepairSession::default()
+            },
+        );
+
+        let authorized = snapshot
+            .recovery_publication_validation_evidence_ids()
+            .expect("stale-after-repair proof remains explicit and publishable as partial");
+        assert_eq!(authorized.len(), 1);
+        assert!(evidence_ids.contains(&authorized[0]));
     }
 
     fn one_call_budget() -> (BudgetState, ExecutionNodeId, NodeBudget) {

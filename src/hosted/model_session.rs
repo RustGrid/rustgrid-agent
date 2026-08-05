@@ -75,6 +75,10 @@ pub(super) struct GatewayAgent<'a> {
     /// Last pure-orchestrator decision applied by the sole lifecycle adapter.
     pub(super) current_decision: Option<ExecutionDecision>,
     pub(super) completion_outcome: Option<OrchestratedMissionOutcome>,
+    /// Semantic identity of the model call whose tool response is currently
+    /// being applied. Transport retries retain this identity.
+    pub(super) active_model_call_id: Option<String>,
+    pub(super) phase_persistence_failure: Option<PhasePersistenceFailure>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -583,6 +587,7 @@ impl<'a> GatewayAgent<'a> {
         &mut self,
         allow_budget_handoff: bool,
     ) -> Result<Option<ImplementationOutcome>> {
+        self.active_model_call_id = None;
         loop {
             let graph_decision = self.reconcile_execution_and_apply()?;
             match graph_decision.decision {
@@ -864,7 +869,7 @@ impl<'a> GatewayAgent<'a> {
             .phases
             .phase_calls(self.phases.active())
             .saturating_add(1)
-            >= self.phases.phase_limit(self.phases.active())
+            >= self.effective_phase_model_call_limit()
         {
             self.emit_phase_budget_warning()?;
         }
@@ -1166,6 +1171,28 @@ impl<'a> GatewayAgent<'a> {
                 .then(|| self.reserve_graph_model_call(&request))
                 .flatten();
             let Some(reservation) = reservation else {
+                let admission_reason = if cost_admitted {
+                    if self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .total_model_calls
+                        .saturating_add(
+                            self.notebook
+                                .orchestration
+                                .budget
+                                .total_model_calls_reserved,
+                        )
+                        >= self.notebook.orchestration.budget.mission.max_model_calls
+                    {
+                        "mission_model_call_budget_exhausted"
+                    } else {
+                        "repair_session_model_call_budget_exhausted"
+                    }
+                } else {
+                    "repair_cost_preflight_rejected"
+                };
+                self.record_validation_repair_admission_rejection(admission_reason)?;
                 let compact_discovery_finalization = matches!(
                     self.current_decision.as_ref(),
                     Some(ExecutionDecision::ContinueDiscovery {
@@ -1260,6 +1287,7 @@ impl<'a> GatewayAgent<'a> {
                 call_phase,
                 registration_attempt,
             );
+            self.active_model_call_id = Some(registration.semantic_call_id.to_string());
             if let Err(error) = self.api.append_event(
                 "progress",
                 json!({

@@ -148,7 +148,7 @@ pub(super) fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, S
         );
     }
     (
-        "orchestration_initialization_failed".into(),
+        "orchestration_execution_failed".into(),
         format!(
             "Hosted orchestration failed: {}",
             truncate_text(&error.to_string(), 2_000)
@@ -190,7 +190,7 @@ pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Val
     if let Some(failure) = error.downcast_ref::<HostedProviderContractFailure>() {
         return json!({
             "status": "failed",
-            "category": "orchestration_initialization_failed",
+            "category": "provider_protocol_failure",
             "code": failure.code,
             "phase": "request_validation",
             "message": failure.message,
@@ -220,7 +220,7 @@ pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Val
     if let Some(mismatch) = error.downcast_ref::<ExecutionBudgetMismatch>() {
         return json!({
             "status": "failed",
-            "category": "orchestration_initialization_failed",
+            "category": "manifest_policy_invalid",
             "code": "execution_budget_mismatch",
             "phase": "manifest_validation",
             "message":
