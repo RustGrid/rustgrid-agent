@@ -215,10 +215,15 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
                 head_sha: None,
                 pull_request_number: None,
                 pull_request_url: None,
+                final_callback: None,
             });
             return Err(error);
         }
     };
+
+    if recover_persisted_terminal_callback(&api, &manifest)? {
+        return Ok(());
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let stop_reason = Arc::new(Mutex::new(None));
@@ -319,23 +324,20 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
                 head_sha: None,
                 pull_request_number: None,
                 pull_request_url: None,
+                final_callback: None,
             };
-            if let Err(error) = api.complete(&completion) {
+            if matches!(
+                deliver_terminal_callback(
+                    &api,
+                    &terminal,
+                    &completion,
+                    failure.notebook_revision,
+                    &terminal_at,
+                )?,
+                TerminalCallbackDelivery::Pending { .. }
+            ) {
                 eprintln!(
-                    "[warning] blocked execution {execution_id} was persisted, but its terminal callback remains pending: {error:#}"
-                );
-                let _ = api.append_event(
-                    "progress",
-                    json!({
-                        "event_type": "worker.infrastructure_terminal_did_not_override_domain",
-                        "canonical_terminal_result_id": terminal.terminal_result_id,
-                        "mission_outcome": terminal.mission_outcome,
-                        "canonical_process_health": terminal.process_health,
-                        "observed_process_health": ProcessHealth::Degraded,
-                        "reconciliation_decision": InfrastructureReconciliationDecision::DomainResultPreserved,
-                        "anomaly_code": "terminal_callback_transport_failed",
-                        "authority": terminal.finality.authority,
-                    }),
+                    "[warning] blocked execution {execution_id} was persisted, but its terminal callback remains pending"
                 );
             }
             let _ = api.append_event(
@@ -414,13 +416,22 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
             completion.terminal_revision = Some(terminal.finality.terminal_revision);
             completion.terminal_authority = Some("worker_domain".into());
             completion.canonical_terminal_result = Some(serde_json::to_value(&terminal)?);
-            if let Err(completion_error) = api.complete(&completion)
-                && completion_error
-                    .downcast_ref::<HostedHttpError>()
-                    .is_none_or(|failure| !failure.invalidates_execution())
-            {
+            completion.mission_outcome = Some(terminal.compatibility_completion_status());
+            let final_notebook_revision = error
+                .downcast_ref::<HostedAgentExecutionFailure>()
+                .map_or(0, |failure| failure.notebook_revision);
+            if matches!(
+                deliver_terminal_callback(
+                    &api,
+                    &terminal,
+                    &completion,
+                    final_notebook_revision,
+                    &terminal_at,
+                )?,
+                TerminalCallbackDelivery::Pending { .. }
+            ) {
                 eprintln!(
-                    "[warning] could not report hosted execution failure: {completion_error:#}"
+                    "[warning] execution {execution_id} was persisted, but its terminal callback remains pending"
                 );
             }
             let _ = api.append_event(
@@ -547,13 +558,23 @@ fn report_hosted_result(
             .transpose()
             .context("pull request number is too large")?,
         pull_request_url: terminal.publication.pull_request_url.clone(),
+        final_callback: None,
     };
-    if let Err(error) = api.complete(&completion) {
+    if matches!(
+        deliver_terminal_callback(
+            api,
+            &terminal,
+            &completion,
+            result.terminal_telemetry.notebook_revision,
+            terminal_at,
+        )?,
+        TerminalCallbackDelivery::Pending { .. }
+    ) {
         // RunFinished is the canonical terminal result. A best-effort API
         // callback cannot reverse that result or trigger the emergency failure
         // path merely because delivery was temporarily unavailable.
         eprintln!(
-            "[warning] hosted execution {execution_id} finished successfully, but the terminal callback remains pending: {error:#}"
+            "[warning] hosted execution {execution_id} finished successfully, but the terminal callback remains pending"
         );
         let mut observed = terminal.clone();
         record_noncritical_post_publication_failure(
@@ -714,6 +735,7 @@ fn report_emergency_failure_with_api(api: &HostedApiClient, execution_id: Uuid) 
         head_sha: None,
         pull_request_number: None,
         pull_request_url: None,
+        final_callback: None,
     };
     if let Err(error) = api.complete(&completion) {
         if error

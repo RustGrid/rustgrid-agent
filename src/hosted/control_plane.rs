@@ -657,6 +657,20 @@ impl HostedApiClient {
         )
     }
 
+    pub(super) fn complete_once(
+        &self,
+        completion: &CompletionRequest,
+        idempotency_key: Uuid,
+    ) -> Result<Value> {
+        self.send_json(
+            Method::POST,
+            &format!("executions/{}/complete", self.execution_id),
+            Some(serde_json::to_value(completion)?),
+            Some(idempotency_key),
+            1,
+        )
+    }
+
     pub(super) fn ensure_fresh(&self) -> Result<()> {
         let refresh_required = {
             let state = self
@@ -818,6 +832,16 @@ pub(super) fn completion_idempotency_key(
     execution_id: Uuid,
     completion: &CompletionRequest,
 ) -> Result<Uuid> {
+    if let (Some(terminal_result_id), Some(terminal_revision)) = (
+        completion.canonical_terminal_result_id,
+        completion.terminal_revision,
+    ) {
+        return Ok(terminal_callback_idempotency_key(
+            execution_id,
+            terminal_result_id,
+            terminal_revision,
+        ));
+    }
     let encoded = serde_json::to_vec(completion)?;
     let key_material = [
         b"completion:".as_slice(),

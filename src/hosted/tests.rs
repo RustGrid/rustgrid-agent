@@ -2663,6 +2663,40 @@ fn request_sequence_server(
     ))
 }
 
+fn request_outcome_sequence_server(
+    responses: Vec<Option<(&'static str, Value)>>,
+) -> Option<(Url, Receiver<String>, thread::JoinHandle<()>)> {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("test HTTP server should bind: {error}"),
+    };
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let _ = sender.send(request);
+            let Some((status, body)) = response else {
+                continue;
+            };
+            let body = body.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    Some((
+        Url::parse(&format!("http://{address}/")).unwrap(),
+        receiver,
+        handle,
+    ))
+}
+
 struct StoppableOkServer {
     api_root: Url,
     requests: Receiver<String>,
@@ -2935,7 +2969,13 @@ fn test_manifest(execution_id: Uuid) -> HostedManifest {
             github_actions: Some(ManifestGithubActionsExecution {
                 workflow_run_id: Some(88),
                 workflow_run_attempt: Some(1),
+                callback_status: None,
+                callback_outbox: None,
             }),
+            canonical_terminal_result_id: None,
+            terminal_revision: None,
+            terminal_authority: None,
+            canonical_terminal_result: None,
         },
         run: ManifestRun {
             id: execution_id,
@@ -6440,6 +6480,9 @@ it("defines every semantic token for light-blue without conflating primary and i
         ("200 OK", json!({})),
         ("200 OK", json!({})),
         ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
     ]) else {
         return;
     };
@@ -6456,7 +6499,10 @@ it("defines every semantic token for light-blue without conflating primary and i
     let telemetry_request = result_requests.recv().unwrap();
     let resolved_event_request = result_requests.recv().unwrap();
     let result_event_request = result_requests.recv().unwrap();
+    let outbox_request = result_requests.recv().unwrap();
+    let attempted_request = result_requests.recv().unwrap();
     let completion_request = result_requests.recv().unwrap();
+    let acknowledged_request = result_requests.recv().unwrap();
     let exit_event_request = result_requests.recv().unwrap();
     result_server.join().unwrap();
 
@@ -6513,6 +6559,9 @@ it("defines every semantic token for light-blue without conflating primary and i
         json!(changed_paths)
     );
 
+    assert!(outbox_request.contains("worker.terminal_callback_outbox_persisted"));
+    assert!(attempted_request.contains("worker.terminal_callback_attempted"));
+
     assert!(completion_request.starts_with(&format!(
         "POST /api/v1/executions/{execution_id}/complete HTTP/1.1"
     )));
@@ -6533,6 +6582,16 @@ it("defines every semantic token for light-blue without conflating primary and i
         completion_body["completion_evaluation"]["status"],
         "complete"
     );
+    assert_eq!(
+        completion_body["final_callback"]["canonical_terminal_result_id"],
+        resolved_event_body["data"]["canonical_terminal_result_id"]
+    );
+    assert_eq!(completion_body["final_callback"]["terminal_revision"], 1);
+    assert_eq!(completion_body["final_callback"]["process_exit_code"], 0);
+    assert_eq!(
+        completion_body["final_callback"]["final_notebook_revision"],
+        18
+    );
     assert_eq!(completion_body["head_branch"], branch);
     assert_eq!(completion_body["head_sha"], commit);
     assert_eq!(completion_body["pull_request_number"], 226);
@@ -6544,6 +6603,7 @@ it("defines every semantic token for light-blue without conflating primary and i
         completion_body["output_summary"],
         "Implemented all five light-blue theme targets."
     );
+    assert!(acknowledged_request.contains("worker.terminal_callback_acknowledged"));
     assert!(exit_event_request.contains("worker.process_exit_code_resolved"));
 }
 
@@ -6551,6 +6611,8 @@ it("defines every semantic token for light-blue without conflating primary and i
 fn successful_run_remains_successful_when_terminal_callback_transport_fails() {
     let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_0020);
     let Some((api_root, requests, server)) = request_sequence_server(vec![
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
         ("200 OK", json!({})),
         ("200 OK", json!({})),
         ("200 OK", json!({})),
@@ -6587,10 +6649,196 @@ fn successful_run_remains_successful_when_terminal_callback_transport_fails() {
 
     server.join().unwrap();
     let delivered = requests.try_iter().collect::<Vec<_>>();
-    assert_eq!(delivered.len(), 3);
+    assert_eq!(delivered.len(), 5);
     assert!(delivered[0].contains("/telemetry/batch"));
     assert!(delivered[1].contains("/worker-events"));
     assert!(delivered[2].contains("worker.canonical_terminal_result_persisted"));
+    assert!(delivered[3].contains("worker.terminal_callback_outbox_persisted"));
+    assert!(delivered[4].contains("worker.terminal_callback_attempted"));
+}
+
+#[test]
+fn accepted_callback_timeout_retries_with_the_same_idempotency_identity() {
+    let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_0023);
+    let Some((api_root, requests, server)) = request_outcome_sequence_server(vec![
+        Some(("200 OK", json!({}))),
+        Some(("200 OK", json!({}))),
+        None,
+        Some(("200 OK", json!({}))),
+        Some(("200 OK", json!({}))),
+        Some(("200 OK", json!({}))),
+        Some(("200 OK", json!({}))),
+    ]) else {
+        return;
+    };
+    let clock = Arc::new(ManualHostedClock::new(SystemTime::now()));
+    let api = test_api_client_with_clock(api_root, execution_id, clock.clone());
+    let result = HostedResult {
+        summary: "Canonical result persisted before callback delivery.".into(),
+        branch: "rustgrid/callback-timeout".into(),
+        commit: "a".repeat(40),
+        pull_request: PullRequestResult {
+            number: 23,
+            url: "https://github.example/RustGrid/example/pull/23".into(),
+        },
+        validation: vec![ValidationResult {
+            id: "tests".into(),
+            command: "cargo test".into(),
+            status: "passed".into(),
+            output: String::new(),
+        }],
+        completeness: test_completion_evaluation(CompletionStatus::Complete),
+        terminal_telemetry: TerminalTelemetry {
+            notebook_revision: 11,
+            ..TerminalTelemetry::default()
+        },
+    };
+    let terminal = resolve_published_terminal_result(execution_id, &result, "2026-08-04T00:00:00Z");
+    let completion = CompletionRequest {
+        status: terminal.completion_request_status().into(),
+        canonical_terminal_result_id: Some(terminal.terminal_result_id),
+        terminal_revision: Some(terminal.finality.terminal_revision),
+        terminal_authority: Some("worker_domain".into()),
+        canonical_terminal_result: Some(serde_json::to_value(&terminal).unwrap()),
+        mission_outcome: Some(terminal.compatibility_completion_status()),
+        process_health: Some(terminal.process_health.as_str().into()),
+        completion_evaluation: Some(terminal.completion.clone()),
+        output_summary: Some(result.summary.clone()),
+        failure_code: None,
+        failure_message: None,
+        head_branch: terminal.publication.branch.clone(),
+        head_sha: terminal.publication.commit_sha.clone(),
+        pull_request_number: Some(23),
+        pull_request_url: terminal.publication.pull_request_url.clone(),
+        final_callback: None,
+    };
+
+    assert_eq!(
+        deliver_terminal_callback(
+            &api,
+            &terminal,
+            &completion,
+            result.terminal_telemetry.notebook_revision,
+            "2026-08-04T00:00:00Z",
+        )
+        .unwrap(),
+        TerminalCallbackDelivery::Acknowledged { attempts: 2 }
+    );
+    server.join().unwrap();
+    let delivered = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(delivered.len(), 7);
+    let callback_requests = delivered
+        .iter()
+        .filter(|request| request.contains(&format!("/executions/{execution_id}/complete")))
+        .collect::<Vec<_>>();
+    assert_eq!(callback_requests.len(), 2);
+    let idempotency_key = |request: &str| {
+        request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("idempotency-key:"))
+            .unwrap()
+            .to_ascii_lowercase()
+    };
+    assert_eq!(
+        idempotency_key(callback_requests[0]),
+        idempotency_key(callback_requests[1])
+    );
+    assert!(delivered[3].contains("worker.terminal_callback_retry_scheduled"));
+    assert!(delivered[6].contains("worker.terminal_callback_acknowledged"));
+}
+
+#[test]
+fn persisted_callback_outbox_is_replayed_after_worker_restart() {
+    let execution_id = Uuid::from_u128(0x2260_0000_0000_4000_8000_0000_0000_0024);
+    let Some((api_root, requests, server)) =
+        request_sequence_server(vec![("200 OK", json!({})), ("200 OK", json!({}))])
+    else {
+        return;
+    };
+    let api = test_api_client(api_root, execution_id);
+    let result = HostedResult {
+        summary: "Canonical result and callback envelope survived restart.".into(),
+        branch: "rustgrid/callback-restart".into(),
+        commit: "a".repeat(40),
+        pull_request: PullRequestResult {
+            number: 24,
+            url: "https://github.example/RustGrid/example/pull/24".into(),
+        },
+        validation: vec![ValidationResult {
+            id: "tests".into(),
+            command: "cargo test".into(),
+            status: "passed".into(),
+            output: String::new(),
+        }],
+        completeness: test_completion_evaluation(CompletionStatus::Complete),
+        terminal_telemetry: TerminalTelemetry::default(),
+    };
+    let canonical =
+        resolve_published_terminal_result(execution_id, &result, "2026-08-04T10:00:00Z");
+    let callback_key = terminal_callback_idempotency_key(
+        execution_id,
+        canonical.terminal_result_id,
+        canonical.finality.terminal_revision,
+    );
+    let callback = FinalExecutionCallback {
+        execution_id,
+        canonical_terminal_result_id: canonical.terminal_result_id,
+        terminal_revision: canonical.finality.terminal_revision,
+        final_notebook_revision: 12,
+        process_exit_code: 0,
+        workflow_run_id: "88".into(),
+        sent_at: "2026-08-04T10:00:01Z".into(),
+        idempotency_key: callback_key.to_string(),
+    };
+    let completion = CompletionRequest {
+        status: canonical.completion_request_status().into(),
+        canonical_terminal_result_id: Some(canonical.terminal_result_id),
+        terminal_revision: Some(canonical.finality.terminal_revision),
+        terminal_authority: Some("worker_domain".into()),
+        canonical_terminal_result: Some(serde_json::to_value(&canonical).unwrap()),
+        mission_outcome: Some(canonical.compatibility_completion_status()),
+        process_health: Some("healthy".into()),
+        completion_evaluation: Some(canonical.completion.clone()),
+        output_summary: Some(result.summary),
+        failure_code: None,
+        failure_message: None,
+        head_branch: canonical.publication.branch.clone(),
+        head_sha: canonical.publication.commit_sha.clone(),
+        pull_request_number: Some(24),
+        pull_request_url: canonical.publication.pull_request_url.clone(),
+        final_callback: Some(callback.clone()),
+    };
+    let mut manifest = test_manifest(execution_id);
+    manifest.execution.canonical_terminal_result_id = Some(canonical.terminal_result_id);
+    manifest.execution.terminal_revision =
+        Some(i64::try_from(canonical.finality.terminal_revision).expect("test revision fits i64"));
+    manifest.execution.terminal_authority = Some("worker_domain".into());
+    manifest.execution.canonical_terminal_result = Some(serde_json::to_value(&canonical).unwrap());
+    let github = manifest.execution.github_actions.as_mut().unwrap();
+    github.callback_status = Some("pending".into());
+    github.callback_outbox = Some(json!({
+        "outbox": {
+            "execution_id": execution_id,
+            "canonical_terminal_result_id": canonical.terminal_result_id,
+            "payload_hash": "a".repeat(64),
+            "attempts": 1,
+            "created_at": "2026-08-04T10:00:00Z"
+        },
+        "callback": callback,
+        "completion": completion,
+    }));
+
+    assert!(recover_persisted_terminal_callback(&api, &manifest).unwrap());
+    server.join().unwrap();
+    let delivered = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(delivered.len(), 2);
+    assert!(delivered[0].contains("worker.terminal_callback_attempted"));
+    assert!(
+        delivered[1]
+            .to_ascii_lowercase()
+            .contains(&format!("idempotency-key: {callback_key}"))
+    );
+    assert!(delivered[1].contains(&canonical.terminal_result_id.to_string()));
 }
 
 #[test]
@@ -10418,6 +10666,7 @@ fn ai_gateway_and_completion_use_execution_bearer_and_idempotency_keys() {
             head_sha: None,
             pull_request_number: None,
             pull_request_url: None,
+            final_callback: None,
         })
         .unwrap();
     completion_server.join().unwrap();
@@ -10475,6 +10724,7 @@ fn duplicate_partial_completions_have_the_same_idempotency_identity() {
         head_sha: Some("a".repeat(40)),
         pull_request_number: Some(17),
         pull_request_url: Some("https://github.com/RustGrid/example/pull/17".into()),
+        final_callback: None,
     };
     let first = completion_idempotency_key(execution_id, &completion).unwrap();
     let second = completion_idempotency_key(execution_id, &completion).unwrap();
@@ -10485,6 +10735,41 @@ fn duplicate_partial_completions_have_the_same_idempotency_identity() {
     assert_ne!(
         first,
         completion_idempotency_key(execution_id, &changed).unwrap()
+    );
+}
+
+#[test]
+fn canonical_callback_idempotency_survives_mutable_projection_changes() {
+    let execution_id = Uuid::from_u128(0x51515151_5151_4151_8151_515151515151);
+    let terminal_id = Uuid::from_u128(0x52525252_5252_4252_8252_525252525252);
+    let mut completion = CompletionRequest {
+        status: "completed".into(),
+        canonical_terminal_result_id: Some(terminal_id),
+        terminal_revision: Some(3),
+        terminal_authority: Some("worker_domain".into()),
+        canonical_terminal_result: Some(json!({"terminal_result_id": terminal_id})),
+        mission_outcome: Some(CompletionStatus::Complete),
+        process_health: Some("healthy".into()),
+        completion_evaluation: None,
+        output_summary: Some("First transport attempt.".into()),
+        failure_code: None,
+        failure_message: None,
+        head_branch: Some("rustgrid/canonical".into()),
+        head_sha: Some("a".repeat(40)),
+        pull_request_number: Some(19),
+        pull_request_url: Some("https://github.com/RustGrid/example/pull/19".into()),
+        final_callback: None,
+    };
+    let first = completion_idempotency_key(execution_id, &completion).unwrap();
+    completion.output_summary = Some("Retry after an accepted timeout.".into());
+    completion.process_health = Some("degraded".into());
+    assert_eq!(
+        first,
+        completion_idempotency_key(execution_id, &completion).unwrap()
+    );
+    assert_eq!(
+        first,
+        terminal_callback_idempotency_key(execution_id, terminal_id, 3)
     );
 }
 

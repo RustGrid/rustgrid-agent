@@ -305,6 +305,7 @@ pub(super) fn unsuccessful_completion(
         head_sha: None,
         pull_request_number: None,
         pull_request_url: None,
+        final_callback: None,
     }
 }
 

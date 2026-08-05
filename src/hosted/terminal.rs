@@ -50,6 +50,81 @@ pub(super) enum TerminalAuthority {
     AdministrativeOverride,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminalEvidenceSource {
+    CanonicalWorkerResult,
+    FinalCallback,
+    WorkflowConclusion,
+    LeaseExpiration,
+    AdministrativeOverride,
+}
+
+impl TerminalEvidenceSource {
+    pub(super) const fn precedence(self) -> Option<u8> {
+        match self {
+            Self::CanonicalWorkerResult => Some(4),
+            Self::FinalCallback => Some(3),
+            Self::WorkflowConclusion => Some(2),
+            Self::LeaseExpiration => Some(1),
+            // An administrative override is an explicit operation, not an
+            // automatically competing observation in the evidence ordering.
+            Self::AdministrativeOverride => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CallbackStatus {
+    Pending,
+    Acknowledged,
+    Missing,
+    FailedTransport,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct HostedTerminalTransportState {
+    pub(super) callback_status: CallbackStatus,
+    pub(super) callback_attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_callback_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) workflow_conclusion: Option<String>,
+    pub(super) observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct FinalExecutionCallback {
+    pub(super) execution_id: Uuid,
+    pub(super) canonical_terminal_result_id: Uuid,
+    pub(super) terminal_revision: u64,
+    pub(super) final_notebook_revision: u64,
+    pub(super) process_exit_code: i32,
+    pub(super) workflow_run_id: String,
+    pub(super) sent_at: String,
+    pub(super) idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct TerminalCallbackOutboxEntry {
+    pub(super) execution_id: Uuid,
+    pub(super) canonical_terminal_result_id: Uuid,
+    pub(super) payload_hash: String,
+    pub(super) attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) acknowledged_at: Option<String>,
+    pub(super) created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TerminalCallbackDelivery {
+    Acknowledged { attempts: u32 },
+    Pending { attempts: u32 },
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(super) struct TerminalFinality {
     pub(super) terminal_result_id: Uuid,
@@ -83,6 +158,17 @@ pub(super) enum RemainingEvidenceType {
     MissingAutomatedValidation,
     UnresolvedImplementation,
     InfrastructureIncomplete,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RemainingWorkKind {
+    ExternalApproval,
+    ManualVisualInspection,
+    MissingImplementation,
+    FailedValidation,
+    MissingAutomatedValidation,
+    InfrastructureFollowUp,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -138,7 +224,7 @@ impl CanonicalPublicationResult {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct CanonicalTerminalResult {
     pub(super) terminal_result_id: Uuid,
     pub(super) mission_outcome: CanonicalMissionOutcome,
@@ -149,6 +235,7 @@ pub(super) struct CanonicalTerminalResult {
     pub(super) completion: CompletionEvaluation,
     pub(super) remaining_work: Vec<RemainingWorkItem>,
     pub(super) remaining_evidence_types: Vec<RemainingEvidenceType>,
+    pub(super) remaining_work_kinds: Vec<RemainingWorkKind>,
     pub(super) resumability: Resumability,
     pub(super) completed_at: String,
     pub(super) finality: TerminalFinality,
@@ -213,6 +300,370 @@ pub(super) fn canonical_terminal_result_id(execution_id: Uuid) -> Uuid {
     terminal_result_id(execution_id)
 }
 
+pub(super) fn terminal_callback_idempotency_key(
+    execution_id: Uuid,
+    terminal_result_id: Uuid,
+    terminal_revision: u64,
+) -> Uuid {
+    Uuid::new_v5(
+        &HOSTED_NAMESPACE,
+        &[
+            b"terminal-callback:".as_slice(),
+            execution_id.as_bytes().as_slice(),
+            terminal_result_id.as_bytes().as_slice(),
+            terminal_revision.to_be_bytes().as_slice(),
+        ]
+        .concat(),
+    )
+}
+
+fn final_execution_callback(
+    api: &HostedApiClient,
+    canonical: &CanonicalTerminalResult,
+    final_notebook_revision: u64,
+    sent_at: &str,
+) -> FinalExecutionCallback {
+    let idempotency_key = terminal_callback_idempotency_key(
+        api.execution_id,
+        canonical.terminal_result_id,
+        canonical.finality.terminal_revision,
+    );
+    FinalExecutionCallback {
+        execution_id: api.execution_id,
+        canonical_terminal_result_id: canonical.terminal_result_id,
+        terminal_revision: canonical.finality.terminal_revision,
+        final_notebook_revision,
+        process_exit_code: canonical.process_exit_code(),
+        workflow_run_id: api.github_workflow_run_id.to_string(),
+        sent_at: sent_at.into(),
+        idempotency_key: idempotency_key.to_string(),
+    }
+}
+
+fn validate_callback_acknowledgement(
+    canonical: &CanonicalTerminalResult,
+    completion: &CompletionRequest,
+    callback: &FinalExecutionCallback,
+) -> Result<()> {
+    let expected_key = terminal_callback_idempotency_key(
+        callback.execution_id,
+        canonical.terminal_result_id,
+        canonical.finality.terminal_revision,
+    );
+    if terminal_result_id(callback.execution_id) != canonical.terminal_result_id
+        || callback.canonical_terminal_result_id != canonical.terminal_result_id
+        || callback.terminal_revision != canonical.finality.terminal_revision
+        || callback.process_exit_code != canonical.process_exit_code()
+        || callback.idempotency_key != expected_key.to_string()
+        || completion.canonical_terminal_result_id != Some(canonical.terminal_result_id)
+        || completion.terminal_revision != Some(canonical.finality.terminal_revision)
+        || completion.mission_outcome != Some(canonical.compatibility_completion_status())
+        || completion.status != canonical.completion_request_status()
+    {
+        bail!("terminal callback does not acknowledge the finalized canonical result");
+    }
+    Ok(())
+}
+
+fn callback_failure_code(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<HostedHttpError>()
+        .map(|failure| failure.effective_code().to_string())
+        .unwrap_or_else(|| "terminal_callback_transport_failed".into())
+}
+
+fn callback_failure_is_retryable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HostedHttpError>()
+        .is_none_or(|failure| !failure.invalidates_execution() && retryable_status(failure.status))
+}
+
+pub(super) fn deliver_terminal_callback(
+    api: &HostedApiClient,
+    canonical: &CanonicalTerminalResult,
+    completion: &CompletionRequest,
+    final_notebook_revision: u64,
+    sent_at: &str,
+) -> Result<TerminalCallbackDelivery> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let callback = final_execution_callback(api, canonical, final_notebook_revision, sent_at);
+    validate_callback_acknowledgement(canonical, completion, &callback)?;
+    let mut envelope = completion.clone();
+    envelope.final_callback = Some(callback.clone());
+    let payload_hash = sha256_text(&serde_json::to_string(&envelope)?);
+    let outbox = TerminalCallbackOutboxEntry {
+        execution_id: api.execution_id,
+        canonical_terminal_result_id: canonical.terminal_result_id,
+        payload_hash: payload_hash.clone(),
+        attempts: 0,
+        last_error: None,
+        acknowledged_at: None,
+        created_at: sent_at.into(),
+    };
+    if let Err(error) = api.append_event(
+        "progress",
+        json!({
+            "event_type": "worker.terminal_callback_outbox_persisted",
+            "canonical_terminal_result_id": canonical.terminal_result_id,
+            "callback_idempotency_key": callback.idempotency_key,
+            "outbox": outbox,
+            "callback": callback,
+            "completion": envelope,
+            "transport": HostedTerminalTransportState {
+                callback_status: CallbackStatus::Pending,
+                callback_attempts: 0,
+                last_callback_error: None,
+                workflow_conclusion: None,
+                observed_at: sent_at.into(),
+            },
+        }),
+    ) {
+        let error_code = callback_failure_code(&error);
+        let _ = api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.terminal_callback_transport_failed",
+                "canonical_terminal_result_id": canonical.terminal_result_id,
+                "callback_idempotency_key": callback.idempotency_key,
+                "attempt": 0,
+                "transport_result": error_code,
+                "outbox_persisted": false,
+                "transport": HostedTerminalTransportState {
+                    callback_status: CallbackStatus::FailedTransport,
+                    callback_attempts: 0,
+                    last_callback_error: Some(error_code),
+                    workflow_conclusion: None,
+                    observed_at: now_rfc3339(),
+                },
+                "alert": {
+                    "severity": "warning",
+                    "category": "hosted_terminal_transport",
+                    "code": "final_callback_missing",
+                },
+            }),
+        );
+        return Ok(TerminalCallbackDelivery::Pending { attempts: 0 });
+    }
+
+    let idempotency_key = terminal_callback_idempotency_key(
+        api.execution_id,
+        canonical.terminal_result_id,
+        canonical.finality.terminal_revision,
+    );
+    for attempt in 1..=MAX_ATTEMPTS {
+        let _ = api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.terminal_callback_attempted",
+                "canonical_terminal_result_id": canonical.terminal_result_id,
+                "callback_idempotency_key": callback.idempotency_key,
+                "attempt": attempt,
+                "payload_hash": payload_hash,
+            }),
+        );
+        match api.complete_once(&envelope, idempotency_key) {
+            Ok(_) => {
+                let acknowledged_at = now_rfc3339();
+                let _ = api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "worker.terminal_callback_acknowledged",
+                        "canonical_terminal_result_id": canonical.terminal_result_id,
+                        "callback_idempotency_key": callback.idempotency_key,
+                        "attempt": attempt,
+                        "acknowledged_at": acknowledged_at,
+                        "outbox": TerminalCallbackOutboxEntry {
+                            execution_id: api.execution_id,
+                            canonical_terminal_result_id: canonical.terminal_result_id,
+                            payload_hash: payload_hash.clone(),
+                            attempts: attempt,
+                            last_error: None,
+                            acknowledged_at: Some(acknowledged_at.clone()),
+                            created_at: sent_at.into(),
+                        },
+                        "transport": HostedTerminalTransportState {
+                            callback_status: CallbackStatus::Acknowledged,
+                            callback_attempts: attempt,
+                            last_callback_error: None,
+                            workflow_conclusion: None,
+                            observed_at: acknowledged_at,
+                        },
+                    }),
+                );
+                return Ok(TerminalCallbackDelivery::Acknowledged { attempts: attempt });
+            }
+            Err(error) => {
+                let error_code = callback_failure_code(&error);
+                if attempt < MAX_ATTEMPTS && callback_failure_is_retryable(&error) {
+                    let delay = retry_delay((attempt - 1) as usize);
+                    let _ = api.append_event(
+                        "progress",
+                        json!({
+                            "event_type": "worker.terminal_callback_retry_scheduled",
+                            "canonical_terminal_result_id": canonical.terminal_result_id,
+                            "callback_idempotency_key": callback.idempotency_key,
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "delay_milliseconds": delay.as_millis(),
+                            "transport_result": error_code,
+                            "outbox": TerminalCallbackOutboxEntry {
+                                execution_id: api.execution_id,
+                                canonical_terminal_result_id: canonical.terminal_result_id,
+                                payload_hash: payload_hash.clone(),
+                                attempts: attempt,
+                                last_error: Some(error_code.clone()),
+                                acknowledged_at: None,
+                                created_at: sent_at.into(),
+                            },
+                        }),
+                    );
+                    api.clock.sleep(delay);
+                    continue;
+                }
+                let observed_at = now_rfc3339();
+                let transport = HostedTerminalTransportState {
+                    callback_status: CallbackStatus::FailedTransport,
+                    callback_attempts: attempt,
+                    last_callback_error: Some(error_code.clone()),
+                    workflow_conclusion: None,
+                    observed_at: observed_at.clone(),
+                };
+                let _ = api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "worker.terminal_callback_transport_failed",
+                        "canonical_terminal_result_id": canonical.terminal_result_id,
+                        "callback_idempotency_key": callback.idempotency_key,
+                        "attempt": attempt,
+                        "transport_result": error_code,
+                        "outbox": TerminalCallbackOutboxEntry {
+                            execution_id: api.execution_id,
+                            canonical_terminal_result_id: canonical.terminal_result_id,
+                            payload_hash: payload_hash.clone(),
+                            attempts: attempt,
+                            last_error: Some(error_code.clone()),
+                            acknowledged_at: None,
+                            created_at: sent_at.into(),
+                        },
+                        "transport": transport,
+                        "alert": {
+                            "severity": "warning",
+                            "category": "hosted_terminal_transport",
+                            "code": "final_callback_missing",
+                        },
+                    }),
+                );
+                let _ = api.append_event(
+                    "progress",
+                    json!({
+                        "event_type": "execution.callback_missing_but_domain_preserved",
+                        "execution_id": api.execution_id,
+                        "canonical_terminal_result_id": canonical.terminal_result_id,
+                        "callback_idempotency_key": callback.idempotency_key,
+                        "reconciliation_authority": TerminalEvidenceSource::CanonicalWorkerResult,
+                        "mission_outcome": canonical.mission_outcome,
+                        "domain_execution_status": canonical.execution_status,
+                        "infrastructure_health": "degraded",
+                        "anomaly_code": "final_callback_missing",
+                    }),
+                );
+                return Ok(TerminalCallbackDelivery::Pending { attempts: attempt });
+            }
+        }
+    }
+    unreachable!("bounded terminal callback loop always returns")
+}
+
+pub(super) fn recover_persisted_terminal_callback(
+    api: &HostedApiClient,
+    manifest: &HostedManifest,
+) -> Result<bool> {
+    let execution = &manifest.execution;
+    let Some(canonical_value) = execution.canonical_terminal_result.as_ref() else {
+        return Ok(false);
+    };
+    let canonical: CanonicalTerminalResult = serde_json::from_value(canonical_value.clone())
+        .context("persisted canonical terminal result is invalid")?;
+    if execution.canonical_terminal_result_id != Some(canonical.terminal_result_id)
+        || execution.terminal_revision != i64::try_from(canonical.finality.terminal_revision).ok()
+        || execution.terminal_authority.as_deref() != Some("worker_domain")
+    {
+        bail!("persisted canonical terminal identity is inconsistent");
+    }
+    let github = execution.github_actions.as_ref();
+    if github.and_then(|state| state.callback_status.as_deref()) == Some("acknowledged") {
+        println!(
+            "[complete] Execution {} already has an acknowledged canonical terminal result",
+            api.execution_id
+        );
+        return Ok(true);
+    }
+    let Some(outbox) = github.and_then(|state| state.callback_outbox.as_ref()) else {
+        eprintln!(
+            "[warning] execution {} has a canonical terminal result but no recoverable callback outbox",
+            api.execution_id
+        );
+        return Ok(true);
+    };
+    let mut completion: CompletionRequest = outbox
+        .get("completion")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("persisted terminal callback completion envelope is invalid")?
+        .ok_or_else(|| anyhow!("persisted terminal callback has no completion envelope"))?;
+    let callback = completion
+        .final_callback
+        .clone()
+        .or_else(|| {
+            outbox
+                .get("callback")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+        })
+        .ok_or_else(|| anyhow!("persisted terminal callback metadata is missing"))?;
+    completion.final_callback = Some(callback.clone());
+    validate_callback_acknowledgement(&canonical, &completion, &callback)?;
+    let idempotency_key = terminal_callback_idempotency_key(
+        api.execution_id,
+        canonical.terminal_result_id,
+        canonical.finality.terminal_revision,
+    );
+    for attempt in 1..=3_u32 {
+        let _ = api.append_event(
+            "progress",
+            json!({
+                "event_type": "worker.terminal_callback_attempted",
+                "canonical_terminal_result_id": canonical.terminal_result_id,
+                "callback_idempotency_key": callback.idempotency_key,
+                "attempt": attempt,
+                "recovered_from_durable_outbox": true,
+            }),
+        );
+        match api.complete_once(&completion, idempotency_key) {
+            Ok(_) => {
+                println!(
+                    "[complete] Execution {} recovered its persisted terminal callback",
+                    api.execution_id
+                );
+                return Ok(true);
+            }
+            Err(error) if attempt < 3 && callback_failure_is_retryable(&error) => {
+                api.clock.sleep(retry_delay((attempt - 1) as usize));
+            }
+            Err(error) => {
+                eprintln!(
+                    "[warning] execution {} preserved its canonical result, but recovered callback delivery remains pending: {}",
+                    api.execution_id,
+                    callback_failure_code(&error)
+                );
+                return Ok(true);
+            }
+        }
+    }
+    unreachable!("bounded recovered callback loop always returns")
+}
+
 fn remaining_evidence_types(completion: &CompletionEvaluation) -> Vec<RemainingEvidenceType> {
     let mut types = Vec::new();
     let mut push = |value| {
@@ -254,6 +705,58 @@ fn remaining_evidence_types(completion: &CompletionEvaluation) -> Vec<RemainingE
     types
 }
 
+fn remaining_work_kinds(
+    completion: &CompletionEvaluation,
+    validation: &[ValidationResult],
+) -> Vec<RemainingWorkKind> {
+    let mut kinds = Vec::new();
+    let mut push = |value| {
+        if !kinds.contains(&value) {
+            kinds.push(value);
+        }
+    };
+    if !completion.pending_external_review.is_empty()
+        || completion
+            .criteria
+            .iter()
+            .any(|criterion| criterion.status == CriterionStatus::ExternalReviewRequired)
+    {
+        push(RemainingWorkKind::ExternalApproval);
+    }
+    if completion.review_checklist.iter().any(|item| {
+        item.status != "completed"
+            && matches!(
+                item.r#type,
+                VerificationType::ManualQa
+                    | VerificationType::AccessibilityReview
+                    | VerificationType::VisualReview
+                    | VerificationType::DeploymentEnvironment
+            )
+    }) {
+        push(RemainingWorkKind::ManualVisualInspection);
+    }
+    if completion.implementation_completeness != ImplementationCompleteness::Complete
+        || !completion.remaining_implementation_work.is_empty()
+    {
+        push(RemainingWorkKind::MissingImplementation);
+    }
+    if validation
+        .iter()
+        .any(|result| matches!(result.status.as_str(), "failed" | "failed_code"))
+    {
+        push(RemainingWorkKind::FailedValidation);
+    }
+    if !completion.remaining_automated_verification.is_empty()
+        || validation.iter().any(|result| result.status != "passed")
+    {
+        push(RemainingWorkKind::MissingAutomatedValidation);
+    }
+    if !completion.unrecovered_tool_failures.is_empty() {
+        push(RemainingWorkKind::InfrastructureFollowUp);
+    }
+    kinds
+}
+
 fn normalized_completion(
     mut completion: CompletionEvaluation,
     outcome: CanonicalMissionOutcome,
@@ -278,23 +781,25 @@ pub(super) fn resolve_published_terminal_result(
     completed_at: &str,
 ) -> CanonicalTerminalResult {
     let remaining_evidence_types = remaining_evidence_types(&result.completeness);
+    let remaining_work_kinds = remaining_work_kinds(&result.completeness, &result.validation);
     let automated_gates_passed = result
         .validation
         .iter()
         .all(|validation| validation.status == "passed");
-    let engineering_work_remains = remaining_evidence_types.iter().any(|kind| {
+    let engineering_work_remains = remaining_work_kinds.iter().any(|kind| {
         matches!(
             kind,
-            RemainingEvidenceType::MissingAutomatedValidation
-                | RemainingEvidenceType::UnresolvedImplementation
-                | RemainingEvidenceType::InfrastructureIncomplete
+            RemainingWorkKind::MissingImplementation
+                | RemainingWorkKind::FailedValidation
+                | RemainingWorkKind::MissingAutomatedValidation
+                | RemainingWorkKind::InfrastructureFollowUp
         )
     }) || !automated_gates_passed;
-    let external_only = !remaining_evidence_types.is_empty()
-        && remaining_evidence_types.iter().all(|kind| {
+    let external_only = !remaining_work_kinds.is_empty()
+        && remaining_work_kinds.iter().all(|kind| {
             matches!(
                 kind,
-                RemainingEvidenceType::ExternalApproval | RemainingEvidenceType::ManualInspection
+                RemainingWorkKind::ExternalApproval | RemainingWorkKind::ManualVisualInspection
             )
         });
     let mission_outcome = if !engineering_work_remains
@@ -347,6 +852,7 @@ pub(super) fn resolve_published_terminal_result(
         completion: normalized_completion(result.completeness.clone(), mission_outcome),
         remaining_work: result.terminal_telemetry.remaining_work.clone(),
         remaining_evidence_types,
+        remaining_work_kinds,
         resumability,
         completed_at: completed_at.into(),
         finality: TerminalFinality {
@@ -377,6 +883,7 @@ pub(super) fn resolve_blocked_terminal_result(
         completion: normalized_completion(completion, CanonicalMissionOutcome::Blocked),
         remaining_work,
         remaining_evidence_types: vec![RemainingEvidenceType::UnresolvedImplementation],
+        remaining_work_kinds: vec![RemainingWorkKind::MissingImplementation],
         resumability: Resumability::Resumable {
             resume_phase: Some(resume_phase.into()),
         },
@@ -451,6 +958,11 @@ pub(super) fn resolve_unsuccessful_terminal_result(
         } else {
             RemainingEvidenceType::InfrastructureIncomplete
         }],
+        remaining_work_kinds: vec![if cancelled {
+            RemainingWorkKind::MissingImplementation
+        } else {
+            RemainingWorkKind::InfrastructureFollowUp
+        }],
         resumability,
         completed_at: completed_at.into(),
         finality: TerminalFinality {
@@ -496,6 +1008,9 @@ pub(super) enum InfrastructureReconciliationDecision {
     DomainResultPreserved,
     DomainFailureConfirmed,
     InfrastructureFallbackRequired,
+    AwaitingGracePeriod,
+    LostWithoutTerminalProof,
+    TerminalStateCorruption,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -506,10 +1021,141 @@ pub(super) struct InfrastructureReconciliationResult {
     pub(super) terminal_result_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct TerminalReconciliation {
+    pub(super) decision: InfrastructureReconciliationDecision,
+    pub(super) authority: TerminalEvidenceSource,
+    pub(super) anomaly_code: Option<&'static str>,
+    pub(super) terminal_result_id: Option<Uuid>,
+    pub(super) domain_status_preserved: bool,
+    pub(super) infrastructure_health: ProcessHealth,
+}
+
+fn strongest_terminal_evidence(
+    sources: impl IntoIterator<Item = TerminalEvidenceSource>,
+) -> TerminalEvidenceSource {
+    sources
+        .into_iter()
+        .filter_map(|source| source.precedence().map(|precedence| (source, precedence)))
+        .max_by_key(|(_, precedence)| *precedence)
+        .map(|(source, _)| source)
+        .unwrap_or(TerminalEvidenceSource::LeaseExpiration)
+}
+
+pub(super) fn reconcile_terminal_execution(
+    canonical: Option<&CanonicalTerminalResult>,
+    canonical_corrupt: bool,
+    callback_status: CallbackStatus,
+    infrastructure: &InfrastructureTerminalMetadata,
+    lease_expired: bool,
+    grace_period_elapsed: bool,
+    resumable_worker_active: bool,
+) -> TerminalReconciliation {
+    if let Some(canonical) = canonical {
+        let callback_missing = matches!(
+            callback_status,
+            CallbackStatus::Missing | CallbackStatus::FailedTransport
+        );
+        return TerminalReconciliation {
+            decision: InfrastructureReconciliationDecision::DomainResultPreserved,
+            authority: strongest_terminal_evidence([
+                TerminalEvidenceSource::CanonicalWorkerResult,
+                TerminalEvidenceSource::WorkflowConclusion,
+            ]),
+            anomaly_code: callback_missing.then_some("final_callback_missing"),
+            terminal_result_id: Some(canonical.terminal_result_id),
+            domain_status_preserved: true,
+            infrastructure_health: if callback_missing {
+                ProcessHealth::Degraded
+            } else {
+                canonical.process_health
+            },
+        };
+    }
+    if canonical_corrupt || callback_status == CallbackStatus::Acknowledged {
+        return TerminalReconciliation {
+            decision: InfrastructureReconciliationDecision::TerminalStateCorruption,
+            authority: if callback_status == CallbackStatus::Acknowledged {
+                TerminalEvidenceSource::FinalCallback
+            } else {
+                TerminalEvidenceSource::WorkflowConclusion
+            },
+            anomaly_code: Some("terminal_state_corruption"),
+            terminal_result_id: None,
+            domain_status_preserved: false,
+            infrastructure_health: ProcessHealth::Failed,
+        };
+    }
+    let workflow_terminal = infrastructure.workflow_status == "completed"
+        || infrastructure.workflow_conclusion.is_some();
+    if workflow_terminal && !grace_period_elapsed {
+        return TerminalReconciliation {
+            decision: InfrastructureReconciliationDecision::AwaitingGracePeriod,
+            authority: TerminalEvidenceSource::WorkflowConclusion,
+            anomaly_code: None,
+            terminal_result_id: None,
+            domain_status_preserved: false,
+            infrastructure_health: ProcessHealth::Degraded,
+        };
+    }
+    if infrastructure.workflow_conclusion.as_deref() == Some("failure") {
+        return TerminalReconciliation {
+            decision: InfrastructureReconciliationDecision::InfrastructureFallbackRequired,
+            authority: TerminalEvidenceSource::WorkflowConclusion,
+            anomaly_code: Some("workflow_failed_without_terminal_result"),
+            terminal_result_id: None,
+            domain_status_preserved: false,
+            infrastructure_health: ProcessHealth::Failed,
+        };
+    }
+    if (workflow_terminal || lease_expired) && grace_period_elapsed && !resumable_worker_active {
+        return TerminalReconciliation {
+            decision: InfrastructureReconciliationDecision::LostWithoutTerminalProof,
+            authority: strongest_terminal_evidence(
+                workflow_terminal
+                    .then_some(TerminalEvidenceSource::WorkflowConclusion)
+                    .into_iter()
+                    .chain(lease_expired.then_some(TerminalEvidenceSource::LeaseExpiration)),
+            ),
+            anomaly_code: Some("terminal_proof_missing"),
+            terminal_result_id: None,
+            domain_status_preserved: false,
+            infrastructure_health: ProcessHealth::Failed,
+        };
+    }
+    TerminalReconciliation {
+        decision: InfrastructureReconciliationDecision::AwaitingGracePeriod,
+        authority: if workflow_terminal {
+            TerminalEvidenceSource::WorkflowConclusion
+        } else {
+            TerminalEvidenceSource::LeaseExpiration
+        },
+        anomaly_code: None,
+        terminal_result_id: None,
+        domain_status_preserved: false,
+        infrastructure_health: ProcessHealth::Degraded,
+    }
+}
+
 pub(super) fn reconcile_infrastructure_terminal(
     canonical: Option<&CanonicalTerminalResult>,
     infrastructure: InfrastructureTerminalMetadata,
 ) -> InfrastructureReconciliationResult {
+    if let Some(canonical) = canonical {
+        let policy = reconcile_terminal_execution(
+            Some(canonical),
+            false,
+            CallbackStatus::Acknowledged,
+            &infrastructure,
+            false,
+            true,
+            false,
+        );
+        debug_assert_eq!(
+            policy.decision,
+            InfrastructureReconciliationDecision::DomainResultPreserved
+        );
+    }
     let workflow_failed = infrastructure.workflow_conclusion.as_deref() == Some("failure");
     match canonical {
         Some(canonical) if workflow_failed && canonical.process_health != ProcessHealth::Failed => {
@@ -832,5 +1478,226 @@ mod tests {
         assert_eq!(canonical.mission_outcome, outcome);
         assert_eq!(canonical.publication, publication);
         assert_eq!(canonical.process_exit_code(), 0);
+    }
+
+    #[test]
+    fn finalized_canonical_result_is_terminal_proof_when_callback_is_missing() {
+        let canonical = resolve_published_terminal_result(
+            Uuid::nil(),
+            &published(completion(CompletionStatus::Complete)),
+            "2026-08-04T00:00:00Z",
+        );
+        let publication = canonical.publication.clone();
+        let reconciled = reconcile_terminal_execution(
+            Some(&canonical),
+            false,
+            CallbackStatus::Missing,
+            &infrastructure("success"),
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            reconciled.decision,
+            InfrastructureReconciliationDecision::DomainResultPreserved
+        );
+        assert_eq!(
+            reconciled.authority,
+            TerminalEvidenceSource::CanonicalWorkerResult
+        );
+        assert_eq!(reconciled.anomaly_code, Some("final_callback_missing"));
+        assert!(reconciled.domain_status_preserved);
+        assert_eq!(reconciled.infrastructure_health, ProcessHealth::Degraded);
+        assert_eq!(canonical.publication, publication);
+        assert_eq!(canonical.execution_status, DomainExecutionStatus::Completed);
+    }
+
+    #[test]
+    fn workflow_completion_without_terminal_proof_observes_grace_before_lost() {
+        let workflow = infrastructure("success");
+        let racing = reconcile_terminal_execution(
+            None,
+            false,
+            CallbackStatus::Missing,
+            &workflow,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            racing.decision,
+            InfrastructureReconciliationDecision::AwaitingGracePeriod
+        );
+
+        let lost = reconcile_terminal_execution(
+            None,
+            false,
+            CallbackStatus::Missing,
+            &workflow,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            lost.decision,
+            InfrastructureReconciliationDecision::LostWithoutTerminalProof
+        );
+        assert_eq!(lost.anomaly_code, Some("terminal_proof_missing"));
+
+        let active = reconcile_terminal_execution(
+            None,
+            false,
+            CallbackStatus::Missing,
+            &workflow,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(
+            active.decision,
+            InfrastructureReconciliationDecision::AwaitingGracePeriod
+        );
+    }
+
+    #[test]
+    fn callback_without_its_canonical_result_is_terminal_corruption() {
+        let reconciled = reconcile_terminal_execution(
+            None,
+            false,
+            CallbackStatus::Acknowledged,
+            &infrastructure("success"),
+            false,
+            true,
+            false,
+        );
+        assert_eq!(
+            reconciled.decision,
+            InfrastructureReconciliationDecision::TerminalStateCorruption
+        );
+        assert_eq!(reconciled.authority, TerminalEvidenceSource::FinalCallback);
+    }
+
+    #[test]
+    fn external_review_only_is_typed_and_stronger_than_partial() {
+        let mut evaluation = completion(CompletionStatus::Uncertain);
+        evaluation.implementation_completeness = ImplementationCompleteness::Complete;
+        evaluation.pending_external_review = vec!["Approve the visual result.".into()];
+        let canonical = resolve_published_terminal_result(
+            Uuid::nil(),
+            &published(evaluation),
+            "2026-08-04T00:00:00Z",
+        );
+        assert_eq!(
+            canonical.remaining_work_kinds,
+            vec![RemainingWorkKind::ExternalApproval]
+        );
+        assert_eq!(
+            canonical.mission_outcome,
+            CanonicalMissionOutcome::CompletePendingExternalReview
+        );
+        assert_eq!(canonical.reason_code, "external_review_required");
+    }
+
+    #[test]
+    fn terminal_callback_identity_uses_only_canonical_coordinates() {
+        let execution_id = Uuid::from_u128(1);
+        let terminal_id = Uuid::from_u128(2);
+        assert_eq!(
+            terminal_callback_idempotency_key(execution_id, terminal_id, 7),
+            terminal_callback_idempotency_key(execution_id, terminal_id, 7)
+        );
+        assert_ne!(
+            terminal_callback_idempotency_key(execution_id, terminal_id, 7),
+            terminal_callback_idempotency_key(execution_id, terminal_id, 8)
+        );
+    }
+
+    #[test]
+    fn administrative_override_is_not_an_implicit_evidence_precedence() {
+        assert_eq!(
+            strongest_terminal_evidence([
+                TerminalEvidenceSource::AdministrativeOverride,
+                TerminalEvidenceSource::WorkflowConclusion,
+                TerminalEvidenceSource::CanonicalWorkerResult,
+                TerminalEvidenceSource::FinalCallback,
+                TerminalEvidenceSource::LeaseExpiration,
+            ]),
+            TerminalEvidenceSource::CanonicalWorkerResult
+        );
+        assert_eq!(
+            strongest_terminal_evidence([
+                TerminalEvidenceSource::AdministrativeOverride,
+                TerminalEvidenceSource::WorkflowConclusion,
+            ]),
+            TerminalEvidenceSource::WorkflowConclusion
+        );
+    }
+
+    #[test]
+    fn final_callback_acknowledges_and_cannot_redefine_canonical_outcome() {
+        let execution_id = Uuid::from_u128(1);
+        let canonical = resolve_published_terminal_result(
+            execution_id,
+            &published(completion(CompletionStatus::Complete)),
+            "2026-08-04T00:00:00Z",
+        );
+        let mut request = CompletionRequest {
+            status: canonical.completion_request_status().into(),
+            canonical_terminal_result_id: Some(canonical.terminal_result_id),
+            terminal_revision: Some(canonical.finality.terminal_revision),
+            terminal_authority: Some("worker_domain".into()),
+            canonical_terminal_result: Some(serde_json::to_value(&canonical).unwrap()),
+            mission_outcome: Some(canonical.compatibility_completion_status()),
+            process_health: Some(canonical.process_health.as_str().into()),
+            completion_evaluation: Some(canonical.completion.clone()),
+            output_summary: None,
+            failure_code: None,
+            failure_message: None,
+            head_branch: canonical.publication.branch.clone(),
+            head_sha: canonical.publication.commit_sha.clone(),
+            pull_request_number: canonical
+                .publication
+                .pull_request_number
+                .map(|number| number as i64),
+            pull_request_url: canonical.publication.pull_request_url.clone(),
+            final_callback: None,
+        };
+        let callback = FinalExecutionCallback {
+            execution_id,
+            canonical_terminal_result_id: canonical.terminal_result_id,
+            terminal_revision: canonical.finality.terminal_revision,
+            final_notebook_revision: 9,
+            process_exit_code: canonical.process_exit_code(),
+            workflow_run_id: "100".into(),
+            sent_at: "2026-08-04T00:00:01Z".into(),
+            idempotency_key: terminal_callback_idempotency_key(
+                execution_id,
+                canonical.terminal_result_id,
+                canonical.finality.terminal_revision,
+            )
+            .to_string(),
+        };
+        validate_callback_acknowledgement(&canonical, &request, &callback).unwrap();
+
+        request.mission_outcome = Some(CompletionStatus::Partial);
+        assert!(validate_callback_acknowledgement(&canonical, &request, &callback).is_err());
+    }
+
+    #[test]
+    fn terminal_callback_outbox_round_trips_for_restart_recovery() {
+        let entry = TerminalCallbackOutboxEntry {
+            execution_id: Uuid::from_u128(1),
+            canonical_terminal_result_id: Uuid::from_u128(2),
+            payload_hash: "a".repeat(64),
+            attempts: 2,
+            last_error: Some("terminal_callback_transport_failed".into()),
+            acknowledged_at: None,
+            created_at: "2026-08-04T00:00:00Z".into(),
+        };
+        let persisted = serde_json::to_vec(&entry).unwrap();
+        let restored: TerminalCallbackOutboxEntry = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(restored, entry);
+        assert_eq!(restored.attempts, 2);
+        assert!(restored.acknowledged_at.is_none());
     }
 }

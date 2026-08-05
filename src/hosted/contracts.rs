@@ -63,12 +63,24 @@ pub(super) struct ManifestExecution {
     pub(super) maximum_cost_usd: Option<String>,
     #[serde(default)]
     pub(super) github_actions: Option<ManifestGithubActionsExecution>,
+    #[serde(default)]
+    pub(super) canonical_terminal_result_id: Option<Uuid>,
+    #[serde(default)]
+    pub(super) terminal_revision: Option<i64>,
+    #[serde(default)]
+    pub(super) terminal_authority: Option<String>,
+    #[serde(default)]
+    pub(super) canonical_terminal_result: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct ManifestGithubActionsExecution {
     pub(super) workflow_run_id: Option<i64>,
     pub(super) workflow_run_attempt: Option<i32>,
+    #[serde(default)]
+    pub(super) callback_status: Option<String>,
+    #[serde(default)]
+    pub(super) callback_outbox: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -250,7 +262,7 @@ pub(super) struct HostedSandboxPolicy {
     pub(super) approval_policy: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct CompletionRequest {
     pub(super) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,6 +293,8 @@ pub(super) struct CompletionRequest {
     pub(super) pull_request_number: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) pull_request_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) final_callback: Option<FinalExecutionCallback>,
 }
 
 #[derive(Clone, Debug)]
@@ -973,6 +987,7 @@ mod tests {
             head_sha: Some("a".repeat(40)),
             pull_request_number: Some(226),
             pull_request_url: Some("https://github.com/RustGrid/example/pull/226".into()),
+            final_callback: None,
         };
 
         assert_eq!(
