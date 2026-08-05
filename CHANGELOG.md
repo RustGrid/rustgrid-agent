@@ -5,6 +5,30 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.38 - 2026-08-05
+
+### Changed
+
+- Derive validation-repair capacity from structured failure assertions,
+  implicated targets, gate criticality, target size, and remaining signed
+  mission capacity.
+- Persist bounded repair-call, repository-write, context-rebuild, reallocation,
+  and attempt-identity evidence so recovery and telemetry remain deterministic.
+- Represent phase-persistence degradation as a typed, durable condition while
+  preserving the canonical worker-domain outcome.
+
+### Fixed
+
+- Prevent repair retries or reallocations from exceeding target, call, cost,
+  repository-write, context-rebuild, or mission limits.
+- Preserve successful and partial-reviewable terminal outcomes when a late
+  phase-transition write fails, reporting degraded health instead of a generic
+  infrastructure or initialization failure.
+- Bind validation-repair attempts to exact semantic model calls, revisions,
+  repository fingerprints, assertions, targets, and validation reruns.
+- Require versioned phase-transition payloads and the canonical
+  `review_incomplete_diff` decision for repair-to-review transitions.
+
 ## 1.4.37 - 2026-08-05
 
 ### Changed
