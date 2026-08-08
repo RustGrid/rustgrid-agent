@@ -598,7 +598,7 @@ pub(super) fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
     {
         "ai_gateway_failed"
     } else if is_hosted_orchestration_invariant_error(error) {
-        "execution_graph_initialization_failed"
+        "OrchestrationStateInvariantFailure"
     } else {
         "orchestration_execution_failed"
     }

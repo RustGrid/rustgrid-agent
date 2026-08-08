@@ -838,6 +838,9 @@ pub(super) struct HostedAgentExecutionFailure {
     pub(super) notebook_revision: u64,
     pub(super) recoverable: bool,
     pub(super) resume_phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resume_from_node: Option<String>,
+    pub(super) repository_fingerprint: String,
     pub(super) recommended_action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) artifact: Option<String>,

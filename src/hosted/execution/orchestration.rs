@@ -71,6 +71,35 @@ fn validate_critical_worker_event_fields(data: &Value) -> std::result::Result<()
         "worker.graph_invariant_violation" => {
             &["category", "code", "phase", "resumable", "node_id"]
         }
+        "worker.lifecycle_invariant_check_started"
+        | "worker.lifecycle_invariant_check_passed"
+        | "worker.lifecycle_invariant_check_failed"
+        | "worker.lifecycle_invariant_not_applicable" => &[
+            "invariant_id",
+            "scope",
+            "phase",
+            "required_evidence_kinds",
+            "available_evidence_kinds",
+            "current_node",
+            "graph_revision",
+            "repository_fingerprint",
+        ],
+        "worker.implementation_barrier_created"
+        | "worker.implementation_barrier_satisfied"
+        | "worker.implementation_barrier_unsatisfied" => &[
+            "required_nodes",
+            "completed_nodes",
+            "unresolved_nodes",
+            "repository_fingerprint",
+            "graph_revision",
+        ],
+        "worker.next_implementation_node_selected" => &[
+            "completed_node",
+            "next_node",
+            "next_node_kind",
+            "graph_revision",
+            "repository_fingerprint",
+        ],
         _ => return Ok(()),
     };
     let missing = required
@@ -139,6 +168,16 @@ impl<'a> GatewayAgent<'a> {
         containment: &'a command::HostedProcessContainment,
         partial_run: Option<PartialRunContext>,
     ) -> Result<Self> {
+        crate::execution_graph::validate_lifecycle_invariant_definitions(
+            &crate::execution_graph::lifecycle_invariant_definitions(),
+        )
+        .map_err(|violation| {
+            anyhow!(HostedInvariantFailure::in_phase(
+                violation.code,
+                "startup",
+                violation.to_string(),
+            ))
+        })?;
         let budget = manifest
             .budget_audit()
             .expect("hosted manifest budget was validated before agent construction");
@@ -2618,13 +2657,14 @@ impl<'a> GatewayAgent<'a> {
         self.tool_failures = self.notebook.failed_changes.clone();
         self.implementation_plan = implementation_plan_from_notebook(&self.notebook);
         validate_lifecycle_invariants(
-            &self.notebook.intended_changes,
             &self.notebook.validation_evidence,
             &snapshot.current_repository.fingerprint,
+            crate::execution_graph::InvariantScope::RepositoryOperationReduction,
         )
-        .map_err(|error| {
-            anyhow!(HostedInvariantFailure::new(
-                "lifecycle_invariant_violated",
+        .map_err(|(code, error)| {
+            anyhow!(HostedInvariantFailure::in_phase(
+                code,
+                self.phases.active().as_str(),
                 error,
             ))
         })?;
@@ -5548,6 +5588,135 @@ impl<'a> GatewayAgent<'a> {
         );
         let verification_evidence_id = self.record_active_target_applied(&target_path)?;
         let reduced_snapshot = self.build_execution_snapshot()?;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.lifecycle_invariant_check_started",
+                "invariant_id": "verified_operation_missing_operation_evidence",
+                "scope": crate::execution_graph::InvariantScope::RepositoryOperationReduction,
+                "phase": self.phases.active(),
+                "required_evidence_kinds": [crate::execution_graph::EvidenceKind::RepositoryOperationVerification],
+                "available_evidence_kinds": [crate::execution_graph::EvidenceKind::RepositoryOperationVerification],
+                "current_node": node_id,
+                "graph_revision": reduced_snapshot.graph.revision(),
+                "repository_fingerprint": repository_fingerprint,
+            }),
+            "repository operation lifecycle invariant check",
+        );
+        if let Err(violation) = crate::execution_graph::check_invariants(
+            &reduced_snapshot.graph,
+            crate::execution_graph::LifecycleState::RepositoryOperationReduction,
+            crate::execution_graph::InvariantTrigger::RepositoryOperationReduced,
+        ) {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.lifecycle_invariant_check_failed",
+                    "invariant_id": violation.code,
+                    "scope": violation.scope,
+                    "phase": self.phases.active(),
+                    "required_evidence_kinds": [crate::execution_graph::EvidenceKind::RepositoryOperationVerification],
+                    "available_evidence_kinds": [],
+                    "current_node": violation.node_id,
+                    "graph_revision": reduced_snapshot.graph.revision(),
+                    "repository_fingerprint": repository_fingerprint,
+                }),
+                "repository operation lifecycle invariant failure",
+            );
+            return Err(anyhow!(HostedInvariantFailure::in_phase(
+                violation.code,
+                self.phases.active().as_str(),
+                violation.to_string(),
+            )));
+        }
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.lifecycle_invariant_check_passed",
+                "invariant_id": "verified_operation_missing_operation_evidence",
+                "scope": crate::execution_graph::InvariantScope::RepositoryOperationReduction,
+                "phase": self.phases.active(),
+                "required_evidence_kinds": [crate::execution_graph::EvidenceKind::RepositoryOperationVerification],
+                "available_evidence_kinds": [crate::execution_graph::EvidenceKind::RepositoryOperationVerification],
+                "current_node": node_id,
+                "graph_revision": reduced_snapshot.graph.revision(),
+                "repository_fingerprint": repository_fingerprint,
+            }),
+            "repository operation lifecycle invariant check",
+        );
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.lifecycle_invariant_not_applicable",
+                "invariant_id": "current_validation_missing_at_completion",
+                "scope": crate::execution_graph::InvariantScope::RepositoryOperationReduction,
+                "phase": self.phases.active(),
+                "required_evidence_kinds": [crate::execution_graph::EvidenceKind::ValidationGateResult],
+                "available_evidence_kinds": [],
+                "current_validation_evidence_required": false,
+                "reason": "implementation barrier not yet reached; repository-operation verification is the only required evidence",
+                "current_node": node_id,
+                "graph_revision": reduced_snapshot.graph.revision(),
+                "repository_fingerprint": repository_fingerprint,
+            }),
+            "future validation evidence suppression",
+        );
+        let barrier = reduced_snapshot.graph.implementation_barrier_proof(
+            reduced_snapshot
+                .current_repository
+                .fingerprint
+                .clone()
+                .into(),
+        );
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.implementation_barrier_created",
+                "repository_fingerprint": barrier.repository_fingerprint,
+                "required_nodes": barrier.required_nodes,
+                "completed_nodes": barrier.completed_nodes,
+                "unresolved_nodes": barrier.unresolved_nodes,
+                "satisfied": barrier.satisfied,
+                "graph_revision": reduced_snapshot.graph.revision(),
+            }),
+            "implementation barrier proof",
+        );
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": if barrier.satisfied {
+                    "worker.implementation_barrier_satisfied"
+                } else {
+                    "worker.implementation_barrier_unsatisfied"
+                },
+                "repository_fingerprint": barrier.repository_fingerprint,
+                "required_nodes": barrier.required_nodes,
+                "completed_nodes": barrier.completed_nodes,
+                "unresolved_nodes": barrier.unresolved_nodes,
+                "graph_revision": reduced_snapshot.graph.revision(),
+            }),
+            "implementation barrier state",
+        );
+        if crate::execution_graph::resolve_next_phase(&reduced_snapshot.graph)
+            == crate::execution_graph::LifecyclePhase::Implementation
+            && let Some(next) = reduced_snapshot
+                .graph
+                .next_runnable_node()
+                .filter(|node| node.kind.is_mutation())
+        {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.next_implementation_node_selected",
+                    "completed_node": node_id,
+                    "next_node": next.id,
+                    "next_node_kind": next.kind,
+                    "graph_revision": reduced_snapshot.graph.revision(),
+                    "repository_fingerprint": repository_fingerprint,
+                }),
+                "next implementation node selection",
+            );
+        }
         let reduced_status = reduced_snapshot
             .graph
             .node(&node_id)

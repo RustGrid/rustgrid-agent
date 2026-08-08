@@ -26,6 +26,7 @@ include!("graph.rs");
 include!("invariant.rs");
 include!("construction.rs");
 include!("validation.rs");
+include!("lifecycle_invariant.rs");
 include!("recovery.rs");
 include!("budget.rs");
 include!("publication.rs");

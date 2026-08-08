@@ -389,12 +389,18 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
             );
             let (code, message) = safe_failure(&error, cancelled);
             let diagnostics = failure_diagnostics(&error, cancelled);
+            let failure_category = diagnostics
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("orchestration_execution_failed");
             let terminal = resolve_unsuccessful_terminal_result(
                 execution_id,
                 cancelled,
                 &code,
+                failure_category,
                 &message,
                 &terminal_at,
+                resolve_failure_resumability(&error, cancelled, &code),
             );
             api.append_event(
                 "progress",
@@ -1938,7 +1944,7 @@ fn run_hosted_execution(
                     } else {
                         let (code, message) = safe_failure(&error, false);
                         Err(agent.categorized_execution_failure(
-                            "execution_graph_initialization_failed",
+                            hosted_failure_category(&error),
                             &code,
                             message,
                             Some(&error),

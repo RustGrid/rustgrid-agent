@@ -190,6 +190,26 @@ pub struct ValidationEvidenceRecord {
     pub duration: Duration,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationAssertion {
+    pub assertion_id: String,
+    pub passed: bool,
+    pub summary: String,
+}
+
+/// Gate-level evidence, distinct from repository-operation verification.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationGateEvidence {
+    pub validation_id: String,
+    pub gate_id: ExecutionNodeId,
+    pub command: String,
+    pub repository_fingerprint: RepositoryFingerprint,
+    pub status: ValidationEvidenceStatus,
+    #[serde(default)]
+    pub assertions: Vec<ValidationAssertion>,
+    pub completed_at: String,
+}
+
 impl ValidationEvidenceRecord {
     pub fn is_reusable_pass(&self, fingerprint: &str) -> bool {
         self.status == ValidationEvidenceStatus::Passed && self.fingerprint == fingerprint
@@ -206,6 +226,12 @@ pub enum EvidenceKind {
     DiffReview,
     Completion,
     Publication,
+    RepositoryOperationVerification,
+    ImplementationBarrierProof,
+    ValidationGateResult,
+    DiffReviewResult,
+    CompletionEvaluation,
+    PublicationEvidence,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

@@ -144,6 +144,15 @@ pub(super) enum Resumability {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(super) struct ResumabilityDecision {
+    pub(super) status: Resumability,
+    pub(super) reason_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resume_from_node: Option<String>,
+    pub(super) repository_fingerprint: String,
+}
+
 impl Resumability {
     pub(super) const fn is_resumable(&self) -> bool {
         matches!(self, Self::Resumable { .. })
@@ -229,6 +238,8 @@ pub(super) struct CanonicalTerminalResult {
     pub(super) terminal_result_id: Uuid,
     pub(super) mission_outcome: CanonicalMissionOutcome,
     pub(super) process_health: ProcessHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) failure_category: Option<String>,
     pub(super) reason_code: String,
     pub(super) execution_status: DomainExecutionStatus,
     pub(super) publication: CanonicalPublicationResult,
@@ -237,6 +248,7 @@ pub(super) struct CanonicalTerminalResult {
     pub(super) remaining_evidence_types: Vec<RemainingEvidenceType>,
     pub(super) remaining_work_kinds: Vec<RemainingWorkKind>,
     pub(super) resumability: Resumability,
+    pub(super) resumability_decision: ResumabilityDecision,
     pub(super) completed_at: String,
     pub(super) finality: TerminalFinality,
 }
@@ -846,6 +858,12 @@ pub(super) fn resolve_published_terminal_result(
         .phase_persistence_failure_code
         .as_deref()
         .unwrap_or(default_reason_code);
+    let resumability_decision = ResumabilityDecision {
+        status: resumability.clone(),
+        reason_code: reason_code.into(),
+        resume_from_node: None,
+        repository_fingerprint: String::new(),
+    };
     let terminal_result_id = terminal_result_id(execution_id);
     CanonicalTerminalResult {
         terminal_result_id,
@@ -859,6 +877,7 @@ pub(super) fn resolve_published_terminal_result(
         } else {
             ProcessHealth::Healthy
         },
+        failure_category: None,
         reason_code: reason_code.into(),
         execution_status,
         publication,
@@ -867,6 +886,7 @@ pub(super) fn resolve_published_terminal_result(
         remaining_evidence_types,
         remaining_work_kinds,
         resumability,
+        resumability_decision,
         completed_at: completed_at.into(),
         finality: TerminalFinality {
             terminal_result_id,
@@ -886,10 +906,20 @@ pub(super) fn resolve_blocked_terminal_result(
     completed_at: &str,
 ) -> CanonicalTerminalResult {
     let terminal_result_id = terminal_result_id(execution_id);
+    let resumability = Resumability::Resumable {
+        resume_phase: Some(resume_phase.into()),
+    };
+    let resumability_decision = ResumabilityDecision {
+        status: resumability.clone(),
+        reason_code: reason_code.into(),
+        resume_from_node: None,
+        repository_fingerprint: String::new(),
+    };
     CanonicalTerminalResult {
         terminal_result_id,
         mission_outcome: CanonicalMissionOutcome::Blocked,
         process_health: ProcessHealth::Healthy,
+        failure_category: None,
         reason_code: reason_code.into(),
         execution_status: DomainExecutionStatus::Blocked,
         publication: CanonicalPublicationResult::not_published(),
@@ -897,9 +927,8 @@ pub(super) fn resolve_blocked_terminal_result(
         remaining_work,
         remaining_evidence_types: vec![RemainingEvidenceType::UnresolvedImplementation],
         remaining_work_kinds: vec![RemainingWorkKind::MissingImplementation],
-        resumability: Resumability::Resumable {
-            resume_phase: Some(resume_phase.into()),
-        },
+        resumability,
+        resumability_decision,
         completed_at: completed_at.into(),
         finality: TerminalFinality {
             terminal_result_id,
@@ -914,8 +943,10 @@ pub(super) fn resolve_unsuccessful_terminal_result(
     execution_id: Uuid,
     cancelled: bool,
     reason_code: &str,
+    failure_category: &str,
     safe_summary: &str,
     completed_at: &str,
+    resumability_decision: ResumabilityDecision,
 ) -> CanonicalTerminalResult {
     let terminal_result_id = terminal_result_id(execution_id);
     let mission_outcome = if cancelled {
@@ -933,17 +964,12 @@ pub(super) fn resolve_unsuccessful_terminal_result(
     } else {
         DomainExecutionStatus::Failed
     };
-    let resumability = if cancelled {
-        Resumability::Resumable {
-            resume_phase: Some("implementation".into()),
-        }
-    } else {
-        Resumability::NotResumable
-    };
+    let resumability = resumability_decision.status.clone();
     CanonicalTerminalResult {
         terminal_result_id,
         mission_outcome,
         process_health,
+        failure_category: Some(failure_category.into()),
         reason_code: reason_code.into(),
         execution_status,
         publication: CanonicalPublicationResult::not_published(),
@@ -977,6 +1003,7 @@ pub(super) fn resolve_unsuccessful_terminal_result(
             RemainingWorkKind::InfrastructureFollowUp
         }],
         resumability,
+        resumability_decision,
         completed_at: completed_at.into(),
         finality: TerminalFinality {
             terminal_result_id,
@@ -984,6 +1011,65 @@ pub(super) fn resolve_unsuccessful_terminal_result(
             authority: TerminalAuthority::WorkerDomain,
             finalized_at: completed_at.into(),
         },
+    }
+}
+
+pub(super) fn resolve_failure_resumability(
+    error: &anyhow::Error,
+    cancelled: bool,
+    reason_code: &str,
+) -> ResumabilityDecision {
+    if cancelled {
+        return ResumabilityDecision {
+            status: Resumability::Resumable {
+                resume_phase: Some("implementation".into()),
+            },
+            reason_code: reason_code.into(),
+            resume_from_node: None,
+            repository_fingerprint: String::new(),
+        };
+    }
+    if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
+        return ResumabilityDecision {
+            status: if failure.resumable {
+                Resumability::Resumable {
+                    resume_phase: Some(failure.resume_phase.clone()),
+                }
+            } else {
+                Resumability::NotResumable
+            },
+            reason_code: failure.code.clone(),
+            resume_from_node: failure.resume_from_node.clone(),
+            repository_fingerprint: failure.repository_fingerprint.clone(),
+        };
+    }
+    if let Some(failure) = error.downcast_ref::<HostedInvariantFailure>() {
+        return ResumabilityDecision {
+            status: Resumability::Resumable {
+                resume_phase: Some(failure.phase.into()),
+            },
+            reason_code: failure.code.into(),
+            resume_from_node: None,
+            repository_fingerprint: String::new(),
+        };
+    }
+    if let Some(failure) =
+        error.downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
+    {
+        return ResumabilityDecision {
+            status: Resumability::Resumable {
+                resume_phase: Some("implementation".into()),
+            },
+            reason_code: failure.code.clone(),
+            resume_from_node: failure.node_id.as_ref().map(ToString::to_string),
+            repository_fingerprint: String::new(),
+        };
+    }
+    ResumabilityDecision {
+        status: Resumability::NotResumable,
+        reason_code: reason_code.into(),
+        resume_from_node: None,
+        repository_fingerprint: String::new(),
     }
 }
 
@@ -997,8 +1083,15 @@ pub(super) fn resolve_infrastructure_fallback_terminal_result(
         execution_id,
         false,
         reason_code,
+        "infrastructure_failure",
         safe_summary,
         completed_at,
+        ResumabilityDecision {
+            status: Resumability::NotResumable,
+            reason_code: reason_code.into(),
+            resume_from_node: None,
+            repository_fingerprint: String::new(),
+        },
     );
     terminal.finality.authority = TerminalAuthority::InfrastructureFallback;
     terminal
@@ -1356,8 +1449,15 @@ mod tests {
             Uuid::nil(),
             false,
             "runner_failed",
+            "orchestration_execution_failed",
             "The runner could not execute reliably.",
             "2026-08-04T00:00:00Z",
+            ResumabilityDecision {
+                status: Resumability::NotResumable,
+                reason_code: "runner_failed".into(),
+                resume_from_node: None,
+                repository_fingerprint: String::new(),
+            },
         );
         assert_eq!(failed.mission_outcome, CanonicalMissionOutcome::Failed);
         assert_eq!(failed.process_health, ProcessHealth::Failed);
@@ -1367,8 +1467,17 @@ mod tests {
             Uuid::nil(),
             true,
             "cancelled",
+            "cancelled",
             "Cancellation was persisted.",
             "2026-08-04T00:00:00Z",
+            ResumabilityDecision {
+                status: Resumability::Resumable {
+                    resume_phase: Some("implementation".into()),
+                },
+                reason_code: "cancelled".into(),
+                resume_from_node: None,
+                repository_fingerprint: String::new(),
+            },
         );
         assert_eq!(
             cancelled.mission_outcome,

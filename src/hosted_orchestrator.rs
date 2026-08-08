@@ -251,6 +251,32 @@ impl From<GraphInvariantError> for OrchestrationInvariantError {
     }
 }
 
+impl From<InvariantViolation> for OrchestrationInvariantError {
+    fn from(error: InvariantViolation) -> Self {
+        Self {
+            code: error.code.into(),
+            message: error.message,
+            node_id: error.node_id,
+        }
+    }
+}
+
+fn lifecycle_for_next_node(node: &ExecutionNode) -> Option<LifecycleState> {
+    match node.kind {
+        ExecutionNodeKind::SourceMutation
+        | ExecutionNodeKind::TestMutation
+        | ExecutionNodeKind::ValidationRepairSession => Some(LifecycleState::Implementation),
+        ExecutionNodeKind::ValidationFocused
+        | ExecutionNodeKind::ValidationSuite
+        | ExecutionNodeKind::ValidationBuild
+        | ExecutionNodeKind::ValidationLint => Some(LifecycleState::Validation),
+        ExecutionNodeKind::DiffReview => Some(LifecycleState::DiffReview),
+        ExecutionNodeKind::CompletionEvaluation => Some(LifecycleState::Completion),
+        ExecutionNodeKind::Publication => Some(LifecycleState::Publication),
+        ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning => None,
+    }
+}
+
 /// Returns the sole authoritative next action for a hosted execution.
 ///
 /// The function is referentially transparent: equal snapshots always produce
@@ -296,6 +322,14 @@ pub fn reconcile_execution(
             outcome: MissionOutcome::PartialReviewable,
             reason: GuardrailReason::OrchestrationInvariantViolation,
         });
+    }
+
+    if let Some(lifecycle) = snapshot
+        .graph
+        .next_runnable_node()
+        .and_then(lifecycle_for_next_node)
+    {
+        check_snapshot_invariants(snapshot, lifecycle, InvariantTrigger::PhaseTransition)?;
     }
 
     let running = snapshot

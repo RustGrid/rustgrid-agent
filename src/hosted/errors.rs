@@ -37,6 +37,19 @@ impl HostedInvariantFailure {
         }
     }
 
+    pub(super) fn in_phase(
+        code: &'static str,
+        phase: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            phase,
+            resumable: true,
+            message: message.into(),
+        }
+    }
+
     pub(super) const fn category(&self) -> &'static str {
         "OrchestrationStateInvariantFailure"
     }
@@ -380,6 +393,14 @@ impl<'a> GatewayAgent<'a> {
             notebook_revision: self.notebook.revision,
             recoverable,
             resume_phase: phase.as_str().into(),
+            resume_from_node: self
+                .notebook
+                .orchestration
+                .graph
+                .as_ref()
+                .and_then(|graph| graph.next_runnable_node())
+                .map(|node| node.id.to_string()),
+            repository_fingerprint: self.notebook.repository_fingerprint.clone(),
             recommended_action: recommended_action.to_owned(),
             artifact: None,
             semantic_status: None,
@@ -530,6 +551,14 @@ impl<'a> GatewayAgent<'a> {
             notebook_revision: self.notebook.revision,
             recoverable: true,
             resume_phase: "artifact_repair".into(),
+            resume_from_node: self
+                .notebook
+                .orchestration
+                .graph
+                .as_ref()
+                .and_then(|graph| graph.next_runnable_node())
+                .map(|node| node.id.to_string()),
+            repository_fingerprint: self.notebook.repository_fingerprint.clone(),
             recommended_action: recommended_action.to_owned(),
             artifact: Some("impact_map".into()),
             semantic_status: Some(semantic_status),

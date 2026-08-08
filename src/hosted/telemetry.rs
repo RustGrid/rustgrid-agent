@@ -135,6 +135,9 @@ pub(super) fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, S
     if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
+    if let Some(failure) = error.downcast_ref::<HostedInvariantFailure>() {
+        return (failure.code.into(), failure.message.clone());
+    }
     if let Some(failure) =
         error.downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
     {
@@ -173,20 +176,37 @@ pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Val
             })
         });
     }
+    if let Some(failure) = error.downcast_ref::<HostedInvariantFailure>() {
+        return json!({
+            "status": "failed",
+            "category": failure.category(),
+            "process_health": "failed",
+            "mission_outcome": "failed",
+            "code": failure.code,
+            "phase": failure.phase,
+            "message": failure.message,
+            "resumable": failure.resumable,
+            "recoverable": failure.resumable,
+            "resume_phase": failure.phase,
+            "recommended_action": "Resume from the next unresolved implementation node in the persisted execution graph.",
+        });
+    }
     if let Some(failure) =
         error.downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
     {
         return json!({
             "status": "failed",
-            "category": "OrchestrationStateCorruption",
+            "category": "OrchestrationStateInvariantFailure",
             "process_health": "failed",
             "mission_outcome": "failed",
             "code": failure.code,
             "phase": "orchestration",
             "message": failure.message,
             "node_id": failure.node_id,
-            "recoverable": false,
-            "recommended_action": "Restore the last valid graph checkpoint and investigate the rejected state transition.",
+            "resumable": true,
+            "recoverable": true,
+            "resume_phase": "implementation",
+            "recommended_action": "Resume from the persisted graph at the next unresolved node after correcting the rejected invariant.",
         });
     }
     if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {

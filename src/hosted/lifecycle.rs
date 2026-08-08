@@ -370,34 +370,42 @@ pub(super) fn legacy_remaining_work(items: &[RemainingWorkItem]) -> Vec<String> 
 }
 
 pub(super) fn validate_lifecycle_invariants(
-    changes: &[IntendedChangeRecord],
     ledger: &[ValidationEvidence],
     current_tree_hash: &str,
-) -> Result<(), String> {
+    scope: crate::execution_graph::InvariantScope,
+) -> Result<(), (&'static str, String)> {
+    if matches!(
+        scope,
+        crate::execution_graph::InvariantScope::RepositoryOperationReduction
+            | crate::execution_graph::InvariantScope::Implementation
+            | crate::execution_graph::InvariantScope::ImplementationBarrier
+    ) {
+        return Ok(());
+    }
+    let validation_is_required = matches!(
+        scope,
+        crate::execution_graph::InvariantScope::DiffReview
+            | crate::execution_graph::InvariantScope::Completion
+            | crate::execution_graph::InvariantScope::Publication
+            | crate::execution_graph::InvariantScope::Terminal
+    );
     let mut passed = BTreeSet::new();
     for evidence in ledger
         .iter()
         .filter(|evidence| evidence.status == ValidationStatus::Passed)
     {
-        if evidence.source_tree_hash != current_tree_hash {
-            return Err("passed validation evidence does not match the current source tree".into());
+        if validation_is_required && evidence.source_tree_hash != current_tree_hash {
+            return Err((
+                "current_validation_missing_for_lifecycle_decision",
+                "passed validation evidence does not match the current source tree".into(),
+            ));
         }
         if !passed.insert((&evidence.command_fingerprint, &evidence.source_tree_hash)) {
-            return Err("identical validation passed more than once for one source tree".into());
+            return Err((
+                "duplicate_validation_evidence",
+                "identical validation passed more than once for one source tree".into(),
+            ));
         }
-    }
-    if changes
-        .iter()
-        .flat_map(|change| &change.targets)
-        .any(|target| {
-            target.status == IntendedChangeStatus::Verified
-                && !ledger.iter().any(|evidence| {
-                    evidence.status == ValidationStatus::Passed
-                        && evidence.source_tree_hash == current_tree_hash
-                })
-        })
-    {
-        return Err("verified target has no current validation evidence".into());
     }
     Ok(())
 }
@@ -903,7 +911,14 @@ mod tests {
             assert!(passed_evidence(&ledger, &changed_tree_fingerprint).is_none());
         }
         assert_eq!(ledger.len(), 3);
-        assert!(validate_lifecycle_invariants(&changes, &ledger, "tree-aops-226").is_ok());
+        assert!(
+            validate_lifecycle_invariants(
+                &ledger,
+                "tree-aops-226",
+                crate::execution_graph::InvariantScope::Completion,
+            )
+            .is_ok()
+        );
         assert_eq!(
             supersede_stale_validation(&mut ledger, "tree-after-one-byte-change"),
             3
@@ -917,7 +932,6 @@ mod tests {
 
     #[test]
     fn duplicate_validation_fails_invariants() {
-        let changes = vec![change(&[IntendedChangeStatus::Applied])];
         let fingerprint = validation_fingerprint("npm test", ".", "tree", "lock", "env");
         let mut evidence = new_running_evidence(
             "one".into(),
@@ -932,7 +946,14 @@ mod tests {
         evidence.status = ValidationStatus::Passed;
         let mut duplicate = evidence.clone();
         duplicate.evidence_id = "two".into();
-        assert!(validate_lifecycle_invariants(&changes, &[evidence, duplicate], "tree").is_err());
+        assert!(
+            validate_lifecycle_invariants(
+                &[evidence, duplicate],
+                "tree",
+                crate::execution_graph::InvariantScope::Validation,
+            )
+            .is_err()
+        );
     }
 
     #[test]

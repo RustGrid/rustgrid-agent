@@ -151,6 +151,30 @@ fn orchestration_defects_keep_structured_category_code_phase_and_resumability() 
         crate::error::TelemetryErrorCode::InternalInvariantFailed
     );
 
+    let invariant = HostedInvariantFailure::in_phase(
+        "verified_operation_missing_operation_evidence",
+        "implementation",
+        "the verified operation lost its durable evidence",
+    );
+    let error = anyhow!(invariant);
+    assert_eq!(
+        hosted_failure_category(&error),
+        "OrchestrationStateInvariantFailure"
+    );
+    let (code, _) = safe_failure(&error, false);
+    assert_eq!(code, "verified_operation_missing_operation_evidence");
+    let diagnostics = failure_diagnostics(&error, false);
+    assert_eq!(
+        diagnostics["category"],
+        "OrchestrationStateInvariantFailure"
+    );
+    assert_eq!(
+        diagnostics["code"],
+        "verified_operation_missing_operation_evidence"
+    );
+    assert_eq!(diagnostics["phase"], "implementation");
+    assert_eq!(diagnostics["resumable"], true);
+
     let accounting = HostedRepairAccountingFailure::incompatible_scope(
         "validation repair attempted to borrow mutation fallback capacity",
     );
@@ -163,6 +187,53 @@ fn orchestration_defects_keep_structured_category_code_phase_and_resumability() 
     assert_eq!(
         classified.terminal_outcome(),
         crate::error::TerminalOutcome::Failed
+    );
+}
+
+#[test]
+fn invariant_resumability_is_resolved_once_for_terminal_projections() {
+    let mut failure = test_execution_failure(
+        "verified_operation_missing_operation_evidence",
+        "operation evidence missing after a coherent write",
+    );
+    failure.category = "OrchestrationStateInvariantFailure";
+    failure.phase = ExecutionPhase::Implementation;
+    failure.resume_phase = "implementation".into();
+    failure.resume_from_node = Some("source-b".into());
+    failure.repository_fingerprint = "tree-after-a".into();
+    failure.resumable = true;
+    let error = anyhow!(failure);
+    let decision = resolve_failure_resumability(
+        &error,
+        false,
+        "verified_operation_missing_operation_evidence",
+    );
+    assert!(decision.status.is_resumable());
+    assert_eq!(
+        decision.reason_code,
+        "verified_operation_missing_operation_evidence"
+    );
+    assert_eq!(decision.resume_from_node.as_deref(), Some("source-b"));
+    assert_eq!(decision.repository_fingerprint, "tree-after-a");
+
+    let terminal = resolve_unsuccessful_terminal_result(
+        Uuid::nil(),
+        false,
+        "verified_operation_missing_operation_evidence",
+        "OrchestrationStateInvariantFailure",
+        "operation evidence missing after a coherent write",
+        "2026-08-08T00:00:00Z",
+        decision.clone(),
+    );
+    assert_eq!(terminal.resumability, decision.status);
+    assert_eq!(terminal.resumability_decision, decision);
+    assert_eq!(
+        terminal.failure_category.as_deref(),
+        Some("OrchestrationStateInvariantFailure")
+    );
+    assert_eq!(
+        terminal.reason_code,
+        "verified_operation_missing_operation_evidence"
     );
 }
 
@@ -3118,6 +3189,8 @@ fn test_execution_failure(code: &str, message: &str) -> HostedAgentExecutionFail
         notebook_revision: 0,
         recoverable: true,
         resume_phase: "discovery".into(),
+        resume_from_node: None,
+        repository_fingerprint: String::new(),
         recommended_action: "Inspect the authoritative failure details.".into(),
         artifact: None,
         semantic_status: None,
@@ -9481,6 +9554,8 @@ fn formatting_failure_is_healthy_blocked_and_resumable() {
         notebook_revision: 0,
         recoverable: true,
         resume_phase: "artifact_repair".into(),
+        resume_from_node: None,
+        repository_fingerprint: String::new(),
         recommended_action: "resume".into(),
         artifact: Some("impact_map".into()),
         semantic_status: Some(ArtifactSemanticStatus::Invalid),

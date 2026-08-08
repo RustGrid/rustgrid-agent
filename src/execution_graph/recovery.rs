@@ -363,6 +363,71 @@ pub struct OperationEvidence {
     pub completed_at: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ExpectedRepositoryTargetState {
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ObservedTargetState {
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+}
+
+/// Proof for one repository operation only. It intentionally says nothing
+/// about automated validation gates for the repository as a whole.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RepositoryOperationVerification {
+    pub node_id: ExecutionNodeId,
+    pub target_path: RepositoryPath,
+    pub operation: TargetOperation,
+    pub expected_state: ExpectedRepositoryTargetState,
+    pub observed_state: ObservedTargetState,
+    pub repository_fingerprint_before: RepositoryFingerprint,
+    pub repository_fingerprint_after: RepositoryFingerprint,
+    pub verified_at: String,
+}
+
+impl RepositoryOperationVerification {
+    pub fn from_completed_node(node: &ExecutionNode) -> Option<Self> {
+        node.target.as_ref()?;
+        let evidence = node.operation_evidence.last()?;
+        let attempt = node.attempts.last()?;
+        let expected_exists = evidence.operation != TargetOperation::DeleteExisting;
+        Some(Self {
+            node_id: node.id.clone(),
+            target_path: evidence.target_path.clone(),
+            operation: evidence.operation.clone(),
+            expected_state: ExpectedRepositoryTargetState {
+                exists: expected_exists,
+                content_hash: evidence.expected_result_hash.clone(),
+            },
+            observed_state: ObservedTargetState {
+                exists: expected_exists,
+                content_hash: evidence.observed_result_hash.clone(),
+            },
+            repository_fingerprint_before: attempt.repository_fingerprint_before.clone().into(),
+            repository_fingerprint_after: evidence.repository_fingerprint.clone(),
+            verified_at: evidence.completed_at.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ImplementationBarrierProof {
+    pub repository_fingerprint: RepositoryFingerprint,
+    #[serde(default)]
+    pub required_nodes: Vec<ExecutionNodeId>,
+    #[serde(default)]
+    pub completed_nodes: Vec<ExecutionNodeId>,
+    #[serde(default)]
+    pub unresolved_nodes: Vec<ExecutionNodeId>,
+    pub satisfied: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeTransition {
     Completed(OperationEvidence),

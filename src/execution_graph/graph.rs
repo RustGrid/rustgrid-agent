@@ -255,7 +255,8 @@ impl ExecutionGraph {
                 matches!(
                     node.status,
                     ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
-                )
+                ) || (node.status == ExecutionNodeStatus::Applied
+                    && node.repository_mutation_lifecycle.is_none())
             })
     }
 
@@ -295,7 +296,8 @@ impl ExecutionGraph {
                 matches!(
                     node.status,
                     ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
-                )
+                ) || (node.status == ExecutionNodeStatus::Applied
+                    && node.repository_mutation_lifecycle.is_none())
             })
             .map(|node| node.id.clone())
             .collect::<Vec<_>>();
@@ -305,7 +307,8 @@ impl ExecutionGraph {
                 !matches!(
                     node.status,
                     ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
-                )
+                ) && !(node.status == ExecutionNodeStatus::Applied
+                    && node.repository_mutation_lifecycle.is_none())
             })
             .map(|node| node.id.clone())
             .collect::<Vec<_>>();
@@ -316,6 +319,47 @@ impl ExecutionGraph {
             satisfied_implementation_nodes,
             unresolved_nodes,
             repository_fingerprint,
+        }
+    }
+
+    pub fn implementation_barrier_proof(
+        &self,
+        repository_fingerprint: RepositoryFingerprint,
+    ) -> ImplementationBarrierProof {
+        let required_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_mutation())
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let completed_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.required
+                    && node.kind.is_mutation()
+                    && matches!(
+                        node.status,
+                        ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
+                    )
+                    || (node.required
+                        && node.kind.is_mutation()
+                        && node.status == ExecutionNodeStatus::Applied
+                        && node.repository_mutation_lifecycle.is_none())
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let unresolved_nodes = required_nodes
+            .iter()
+            .filter(|node_id| !completed_nodes.contains(node_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        ImplementationBarrierProof {
+            repository_fingerprint,
+            required_nodes,
+            completed_nodes,
+            satisfied: unresolved_nodes.is_empty(),
+            unresolved_nodes,
         }
     }
 
