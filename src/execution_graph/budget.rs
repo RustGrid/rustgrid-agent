@@ -185,6 +185,48 @@ impl BudgetState {
         usage.command_runs = usage.command_runs.saturating_add(1);
     }
 
+    /// Returns the bounded accounting view for one repair-intent owner. The
+    /// existing persisted node/session counters remain authoritative; this
+    /// typed projection prevents callers from consulting the wrong namespace.
+    pub fn repair_budget_for(
+        &self,
+        kind: RepairIntentKind,
+        owner: &ExecutionNodeId,
+        max_attempts: u32,
+    ) -> RepairBudget {
+        let mut limits = RepairBudgets::default();
+        limits.for_kind_mut(kind).max_attempts = max_attempts;
+        self.repair_budgets_for(owner, limits)
+            .for_kind(kind)
+            .clone()
+    }
+
+    /// Resolves all repair namespaces for one persisted budget owner. Mutation
+    /// and validation counters are independent; graph-node-owned repair kinds
+    /// retain their separately supplied limits and never inherit either count.
+    pub fn repair_budgets_for(
+        &self,
+        owner: &ExecutionNodeId,
+        limits: RepairBudgets,
+    ) -> RepairBudgets {
+        let usage = self.usage_for(owner);
+        RepairBudgets {
+            mutation_application: RepairBudget {
+                max_attempts: limits.mutation_application.max_attempts,
+                attempts_consumed: usage.mutation_fallback_attempts,
+            },
+            validation: RepairBudget {
+                max_attempts: limits.validation.max_attempts,
+                attempts_consumed: usage.validation_repair_attempts,
+            },
+            // These intents own ordinary graph nodes and therefore do not
+            // borrow mutation or validation-repair counters.
+            review: limits.review,
+            planning: limits.planning,
+            artifact: limits.artifact,
+        }
+    }
+
     pub fn record_validation_parsing_call(&mut self, node_id: ExecutionNodeId) {
         let usage = self.validation_gate_usage.entry(node_id).or_default();
         usage.parsing_calls = usage.parsing_calls.saturating_add(1);

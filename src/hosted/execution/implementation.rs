@@ -180,7 +180,7 @@ impl<'a> GatewayAgent<'a> {
         )? {
             // Reconciliation is authoritative for selecting the next node. The
             // duplicate itself records no failure and consumes no repair work.
-            self.record_active_target_applied(path)?;
+            let _ = self.record_active_target_applied(path)?;
             self.reconcile_execution_and_apply()?;
             return Err(already_applied.into());
         }

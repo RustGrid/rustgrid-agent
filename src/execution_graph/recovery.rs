@@ -174,6 +174,21 @@ pub struct ValidationReadinessProof {
     pub graph_revision: u64,
     #[serde(default)]
     pub satisfied_implementation_nodes: Vec<ExecutionNodeId>,
+    #[serde(default)]
+    pub required_implementation_nodes: usize,
+    #[serde(default)]
+    pub completed_implementation_nodes: usize,
+    #[serde(default)]
+    pub unresolved_nodes: Vec<ExecutionNodeId>,
+    #[serde(default)]
+    pub repository_fingerprint: RepositoryFingerprint,
+}
+
+impl ValidationReadinessProof {
+    pub fn is_satisfied(&self) -> bool {
+        self.unresolved_nodes.is_empty()
+            && self.required_implementation_nodes == self.completed_implementation_nodes
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -223,6 +238,16 @@ pub enum SatisfiedIntent {
     MutationFallback,
 }
 
+impl SatisfiedIntent {
+    pub const fn repair_intent_kind(self) -> Option<RepairIntentKind> {
+        match self {
+            Self::OriginalImplementation => None,
+            Self::ValidationRepair => Some(RepairIntentKind::ValidationRepair),
+            Self::MutationFallback => Some(RepairIntentKind::MutationApplicationFallback),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairIntentKind {
@@ -244,6 +269,10 @@ impl RepairBudget {
     pub const fn exhausted(&self) -> bool {
         self.attempts_consumed >= self.max_attempts
     }
+
+    pub const fn remaining(&self) -> u32 {
+        self.max_attempts.saturating_sub(self.attempts_consumed)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -263,6 +292,16 @@ impl RepairBudgets {
             RepairIntentKind::DiffReviewRepair => &self.review,
             RepairIntentKind::PlanningRepair => &self.planning,
             RepairIntentKind::ArtifactRepair => &self.artifact,
+        }
+    }
+
+    pub const fn for_kind_mut(&mut self, kind: RepairIntentKind) -> &mut RepairBudget {
+        match kind {
+            RepairIntentKind::MutationApplicationFallback => &mut self.mutation_application,
+            RepairIntentKind::ValidationRepair => &mut self.validation,
+            RepairIntentKind::DiffReviewRepair => &mut self.review,
+            RepairIntentKind::PlanningRepair => &mut self.planning,
+            RepairIntentKind::ArtifactRepair => &mut self.artifact,
         }
     }
 }
@@ -461,6 +500,7 @@ pub fn reduce_repository_operation(
                 format!("unknown execution node `{node_id}`"),
             )
         })?;
+        node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Verified);
         node.evidence_ids.push(semantic_id);
         node.operation_evidence.push(evidence);
         next.revision = previous_revision.saturating_add(1);
@@ -512,6 +552,7 @@ pub fn reduce_repository_operation(
                 Some(evidence.repository_fingerprint.to_string());
             active_attempt.outcome = Some(ExecutionNodeStatus::Completed);
             node.status = ExecutionNodeStatus::Completed;
+            node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Verified);
             if !node.evidence_ids.contains(&semantic_id) {
                 node.evidence_ids.push(semantic_id);
             }
@@ -614,10 +655,17 @@ pub enum OrchestrationGuardrailAction {
 #[serde(rename_all = "snake_case")]
 pub enum CycleCause {
     SuccessfulMutationNotReduced,
-    RepositoryStateUnchanged,
-    RepairBudgetExhausted,
+    AlreadyAppliedNotReduced,
+    StaleActivePointer,
+    DecisionSelectorNoProgress,
+    PersistenceMismatch,
     #[default]
-    OrchestrationStateDiverged,
+    #[serde(
+        alias = "repository_state_unchanged",
+        alias = "repair_budget_exhausted",
+        alias = "orchestration_state_diverged"
+    )]
+    Unknown,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

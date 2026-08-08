@@ -129,6 +129,44 @@ fn hosted_lease_loss_suppresses_stale_terminal_writes() {
 }
 
 #[test]
+fn orchestration_defects_keep_structured_category_code_phase_and_resumability() {
+    let invariant = HostedInvariantFailure::new(
+        "successful_mutation_not_reduced",
+        "verified repository evidence did not converge",
+    );
+    assert_eq!(invariant.category(), "OrchestrationStateInvariantFailure");
+    assert_eq!(invariant.phase, "orchestration");
+    assert!(invariant.resumable);
+    let rendered = invariant.to_string();
+    assert!(rendered.contains("code=successful_mutation_not_reduced"));
+    assert!(rendered.contains("resumable=true"));
+    let classified = classify_hosted_execution_failure(&anyhow!(invariant))
+        .expect("typed orchestration invariant");
+    assert_eq!(
+        classified.terminal_outcome(),
+        crate::error::TerminalOutcome::Failed
+    );
+    assert_eq!(
+        classified.telemetry_code(),
+        crate::error::TelemetryErrorCode::InternalInvariantFailed
+    );
+
+    let accounting = HostedRepairAccountingFailure::incompatible_scope(
+        "validation repair attempted to borrow mutation fallback capacity",
+    );
+    assert_eq!(accounting.category(), "RepairAccountingFailure");
+    assert_eq!(accounting.code, "incompatible_repair_budget_scope");
+    assert_eq!(accounting.phase, "validation_repair");
+    assert!(accounting.resumable);
+    let classified = classify_hosted_execution_failure(&anyhow!(accounting))
+        .expect("typed repair accounting failure");
+    assert_eq!(
+        classified.terminal_outcome(),
+        crate::error::TerminalOutcome::Failed
+    );
+}
+
+#[test]
 fn discovery_action_profiles_restrict_finalization_to_the_compact_forced_tool() {
     assert!(!ToolProgressClass::ActionRedirected.is_failure());
     let finalize = ExecutionDecision::ContinueDiscovery {

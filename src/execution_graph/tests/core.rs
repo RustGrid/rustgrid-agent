@@ -57,6 +57,25 @@
             1
         );
         assert_eq!(budget.model_call_breakdown.target_mutation_repair_calls, 0);
+
+        let mutation_budget = budget.repair_budget_for(
+            RepairIntentKind::MutationApplicationFallback,
+            &mutation.id,
+            mutation.budget.max_mutation_fallback_attempts,
+        );
+        let validation_budget = budget.repair_budget_for(
+            RepairIntentKind::ValidationRepair,
+            &validation.id,
+            2,
+        );
+        assert_eq!(mutation_budget.attempts_consumed, 0);
+        assert_eq!(validation_budget.attempts_consumed, 1);
+        assert_eq!(validation_budget.remaining(), 1);
+        assert_ne!(
+            mutation_budget.attempts_consumed,
+            validation_budget.attempts_consumed,
+            "repair intents must resolve through independent persisted counters"
+        );
     }
 
     #[test]

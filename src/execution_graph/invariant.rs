@@ -56,6 +56,24 @@ impl ExecutionGraph {
                     "node `{}` has successful operation evidence without Completed status", node.id
                 )));
             }
+            if !node.operation_evidence.is_empty()
+                && node.repository_mutation_lifecycle
+                    != Some(RepositoryMutationLifecycle::Verified)
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "node `{}` has successful operation evidence without Verified repository lifecycle",
+                    node.id
+                )));
+            }
+            if node.repository_mutation_lifecycle
+                == Some(RepositoryMutationLifecycle::AppliedUnverified)
+                && node.status == ExecutionNodeStatus::Completed
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "node `{}` completed before repository verification",
+                    node.id
+                )));
+            }
             if node.kind.is_mutation()
                 && node.status == ExecutionNodeStatus::Completed
                 && let Some(attempt) = node.attempts.last()

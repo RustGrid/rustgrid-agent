@@ -262,34 +262,61 @@ impl ExecutionGraph {
     pub fn validation_readiness_proof(
         &self,
     ) -> Result<ValidationReadinessProof, GraphInvariantError> {
-        if !self.implementation_barrier_satisfied() {
-            let incomplete = self
-                .nodes
+        let proof = self.validation_readiness(RepositoryFingerprint::default());
+        if !proof.is_satisfied() {
+            let incomplete = proof
+                .unresolved_nodes
                 .iter()
-                .filter(|node| {
-                    node.required
-                        && node.kind.is_mutation()
-                        && !matches!(
-                            node.status,
-                            ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
-                        )
+                .filter_map(|node_id| {
+                    self.node(node_id)
+                        .map(|node| format!("{}:{:?}", node.id, node.status))
                 })
-                .map(|node| format!("{}:{:?}", node.id, node.status))
                 .collect::<Vec<_>>();
             return Err(GraphInvariantError::new(format!(
                 "implementation_barrier_unsatisfied: required implementation nodes remain [{}]",
                 incomplete.join(", ")
             )));
         }
-        Ok(ValidationReadinessProof {
+        Ok(proof)
+    }
+
+    pub fn validation_readiness(
+        &self,
+        repository_fingerprint: RepositoryFingerprint,
+    ) -> ValidationReadinessProof {
+        let required = self
+            .nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_mutation())
+            .collect::<Vec<_>>();
+        let satisfied_implementation_nodes = required
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
+                )
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let unresolved_nodes = required
+            .iter()
+            .filter(|node| {
+                !matches!(
+                    node.status,
+                    ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
+                )
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        ValidationReadinessProof {
             graph_revision: self.revision,
-            satisfied_implementation_nodes: self
-                .nodes
-                .iter()
-                .filter(|node| node.required && node.kind.is_mutation())
-                .map(|node| node.id.clone())
-                .collect(),
-        })
+            required_implementation_nodes: required.len(),
+            completed_implementation_nodes: satisfied_implementation_nodes.len(),
+            satisfied_implementation_nodes,
+            unresolved_nodes,
+            repository_fingerprint,
+        }
     }
 
     pub fn has_blocking_required_node(&self) -> bool {

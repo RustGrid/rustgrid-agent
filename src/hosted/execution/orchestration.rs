@@ -17,6 +17,74 @@ struct TargetContextIdentity<'a> {
     accepted_intent_hash: &'a str,
 }
 
+fn validate_critical_worker_event_fields(data: &Value) -> std::result::Result<(), String> {
+    let Some(object) = data.as_object() else {
+        return Ok(());
+    };
+    let Some(event_type) = object.get("event_type").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let required: &[&str] = match event_type {
+        "worker.repository_operation_reduction_started"
+        | "worker.successful_mutation_reconciliation_started" => &[
+            "node_id",
+            "operation",
+            "attempt_id",
+            "repair_intent_kind",
+            "repair_budget_owner",
+            "repository_fingerprint_before",
+            "repository_fingerprint_after",
+            "verification_evidence_id",
+            "node_status_before",
+        ],
+        "worker.repository_operation_reduced"
+        | "worker.node_completed_from_verified_write"
+        | "worker.successful_mutation_reconciliation_completed" => &[
+            "node_id",
+            "operation",
+            "attempt_id",
+            "repair_intent_kind",
+            "repair_budget_owner",
+            "repository_fingerprint_before",
+            "repository_fingerprint_after",
+            "verification_evidence_id",
+            "node_status_before",
+            "node_status_after",
+        ],
+        "worker.implementation_barrier_checked"
+        | "worker.implementation_barrier_rejected_validation" => &[
+            "validation_node_id",
+            "implementation_barrier_result",
+            "required_implementation_nodes",
+            "completed_implementation_nodes",
+            "unresolved_nodes",
+            "repository_fingerprint",
+        ],
+        "worker.repair_intent_session_created"
+        | "worker.repair_budget_scope_resolved"
+        | "worker.validation_repair_target_bound" => &[
+            "repair_intent_kind",
+            "repair_budget_owner",
+            "repair_budget",
+            "target_node_id",
+        ],
+        "worker.graph_invariant_violation" => {
+            &["category", "code", "phase", "resumable", "node_id"]
+        }
+        _ => return Ok(()),
+    };
+    let missing = required
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{event_type} lacks fields: {}", missing.join(", ")))
+    }
+}
+
 fn target_context_already_prepared(
     events: &[crate::execution_graph::ExecutionDomainEvent],
     identity: &TargetContextIdentity<'_>,
@@ -471,6 +539,12 @@ impl<'a> GatewayAgent<'a> {
         data: Value,
         operation: &str,
     ) -> bool {
+        if let Err(error) = validate_critical_worker_event_fields(&data) {
+            eprintln!(
+                "[warning] {operation} was not emitted because its telemetry contract is incomplete: {error}"
+            );
+            return false;
+        }
         match self.api.append_event(event_type, data) {
             Ok(()) => true,
             Err(error) => {
@@ -1931,31 +2005,48 @@ impl<'a> GatewayAgent<'a> {
                     .graph
                     .as_ref()
                     .ok_or_else(|| anyhow!("validation requires an authoritative execution graph"))?
-                    .validation_readiness_proof();
+                    .validation_readiness(crate::execution_graph::RepositoryFingerprint::new(
+                        repository_fingerprint.clone(),
+                    ));
                 self.append_event_recoverable(
                     "validation",
                     json!({
                         "event_type": "worker.implementation_barrier_checked",
                         "validation_node_id": node_id,
-                        "satisfied": barrier.is_ok(),
-                        "graph_revision": self.notebook.orchestration.graph_revision,
+                        "implementation_barrier_result": barrier.is_satisfied(),
+                        "required_implementation_nodes": barrier.required_implementation_nodes,
+                        "completed_implementation_nodes": barrier.completed_implementation_nodes,
+                        "unresolved_nodes": barrier.unresolved_nodes,
+                        "repository_fingerprint": barrier.repository_fingerprint,
+                        "graph_revision": barrier.graph_revision,
                     }),
                     "implementation barrier check",
                 );
-                if let Err(error) = barrier {
+                if !barrier.is_satisfied() {
                     self.append_event_recoverable(
                         "validation",
                         json!({
                             "event_type": "worker.implementation_barrier_rejected_validation",
                             "validation_node_id": node_id,
-                            "reason": error.to_string(),
-                            "graph_revision": self.notebook.orchestration.graph_revision,
+                            "category": "OrchestrationStateInvariantFailure",
+                            "code": "implementation_barrier_unsatisfied",
+                            "phase": "validation",
+                            "resumable": true,
+                            "implementation_barrier_result": false,
+                            "required_implementation_nodes": barrier.required_implementation_nodes,
+                            "completed_implementation_nodes": barrier.completed_implementation_nodes,
+                            "unresolved_nodes": barrier.unresolved_nodes,
+                            "repository_fingerprint": barrier.repository_fingerprint,
+                            "graph_revision": barrier.graph_revision,
                         }),
                         "implementation barrier rejected validation",
                     );
                     return Err(anyhow!(HostedInvariantFailure::new(
                         "implementation_barrier_unsatisfied",
-                        error.to_string(),
+                        format!(
+                            "required implementation nodes remain unresolved: {:?}",
+                            barrier.unresolved_nodes
+                        ),
                     )));
                 }
                 let repaired_failures = self
@@ -2064,14 +2155,30 @@ impl<'a> GatewayAgent<'a> {
                 .budget
                 .repair_session_for_failure(&failure.id)
                 .cloned();
+            let repair_budget_owner = session.as_ref().map(|session| {
+                crate::execution_graph::ExecutionNodeId::new(session.session_id.clone())
+            });
+            let repair_budget = session.as_ref().and_then(|session| {
+                repair_budget_owner.as_ref().map(|owner| {
+                    self.notebook.orchestration.budget.repair_budget_for(
+                        crate::execution_graph::RepairIntentKind::ValidationRepair,
+                        owner,
+                        session.budget.max_target_attempts,
+                    )
+                })
+            });
             self.append_event_recoverable(
                 "validation",
                 json!({
                     "event_type": "worker.repair_intent_session_created",
                     "repair_intent_kind": crate::execution_graph::RepairIntentKind::ValidationRepair,
                     "repair_session_id": session.as_ref().map(|session| session.session_id.as_str()),
+                    "repair_budget_owner": repair_budget_owner,
+                    "repair_budget": repair_budget,
+                    "target_node_id": target.node_id,
                     "failed_validation_id": repair.repair_intent.failed_validation_id,
                     "failure_revision": session.as_ref().map(|session| session.current_assertion_set_revision),
+                    "repository_fingerprint": repair.repository_fingerprint,
                 }),
                 "validation repair session created",
             );
@@ -2081,6 +2188,9 @@ impl<'a> GatewayAgent<'a> {
                     "event_type": "worker.repair_budget_scope_resolved",
                     "repair_intent_kind": crate::execution_graph::RepairIntentKind::ValidationRepair,
                     "repair_session_id": session.as_ref().map(|session| session.session_id.as_str()),
+                    "repair_budget_owner": repair_budget_owner,
+                    "repair_budget": repair_budget,
+                    "target_node_id": target.node_id,
                     "max_target_attempts": session.as_ref().map(|session| session.budget.max_target_attempts),
                     "mutation_fallback_attempts_consumed": self.notebook.orchestration.budget.usage_for(&target.node_id).mutation_fallback_attempts,
                     "validation_repair_attempts_consumed": session.as_ref().map(|session| {
@@ -2095,6 +2205,9 @@ impl<'a> GatewayAgent<'a> {
                 json!({
                     "event_type": "worker.validation_repair_target_bound",
                     "repair_session_id": session.as_ref().map(|session| session.session_id.as_str()),
+                    "repair_intent_kind": crate::execution_graph::RepairIntentKind::ValidationRepair,
+                    "repair_budget_owner": repair_budget_owner,
+                    "repair_budget": repair_budget,
                     "repair_intent_id": repair.repair_intent.repair_intent_id,
                     "target_node_id": target.node_id,
                     "selected_target": repair.selected_target,
@@ -2794,23 +2907,65 @@ impl<'a> GatewayAgent<'a> {
                     .node(node_id)
                     .is_some_and(|node| node.kind.is_mutation())
             });
+            let cycle_cause = cycle_node_id.as_ref().map_or(
+                crate::execution_graph::CycleCause::Unknown,
+                |node_id| {
+                    let last_repository_event = crate::execution_graph::current_execution_epoch(
+                        &snapshot.events,
+                    )
+                    .iter()
+                    .rev()
+                    .find(|event| event.node_id() == Some(node_id));
+                    match last_repository_event {
+                        Some(
+                            crate::execution_graph::ExecutionDomainEvent::TargetOperationAlreadyApplied { .. },
+                        ) => crate::execution_graph::CycleCause::AlreadyAppliedNotReduced,
+                        Some(
+                            crate::execution_graph::ExecutionDomainEvent::TargetMutationProduced { .. },
+                        ) => crate::execution_graph::CycleCause::SuccessfulMutationNotReduced,
+                        _ if snapshot.graph.node(node_id).is_some_and(|node| {
+                            node.status != crate::execution_graph::ExecutionNodeStatus::Running
+                        }) => crate::execution_graph::CycleCause::StaleActivePointer,
+                        _ => crate::execution_graph::CycleCause::DecisionSelectorNoProgress,
+                    }
+                },
+            );
             if repeated_count == 1
                 && cycle_on_repository_node
                 && matches!(
-                    &decision,
-                    ExecutionDecision::ExecuteTarget {
-                        action: crate::hosted_orchestrator::MutationAction::VerifyTargetState { .. },
-                        ..
-                    }
+                    cycle_cause,
+                    crate::execution_graph::CycleCause::SuccessfulMutationNotReduced
+                        | crate::execution_graph::CycleCause::AlreadyAppliedNotReduced
                 )
             {
+                let cycle_node = cycle_node_id
+                    .as_ref()
+                    .and_then(|node_id| snapshot.graph.node(node_id));
+                let cycle_operation = cycle_node
+                    .and_then(|node| node.target.as_ref())
+                    .map(|target| target.effective_operation());
+                let cycle_attempt = cycle_node
+                    .and_then(|node| node.attempts.last())
+                    .map(|attempt| attempt.attempt);
+                let cycle_repository_fingerprint_before = cycle_node
+                    .and_then(|node| node.attempts.last())
+                    .map(|attempt| attempt.repository_fingerprint_before.clone());
+                let cycle_node_status_before = cycle_node.map(|node| node.status);
                 self.append_event_recoverable(
                     "progress",
                     json!({
                         "event_type": "worker.successful_mutation_reconciliation_started",
                         "node_id": cycle_node_id,
+                        "operation": cycle_operation,
+                        "attempt_id": cycle_attempt,
+                        "repository_fingerprint_before": cycle_repository_fingerprint_before,
+                        "repository_fingerprint_after": snapshot.current_repository.fingerprint,
+                        "verification_evidence_id": null,
+                        "node_status_before": cycle_node_status_before,
+                        "repair_intent_kind": null,
+                        "repair_budget_owner": null,
                         "guardrail_action": crate::execution_graph::OrchestrationGuardrailAction::ReconcileSuccessfulMutation,
-                        "cycle_cause": crate::execution_graph::CycleCause::SuccessfulMutationNotReduced,
+                        "cycle_cause": cycle_cause,
                         "graph_revision_before": snapshot.graph.revision,
                     }),
                     "successful mutation cycle reconciliation",
@@ -2822,6 +2977,19 @@ impl<'a> GatewayAgent<'a> {
                     json!({
                         "event_type": "worker.successful_mutation_reconciliation_completed",
                         "node_id": cycle_node_id,
+                        "operation": cycle_operation,
+                        "attempt_id": cycle_attempt,
+                        "repository_fingerprint_before": cycle_repository_fingerprint_before,
+                        "repository_fingerprint_after": reconciled.current_repository.fingerprint,
+                        "verification_evidence_id": cycle_node_id.as_ref().and_then(|node_id| {
+                            reconciled.graph.node(node_id).and_then(|node| {
+                                node.operation_evidence.last().map(|evidence| evidence.semantic_id.as_str())
+                            })
+                        }),
+                        "node_status_before": cycle_node_status_before,
+                        "node_status_after": cycle_node_id.as_ref().and_then(|node_id| reconciled.graph.node(node_id)).map(|node| node.status),
+                        "repair_intent_kind": null,
+                        "repair_budget_owner": null,
                         "graph_revision_before": snapshot.graph.revision,
                         "graph_revision_after": reconciled.graph.revision,
                         "node_status": cycle_node_id.as_ref().and_then(|node_id| reconciled.graph.node(node_id)).map(|node| node.status),
@@ -2846,15 +3014,19 @@ impl<'a> GatewayAgent<'a> {
                         json!({
                             "event_type": "worker.graph_invariant_violation",
                             "node_id": cycle_node_id,
+                            "category": "OrchestrationStateInvariantFailure",
+                            "code": "successful_mutation_not_reduced",
+                            "phase": "implementation",
+                            "resumable": true,
                             "invariant": "cycle_recovery_cannot_skip_required_implementation",
-                            "cycle_cause": crate::execution_graph::CycleCause::OrchestrationStateDiverged,
+                            "cycle_cause": crate::execution_graph::CycleCause::PersistenceMismatch,
                             "guardrail_action": crate::execution_graph::OrchestrationGuardrailAction::FailOrchestrator,
                             "graph_revision": snapshot.graph.revision,
                         }),
                         "unreconciled repository-operation cycle",
                     );
                     return Err(anyhow!(HostedInvariantFailure::new(
-                        "unreconciled_repository_operation_cycle",
+                        "successful_mutation_not_reduced",
                         "a deterministic repository-operation cycle remained after local reconciliation while required implementation nodes were unfinished",
                     )));
                 }
@@ -3094,11 +3266,21 @@ impl<'a> GatewayAgent<'a> {
         &mut self,
         mut event: crate::execution_graph::ExecutionDomainEvent,
     ) -> Result<()> {
+        let validation_repair_admission = matches!(
+            event,
+            crate::execution_graph::ExecutionDomainEvent::ValidationRepairStarted { .. }
+        );
         bind_validation_repair_model_call(&mut event, self.active_model_call_id.as_deref());
         let mut snapshot = self.build_execution_snapshot()?;
-        snapshot
-            .append_event(event)
-            .map_err(|error| anyhow!("could not apply hosted execution event: {error}"))?;
+        snapshot.append_event(event).map_err(|error| {
+            if validation_repair_admission {
+                anyhow!(HostedRepairAccountingFailure::incompatible_scope(
+                    error.to_string()
+                ))
+            } else {
+                anyhow!("could not apply hosted execution event: {error}")
+            }
+        })?;
         let mut orchestration = std::mem::take(&mut self.notebook.orchestration);
         orchestration.replace_from_snapshot(&snapshot);
         orchestration.materialize_legacy_notebook(&mut self.notebook);
@@ -4108,7 +4290,7 @@ impl<'a> GatewayAgent<'a> {
     pub(in crate::hosted) fn record_active_target_applied(
         &mut self,
         target_path: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let validation_repair = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget {
                 action:
@@ -4183,7 +4365,7 @@ impl<'a> GatewayAgent<'a> {
         let node_id = match self.current_decision.as_ref() {
             Some(ExecutionDecision::ExecuteTarget { node_id, .. })
             | Some(ExecutionDecision::RepairTarget { node_id, .. }) => node_id.clone(),
-            _ => return Ok(()),
+            _ => return Ok(String::new()),
         };
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         let evidence_id = format!(
@@ -4285,7 +4467,7 @@ impl<'a> GatewayAgent<'a> {
                 node_id: node_id.clone(),
                 target_path: target_path.to_owned(),
                 repository_fingerprint: fingerprint.clone(),
-                evidence_id,
+                evidence_id: evidence_id.clone(),
                 completed_at: now_rfc3339(),
                 satisfied_intent: if validation_repair.is_some() {
                     crate::execution_graph::SatisfiedIntent::ValidationRepair
@@ -4307,7 +4489,13 @@ impl<'a> GatewayAgent<'a> {
                     .map(|(failure_id, ..)| failure_id.clone()),
                 created_target_evidence,
             },
-        )?;
+        )
+        .map_err(|error| {
+            anyhow!(HostedInvariantFailure::new(
+                "successful_mutation_not_reduced",
+                error.to_string(),
+            ))
+        })?;
         if let Some((
             failure_id,
             validation_node_id,
@@ -4373,7 +4561,7 @@ impl<'a> GatewayAgent<'a> {
                 "validation repair attempt",
             );
         }
-        Ok(())
+        Ok(evidence_id)
     }
 
     pub(in crate::hosted) fn record_active_target_already_applied(
@@ -4462,6 +4650,45 @@ impl<'a> GatewayAgent<'a> {
                     "active node has no persisted attempt",
                 )
             })?;
+        let node_status_before = node.status;
+        let lifecycle_before = node.repository_mutation_lifecycle;
+        let repository_fingerprint_before = node
+            .attempts
+            .last()
+            .map(|attempt| attempt.repository_fingerprint_before.clone());
+        let repair_intent_kind = satisfied_intent.repair_intent_kind();
+        let repair_budget_owner = match repair_intent_kind {
+            Some(crate::execution_graph::RepairIntentKind::ValidationRepair) => {
+                repair_failure_id.as_ref().map(|failure_id| {
+                    crate::execution_graph::ExecutionNodeId::new(
+                        crate::execution_graph::BudgetState::repair_session_id(failure_id),
+                    )
+                })
+            }
+            Some(crate::execution_graph::RepairIntentKind::MutationApplicationFallback) => {
+                Some(node_id.clone())
+            }
+            _ => None,
+        };
+        let repair_budget = repair_intent_kind.and_then(|kind| {
+            let owner = repair_budget_owner.as_ref()?;
+            let maximum = match kind {
+                crate::execution_graph::RepairIntentKind::ValidationRepair => repair_failure_id
+                    .as_ref()
+                    .and_then(|failure_id| {
+                        snapshot
+                            .budget
+                            .repair_session_for_failure(failure_id)
+                            .map(|session| session.budget.max_target_attempts)
+                    })
+                    .unwrap_or_default(),
+                crate::execution_graph::RepairIntentKind::MutationApplicationFallback => {
+                    node.budget.max_mutation_fallback_attempts
+                }
+                _ => 0,
+            };
+            Some(snapshot.budget.repair_budget_for(kind, owner, maximum))
+        });
         let transition = crate::execution_graph::AlreadyAppliedTransition {
             node_id: node_id.clone(),
             operation: probe.operation.clone(),
@@ -4479,10 +4706,18 @@ impl<'a> GatewayAgent<'a> {
             json!({
                 "event_type": "worker.repository_operation_reduction_started",
                 "node_id": node_id,
-                "attempt": attempt,
+                "attempt_id": attempt,
                 "operation": probe.operation.as_str(),
                 "target_path": probe.target_path,
                 "result": "already_applied",
+                "repair_intent_kind": repair_intent_kind,
+                "repair_budget_owner": repair_budget_owner,
+                "repair_budget": repair_budget,
+                "repository_fingerprint_before": repository_fingerprint_before,
+                "repository_fingerprint_after": probe.repository_fingerprint,
+                "verification_evidence_id": semantic_id,
+                "node_status_before": node_status_before,
+                "mutation_lifecycle_before": lifecycle_before,
                 "semantic_decision_hash": semantic_id,
                 "graph_revision_before": revision_before,
             }),
@@ -4498,7 +4733,13 @@ impl<'a> GatewayAgent<'a> {
                 satisfied_intent,
                 repair_failure_id,
             },
-        )?;
+        )
+        .map_err(|error| {
+            anyhow!(HostedInvariantFailure::new(
+                "successful_mutation_not_reduced",
+                error.to_string(),
+            ))
+        })?;
         self.current_decision = None;
         self.persist_orchestration_checkpoint("already_applied_node_completed", false)?;
         let graph = self
@@ -4520,6 +4761,9 @@ impl<'a> GatewayAgent<'a> {
             );
         }
         let revision_after = graph.revision;
+        let node_after = graph.node(&node_id);
+        let node_status_after = node_after.map(|node| node.status);
+        let lifecycle_after = node_after.and_then(|node| node.repository_mutation_lifecycle);
         let selected_next_node = graph.next_runnable_node().map(|node| node.id.to_string());
         for (event_type, description) in [
             (
@@ -4544,9 +4788,20 @@ impl<'a> GatewayAgent<'a> {
                 json!({
                     "event_type": event_type,
                     "node_id": node_id,
-                    "attempt": attempt,
+                    "attempt_id": attempt,
                     "operation": transition.operation.as_str(),
                     "target_path": transition.target_path,
+                    "result": "already_applied",
+                    "repair_intent_kind": repair_intent_kind,
+                    "repair_budget_owner": repair_budget_owner,
+                    "repair_budget": repair_budget,
+                    "repository_fingerprint_before": repository_fingerprint_before,
+                    "repository_fingerprint_after": transition.repository_fingerprint,
+                    "verification_evidence_id": semantic_id,
+                    "node_status_before": node_status_before,
+                    "node_status_after": node_status_after,
+                    "mutation_lifecycle_before": lifecycle_before,
+                    "mutation_lifecycle_after": lifecycle_after,
                     "semantic_decision_hash": semantic_id,
                     "graph_revision_before": revision_before,
                     "graph_revision_after": revision_after,
@@ -5121,6 +5376,101 @@ impl<'a> GatewayAgent<'a> {
         let usage = self.notebook.orchestration.budget.usage_for(&node_id);
         let mutation_attempt = usage.model_calls_consumed;
         let repair_attempt = usage.mutation_fallback_attempts;
+        let active_node = self
+            .notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.node(&node_id));
+        let attempt_id = active_node
+            .and_then(|node| node.attempts.last())
+            .map(|attempt| attempt.attempt);
+        let repository_fingerprint_before = active_node
+            .and_then(|node| node.attempts.last())
+            .map(|attempt| attempt.repository_fingerprint_before.clone());
+        let node_status_before = active_node.map(|node| node.status);
+        let lifecycle_before = active_node.and_then(|node| node.repository_mutation_lifecycle);
+        let (repair_intent_kind, repair_budget_owner, repair_budget) = match self
+            .current_decision
+            .as_ref()
+        {
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
+                ..
+            }) if failure.category
+                == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                let session = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .repair_session_for_failure(&failure.id);
+                let owner = crate::execution_graph::ExecutionNodeId::new(
+                    session
+                        .map(|session| session.session_id.clone())
+                        .unwrap_or_else(|| {
+                            crate::execution_graph::BudgetState::repair_session_id(&failure.id)
+                        }),
+                );
+                let maximum = session.map_or(0, |session| session.budget.max_target_attempts);
+                (
+                    Some(crate::execution_graph::RepairIntentKind::ValidationRepair),
+                    Some(owner.clone()),
+                    Some(self.notebook.orchestration.budget.repair_budget_for(
+                        crate::execution_graph::RepairIntentKind::ValidationRepair,
+                        &owner,
+                        maximum,
+                    )),
+                )
+            }
+            Some(ExecutionDecision::RepairTarget { context, .. })
+                if context.failure.category
+                    == crate::execution_graph::FailureCategory::ValidationFailure =>
+            {
+                let session = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .repair_session_for_failure(&context.failure.id);
+                let owner = crate::execution_graph::ExecutionNodeId::new(
+                    session
+                        .map(|session| session.session_id.clone())
+                        .unwrap_or_else(|| {
+                            crate::execution_graph::BudgetState::repair_session_id(
+                                &context.failure.id,
+                            )
+                        }),
+                );
+                let maximum = session.map_or(0, |session| session.budget.max_target_attempts);
+                (
+                    Some(crate::execution_graph::RepairIntentKind::ValidationRepair),
+                    Some(owner.clone()),
+                    Some(self.notebook.orchestration.budget.repair_budget_for(
+                        crate::execution_graph::RepairIntentKind::ValidationRepair,
+                        &owner,
+                        maximum,
+                    )),
+                )
+            }
+            Some(ExecutionDecision::ExecuteTarget {
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            })
+            | Some(ExecutionDecision::RepairTarget { .. }) => {
+                let maximum =
+                    active_node.map_or(0, |node| node.budget.max_mutation_fallback_attempts);
+                (
+                    Some(crate::execution_graph::RepairIntentKind::MutationApplicationFallback),
+                    Some(node_id.clone()),
+                    Some(self.notebook.orchestration.budget.repair_budget_for(
+                        crate::execution_graph::RepairIntentKind::MutationApplicationFallback,
+                        &node_id,
+                        maximum,
+                    )),
+                )
+            }
+            _ => (None, None, None),
+        };
         let observed_target_hash = repo_file_sha256(&self.repo.root, &target_path);
         let source_absent = operation
             .source_path()
@@ -5180,14 +5530,23 @@ impl<'a> GatewayAgent<'a> {
             json!({
                 "event_type": "worker.repository_operation_reduction_started",
                 "node_id": node_id,
+                "attempt_id": attempt_id,
                 "operation": operation.as_str(),
                 "target_path": target_path,
                 "result": "verified",
+                "repair_intent_kind": repair_intent_kind,
+                "repair_budget_owner": repair_budget_owner,
+                "repair_budget": repair_budget,
+                "repository_fingerprint_before": repository_fingerprint_before,
+                "repository_fingerprint_after": repository_fingerprint,
+                "verification_evidence_id": null,
+                "node_status_before": node_status_before,
+                "mutation_lifecycle_before": lifecycle_before,
                 "graph_revision_before": graph_revision_before,
             }),
             "repository operation reduction",
         );
-        self.record_active_target_applied(&target_path)?;
+        let verification_evidence_id = self.record_active_target_applied(&target_path)?;
         let reduced_snapshot = self.build_execution_snapshot()?;
         let reduced_status = reduced_snapshot
             .graph
@@ -5198,9 +5557,21 @@ impl<'a> GatewayAgent<'a> {
             json!({
                 "event_type": "worker.repository_operation_reduced",
                 "node_id": node_id,
+                "attempt_id": attempt_id,
                 "operation": operation.as_str(),
                 "target_path": target_path,
                 "result": "verified",
+                "repair_intent_kind": repair_intent_kind,
+                "repair_budget_owner": repair_budget_owner,
+                "repair_budget": repair_budget,
+                "repository_fingerprint_before": repository_fingerprint_before,
+                "repository_fingerprint_after": repository_fingerprint,
+                "verification_evidence_id": verification_evidence_id,
+                "node_status_before": node_status_before,
+                "node_status_after": reduced_status,
+                "mutation_lifecycle_before": lifecycle_before,
+                "mutation_lifecycle_after": reduced_snapshot.graph.node(&node_id)
+                    .and_then(|node| node.repository_mutation_lifecycle),
                 "graph_revision_before": graph_revision_before,
                 "graph_revision_after": reduced_snapshot.graph.revision,
                 "node_status": reduced_status,
@@ -5213,7 +5584,16 @@ impl<'a> GatewayAgent<'a> {
                 json!({
                     "event_type": "worker.node_completed_from_verified_write",
                     "node_id": node_id,
+                    "attempt_id": attempt_id,
+                    "operation": operation.as_str(),
                     "target_path": target_path,
+                    "repair_intent_kind": repair_intent_kind,
+                    "repair_budget_owner": repair_budget_owner,
+                    "repository_fingerprint_before": repository_fingerprint_before,
+                    "repository_fingerprint_after": repository_fingerprint,
+                    "verification_evidence_id": verification_evidence_id,
+                    "node_status_before": node_status_before,
+                    "node_status_after": reduced_status,
                     "graph_revision": reduced_snapshot.graph.revision,
                 }),
                 "node completion from verified write",
@@ -5456,5 +5836,33 @@ mod tests {
                 accepted_intent_hash: "intent-1",
             },
         ));
+    }
+
+    #[test]
+    fn critical_repository_telemetry_requires_machine_decision_fields() {
+        let complete = json!({
+            "event_type": "worker.repository_operation_reduced",
+            "node_id": "source-000",
+            "operation": "modify_existing",
+            "attempt_id": 2,
+            "repair_intent_kind": "mutation_application_fallback",
+            "repair_budget_owner": "source-000",
+            "repository_fingerprint_before": "tree-1",
+            "repository_fingerprint_after": "tree-2",
+            "verification_evidence_id": "mutation-1",
+            "node_status_before": "running",
+            "node_status_after": "completed",
+        });
+        validate_critical_worker_event_fields(&complete).expect("complete telemetry contract");
+
+        let incomplete = json!({
+            "event_type": "worker.repository_operation_reduced",
+            "node_id": "source-000",
+        });
+        let error = validate_critical_worker_event_fields(&incomplete)
+            .expect_err("missing decision fields must be rejected");
+        assert!(error.contains("attempt_id"));
+        assert!(error.contains("verification_evidence_id"));
+        assert!(error.contains("node_status_after"));
     }
 }

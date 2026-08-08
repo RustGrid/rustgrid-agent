@@ -22,6 +22,8 @@ impl std::error::Error for HostedLeaseLost {}
 #[derive(Debug)]
 pub(super) struct HostedInvariantFailure {
     pub(super) code: &'static str,
+    pub(super) phase: &'static str,
+    pub(super) resumable: bool,
     pub(super) message: String,
 }
 
@@ -29,18 +31,71 @@ impl HostedInvariantFailure {
     pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
+            phase: "orchestration",
+            resumable: true,
             message: message.into(),
         }
+    }
+
+    pub(super) const fn category(&self) -> &'static str {
+        "OrchestrationStateInvariantFailure"
     }
 }
 
 impl std::fmt::Display for HostedInvariantFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.code, self.message)
+        write!(
+            formatter,
+            "category={} code={} phase={} resumable={}: {}",
+            self.category(),
+            self.code,
+            self.phase,
+            self.resumable,
+            self.message
+        )
     }
 }
 
 impl std::error::Error for HostedInvariantFailure {}
+
+#[derive(Debug)]
+pub(super) struct HostedRepairAccountingFailure {
+    pub(super) code: &'static str,
+    pub(super) phase: &'static str,
+    pub(super) resumable: bool,
+    pub(super) message: String,
+}
+
+impl HostedRepairAccountingFailure {
+    pub(super) fn incompatible_scope(message: impl Into<String>) -> Self {
+        Self {
+            code: "incompatible_repair_budget_scope",
+            phase: "validation_repair",
+            resumable: true,
+            message: message.into(),
+        }
+    }
+
+    pub(super) const fn category(&self) -> &'static str {
+        "RepairAccountingFailure"
+    }
+}
+
+impl std::fmt::Display for HostedRepairAccountingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "category={} code={} phase={} resumable={}: {}",
+            self.category(),
+            self.code,
+            self.phase,
+            self.resumable,
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for HostedRepairAccountingFailure {}
 
 pub(super) fn classify_hosted_execution_failure(
     error: &anyhow::Error,
@@ -117,6 +172,9 @@ pub(super) fn classify_hosted_execution_failure(
         ));
     }
     if error.downcast_ref::<HostedInvariantFailure>().is_some()
+        || error
+            .downcast_ref::<HostedRepairAccountingFailure>()
+            .is_some()
         || error
             .downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
             .is_some()

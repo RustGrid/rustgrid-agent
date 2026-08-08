@@ -480,6 +480,11 @@ pub struct ExecutionNode {
     pub evidence_ids: Vec<String>,
     #[serde(default)]
     pub operation_evidence: Vec<OperationEvidence>,
+    /// Durable repository-operation phase for mutation nodes. This is a
+    /// projection of domain events and is therefore replay-safe; legacy
+    /// checkpoints omit it and reconstruct it as events are replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_mutation_lifecycle: Option<RepositoryMutationLifecycle>,
 }
 
 impl ExecutionNode {

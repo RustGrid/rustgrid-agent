@@ -280,9 +280,36 @@
                 repository_fingerprint: "tree-1".into(),
             })
             .unwrap();
+        assert_eq!(
+            snapshot
+                .graph
+                .node(&node_id)
+                .and_then(|node| node.repository_mutation_lifecycle),
+            Some(RepositoryMutationLifecycle::Proposed)
+        );
+        snapshot
+            .append_event(ExecutionDomainEvent::TargetMutationIntentRecorded {
+                sequence: 4,
+                node_id: node_id.clone(),
+                target_path: target_path.clone(),
+                operation: TargetOperation::ModifyExisting,
+                source_path: None,
+                expected_result_content_hash: Some("after".into()),
+                expected_source_content_hash: None,
+                repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+                accepted_intent_hash: "accepted-intent".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .graph
+                .node(&node_id)
+                .and_then(|node| node.repository_mutation_lifecycle),
+            Some(RepositoryMutationLifecycle::Validated)
+        );
         snapshot
             .append_event(ExecutionDomainEvent::TargetMutationProduced {
-                sequence: 4,
+                sequence: 5,
                 node_id: node_id.clone(),
                 target_path: target_path.clone(),
                 expected_repository_fingerprint: RepositoryFingerprint::new("tree-1"),
@@ -291,9 +318,16 @@
                 after_content_hash: Some("after".into()),
             })
             .unwrap();
+        assert_eq!(
+            snapshot
+                .graph
+                .node(&node_id)
+                .and_then(|node| node.repository_mutation_lifecycle),
+            Some(RepositoryMutationLifecycle::AppliedUnverified)
+        );
         snapshot
             .append_event(ExecutionDomainEvent::FailureSuperseded {
-                sequence: 5,
+                sequence: 6,
                 node_id: node_id.clone(),
                 failure_id: FailureId::new("patch-failure"),
                 repository_fingerprint: "tree-2".into(),
@@ -306,7 +340,7 @@
         );
         snapshot
             .append_event(ExecutionDomainEvent::MutationApplied {
-                sequence: 6,
+                sequence: 7,
                 node_id: node_id.clone(),
                 target_path: target_path.clone(),
                 repository_fingerprint: "tree-2".into(),
@@ -338,6 +372,10 @@
             Some(ExecutionNodeStatus::Completed)
         );
         assert_eq!(completed.operation_evidence.len(), 1);
+        assert_eq!(
+            completed.repository_mutation_lifecycle,
+            Some(RepositoryMutationLifecycle::Verified)
+        );
         assert_eq!(
             completed.operation_evidence[0].outcome,
             RepositoryOperationOutcome::Applied
@@ -1018,6 +1056,14 @@
             "partial dependency satisfaction must not erase remaining work"
         );
         assert!(snapshot.graph.next_runnable_node().is_none());
+        let readiness = snapshot
+            .graph
+            .validation_readiness(RepositoryFingerprint::new("tree-2"));
+        assert!(!readiness.is_satisfied());
+        assert_eq!(readiness.required_implementation_nodes, 2);
+        assert_eq!(readiness.completed_implementation_nodes, 1);
+        assert_eq!(readiness.unresolved_nodes, vec![pending_test.clone()]);
+        assert_eq!(readiness.repository_fingerprint.as_str(), "tree-2");
         assert!(
             snapshot
                 .graph

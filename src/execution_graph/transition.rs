@@ -539,6 +539,10 @@ impl ExecutionGraph {
                     GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
                 })?;
                 node.status = ExecutionNodeStatus::Running;
+                if node.kind.is_mutation() {
+                    node.repository_mutation_lifecycle =
+                        Some(RepositoryMutationLifecycle::Proposed);
+                }
                 if !node
                     .attempts
                     .iter()
@@ -554,12 +558,26 @@ impl ExecutionGraph {
                 self.revision = self.revision.saturating_add(1);
             }
             ExecutionDomainEvent::TargetContextPrepared { .. }
-            | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
-            | ExecutionDomainEvent::TargetMutationProduced { .. } => {
+            => {
                 // These events advance the action state while the same node
                 // attempt remains Running. The orchestrator derives the next
                 // action from the append-only event stream.
                 // Action-stream facts do not mutate durable graph state.
+            }
+            ExecutionDomainEvent::TargetMutationIntentRecorded { node_id, .. } => {
+                let node = self.node_mut(node_id).ok_or_else(|| {
+                    GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
+                })?;
+                node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Validated);
+                self.revision = self.revision.saturating_add(1);
+            }
+            ExecutionDomainEvent::TargetMutationProduced { node_id, .. } => {
+                let node = self.node_mut(node_id).ok_or_else(|| {
+                    GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
+                })?;
+                node.repository_mutation_lifecycle =
+                    Some(RepositoryMutationLifecycle::AppliedUnverified);
+                self.revision = self.revision.saturating_add(1);
             }
             ExecutionDomainEvent::MutationApplied {
                 node_id,
@@ -631,6 +649,14 @@ impl ExecutionGraph {
                     GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
                 })?;
                 node.status = status;
+                node.repository_mutation_lifecycle = Some(if matches!(
+                    failure.category,
+                    FailureCategory::MutationConflict | FailureCategory::PlanRepositoryConflict
+                ) {
+                    RepositoryMutationLifecycle::Conflict
+                } else {
+                    RepositoryMutationLifecycle::Rejected
+                });
                 if let Some(attempt) = node.attempts.last_mut() {
                     attempt.outcome = Some(status);
                     attempt.failure_id = Some(failure.id.clone());
