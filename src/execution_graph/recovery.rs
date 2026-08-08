@@ -144,6 +144,76 @@ pub enum RepositoryOperationOutcome {
     Failed,
 }
 
+/// Durable lifecycle of one repository mutation. Producing or applying a
+/// payload is deliberately not sufficient to satisfy execution dependencies;
+/// only deterministic post-write verification may produce `Verified`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryMutationLifecycle {
+    #[default]
+    Proposed,
+    Validated,
+    AppliedUnverified,
+    Verified,
+    Rejected,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OperationIntent {
+    pub operation: TargetOperation,
+    pub target_path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_result_hash: Option<ContentHash>,
+    #[serde(default)]
+    pub satisfied_intent: SatisfiedIntent,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationReadinessProof {
+    pub graph_revision: u64,
+    #[serde(default)]
+    pub satisfied_implementation_nodes: Vec<ExecutionNodeId>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "evidence", rename_all = "snake_case")]
+pub enum SuccessfulOperationEvidence {
+    Applied {
+        before: RepositoryFingerprint,
+        after: RepositoryFingerprint,
+    },
+    AlreadyApplied {
+        observed: RepositoryFingerprint,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RepositoryOperationResult {
+    Verified {
+        outcome: RepositoryOperationOutcome,
+        evidence: SuccessfulOperationEvidence,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_result_hash: Option<ContentHash>,
+        semantic_id: String,
+        attempt: u32,
+        completed_at: String,
+    },
+    Rejected,
+    Conflict,
+}
+
+impl RepositoryOperationResult {
+    pub const fn lifecycle(&self) -> RepositoryMutationLifecycle {
+        match self {
+            Self::Verified { .. } => RepositoryMutationLifecycle::Verified,
+            Self::Rejected => RepositoryMutationLifecycle::Rejected,
+            Self::Conflict => RepositoryMutationLifecycle::Conflict,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SatisfiedIntent {
@@ -151,6 +221,50 @@ pub enum SatisfiedIntent {
     OriginalImplementation,
     ValidationRepair,
     MutationFallback,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairIntentKind {
+    #[default]
+    MutationApplicationFallback,
+    ValidationRepair,
+    DiffReviewRepair,
+    PlanningRepair,
+    ArtifactRepair,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RepairBudget {
+    pub max_attempts: u32,
+    pub attempts_consumed: u32,
+}
+
+impl RepairBudget {
+    pub const fn exhausted(&self) -> bool {
+        self.attempts_consumed >= self.max_attempts
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RepairBudgets {
+    pub mutation_application: RepairBudget,
+    pub validation: RepairBudget,
+    pub review: RepairBudget,
+    pub planning: RepairBudget,
+    pub artifact: RepairBudget,
+}
+
+impl RepairBudgets {
+    pub const fn for_kind(&self, kind: RepairIntentKind) -> &RepairBudget {
+        match kind {
+            RepairIntentKind::MutationApplicationFallback => &self.mutation_application,
+            RepairIntentKind::ValidationRepair => &self.validation,
+            RepairIntentKind::DiffReviewRepair => &self.review,
+            RepairIntentKind::PlanningRepair => &self.planning,
+            RepairIntentKind::ArtifactRepair => &self.artifact,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -224,6 +338,197 @@ pub struct TransitionError {
     pub message: String,
 }
 
+pub type OperationReductionError = TransitionError;
+
+/// The sole reducer from a verified repository result into authoritative graph
+/// state. It uses clone-then-commit so attempt finalization, node completion,
+/// evidence attachment, and dependency refresh are atomic.
+pub fn reduce_repository_operation(
+    graph: &mut ExecutionGraph,
+    node_id: ExecutionNodeId,
+    intent: OperationIntent,
+    result: RepositoryOperationResult,
+) -> Result<GraphMutationResult, OperationReductionError> {
+    let (
+        outcome,
+        successful_evidence,
+        observed_result_hash,
+        semantic_id,
+        attempt,
+        completed_at,
+    ) = match result {
+        RepositoryOperationResult::Verified {
+            outcome,
+            evidence,
+            observed_result_hash,
+            semantic_id,
+            attempt,
+            completed_at,
+        } => (
+            outcome,
+            evidence,
+            observed_result_hash,
+            semantic_id,
+            attempt,
+            completed_at,
+        ),
+        RepositoryOperationResult::Rejected => {
+            return Err(TransitionError::new(
+                "repository_operation_rejected",
+                format!("repository operation for node `{node_id}` was rejected before verification"),
+            ));
+        }
+        RepositoryOperationResult::Conflict => {
+            return Err(TransitionError::new(
+                "repository_operation_conflict",
+                format!("repository operation for node `{node_id}` conflicts with repository state"),
+            ));
+        }
+    };
+    if !matches!(
+        outcome,
+        RepositoryOperationOutcome::Applied | RepositoryOperationOutcome::AlreadyApplied
+    ) {
+        return Err(TransitionError::new(
+            "repository_operation_not_successful",
+            format!("verified repository operation for node `{node_id}` has non-success outcome {outcome:?}"),
+        ));
+    }
+    if semantic_id.trim().is_empty() || completed_at.trim().is_empty() {
+        return Err(TransitionError::new(
+            "repository_operation_evidence_incomplete",
+            format!("verified repository operation for node `{node_id}` lacks durable completion evidence"),
+        ));
+    }
+
+    let repository_fingerprint = match &successful_evidence {
+        SuccessfulOperationEvidence::Applied { after, .. } => after.clone(),
+        SuccessfulOperationEvidence::AlreadyApplied { observed } => observed.clone(),
+    };
+    let evidence = OperationEvidence {
+        semantic_id: semantic_id.clone(),
+        outcome,
+        operation: intent.operation.clone(),
+        target_path: intent.target_path.clone(),
+        expected_result_hash: intent.expected_result_hash.clone(),
+        observed_result_hash,
+        repository_fingerprint,
+        attempt,
+        completed_at: completed_at.clone(),
+    };
+    let node = graph.node(&node_id).ok_or_else(|| {
+        TransitionError::new(
+            "repository_operation_node_unknown",
+            format!("unknown execution node `{node_id}`"),
+        )
+    })?;
+    if !node.kind.is_mutation()
+        || node.target.as_ref().is_none_or(|target| {
+            target.effective_operation() != intent.operation
+                || target.effective_operation().destination_path(&target.path)
+                    != intent.target_path
+        })
+    {
+        return Err(TransitionError::new(
+            "repository_operation_intent_conflict",
+            format!("repository operation intent does not match mutation node `{node_id}`"),
+        ));
+    }
+    if node.status == ExecutionNodeStatus::Completed
+        && intent.satisfied_intent == SatisfiedIntent::ValidationRepair
+    {
+        if let Some(existing) = node
+            .operation_evidence
+            .iter()
+            .find(|existing| existing.semantic_id == evidence.semantic_id)
+        {
+            return if existing == &evidence {
+                Ok(GraphMutationResult::NoChange {
+                    current_revision: graph.revision,
+                })
+            } else {
+                Err(TransitionError::new(
+                    "repository_operation_evidence_conflict",
+                    format!("completed node `{node_id}` has conflicting validation-repair evidence"),
+                ))
+            };
+        }
+        let mut next = graph.clone();
+        let previous_revision = next.revision;
+        let node = next.node_mut(&node_id).ok_or_else(|| {
+            TransitionError::new(
+                "repository_operation_node_unknown",
+                format!("unknown execution node `{node_id}`"),
+            )
+        })?;
+        node.evidence_ids.push(semantic_id);
+        node.operation_evidence.push(evidence);
+        next.revision = previous_revision.saturating_add(1);
+        next.validate_invariants().map_err(|error| {
+            TransitionError::new("repository_operation_invariant_failed", error.to_string())
+        })?;
+        let new_revision = next.revision;
+        *graph = next;
+        return Ok(GraphMutationResult::Changed { new_revision });
+    }
+    match reduce_operation_outcome(node, outcome, evidence.clone())? {
+        NodeTransition::NoOp(_) => Ok(GraphMutationResult::NoChange {
+            current_revision: graph.revision,
+        }),
+        NodeTransition::StateConflict => Err(TransitionError::new(
+            "repository_operation_evidence_conflict",
+            format!("completed node `{node_id}` has conflicting operation evidence"),
+        )),
+        NodeTransition::InvalidTransition => Err(TransitionError::new(
+            "repository_operation_before_node_activation",
+            format!("node `{node_id}` cannot complete before activation"),
+        )),
+        NodeTransition::Completed(_) => {
+            let mut next = graph.clone();
+            let previous_revision = next.revision;
+            let node = next.node_mut(&node_id).ok_or_else(|| {
+                TransitionError::new(
+                    "repository_operation_node_unknown",
+                    format!("unknown execution node `{node_id}`"),
+                )
+            })?;
+            let active_attempt = node.attempts.last_mut().ok_or_else(|| {
+                TransitionError::new(
+                    "repository_operation_attempt_missing",
+                    format!("active node `{node_id}` has no persisted attempt"),
+                )
+            })?;
+            if active_attempt.attempt != attempt {
+                return Err(TransitionError::new(
+                    "repository_operation_attempt_conflict",
+                    format!(
+                        "active node `{node_id}` attempt {} does not match operation attempt {attempt}",
+                        active_attempt.attempt
+                    ),
+                ));
+            }
+            active_attempt.completed_at = Some(completed_at);
+            active_attempt.repository_fingerprint_after =
+                Some(evidence.repository_fingerprint.to_string());
+            active_attempt.outcome = Some(ExecutionNodeStatus::Completed);
+            node.status = ExecutionNodeStatus::Completed;
+            if !node.evidence_ids.contains(&semantic_id) {
+                node.evidence_ids.push(semantic_id);
+            }
+            node.operation_evidence.push(evidence);
+            next.dependency_satisfaction_overrides.remove(&node_id);
+            next.refresh_readiness_without_revision();
+            next.revision = previous_revision.saturating_add(1);
+            next.validate_invariants().map_err(|error| {
+                TransitionError::new("repository_operation_invariant_failed", error.to_string())
+            })?;
+            let new_revision = next.revision;
+            *graph = next;
+            Ok(GraphMutationResult::Changed { new_revision })
+        }
+    }
+}
+
 impl TransitionError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
@@ -286,12 +591,33 @@ impl OrchestrationCycleResult {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationGuardrailOutcome {
+    ReconcileSuccessfulMutation,
     ReconcileNodeState,
     AdvanceToNextNode,
     ReviewIncompleteDiff,
     FinishBlocked,
     #[default]
     FailOrchestrator,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationGuardrailAction {
+    ReconcileSuccessfulMutation,
+    AttemptBoundedRecovery,
+    FinishBlocked,
+    #[default]
+    FailOrchestrator,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleCause {
+    SuccessfulMutationNotReduced,
+    RepositoryStateUnchanged,
+    RepairBudgetExhausted,
+    #[default]
+    OrchestrationStateDiverged,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -481,7 +807,7 @@ impl ValidationRepairBudget {
             max_model_calls: self.max_model_calls,
             max_cost_micros: self.max_cost_micros,
             max_duration: Duration::from_secs(10 * 60),
-            max_repair_attempts: self.max_target_attempts,
+            max_mutation_fallback_attempts: 0,
         }
     }
 }
@@ -1181,6 +1507,8 @@ pub struct FailureRecord {
     pub recovered: bool,
     #[serde(default)]
     pub superseded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_attempt: Option<u32>,
     pub attempt: u32,
     pub repository_fingerprint: String,
     pub message: String,
@@ -1224,9 +1552,18 @@ impl FailureRecord {
     }
 
     pub fn mark_superseded(&mut self, repository_fingerprint: impl Into<String>) {
+        self.mark_superseded_by(repository_fingerprint, None);
+    }
+
+    pub fn mark_superseded_by(
+        &mut self,
+        repository_fingerprint: impl Into<String>,
+        attempt: Option<u32>,
+    ) {
         self.status = FailureStatus::Superseded;
         self.recovered = false;
         self.superseded = true;
+        self.superseded_by_attempt = attempt;
         self.resolved_repository_fingerprint = Some(repository_fingerprint.into());
     }
 
@@ -1324,6 +1661,19 @@ impl FailureStore {
         true
     }
 
+    pub fn mark_superseded_by(
+        &mut self,
+        id: &FailureId,
+        repository_fingerprint: impl Into<String>,
+        attempt: Option<u32>,
+    ) -> bool {
+        let Some(failure) = self.get_mut(id) else {
+            return false;
+        };
+        failure.mark_superseded_by(repository_fingerprint, attempt);
+        true
+    }
+
     /// Supersedes every unresolved failure for the applied node or target. This
     /// covers duplicate requests and later successful mutations of the same path.
     pub fn supersede_for_applied_target(
@@ -1331,6 +1681,7 @@ impl FailureStore {
         node_id: &ExecutionNodeId,
         target_path: &str,
         repository_fingerprint: &str,
+        superseded_by_attempt: Option<u32>,
     ) -> Vec<FailureId> {
         let mut superseded = Vec::new();
         for failure in self.records.iter_mut().filter(|failure| {
@@ -1339,7 +1690,10 @@ impl FailureStore {
                 && (&failure.node_id == node_id
                     || failure.target_path.as_deref() == Some(target_path))
         }) {
-            failure.mark_superseded(repository_fingerprint.to_owned());
+            failure.mark_superseded_by(
+                repository_fingerprint.to_owned(),
+                superseded_by_attempt,
+            );
             superseded.push(failure.id.clone());
         }
         superseded

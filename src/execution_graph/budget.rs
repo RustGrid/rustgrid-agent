@@ -9,7 +9,8 @@ pub struct NodeBudgetUsage {
     pub cost_micros_reserved: u64,
     #[serde(with = "duration_millis")]
     pub duration: Duration,
-    pub repair_attempts: u32,
+    #[serde(rename = "repair_attempts", alias = "mutation_fallback_attempts")]
+    pub mutation_fallback_attempts: u32,
     #[serde(default)]
     pub validation_repair_attempts: u32,
 }
@@ -835,12 +836,12 @@ impl BudgetState {
 
     pub fn record_repair_attempt(&mut self, node_id: ExecutionNodeId) {
         let usage = self.node_usage.entry(node_id).or_default();
-        usage.repair_attempts = usage.repair_attempts.saturating_add(1);
+        usage.mutation_fallback_attempts = usage.mutation_fallback_attempts.saturating_add(1);
     }
 
     pub fn restore_repair_attempt(&mut self, node_id: &ExecutionNodeId) {
         let usage = self.node_usage.entry(node_id.clone()).or_default();
-        usage.repair_attempts = usage.repair_attempts.saturating_sub(1);
+        usage.mutation_fallback_attempts = usage.mutation_fallback_attempts.saturating_sub(1);
     }
 
     pub fn record_validation_repair_attempt(&mut self, node_id: ExecutionNodeId) {
@@ -928,7 +929,8 @@ impl BudgetState {
             || (node_budget.max_cost_micros > 0
                 && usage.cost_micros >= node_budget.max_cost_micros)
             || (!node_budget.max_duration.is_zero() && usage.duration >= node_budget.max_duration)
-            || usage.repair_attempts > node_budget.max_repair_attempts
+            || usage.mutation_fallback_attempts
+                > node_budget.max_mutation_fallback_attempts
             || self.total_model_calls >= self.mission.max_model_calls
             || self.total_cost_micros >= self.mission.max_cost_micros
             || self.elapsed >= self.mission.max_duration;

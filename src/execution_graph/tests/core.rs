@@ -39,8 +39,8 @@
         budget.record_model_call_purpose(ModelCallPurpose::ValidationRepairMutation);
 
         assert_eq!(budget.usage_for(&validation.id).validation_repair_attempts, 1);
-        assert_eq!(budget.usage_for(&validation.id).repair_attempts, 0);
-        assert_eq!(budget.usage_for(&mutation.id).repair_attempts, 0);
+        assert_eq!(budget.usage_for(&validation.id).mutation_fallback_attempts, 0);
+        assert_eq!(budget.usage_for(&mutation.id).mutation_fallback_attempts, 0);
         assert_eq!(
             budget.validation_gate_usage.get(&validation.id),
             Some(&ValidationGateBudget {
@@ -395,7 +395,7 @@
                 max_model_calls: 1,
                 max_cost_micros: 1_000,
                 max_duration: Duration::from_secs(10),
-                max_repair_attempts: 0,
+                max_mutation_fallback_attempts: 0,
             },
         )
     }
@@ -558,7 +558,7 @@
             .find(|node| node.kind.is_mutation())
             .expect("mutation node");
         mutation.budget.max_model_calls = 1;
-        mutation.budget.max_repair_attempts = 1;
+        mutation.budget.max_mutation_fallback_attempts = 1;
         let error = graph.validate_invariants().unwrap_err();
         assert!(error.message.contains("budget_configuration_invalid"));
         assert!(error.message.contains("cannot fund a primary attempt and a distinct repair"));
@@ -981,7 +981,7 @@
         failures.record(failure);
         assert!(failures.has_unresolved_for_node(&node_id));
         assert_eq!(
-            failures.supersede_for_applied_target(&node_id, "src/theme.ts", "tree-2"),
+            failures.supersede_for_applied_target(&node_id, "src/theme.ts", "tree-2", Some(2)),
             vec![FailureId::new("failure-1")]
         );
         assert!(!failures.has_unresolved());
@@ -1020,7 +1020,7 @@
 
         assert!(
             failures
-                .supersede_for_applied_target(&node_id, "src/theme.ts", "tree-2")
+                .supersede_for_applied_target(&node_id, "src/theme.ts", "tree-2", Some(2))
                 .is_empty()
         );
         assert_eq!(failures.unresolved().count(), preserved.len());
@@ -1127,7 +1127,7 @@
         );
         assert_eq!(
             replayed.graph.node(&source.id).map(|node| node.status),
-            Some(ExecutionNodeStatus::Superseded)
+            Some(ExecutionNodeStatus::Ready)
         );
         assert_eq!(
             replayed.graph.node(&test.id).map(|node| node.status),
@@ -1222,12 +1222,24 @@
             })
             .expect("record repository evidence");
         persisted
-            .append_event(ExecutionDomainEvent::MutationApplied {
+            .append_event(ExecutionDomainEvent::NodeStarted {
                 sequence: 2,
+                node_id: source.id.clone(),
+                attempt: 1,
+                started_at: "2026-08-08T00:00:01Z".to_owned(),
+                repository_fingerprint: "tree-1".to_owned(),
+            })
+            .expect("start mutation attempt");
+        persisted
+            .append_event(ExecutionDomainEvent::MutationApplied {
+                sequence: 3,
                 node_id: source.id.clone(),
                 target_path: "src/theme.ts".to_owned(),
                 repository_fingerprint: "tree-2".to_owned(),
                 evidence_id: "mutation-theme-tree-2".to_owned(),
+                completed_at: "2026-08-08T00:00:02Z".to_owned(),
+                satisfied_intent: SatisfiedIntent::OriginalImplementation,
+                repair_failure_id: None,
                 created_target_evidence: None,
             })
             .expect("record mutation evidence");
@@ -1249,7 +1261,7 @@
         replacement.revision = initial_graph.revision.saturating_add(1);
         persisted
             .append_event(ExecutionDomainEvent::GraphCreated {
-                sequence: 3,
+                sequence: 4,
                 graph_id: replacement.graph_id.clone(),
                 revision: replacement.revision,
                 graph: Some(replacement.clone()),
@@ -1257,9 +1269,9 @@
             })
             .expect("append replacement topology");
 
-        assert_eq!(persisted.events.len(), 3);
+        assert_eq!(persisted.events.len(), 4);
         assert!(matches!(
-            &persisted.events[1],
+            &persisted.events[2],
             ExecutionDomainEvent::MutationApplied { node_id, .. } if node_id == &source.id
         ));
         assert_eq!(persisted.graph, replacement);
@@ -1394,7 +1406,7 @@
             .collect::<Vec<_>>();
         for mutation_id in mutation_ids {
             validation_graph
-                .set_node_status(&mutation_id, ExecutionNodeStatus::Applied)
+                .set_node_status(&mutation_id, ExecutionNodeStatus::Completed)
                 .expect("apply prerequisite mutation");
         }
         let validation = validation_graph
@@ -1715,6 +1727,9 @@
             target_path: evidence.path.clone(),
             repository_fingerprint: evidence.repository_fingerprint_after.to_string(),
             evidence_id: "mutation-create".into(),
+            completed_at: "2026-08-08T00:00:01Z".into(),
+            satisfied_intent: SatisfiedIntent::OriginalImplementation,
+            repair_failure_id: None,
             created_target_evidence: Some(evidence.clone()),
         };
         let replayed: ExecutionDomainEvent =

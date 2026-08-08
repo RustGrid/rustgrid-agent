@@ -53,7 +53,7 @@ fn recovery_publication_snapshot() -> (ExecutionSnapshot, ExecutionNodeId, Vec<S
         .collect::<Vec<_>>();
     for node_id in mutation_ids {
         graph
-            .set_node_status(&node_id, ExecutionNodeStatus::Applied)
+            .set_node_status(&node_id, ExecutionNodeStatus::Completed)
             .expect("apply recovery fixture target");
     }
 

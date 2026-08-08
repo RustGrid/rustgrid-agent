@@ -1600,7 +1600,7 @@ fn hard_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> 
             >= node.budget.max_model_calls)
         || (node.budget.max_cost_micros > 0 && usage.cost_micros >= node.budget.max_cost_micros)
         || (!node.budget.max_duration.is_zero() && usage.duration >= node.budget.max_duration)
-        || usage.repair_attempts > node.budget.max_repair_attempts
+        || usage.mutation_fallback_attempts > node.budget.max_mutation_fallback_attempts
         || snapshot.budget.total_model_calls >= snapshot.budget.mission.max_model_calls
         || snapshot.budget.total_cost_micros >= snapshot.budget.mission.max_cost_micros
         || snapshot.budget.elapsed >= snapshot.budget.mission.max_duration
@@ -1628,7 +1628,11 @@ fn repair_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -
                     }))
         });
     repair_pending
-        && snapshot.budget.usage_for(&node.id).repair_attempts >= node.budget.max_repair_attempts
+        && snapshot
+            .budget
+            .usage_for(&node.id)
+            .mutation_fallback_attempts
+            >= node.budget.max_mutation_fallback_attempts
 }
 
 fn validation_repair_session_exhausted(
@@ -2042,7 +2046,7 @@ mod tests {
             .id
             .clone();
         let status = if kind.is_mutation() {
-            ExecutionNodeStatus::Applied
+            ExecutionNodeStatus::Completed
         } else if kind.is_validation() {
             ExecutionNodeStatus::Passed
         } else {
@@ -2150,7 +2154,7 @@ mod tests {
             .iter_mut()
             .filter(|node| node.kind.is_mutation())
         {
-            node.status = ExecutionNodeStatus::Applied;
+            node.status = ExecutionNodeStatus::Completed;
         }
         state.graph.refresh_readiness();
         let validation_node = state
@@ -2229,7 +2233,7 @@ mod tests {
                 .nodes
                 .iter()
                 .filter(|node| node.kind.is_mutation())
-                .all(|node| node.status == ExecutionNodeStatus::Applied)
+                .all(|node| node.status == ExecutionNodeStatus::Completed)
         );
         assert_eq!(
             state
@@ -2375,7 +2379,7 @@ mod tests {
                 .nodes
                 .iter()
                 .filter(|node| node.kind.is_mutation())
-                .all(|node| node.status == ExecutionNodeStatus::Applied)
+                .all(|node| node.status == ExecutionNodeStatus::Completed)
         );
         assert_eq!(
             state.target_state(
@@ -2466,7 +2470,7 @@ mod tests {
                 .nodes
                 .iter()
                 .filter(|node| node.kind.is_mutation())
-                .all(|node| node.status == ExecutionNodeStatus::Applied)
+                .all(|node| node.status == ExecutionNodeStatus::Completed)
         );
         assert!(matches!(
             reconcile_execution(&state).unwrap(),
@@ -2496,14 +2500,14 @@ mod tests {
             .graph
             .set_node_status(&node, ExecutionNodeStatus::Applied)
             .unwrap();
-        let before_repairs = state.budget.usage_for(&node).repair_attempts;
+        let before_repairs = state.budget.usage_for(&node).mutation_fallback_attempts;
         assert!(matches!(
             classify_mutation_request(&state, &node).unwrap(),
             Some(MutationResult::AlreadyApplied { .. })
         ));
         assert!(!state.failures.has_unresolved());
         assert_eq!(
-            state.budget.usage_for(&node).repair_attempts,
+            state.budget.usage_for(&node).mutation_fallback_attempts,
             before_repairs
         );
     }
@@ -2529,7 +2533,7 @@ mod tests {
             .clone();
         state
             .graph
-            .set_node_status(&source_id, ExecutionNodeStatus::Applied)
+            .set_node_status(&source_id, ExecutionNodeStatus::Completed)
             .unwrap();
         state
             .graph
@@ -3075,7 +3079,7 @@ mod tests {
             max_model_calls: 10,
             max_cost_micros: 10_000,
             max_duration: std::time::Duration::from_secs(100),
-            max_repair_attempts: 1,
+            max_mutation_fallback_attempts: 1,
         };
         state.budget.mission = MissionBudget {
             max_model_calls: 20,
@@ -3111,7 +3115,7 @@ mod tests {
             .clone();
         let node = state.graph.node_mut(&node_id).expect("mutation node");
         node.status = ExecutionNodeStatus::FailedRecoverable;
-        node.budget.max_repair_attempts = 1;
+        node.budget.max_mutation_fallback_attempts = 1;
         let mut failure = FailureRecord::new(
             "failure-1",
             node_id.clone(),

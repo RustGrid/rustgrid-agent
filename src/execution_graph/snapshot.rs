@@ -683,16 +683,18 @@ impl ExecutionSnapshot {
             let node = self.graph.node(node_id).ok_or_else(|| {
                 GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
             })?;
-            if self.budget.usage_for(node_id).repair_attempts >= node.budget.max_repair_attempts {
+            if self.budget.usage_for(node_id).mutation_fallback_attempts
+                >= node.budget.max_mutation_fallback_attempts
+            {
                 return Err(GraphInvariantError::new(format!(
                     "node `{node_id}` cannot start repair beyond its {}-attempt budget",
-                    node.budget.max_repair_attempts
+                    node.budget.max_mutation_fallback_attempts
                 )));
             }
         }
         match &event {
             ExecutionDomainEvent::MutationRepairAllowanceRestored { node_id, .. } => {
-                if self.budget.usage_for(node_id).repair_attempts == 0 {
+                if self.budget.usage_for(node_id).mutation_fallback_attempts == 0 {
                     return Err(GraphInvariantError::new(format!(
                         "node `{node_id}` cannot restore an unconsumed mutation repair allowance"
                     )));
@@ -702,11 +704,12 @@ impl ExecutionSnapshot {
                 let node = self.graph.node(node_id).ok_or_else(|| {
                     GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
                 })?;
-                if self.budget.usage_for(node_id).repair_attempts >= node.budget.max_repair_attempts
+                if self.budget.usage_for(node_id).mutation_fallback_attempts
+                    >= node.budget.max_mutation_fallback_attempts
                 {
                     return Err(GraphInvariantError::new(format!(
                         "node `{node_id}` cannot consume mutation repair allowance beyond its {}-attempt budget",
-                        node.budget.max_repair_attempts
+                        node.budget.max_mutation_fallback_attempts
                     )));
                 }
             }
@@ -1025,12 +1028,17 @@ impl ExecutionSnapshot {
                     node_id,
                     target_path,
                     repository_fingerprint,
+                    self.graph
+                        .node(node_id)
+                        .and_then(|node| node.attempts.last())
+                        .map(|attempt| attempt.attempt),
                 );
                 self.evidence
                     .supersede_stale_validation(repository_fingerprint);
             }
             ExecutionDomainEvent::TargetOperationAlreadyApplied {
                 sequence,
+                attempt,
                 transition,
                 semantic_id,
                 satisfied_intent,
@@ -1057,6 +1065,7 @@ impl ExecutionSnapshot {
                     &transition.node_id,
                     &transition.target_path,
                     transition.repository_fingerprint.as_str(),
+                    Some(*attempt),
                 );
                 if *satisfied_intent == SatisfiedIntent::ValidationRepair
                     && let Some(failure_id) = repair_failure_id
@@ -1068,7 +1077,7 @@ impl ExecutionSnapshot {
             }
             ExecutionDomainEvent::MutationRejected { failure, .. } => {
                 self.failures.record(failure.clone());
-                self.materialize_unresolved_failure_status(&failure.node_id, false)?;
+                self.materialize_unresolved_failure_status(&failure.node_id)?;
             }
             ExecutionDomainEvent::MutationSuperseded {
                 sequence,
@@ -1078,7 +1087,7 @@ impl ExecutionSnapshot {
             } => {
                 self.failures
                     .mark_superseded(failure_id, repository_fingerprint.clone());
-                self.materialize_unresolved_failure_status(node_id, true)?;
+                self.materialize_unresolved_failure_status(node_id)?;
                 self.budget.record_progress_kind(
                     *sequence,
                     ProgressEventKind::FailureSuperseded,
@@ -1087,7 +1096,7 @@ impl ExecutionSnapshot {
             }
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {
                 self.failures.record(failure.clone());
-                self.materialize_unresolved_failure_status(&failure.node_id, false)?;
+                self.materialize_unresolved_failure_status(&failure.node_id)?;
             }
             ExecutionDomainEvent::FailureRecovered {
                 sequence,
@@ -1097,7 +1106,7 @@ impl ExecutionSnapshot {
             } => {
                 self.failures
                     .mark_recovered(failure_id, repository_fingerprint.clone());
-                self.materialize_unresolved_failure_status(node_id, false)?;
+                self.materialize_unresolved_failure_status(node_id)?;
                 self.budget.record_progress_kind(
                     *sequence,
                     ProgressEventKind::FailureRepaired,
@@ -1110,9 +1119,18 @@ impl ExecutionSnapshot {
                 failure_id,
                 repository_fingerprint,
             } => {
+                let superseded_by_attempt = self
+                    .graph
+                    .node(node_id)
+                    .and_then(|node| node.attempts.last())
+                    .map(|attempt| attempt.attempt);
                 self.failures
-                    .mark_superseded(failure_id, repository_fingerprint.clone());
-                self.materialize_unresolved_failure_status(node_id, true)?;
+                    .mark_superseded_by(
+                        failure_id,
+                        repository_fingerprint.clone(),
+                        superseded_by_attempt,
+                    );
+                self.materialize_unresolved_failure_status(node_id)?;
                 self.budget.record_progress_kind(
                     *sequence,
                     ProgressEventKind::FailureSuperseded,
@@ -1128,7 +1146,7 @@ impl ExecutionSnapshot {
                 failure_id,
                 ..
             } => {
-                self.materialize_unresolved_failure_status(node_id, false)?;
+                self.materialize_unresolved_failure_status(node_id)?;
                 if let Some(failure) = self.failures.get(failure_id).cloned() {
                     let revision = self
                         .budget
@@ -1332,7 +1350,6 @@ impl ExecutionSnapshot {
     fn materialize_unresolved_failure_status(
         &mut self,
         node_id: &ExecutionNodeId,
-        superseded_target: bool,
     ) -> Result<(), GraphInvariantError> {
         let unresolved = self
             .failures
@@ -1343,8 +1360,6 @@ impl ExecutionSnapshot {
             Some(ExecutionNodeStatus::FailedBlocking)
         } else if !unresolved.is_empty() {
             Some(ExecutionNodeStatus::FailedRecoverable)
-        } else if superseded_target {
-            Some(ExecutionNodeStatus::Superseded)
         } else {
             self.graph.node(node_id).and_then(|node| {
                 matches!(

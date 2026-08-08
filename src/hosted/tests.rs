@@ -659,7 +659,7 @@ fn incompatible_repair_tool_is_rejected_without_touching_repository_or_allowance
         crate::execution_graph::BudgetState::new(crate::execution_graph::MissionBudget::default());
     budget.record_repair_attempt(node_id.clone());
     budget.restore_repair_attempt(&node_id);
-    assert_eq!(budget.usage_for(&node_id).repair_attempts, 0);
+    assert_eq!(budget.usage_for(&node_id).mutation_fallback_attempts, 0);
 }
 
 #[test]
@@ -757,7 +757,7 @@ fn bounded_build_and_repair_plan_requests_fit_the_planning_bootstrap_budget() {
         max_model_calls: 2,
         max_cost_micros: 300_000,
         max_duration: Duration::from_secs(90),
-        max_repair_attempts: 0,
+        max_mutation_fallback_attempts: 0,
     };
     let mut budget = BudgetState::new(MissionBudget::for_complexity(
         crate::execution_graph::MissionComplexity::Small,
@@ -827,7 +827,7 @@ fn compact_finalization_cost_admits_the_third_discovery_call() {
         max_model_calls: 3,
         max_cost_micros: 350_000,
         max_duration: Duration::from_secs(120),
-        max_repair_attempts: 0,
+        max_mutation_fallback_attempts: 0,
     };
     let mut budget = BudgetState::new(MissionBudget::for_complexity(
         crate::execution_graph::MissionComplexity::Small,
@@ -870,7 +870,7 @@ fn cost_rejection_telemetry_exposes_the_complete_failed_inequality() {
             max_model_calls: 3,
             max_cost_micros: 350_000,
             max_duration: Duration::from_secs(120),
-            max_repair_attempts: 0,
+            max_mutation_fallback_attempts: 0,
         },
         1,
         estimate.estimated_request_cost,
@@ -2015,7 +2015,7 @@ fn recovery_authorization_fixture() -> (
             ExecutionNodeKind::DiffReview
             | ExecutionNodeKind::CompletionEvaluation
             | ExecutionNodeKind::Publication => ExecutionNodeStatus::Pending,
-            kind if kind.is_mutation() => ExecutionNodeStatus::Applied,
+            kind if kind.is_mutation() => ExecutionNodeStatus::Completed,
             kind if kind.is_validation() => ExecutionNodeStatus::Passed,
             _ => node.status,
         };
@@ -4639,7 +4639,7 @@ fn legacy_progress_observation_cannot_stop_before_the_graph_soft_bound() {
         max_model_calls: 10,
         max_cost_micros: 10_000,
         max_duration: Duration::from_secs(100),
-        max_repair_attempts: 2,
+        max_mutation_fallback_attempts: 2,
     };
     let mut budget = BudgetState::new(MissionBudget::default());
     for _ in 0..4 {
@@ -5944,7 +5944,7 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
         .id
         .clone();
     graph
-        .set_node_status(&mutation_node, ExecutionNodeStatus::Applied)
+        .set_node_status(&mutation_node, ExecutionNodeStatus::Completed)
         .unwrap();
     graph
         .set_node_status(&validation_node, ExecutionNodeStatus::Passed)

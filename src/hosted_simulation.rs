@@ -514,12 +514,12 @@ impl SimulationHarness {
                 action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                 target,
             } => {
-                if self
-                    .snapshot
-                    .graph
-                    .node(&node_id)
-                    .is_none_or(|node| node.status != ExecutionNodeStatus::Applied)
-                {
+                if self.snapshot.graph.node(&node_id).is_none_or(|node| {
+                    !matches!(
+                        node.status,
+                        ExecutionNodeStatus::Applied | ExecutionNodeStatus::Completed
+                    )
+                }) {
                     self.simulate_target(node_id, target.target, false)?;
                     return Ok(None);
                 }
@@ -823,6 +823,17 @@ impl SimulationHarness {
         target: PlannedTarget,
         repairing: bool,
     ) -> Result<(), SimulationError> {
+        let validation_repair = repairing
+            && self
+                .snapshot
+                .graph
+                .node(&node_id)
+                .is_some_and(|node| node.status == ExecutionNodeStatus::Completed)
+            && self
+                .snapshot
+                .failures
+                .unresolved()
+                .any(|failure| failure.category == FailureCategory::ValidationFailure);
         if !repairing
             && let Some(MutationResult::AlreadyApplied { .. }) =
                 classify_mutation_request(&self.snapshot, &node_id)?
@@ -844,7 +855,9 @@ impl SimulationHarness {
         }
 
         self.charge_model_call(&node_id)?;
-        self.start_node(&node_id)?;
+        if !validation_repair {
+            self.start_node(&node_id)?;
+        }
         let result = self
             .take_target_result(&target.path)
             .unwrap_or(ScriptedTargetResult::Applied);
@@ -860,6 +873,15 @@ impl SimulationHarness {
                     target_path: target.path.clone(),
                     repository_fingerprint: after.clone(),
                     evidence_id,
+                    completed_at: format!("simulation-event-{}", self.sequence()),
+                    satisfied_intent: if validation_repair {
+                        SatisfiedIntent::ValidationRepair
+                    } else if repairing {
+                        SatisfiedIntent::MutationFallback
+                    } else {
+                        SatisfiedIntent::OriginalImplementation
+                    },
+                    repair_failure_id: None,
                     created_target_evidence: None,
                 })?;
                 if repairing {
@@ -1702,6 +1724,16 @@ mod tests {
                 .any(|event| matches!(event, ExecutionDomainEvent::FailureRecovered { .. }))
         );
         assert_eq!(persisted.failures.unresolved().count(), 0);
+        let implementation = persisted
+            .graph
+            .nodes()
+            .find(|node| node.kind.is_mutation())
+            .expect("implementation node");
+        assert_eq!(implementation.status, ExecutionNodeStatus::Completed);
+        assert!(
+            implementation.operation_evidence.len() >= 2,
+            "validation repair evidence must not reopen implementation"
+        );
 
         let encoded = serde_json::to_string(&suffix).expect("serialize domain event suffix");
         let replay_events: Vec<ExecutionDomainEvent> =

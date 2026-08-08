@@ -110,6 +110,14 @@ pub enum ExecutionDomainEvent {
         target_path: String,
         repository_fingerprint: String,
         evidence_id: String,
+        /// Completion time captured after deterministic target verification.
+        /// Legacy journals replay using the active attempt's stable start time.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        completed_at: String,
+        #[serde(default)]
+        satisfied_intent: SatisfiedIntent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repair_failure_id: Option<FailureId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_target_evidence: Option<CreatedTargetEvidence>,
     },
@@ -557,22 +565,50 @@ impl ExecutionGraph {
                 node_id,
                 repository_fingerprint,
                 evidence_id,
+                completed_at,
+                satisfied_intent,
                 ..
             } => {
-                self.dependency_satisfaction_overrides.remove(node_id);
-                let node = self.node_mut(node_id).ok_or_else(|| {
+                let node = self.node(node_id).ok_or_else(|| {
                     GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
                 })?;
-                node.status = ExecutionNodeStatus::Applied;
-                if !node.evidence_ids.contains(evidence_id) {
-                    node.evidence_ids.push(evidence_id.clone());
-                }
-                if let Some(attempt) = node.attempts.last_mut() {
-                    attempt.repository_fingerprint_after = Some(repository_fingerprint.clone());
-                    attempt.outcome = Some(ExecutionNodeStatus::Applied);
-                }
-                self.revision = self.revision.saturating_add(1);
-                self.refresh_readiness();
+                let target = node.target.as_ref().ok_or_else(|| {
+                    GraphInvariantError::new(format!("mutation node `{node_id}` has no target"))
+                })?;
+                let attempt = node.attempts.last().ok_or_else(|| {
+                    GraphInvariantError::new(format!("active mutation node `{node_id}` has no attempt"))
+                })?;
+                let operation = target.effective_operation();
+                let target_path = operation.destination_path(&target.path).to_owned();
+                let attempt_number = attempt.attempt;
+                let fingerprint_before = attempt.repository_fingerprint_before.clone();
+                let completion_time = if completed_at.is_empty() {
+                    attempt.started_at.clone()
+                } else {
+                    completed_at.clone()
+                };
+                reduce_repository_operation(
+                    self,
+                    node_id.clone(),
+                    OperationIntent {
+                        operation,
+                        target_path,
+                        expected_result_hash: None,
+                        satisfied_intent: *satisfied_intent,
+                    },
+                    RepositoryOperationResult::Verified {
+                        outcome: RepositoryOperationOutcome::Applied,
+                        evidence: SuccessfulOperationEvidence::Applied {
+                            before: RepositoryFingerprint::new(fingerprint_before),
+                            after: RepositoryFingerprint::new(repository_fingerprint.clone()),
+                        },
+                        observed_result_hash: None,
+                        semantic_id: evidence_id.clone(),
+                        attempt: attempt_number,
+                        completed_at: completion_time,
+                    },
+                )
+                .map_err(|error| GraphInvariantError::new(error.to_string()))?;
             }
             ExecutionDomainEvent::TargetOperationAlreadyApplied {
                 execution_id,
@@ -601,8 +637,9 @@ impl ExecutionGraph {
                 }
                 self.revision = self.revision.saturating_add(1);
             }
-            ExecutionDomainEvent::MutationSuperseded { node_id, .. } => {
-                self.set_node_status(node_id, ExecutionNodeStatus::Applied)?;
+            ExecutionDomainEvent::MutationSuperseded { .. } => {
+                // Failure reconciliation is independent from node lifecycle.
+                // A later verified repository result owns node completion.
             }
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {
                 self.set_node_status(&failure.node_id, failure.category.node_status())?;
@@ -630,8 +667,9 @@ impl ExecutionGraph {
                     self.refresh_readiness();
                 }
             }
-            ExecutionDomainEvent::FailureSuperseded { node_id, .. } => {
-                self.set_node_status(node_id, ExecutionNodeStatus::Superseded)?;
+            ExecutionDomainEvent::FailureSuperseded { .. } => {
+                // The failure store applies the status change. Never use
+                // failure vocabulary as an execution-node transition.
             }
             ExecutionDomainEvent::NodeCompleted {
                 node_id, status, ..
@@ -831,6 +869,19 @@ impl ExecutionGraph {
                     if node.kind.is_mutation() {
                         if node.status == ExecutionNodeStatus::Running {
                             node.status = ExecutionNodeStatus::Pending;
+                            changed = true;
+                        } else if node.status == ExecutionNodeStatus::Applied {
+                            // `Applied` is the legacy terminal representation
+                            // for a verified write. Normalize it at the explicit
+                            // new-attempt boundary so validation uses the same
+                            // Completed barrier as current reducers.
+                            node.status = ExecutionNodeStatus::Completed;
+                            if let Some(attempt) = node.attempts.last_mut() {
+                                attempt.completed_at.get_or_insert_with(|| {
+                                    attempt.started_at.clone()
+                                });
+                                attempt.outcome = Some(ExecutionNodeStatus::Completed);
+                            }
                             changed = true;
                         }
                         continue;

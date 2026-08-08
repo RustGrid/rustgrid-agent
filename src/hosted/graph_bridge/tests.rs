@@ -330,7 +330,7 @@ fn unstarted_required_gates_materialize_as_ready_or_pending_never_running() {
         .id
         .clone();
     graph
-        .set_node_status(&mutation_id, ExecutionNodeStatus::Applied)
+        .set_node_status(&mutation_id, ExecutionNodeStatus::Completed)
         .unwrap();
     graph.refresh_readiness();
     let statuses = materialize_required_gates(&graph, &EvidenceStore::default())
@@ -810,6 +810,9 @@ fn notebook_is_materialized_from_graph_failures_validation_and_events() {
             target_path: source.path.clone(),
             repository_fingerprint: "tree-1".to_owned(),
             evidence_id: "mutation-source".to_owned(),
+            completed_at: "2026-08-08T00:00:01Z".to_owned(),
+            satisfied_intent: crate::execution_graph::SatisfiedIntent::OriginalImplementation,
+            repair_failure_id: None,
             created_target_evidence: None,
         }],
         failures,
@@ -1272,6 +1275,9 @@ fn duplicate_path_is_not_applied_without_node_specific_evidence() {
             target_path: "src/shared.rs".to_owned(),
             repository_fingerprint: "tree-1".to_owned(),
             evidence_id: "mutation-one".to_owned(),
+            completed_at: "2026-08-08T00:00:01Z".to_owned(),
+            satisfied_intent: crate::execution_graph::SatisfiedIntent::OriginalImplementation,
+            repair_failure_id: None,
             created_target_evidence: None,
         }],
         ..HostedOrchestrationCheckpoint::default()
@@ -1446,7 +1452,7 @@ fn serialized_checkpoint_resume_selects_the_next_ready_node() {
         .id
         .clone();
     graph
-        .set_node_status(&first_id, ExecutionNodeStatus::Applied)
+        .set_node_status(&first_id, ExecutionNodeStatus::Completed)
         .expect("apply first target");
     let checkpoint = HostedOrchestrationCheckpoint {
         graph_revision: graph.revision,
@@ -1642,7 +1648,7 @@ fn newer_attempt_reopens_remaining_work_after_a_published_partial_result() {
     assert!(resumed.graph.dependency_satisfaction_overrides.is_empty());
     assert_eq!(
         resumed.graph.node(&first_id).map(|node| node.status),
-        Some(ExecutionNodeStatus::Applied)
+        Some(ExecutionNodeStatus::Completed)
     );
     assert_eq!(
         resumed.graph.node(&second_id).map(|node| node.status),
@@ -1659,6 +1665,10 @@ fn newer_attempt_reopens_remaining_work_after_a_published_partial_result() {
         ExecutionDecision::ExecuteTarget { target, .. }
             if target.target == second
     ));
+    resumed
+        .graph
+        .set_node_status(&second_id, ExecutionNodeStatus::Completed)
+        .expect("complete resumed implementation before validation");
 
     assert!(crate::execution_graph::current_execution_epoch(&resumed.events).is_empty());
     resumed

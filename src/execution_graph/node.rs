@@ -408,7 +408,8 @@ pub struct NodeBudget {
     pub max_cost_micros: u64,
     #[serde(with = "duration_millis")]
     pub max_duration: Duration,
-    pub max_repair_attempts: u32,
+    #[serde(rename = "max_repair_attempts", alias = "max_mutation_fallback_attempts")]
+    pub max_mutation_fallback_attempts: u32,
 }
 
 impl NodeBudget {
@@ -423,9 +424,9 @@ impl NodeBudget {
                 .max_cost_micros
                 .saturating_sub(usage.cost_micros.saturating_add(usage.cost_micros_reserved)),
             duration: self.max_duration.saturating_sub(usage.duration),
-            repair_attempts: self
-                .max_repair_attempts
-                .saturating_sub(usage.repair_attempts),
+            mutation_fallback_attempts: self
+                .max_mutation_fallback_attempts
+                .saturating_sub(usage.mutation_fallback_attempts),
         }
     }
 }
@@ -437,7 +438,8 @@ pub struct NodeBudgetRemaining {
     pub cost_micros: u64,
     #[serde(with = "duration_millis")]
     pub duration: Duration,
-    pub repair_attempts: u32,
+    #[serde(rename = "repair_attempts", alias = "mutation_fallback_attempts")]
+    pub mutation_fallback_attempts: u32,
 }
 
 impl NodeBudgetRemaining {

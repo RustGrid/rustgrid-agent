@@ -76,7 +76,7 @@ impl<'a> GatewayAgent<'a> {
                 .orchestration
                 .budget
                 .usage_for(node_id)
-                .repair_attempts
+                .mutation_fallback_attempts
         });
         (node_id, mutation_attempt, repair_attempt)
     }

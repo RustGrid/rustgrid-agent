@@ -202,6 +202,11 @@
                 repository_fingerprint: "tree-2".to_owned(),
             })
             .expect("resolve valid mutation failure");
+        assert_eq!(
+            snapshot.graph.node(&source).map(|node| node.status),
+            Some(ExecutionNodeStatus::Ready),
+            "superseding a failure must not supersede the execution node"
+        );
         let already_resolved = snapshot
             .append_event(ExecutionDomainEvent::FailureRecovered {
                 sequence: 3,
@@ -287,26 +292,70 @@
             })
             .unwrap();
         snapshot
-            .append_event(ExecutionDomainEvent::MutationApplied {
+            .append_event(ExecutionDomainEvent::FailureSuperseded {
                 sequence: 5,
+                node_id: node_id.clone(),
+                failure_id: FailureId::new("patch-failure"),
+                repository_fingerprint: "tree-2".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot.graph.node(&node_id).map(|node| node.status),
+            Some(ExecutionNodeStatus::Running),
+            "failure supersession must not replace the active repair node state"
+        );
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationApplied {
+                sequence: 6,
                 node_id: node_id.clone(),
                 target_path: target_path.clone(),
                 repository_fingerprint: "tree-2".into(),
                 evidence_id: "verified-repair-evidence".into(),
+                completed_at: "2026-08-08T00:00:05Z".into(),
+                satisfied_intent: SatisfiedIntent::MutationFallback,
+                repair_failure_id: None,
                 created_target_evidence: None,
             })
             .unwrap();
 
         assert_eq!(
             snapshot.graph.node(&node_id).map(|node| node.status),
-            Some(ExecutionNodeStatus::Applied)
+            Some(ExecutionNodeStatus::Completed)
         );
+        let completed = snapshot.graph.node(&node_id).expect("completed mutation node");
+        let final_attempt = completed.attempts.last().expect("final mutation attempt");
+        assert_eq!(final_attempt.attempt, 2);
+        assert_eq!(
+            final_attempt.completed_at.as_deref(),
+            Some("2026-08-08T00:00:05Z")
+        );
+        assert_eq!(
+            final_attempt.repository_fingerprint_after.as_deref(),
+            Some("tree-2")
+        );
+        assert_eq!(
+            final_attempt.outcome,
+            Some(ExecutionNodeStatus::Completed)
+        );
+        assert_eq!(completed.operation_evidence.len(), 1);
+        assert_eq!(
+            completed.operation_evidence[0].outcome,
+            RepositoryOperationOutcome::Applied
+        );
+        assert!(snapshot.graph.active_node().is_none());
         assert_eq!(
             snapshot
                 .failures
                 .get(&FailureId::new("patch-failure"))
                 .map(|failure| failure.status),
             Some(FailureStatus::Superseded)
+        );
+        assert_eq!(
+            snapshot
+                .failures
+                .get(&FailureId::new("patch-failure"))
+                .and_then(|failure| failure.superseded_by_attempt),
+            Some(2)
         );
         assert!(!snapshot.failures.has_unresolved());
 
@@ -916,7 +965,7 @@
     }
 
     #[test]
-    fn partial_guardrail_satisfies_edges_without_erasing_remaining_targets() {
+    fn partial_guardrail_cannot_bypass_the_implementation_barrier() {
         let mut graph = graph();
         let source = graph
             .nodes
@@ -933,7 +982,7 @@
             .id
             .clone();
         graph
-            .set_node_status(&source, ExecutionNodeStatus::Applied)
+            .set_node_status(&source, ExecutionNodeStatus::Completed)
             .expect("apply useful source work");
         let mut snapshot = ExecutionSnapshot {
             run_id: "run-partial".to_owned(),
@@ -968,16 +1017,20 @@
                 .any(|node| node.id == pending_test),
             "partial dependency satisfaction must not erase remaining work"
         );
-        let validation = snapshot
-            .graph
-            .next_runnable_node()
-            .expect("validation becomes runnable");
-        assert!(validation.kind.is_validation());
+        assert!(snapshot.graph.next_runnable_node().is_none());
+        assert!(
+            snapshot
+                .graph
+                .validation_readiness_proof()
+                .expect_err("unfinished test mutation must block validation")
+                .message
+                .contains("implementation_barrier_unsatisfied")
+        );
         snapshot.validate_invariants().expect("valid partial graph");
     }
 
     #[test]
-    fn partial_route_reaches_draft_publication_without_erasing_remaining_targets() {
+    fn partial_route_reaches_draft_publication_after_implementation_barrier() {
         let mut graph = graph();
         let source = graph
             .nodes
@@ -1021,8 +1074,11 @@
             .id
             .clone();
         graph
-            .set_node_status(&source, ExecutionNodeStatus::Applied)
+            .set_node_status(&source, ExecutionNodeStatus::Completed)
             .expect("apply useful source work");
+        graph
+            .set_node_status(&pending_test, ExecutionNodeStatus::Completed)
+            .expect("complete required test work before validation");
         let mut snapshot = ExecutionSnapshot {
             run_id: "run-partial-publication".to_owned(),
             current_repository: RepositorySnapshot {
@@ -1153,13 +1209,7 @@
         );
         assert!(snapshot.publication.is_published());
         assert!(snapshot.publication.draft);
-        assert!(
-            snapshot
-                .remaining_required_nodes()
-                .iter()
-                .any(|node| node.id == pending_test),
-            "publishing a partial result must preserve explicit remaining mutation work"
-        );
+        assert!(snapshot.graph.implementation_barrier_satisfied());
         snapshot
             .validate_invariants()
             .expect("partial validation-to-publication route remains graph-valid");
@@ -1215,7 +1265,7 @@
                 })
                 .expect("bounded repair start");
         }
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 1);
+        assert_eq!(snapshot.budget.usage_for(&node_id).mutation_fallback_attempts, 1);
         snapshot
             .graph
             .set_node_status(&node_id, ExecutionNodeStatus::FailedRecoverable)
@@ -1230,7 +1280,7 @@
             })
             .expect_err("repair budget must be hard bounded");
         assert!(error.message.contains("cannot start repair beyond"));
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 1);
+        assert_eq!(snapshot.budget.usage_for(&node_id).mutation_fallback_attempts, 1);
     }
 
     #[test]
@@ -1272,7 +1322,7 @@
                 repository_fingerprint: "tree-1".into(),
             })
             .expect("first tiny repair starts");
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 1);
+        assert_eq!(snapshot.budget.usage_for(&node_id).mutation_fallback_attempts, 1);
         assert_eq!(
             snapshot.graph.node(&node_id).map(|node| node.status),
             Some(ExecutionNodeStatus::Running),
@@ -1293,7 +1343,7 @@
                 node_id: node_id.clone(),
             })
             .expect("provider-contract violation restores the allowance");
-        assert_eq!(snapshot.budget.usage_for(&node_id).repair_attempts, 0);
+        assert_eq!(snapshot.budget.usage_for(&node_id).mutation_fallback_attempts, 0);
         assert!(mutation_repair_allowance_is_restored(
             &snapshot.events,
             &node_id
@@ -1312,7 +1362,7 @@
                 node_id: node_id.clone(),
             })
             .expect("compatible retry re-consumes the allowance after restart");
-        assert_eq!(resumed.budget.usage_for(&node_id).repair_attempts, 1);
+        assert_eq!(resumed.budget.usage_for(&node_id).mutation_fallback_attempts, 1);
         assert!(!mutation_repair_allowance_is_restored(
             &resumed.events,
             &node_id
@@ -1326,7 +1376,7 @@
             max_model_calls: 10,
             max_cost_micros: 10_000,
             max_duration: Duration::from_secs(100),
-            max_repair_attempts: 1,
+            max_mutation_fallback_attempts: 1,
         };
         let mut state = BudgetState::new(MissionBudget {
             max_model_calls: 20,

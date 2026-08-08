@@ -218,9 +218,7 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
             } else {
                 distributed_calls
             };
-            let max_repair_attempts = if node.kind.is_validation() {
-                mission.max_target_repair_rounds
-            } else if node.kind.is_mutation() && max_model_calls >= 2 {
+            let max_mutation_fallback_attempts = if node.kind.is_mutation() && max_model_calls >= 2 {
                 mission.max_target_repair_rounds.min(1)
             } else {
                 // A nominal repair allowance is unsafe when the node cannot
@@ -235,7 +233,7 @@ fn assign_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionBudget) {
                     count,
                     position,
                 )),
-                max_repair_attempts,
+                max_mutation_fallback_attempts,
             };
         }
     }
@@ -264,7 +262,7 @@ fn assign_bootstrap_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionB
                 max_model_calls: discovery_calls,
                 max_cost_micros: discovery_cost,
                 max_duration: discovery_duration,
-                max_repair_attempts: 0,
+                max_mutation_fallback_attempts: 0,
             },
             ExecutionNodeKind::Planning => NodeBudget {
                 max_model_calls: planning_calls,
@@ -272,7 +270,7 @@ fn assign_bootstrap_node_budgets(nodes: &mut [ExecutionNode], mission: &MissionB
                 max_duration: planning_duration,
                 // The second bootstrap call is reserved for one bounded
                 // implementation-plan repair after an invalid first artifact.
-                max_repair_attempts: 1,
+                max_mutation_fallback_attempts: 1,
             },
             _ => NodeBudget::default(),
         };

@@ -56,6 +56,29 @@ impl ExecutionGraph {
                     "node `{}` has successful operation evidence without Completed status", node.id
                 )));
             }
+            if node.kind.is_mutation()
+                && node.status == ExecutionNodeStatus::Completed
+                && let Some(attempt) = node.attempts.last()
+                && (attempt.outcome == Some(ExecutionNodeStatus::Completed)
+                    || !node.operation_evidence.is_empty())
+                && (attempt.completed_at.is_none()
+                    || attempt.repository_fingerprint_after.is_none()
+                    || attempt.outcome != Some(ExecutionNodeStatus::Completed))
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "node `{}` completed from a verified write without a finalized attempt",
+                    node.id
+                )));
+            }
+            if node.kind.is_validation()
+                && node.status == ExecutionNodeStatus::Running
+                && !self.implementation_barrier_satisfied()
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "validation node `{}` advanced before the implementation barrier was satisfied",
+                    node.id
+                )));
+            }
             let mut operation_semantic_ids = BTreeSet::new();
             for evidence in &node.operation_evidence {
                 if evidence.semantic_id.trim().is_empty() {
@@ -74,12 +97,12 @@ impl ExecutionGraph {
                 }
             }
             if node.kind.is_mutation()
-                && node.budget.max_repair_attempts > 0
+                && node.budget.max_mutation_fallback_attempts > 0
                 && node.budget.max_model_calls < 2
             {
                 return Err(GraphInvariantError::new(format!(
                     "budget_configuration_invalid: mutation node `{}` reserves {} repair attempt(s) but max_model_calls={} cannot fund a primary attempt and a distinct repair",
-                    node.id, node.budget.max_repair_attempts, node.budget.max_model_calls,
+                    node.id, node.budget.max_mutation_fallback_attempts, node.budget.max_model_calls,
                 )));
             }
             if node.kind.is_validation() && node.validation.is_none() {

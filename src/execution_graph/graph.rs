@@ -245,6 +245,53 @@ impl ExecutionGraph {
             .all(|node| node.status.is_success())
     }
 
+    /// Hard boundary between implementation and validation. Partial-review
+    /// dependency overrides never satisfy this proof.
+    pub fn implementation_barrier_satisfied(&self) -> bool {
+        self.nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_mutation())
+            .all(|node| {
+                matches!(
+                    node.status,
+                    ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
+                )
+            })
+    }
+
+    pub fn validation_readiness_proof(
+        &self,
+    ) -> Result<ValidationReadinessProof, GraphInvariantError> {
+        if !self.implementation_barrier_satisfied() {
+            let incomplete = self
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.required
+                        && node.kind.is_mutation()
+                        && !matches!(
+                            node.status,
+                            ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
+                        )
+                })
+                .map(|node| format!("{}:{:?}", node.id, node.status))
+                .collect::<Vec<_>>();
+            return Err(GraphInvariantError::new(format!(
+                "implementation_barrier_unsatisfied: required implementation nodes remain [{}]",
+                incomplete.join(", ")
+            )));
+        }
+        Ok(ValidationReadinessProof {
+            graph_revision: self.revision,
+            satisfied_implementation_nodes: self
+                .nodes
+                .iter()
+                .filter(|node| node.required && node.kind.is_mutation())
+                .map(|node| node.id.clone())
+                .collect(),
+        })
+    }
+
     pub fn has_blocking_required_node(&self) -> bool {
         self.nodes
             .iter()
@@ -355,9 +402,12 @@ impl ExecutionGraph {
             .map(|node| node.id.clone())
             .chain(self.dependency_satisfaction_overrides.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let implementation_barrier_satisfied = self.implementation_barrier_satisfied();
         let mut changed = false;
         for node in &mut self.nodes {
-            let dependencies_satisfied = node
+            let dependencies_satisfied = (!node.kind.is_validation()
+                || implementation_barrier_satisfied)
+                && node
                 .dependencies
                 .iter()
                 .all(|dependency| successful.contains(dependency));
@@ -383,59 +433,26 @@ impl ExecutionGraph {
         transition: &AlreadyAppliedTransition,
     ) -> Result<GraphMutationResult, TransitionError> {
         let semantic_id = transition.semantic_id(execution_id, attempt);
-        let evidence = transition.evidence(semantic_id.clone(), attempt);
-        let node = self.node(&transition.node_id).ok_or_else(|| TransitionError::new(
-            "already_applied_node_unknown", format!("unknown execution node `{}`", transition.node_id)
-        ))?;
-        if node.target.as_ref().is_none_or(|target| {
-            target.effective_operation() != transition.operation
-                || target.effective_operation().destination_path(&target.path) != transition.target_path
-        }) {
-            return Err(TransitionError::new(
-                "already_applied_evidence_conflict",
-                format!("already-applied evidence does not match node `{}` operation target", transition.node_id),
-            ));
-        }
-        match reduce_operation_outcome(node, RepositoryOperationOutcome::AlreadyApplied, evidence.clone())? {
-            NodeTransition::NoOp(_) => Ok(GraphMutationResult::NoChange { current_revision: self.revision }),
-            NodeTransition::StateConflict => Err(TransitionError::new(
-                "already_applied_evidence_conflict",
-                format!("completed node `{}` has conflicting operation evidence", transition.node_id),
-            )),
-            NodeTransition::InvalidTransition => Err(TransitionError::new(
-                "already_applied_before_node_activation",
-                format!("node `{}` cannot complete before activation", transition.node_id),
-            )),
-            NodeTransition::Completed(_) => {
-                let mut next = self.clone();
-                let previous_revision = next.revision;
-                let node = next.node_mut(&transition.node_id).ok_or_else(|| TransitionError::new(
-                    "already_applied_node_unknown", format!("unknown execution node `{}`", transition.node_id)
-                ))?;
-                let active_attempt = node.attempts.last_mut().ok_or_else(|| TransitionError::new(
-                    "already_applied_attempt_missing", format!("active node `{}` has no persisted attempt", transition.node_id)
-                ))?;
-                if active_attempt.attempt != attempt {
-                    return Err(TransitionError::new(
-                        "already_applied_attempt_conflict",
-                        format!("active node `{}` attempt {} does not match transition attempt {attempt}", transition.node_id, active_attempt.attempt),
-                    ));
-                }
-                active_attempt.completed_at = Some(transition.completed_at.clone());
-                active_attempt.repository_fingerprint_after = Some(transition.repository_fingerprint.to_string());
-                active_attempt.outcome = Some(ExecutionNodeStatus::Completed);
-                node.status = ExecutionNodeStatus::Completed;
-                if !node.evidence_ids.contains(&semantic_id) { node.evidence_ids.push(semantic_id); }
-                node.operation_evidence.push(evidence);
-                next.dependency_satisfaction_overrides.remove(&transition.node_id);
-                next.refresh_readiness_without_revision();
-                next.revision = previous_revision.saturating_add(1);
-                next.validate_invariants().map_err(|error| TransitionError::new("already_applied_invariant_failed", error.to_string()))?;
-                let new_revision = next.revision;
-                *self = next;
-                Ok(GraphMutationResult::Changed { new_revision })
-            }
-        }
+        reduce_repository_operation(
+            self,
+            transition.node_id.clone(),
+            OperationIntent {
+                operation: transition.operation.clone(),
+                target_path: transition.target_path.clone(),
+                expected_result_hash: transition.expected_result_hash.clone(),
+                satisfied_intent: SatisfiedIntent::OriginalImplementation,
+            },
+            RepositoryOperationResult::Verified {
+                outcome: RepositoryOperationOutcome::AlreadyApplied,
+                evidence: SuccessfulOperationEvidence::AlreadyApplied {
+                    observed: transition.repository_fingerprint.clone(),
+                },
+                observed_result_hash: transition.observed_result_hash.clone(),
+                semantic_id,
+                attempt,
+                completed_at: transition.completed_at.clone(),
+            },
+        )
     }
 
     pub fn validation_node_for_fingerprint(

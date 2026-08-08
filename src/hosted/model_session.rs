@@ -1092,7 +1092,7 @@ impl<'a> GatewayAgent<'a> {
                     .orchestration
                     .budget
                     .usage_for(&node_id)
-                    .repair_attempts;
+                    .mutation_fallback_attempts;
                 self.append_event_recoverable(
                     "progress",
                     json!({
@@ -1582,7 +1582,7 @@ impl<'a> GatewayAgent<'a> {
                     .orchestration
                     .budget
                     .usage_for(&violation.node_id)
-                    .repair_attempts;
+                    .mutation_fallback_attempts;
                 self.restore_mutation_repair_allowance(&violation.node_id)?;
                 let repeated_strategy = self
                     .notebook
@@ -1887,6 +1887,7 @@ impl<'a> GatewayAgent<'a> {
                                     mutation_before_hash,
                                     mutation_after_hash,
                                 )?;
+                                self.verify_active_target_state()?;
                             }
                             self.reconcile_authoritative_target_state()?;
                             self.reconcile_active_phase(
@@ -2470,7 +2471,7 @@ impl GatewayAgent<'_> {
                     .orchestration
                     .budget
                     .usage_for(node_id)
-                    .repair_attempts;
+                    .mutation_fallback_attempts;
                 (mutation_attempt, repair_attempt)
             });
         let node_id = self
