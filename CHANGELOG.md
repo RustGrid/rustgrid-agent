@@ -5,6 +5,14 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.42 - 2026-08-08
+
+### Fixed
+
+- Express legacy already-applied implementation satisfaction as one minimal
+  boolean predicate so the release candidate passes the pinned Rust 1.94
+  strict Clippy gate without changing lifecycle behavior.
+
 ## 1.4.41 - 2026-08-08
 
 ### Changed

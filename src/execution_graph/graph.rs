@@ -304,10 +304,10 @@ impl ExecutionGraph {
         let unresolved_nodes = required
             .iter()
             .filter(|node| {
-                !matches!(
+                !(matches!(
                     node.status,
                     ExecutionNodeStatus::Completed | ExecutionNodeStatus::Skipped
-                ) && !(node.status == ExecutionNodeStatus::Applied
+                ) || node.status == ExecutionNodeStatus::Applied
                     && node.repository_mutation_lifecycle.is_none())
             })
             .map(|node| node.id.clone())
