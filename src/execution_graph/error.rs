@@ -3,6 +3,12 @@ pub struct GraphInvariantError {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphMutationResult {
+    Changed { new_revision: u64 },
+    NoChange { current_revision: u64 },
+}
+
 impl GraphInvariantError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {

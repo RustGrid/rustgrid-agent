@@ -40,6 +40,13 @@ impl TargetStateProbe {
             },
         };
         match &self.operation {
+            TargetOperation::ModifyExisting
+                if self.target_exists
+                    && self.expected_result_content_hash.is_some()
+                    && self.expected_result_content_hash == self.target_content_hash =>
+            {
+                TargetInspectionOutcome::AlreadyApplied
+            }
             TargetOperation::ModifyExisting if self.target_exists => {
                 TargetInspectionOutcome::ExistingTargetLoaded
             }
@@ -123,6 +130,202 @@ pub enum TargetInspectionOutcome {
     UnsafePath,
     #[default]
     InspectionInfrastructureFailure,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryOperationOutcome {
+    Applied,
+    AlreadyApplied,
+    Repaired,
+    Rejected,
+    Conflict,
+    #[default]
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SatisfiedIntent {
+    #[default]
+    OriginalImplementation,
+    ValidationRepair,
+    MutationFallback,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AlreadyAppliedTransition {
+    pub node_id: ExecutionNodeId,
+    pub operation: TargetOperation,
+    pub target_path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_result_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_result_hash: Option<ContentHash>,
+    pub repository_fingerprint: RepositoryFingerprint,
+    pub completed_at: String,
+}
+
+impl AlreadyAppliedTransition {
+    pub fn semantic_id(&self, execution_id: &str, attempt: u32) -> String {
+        stable_hash(&format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0already_applied",
+            execution_id,
+            self.node_id,
+            attempt,
+            self.operation.as_str(),
+            self.target_path,
+            self.expected_result_hash.as_deref().unwrap_or_default(),
+            self.repository_fingerprint,
+        ))
+    }
+
+    pub fn evidence(&self, semantic_id: String, attempt: u32) -> OperationEvidence {
+        OperationEvidence {
+            semantic_id,
+            outcome: RepositoryOperationOutcome::AlreadyApplied,
+            operation: self.operation.clone(),
+            target_path: self.target_path.clone(),
+            expected_result_hash: self.expected_result_hash.clone(),
+            observed_result_hash: self.observed_result_hash.clone(),
+            repository_fingerprint: self.repository_fingerprint.clone(),
+            attempt,
+            completed_at: self.completed_at.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OperationEvidence {
+    pub semantic_id: String,
+    pub outcome: RepositoryOperationOutcome,
+    pub operation: TargetOperation,
+    pub target_path: RepositoryPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_result_hash: Option<ContentHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_result_hash: Option<ContentHash>,
+    pub repository_fingerprint: RepositoryFingerprint,
+    pub attempt: u32,
+    pub completed_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeTransition {
+    Completed(OperationEvidence),
+    NoOp(OperationEvidence),
+    StateConflict,
+    InvalidTransition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl TransitionError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self { code, message: message.into() }
+    }
+}
+
+impl fmt::Display for TransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for TransitionError {}
+
+pub fn reduce_operation_outcome(
+    node: &ExecutionNode,
+    outcome: RepositoryOperationOutcome,
+    evidence: OperationEvidence,
+) -> Result<NodeTransition, TransitionError> {
+    let successful = matches!(outcome, RepositoryOperationOutcome::Applied | RepositoryOperationOutcome::AlreadyApplied);
+    match node.status {
+        ExecutionNodeStatus::Running if successful => Ok(NodeTransition::Completed(evidence)),
+        ExecutionNodeStatus::Completed if successful => {
+            if node.operation_evidence.iter().any(|existing| existing == &evidence) {
+                Ok(NodeTransition::NoOp(evidence))
+            } else {
+                Ok(NodeTransition::StateConflict)
+            }
+        }
+        ExecutionNodeStatus::Pending | ExecutionNodeStatus::Ready => Ok(NodeTransition::InvalidTransition),
+        _ => Err(TransitionError::new(
+            "operation_outcome_invalid",
+            format!("operation outcome {outcome:?} cannot reduce node `{}` in status {:?}", node.id, node.status),
+        )),
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OrchestrationCycleResult {
+    pub graph_changed: bool,
+    pub repository_changed: bool,
+    pub validation_changed: bool,
+    pub external_wait_scheduled: bool,
+    pub terminal_selected: bool,
+}
+
+impl OrchestrationCycleResult {
+    pub const fn made_semantic_progress(&self) -> bool {
+        self.graph_changed || self.repository_changed || self.validation_changed || self.external_wait_scheduled || self.terminal_selected
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationGuardrailOutcome {
+    ReconcileNodeState,
+    AdvanceToNextNode,
+    ReviewIncompleteDiff,
+    FinishBlocked,
+    #[default]
+    FailOrchestrator,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SemanticCycleObservation {
+    pub semantic_state_hash: String,
+    pub semantic_decision_hash: String,
+    pub outcome: String,
+    pub repeated_count: u8,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct WorkerLiveness {
+    pub lease_renewed_at: Option<String>,
+    pub last_semantic_progress_at: Option<String>,
+}
+
+pub const MAX_IDENTICAL_DETERMINISTIC_CYCLES: u8 = 2;
+
+pub fn observe_semantic_cycle(
+    history: &mut Vec<SemanticCycleObservation>,
+    state_hash: &str,
+    decision_hash: &str,
+    outcome: &str,
+    observed_at: &str,
+) -> u8 {
+    const MAX_HISTORY: usize = 8;
+    let repeated_count = history.last().map_or(1, |prior| {
+        if prior.semantic_state_hash == state_hash && prior.semantic_decision_hash == decision_hash && prior.outcome == outcome {
+            prior.repeated_count.saturating_add(1)
+        } else { 1 }
+    });
+    history.push(SemanticCycleObservation {
+        semantic_state_hash: state_hash.to_owned(),
+        semantic_decision_hash: decision_hash.to_owned(),
+        outcome: outcome.to_owned(),
+        repeated_count,
+        observed_at: observed_at.to_owned(),
+    });
+    if history.len() > MAX_HISTORY { history.remove(0); }
+    repeated_count
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

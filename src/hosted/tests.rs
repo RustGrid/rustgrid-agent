@@ -913,9 +913,15 @@ fn orchestration_decision_key_changes_only_after_reconciliation_input_changes() 
     );
     assert!(!orchestration_decision_is_new(Some(&first), &first));
     snapshot.graph.revision += 1;
-    let after_event = execution_decision_idempotency_key(&snapshot, &decision);
-    assert_ne!(first, after_event);
-    assert!(orchestration_decision_is_new(Some(&first), &after_event));
+    let after_revision_only = execution_decision_idempotency_key(&snapshot, &decision);
+    assert_eq!(first, after_revision_only);
+    snapshot.current_repository.fingerprint = "tree-2".into();
+    let after_repository_change = execution_decision_idempotency_key(&snapshot, &decision);
+    assert_ne!(first, after_repository_change);
+    assert!(orchestration_decision_is_new(
+        Some(&first),
+        &after_repository_change
+    ));
 }
 
 #[test]

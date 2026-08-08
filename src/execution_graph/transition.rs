@@ -113,6 +113,17 @@ pub enum ExecutionDomainEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         created_target_evidence: Option<CreatedTargetEvidence>,
     },
+    TargetOperationAlreadyApplied {
+        sequence: u64,
+        execution_id: String,
+        attempt: u32,
+        transition: AlreadyAppliedTransition,
+        semantic_id: String,
+        #[serde(default)]
+        satisfied_intent: SatisfiedIntent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repair_failure_id: Option<FailureId>,
+    },
     MutationRejected {
         sequence: u64,
         node_id: ExecutionNodeId,
@@ -303,6 +314,7 @@ impl ExecutionDomainEvent {
             Self::TargetMutationIntentRecorded { .. } => "target_mutation_intent_recorded",
             Self::TargetMutationProduced { .. } => "target_mutation_produced",
             Self::MutationApplied { .. } => "mutation_applied",
+            Self::TargetOperationAlreadyApplied { .. } => "target_operation_already_applied",
             Self::MutationRejected { .. } => "mutation_rejected",
             Self::MutationSuperseded { .. } => "mutation_superseded",
             Self::FailureRecorded { .. } => "failure_recorded",
@@ -348,6 +360,7 @@ impl ExecutionDomainEvent {
             | Self::TargetMutationIntentRecorded { sequence, .. }
             | Self::TargetMutationProduced { sequence, .. }
             | Self::MutationApplied { sequence, .. }
+            | Self::TargetOperationAlreadyApplied { sequence, .. }
             | Self::MutationRejected { sequence, .. }
             | Self::MutationSuperseded { sequence, .. }
             | Self::FailureRecorded { sequence, .. }
@@ -404,6 +417,7 @@ impl ExecutionDomainEvent {
             | Self::CommitCreated { node_id, .. }
             | Self::BranchPushed { node_id, .. }
             | Self::PullRequestCreated { node_id, .. } => Some(node_id),
+            Self::TargetOperationAlreadyApplied { transition, .. } => Some(&transition.node_id),
             Self::FailureRecorded { failure, .. } => Some(&failure.node_id),
             Self::ValidationRepairCompleted {
                 validation_node_id,
@@ -473,6 +487,8 @@ impl ExecutionGraph {
         event: &ExecutionDomainEvent,
         additionally_satisfied: &BTreeSet<ExecutionNodeId>,
     ) -> Result<(), GraphInvariantError> {
+        let graph_before = self.clone();
+        let revision_before = self.revision;
         let satisfied = self.dependency_satisfaction_ids(additionally_satisfied);
         let guarded_node = match event {
             ExecutionDomainEvent::NodeStarted { node_id, .. }
@@ -490,6 +506,7 @@ impl ExecutionGraph {
             | ExecutionDomainEvent::CommitCreated { node_id, .. }
             | ExecutionDomainEvent::BranchPushed { node_id, .. }
             | ExecutionDomainEvent::PullRequestCreated { node_id, .. } => Some(node_id),
+            ExecutionDomainEvent::TargetOperationAlreadyApplied { transition, .. } => Some(&transition.node_id),
             ExecutionDomainEvent::NodeCompleted {
                 node_id, status, ..
             } if status.satisfies_dependency() && *status != ExecutionNodeStatus::Skipped => {
@@ -534,7 +551,7 @@ impl ExecutionGraph {
                 // These events advance the action state while the same node
                 // attempt remains Running. The orchestrator derives the next
                 // action from the append-only event stream.
-                self.revision = self.revision.saturating_add(1);
+                // Action-stream facts do not mutate durable graph state.
             }
             ExecutionDomainEvent::MutationApplied {
                 node_id,
@@ -556,6 +573,19 @@ impl ExecutionGraph {
                 }
                 self.revision = self.revision.saturating_add(1);
                 self.refresh_readiness();
+            }
+            ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                execution_id,
+                attempt,
+                transition,
+                semantic_id,
+                ..
+            } => {
+                if semantic_id != &transition.semantic_id(execution_id, *attempt) {
+                    return Err(GraphInvariantError::new("already-applied transition semantic identity does not match its payload"));
+                }
+                self.apply_already_applied_transition(execution_id, *attempt, transition)
+                    .map_err(|error| GraphInvariantError::new(error.to_string()))?;
             }
             ExecutionDomainEvent::MutationRejected {
                 node_id, failure, ..
@@ -838,6 +868,13 @@ impl ExecutionGraph {
             | ExecutionDomainEvent::ExecutionResumed { .. }
             | ExecutionDomainEvent::RunFinished { .. } => {}
         }
+        let mut before_without_revision = graph_before;
+        before_without_revision.revision = self.revision;
+        if *self == before_without_revision {
+            self.revision = revision_before;
+        } else {
+            self.revision = revision_before.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -853,6 +890,7 @@ impl ExecutionGraph {
         })?;
         let kind_matches = match event {
             ExecutionDomainEvent::MutationApplied { .. }
+            | ExecutionDomainEvent::TargetOperationAlreadyApplied { .. }
             | ExecutionDomainEvent::MutationRepairAllowanceRestored { .. }
             | ExecutionDomainEvent::MutationRepairAllowanceConsumed { .. }
             | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }

@@ -250,6 +250,12 @@ impl ExecutionSnapshot {
                     } if failure_id == &failure.id => Some(result),
                     _ => None,
                 });
+            let already_applied = current_execution_epoch(&self.events).iter().rev().any(|event| {
+                matches!(event, ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                    satisfied_intent: SatisfiedIntent::ValidationRepair,
+                    repair_failure_id: Some(repaired_failure_id), ..
+                } if repaired_failure_id == &failure.id)
+            });
             match latest {
                 Some(RepairResult::MutationProduced { .. }) => RepairStatus::CandidateApplied,
                 Some(RepairResult::AlreadySatisfiesRepairIntent { .. }) => {
@@ -273,6 +279,7 @@ impl ExecutionSnapshot {
                         RepairStatus::Unresolved
                     }
                 }
+                None if already_applied => RepairStatus::AlreadySatisfied,
                 None => RepairStatus::Pending,
             }
         });
@@ -613,6 +620,28 @@ impl ExecutionSnapshot {
                 "domain events cannot be appended after RunFinished",
             ));
         }
+        if let ExecutionDomainEvent::TargetOperationAlreadyApplied {
+            execution_id,
+            attempt,
+            transition,
+            semantic_id,
+            ..
+        } = &event
+            && let Some(node) = self.graph.node(&transition.node_id)
+            && let Some(existing) = node.operation_evidence.iter().find(|evidence| evidence.semantic_id == *semantic_id)
+        {
+            let candidate_matches = semantic_id == &transition.semantic_id(execution_id, *attempt)
+                && existing.attempt == *attempt
+                && existing.operation == transition.operation
+                && existing.target_path == transition.target_path
+                && existing.expected_result_hash == transition.expected_result_hash
+                && existing.observed_result_hash == transition.observed_result_hash
+                && existing.repository_fingerprint == transition.repository_fingerprint
+                && existing.completed_at == transition.completed_at
+                && existing.outcome == RepositoryOperationOutcome::AlreadyApplied;
+            if candidate_matches { return Ok(()); }
+            return Err(GraphInvariantError::new("already-applied semantic identity was replayed with conflicting evidence"));
+        }
         if let Some(previous) = self.events.last()
             && event.sequence() <= previous.sequence()
         {
@@ -813,15 +842,26 @@ impl ExecutionSnapshot {
         }
 
         let dependency_satisfaction = self.dependency_satisfaction_ids();
+        let graph_revision_before_event = self.graph.revision;
         self.graph
             .apply_domain_event_with_dependency_satisfaction(&event, &dependency_satisfaction)?;
-        if let ExecutionDomainEvent::ValidationRepairCompleted { failure_id, .. } = &event
+        let completed_repair_failure = match &event {
+            ExecutionDomainEvent::ValidationRepairCompleted { failure_id, .. } => Some(failure_id),
+            ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                satisfied_intent: SatisfiedIntent::ValidationRepair,
+                repair_failure_id: Some(failure_id), ..
+            } => Some(failure_id),
+            _ => None,
+        };
+        if let Some(failure_id) = completed_repair_failure
             && let Some(session) = self.budget.repair_session_for_failure(failure_id)
         {
             let session_node_id = ExecutionNodeId::new(session.session_id.clone());
-            if let Some(node) = self.graph.node_mut(&session_node_id) {
+            if let Some(node) = self.graph.node_mut(&session_node_id)
+                && node.status != ExecutionNodeStatus::Skipped
+            {
                 node.status = ExecutionNodeStatus::Skipped;
-                self.graph.revision = self.graph.revision.saturating_add(1);
+                self.graph.revision = graph_revision_before_event.saturating_add(1);
             }
         }
         if repair_started {
@@ -988,6 +1028,43 @@ impl ExecutionSnapshot {
                 );
                 self.evidence
                     .supersede_stale_validation(repository_fingerprint);
+            }
+            ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                sequence,
+                transition,
+                semantic_id,
+                satisfied_intent,
+                repair_failure_id,
+                ..
+            } => {
+                let progress = self.graph.node(&transition.node_id).map_or(
+                    ProgressEventKind::SourceMutationApplied,
+                    |node| if node.kind == ExecutionNodeKind::TestMutation {
+                        ProgressEventKind::TestMutationApplied
+                    } else { ProgressEventKind::SourceMutationApplied },
+                );
+                self.budget.record_progress_kind(*sequence, progress, Some(transition.node_id.clone()));
+                self.current_repository.fingerprint = transition.repository_fingerprint.to_string();
+                self.current_repository.source_tree_hash = transition.repository_fingerprint.to_string();
+                self.evidence.record(EvidenceRecord {
+                    evidence_id: semantic_id.clone(),
+                    kind: EvidenceKind::Mutation,
+                    node_id: Some(transition.node_id.clone()),
+                    repository_fingerprint: transition.repository_fingerprint.to_string(),
+                    summary: format!("operation `{}` already satisfied for `{}`", transition.operation.as_str(), transition.target_path),
+                });
+                self.failures.supersede_for_applied_target(
+                    &transition.node_id,
+                    &transition.target_path,
+                    transition.repository_fingerprint.as_str(),
+                );
+                if *satisfied_intent == SatisfiedIntent::ValidationRepair
+                    && let Some(failure_id) = repair_failure_id
+                    && let Some(session) = self.budget.repair_session_for_failure_mut(failure_id)
+                {
+                    session.status = ValidationRepairSessionStatus::ReadyForRerun;
+                    session.stop_reason = None;
+                }
             }
             ExecutionDomainEvent::MutationRejected { failure, .. } => {
                 self.failures.record(failure.clone());

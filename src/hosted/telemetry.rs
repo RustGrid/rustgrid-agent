@@ -135,6 +135,11 @@ pub(super) fn safe_failure(error: &anyhow::Error, cancelled: bool) -> (String, S
     if let Some(failure) = error.downcast_ref::<HostedAgentExecutionFailure>() {
         return (failure.code.clone(), failure.message.clone());
     }
+    if let Some(failure) =
+        error.downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
+    {
+        return (failure.code.clone(), failure.message.clone());
+    }
     if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {
         return (failure.code.into(), failure.message.clone());
     }
@@ -166,6 +171,22 @@ pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Val
                 "phase": failure.phase,
                 "message": failure.message,
             })
+        });
+    }
+    if let Some(failure) =
+        error.downcast_ref::<crate::hosted_orchestrator::OrchestrationInvariantError>()
+    {
+        return json!({
+            "status": "failed",
+            "category": "OrchestrationStateCorruption",
+            "process_health": "failed",
+            "mission_outcome": "failed",
+            "code": failure.code,
+            "phase": "orchestration",
+            "message": failure.message,
+            "node_id": failure.node_id,
+            "recoverable": false,
+            "recommended_action": "Restore the last valid graph checkpoint and investigate the rejected state transition.",
         });
     }
     if let Some(failure) = error.downcast_ref::<HostedStartupFailure>() {

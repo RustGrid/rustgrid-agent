@@ -425,6 +425,31 @@ impl<'a> GatewayAgent<'a> {
                     "hosted_orchestration".into(),
                     serde_json::to_value(graph_telemetry).unwrap_or_else(|_| json!({})),
                 );
+                let identical_decisions = self
+                    .notebook
+                    .orchestration
+                    .semantic_cycle_history
+                    .last()
+                    .map_or(0, |observation| observation.repeated_count);
+                let cycle_guardrail_activations = self
+                    .notebook
+                    .orchestration
+                    .semantic_cycle_history
+                    .iter()
+                    .filter(|observation| {
+                        observation.repeated_count
+                            >= crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES
+                    })
+                    .count();
+                object.insert("orchestration_convergence".into(), json!({
+                    "identical_decisions_per_execution": identical_decisions,
+                    "identical_target_probes_per_node": if self.notebook.orchestration.semantic_cycle_history.last().is_some_and(|observation| observation.outcome == "prepare_target_context") { identical_decisions } else { 0 },
+                    "graph_revisions_without_semantic_progress": identical_decisions.saturating_sub(1),
+                    "last_semantic_progress_at": self.notebook.orchestration.worker_liveness.last_semantic_progress_at,
+                    "lease_renewed_at": self.notebook.orchestration.worker_liveness.lease_renewed_at,
+                    "cycle_guardrail_activations": cycle_guardrail_activations,
+                    "alert_active": identical_decisions > 3,
+                }));
             }
             object.insert(
                 "context_policy".into(),
@@ -591,6 +616,8 @@ impl<'a> GatewayAgent<'a> {
             requested_at: now_rfc3339(),
             reason: "user_or_lease_owner requested hosted execution cancellation".into(),
             requested_by: Some("user_or_lease_owner".into()),
+            initiator: crate::execution_graph::CancellationInitiator::User,
+            reason_code: "user_or_lease_owner_requested".into(),
             active_validation_terminated,
             checkpointed: true,
         };
@@ -1844,9 +1871,10 @@ impl<'a> GatewayAgent<'a> {
                 .ok()
                 .and_then(|node_id| node_started(&node_id, self)),
             ExecutionDecision::ExecuteTarget {
+                node_id,
                 action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                 ..
-            } => None,
+            } => node_started(node_id, self),
             ExecutionDecision::ExecuteTarget {
                 action:
                     crate::hosted_orchestrator::MutationAction::RepairTarget {
@@ -2578,8 +2606,28 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<DecisionExecutionResult> {
         self.reconcile_repository_failure_supersession()?;
         let snapshot = self.build_execution_snapshot()?;
-        let mut decision = reconcile_execution(&snapshot)
-            .map_err(|error| anyhow!("hosted orchestration invariant failed: {error}"))?;
+        if let Some(stale_node_id) = self
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id)
+            .filter(|node_id| {
+                snapshot
+                    .graph
+                    .node(node_id)
+                    .is_some_and(|node| node.status.is_terminal())
+            })
+            .cloned()
+        {
+            self.current_decision = None;
+            self.append_event_recoverable("progress", json!({
+                "event_type": "worker.active_node_pointer_reconciled",
+                "node_id": stale_node_id,
+                "graph_revision_before": snapshot.graph.revision,
+                "graph_revision_after": snapshot.graph.revision,
+                "selected_next_node": snapshot.graph.next_runnable_node().map(|node| node.id.as_str()),
+            }), "stale active node pointer reconciled");
+        }
+        let mut decision = reconcile_execution(&snapshot).map_err(anyhow::Error::new)?;
         if let ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::RepairTarget {
@@ -2615,6 +2663,76 @@ impl<'a> GatewayAgent<'a> {
             self.notebook.last_orchestration_decision_key.as_deref(),
             &decision_key,
         ) {
+            let observed_at = now_rfc3339();
+            let semantic_state_hash = decision_key
+                .rsplit(':')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            let semantic_decision_hash = sha256_text(&decision_key);
+            let repeated_count = crate::execution_graph::observe_semantic_cycle(
+                &mut self.notebook.orchestration.semantic_cycle_history,
+                &semantic_state_hash,
+                &semantic_decision_hash,
+                execution_decision_name(&decision),
+                &observed_at,
+            );
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.semantic_decision_deduplicated",
+                    "node_id": decision.node_id(),
+                    "semantic_state_hash": semantic_state_hash,
+                    "semantic_decision_hash": semantic_decision_hash,
+                    "graph_revision_before": snapshot.graph.revision,
+                    "graph_revision_after": snapshot.graph.revision,
+                    "repeated_cycle_count": repeated_count,
+                }),
+                "semantic orchestration decision deduplicated",
+            );
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": "worker.graph_revision_no_change",
+                    "node_id": decision.node_id(),
+                    "semantic_state_hash": semantic_state_hash,
+                    "semantic_decision_hash": semantic_decision_hash,
+                    "graph_revision": snapshot.graph.revision,
+                    "repeated_cycle_count": repeated_count,
+                }),
+                "graph revision unchanged",
+            );
+            if repeated_count >= crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES {
+                let outcome = if snapshot.current_repository.has_changes() {
+                    OrchestratedMissionOutcome::PartialReviewable
+                } else {
+                    OrchestratedMissionOutcome::BlockedNoDiff
+                };
+                self.notebook.orchestration.cycle_cancellation_request =
+                    Some(crate::execution_graph::CancellationRequest {
+                        initiator: crate::execution_graph::CancellationInitiator::CycleGuardrail,
+                        reason_code: "deterministic_orchestration_cycle".into(),
+                        requested_at: observed_at,
+                    });
+                self.append_event_recoverable("progress", json!({
+                    "event_type": "worker.orchestration_cycle_detected",
+                    "node_id": decision.node_id(),
+                    "semantic_state_hash": semantic_state_hash,
+                    "semantic_decision_hash": semantic_decision_hash,
+                    "graph_revision_before": snapshot.graph.revision,
+                    "graph_revision_after": snapshot.graph.revision,
+                    "repeated_cycle_count": repeated_count,
+                    "guardrail_outcome": if snapshot.current_repository.has_changes() {
+                        crate::execution_graph::OrchestrationGuardrailOutcome::ReviewIncompleteDiff
+                    } else { crate::execution_graph::OrchestrationGuardrailOutcome::FinishBlocked },
+                    "cancellation_initiator": "cycle_guardrail",
+                    "reason_code": "deterministic_orchestration_cycle",
+                }), "deterministic orchestration cycle detected");
+                return self.apply_execution_decision(ExecutionDecision::StopForGuardrail {
+                    outcome,
+                    reason: crate::execution_graph::GuardrailReason::NoProgress,
+                });
+            }
             self.current_decision = Some(decision.clone());
             return Ok(DecisionExecutionResult {
                 decision,
@@ -2633,6 +2751,10 @@ impl<'a> GatewayAgent<'a> {
                 return Err(error);
             }
         };
+        self.notebook
+            .orchestration
+            .worker_liveness
+            .last_semantic_progress_at = Some(now_rfc3339());
         self.append_event_recoverable(
             "progress",
             json!({
@@ -4060,6 +4182,183 @@ impl<'a> GatewayAgent<'a> {
         Ok(())
     }
 
+    pub(in crate::hosted) fn record_active_target_already_applied(
+        &mut self,
+        probe: &crate::execution_graph::TargetStateProbe,
+    ) -> Result<()> {
+        if probe.inspection_outcome()
+            != crate::execution_graph::TargetInspectionOutcome::AlreadyApplied
+        {
+            bail!("already-applied transition requires operation-aware matching evidence");
+        }
+        let (node_id, satisfied_intent, repair_failure_id) = match self.current_decision.as_ref() {
+            Some(ExecutionDecision::ExecuteTarget {
+                node_id,
+                target,
+                action,
+            }) => {
+                let repair_failure_id = target
+                    .validation_repair
+                    .as_ref()
+                    .map(|repair| {
+                        crate::execution_graph::FailureId::new(
+                            repair.repair_intent.failed_validation_id.clone(),
+                        )
+                    })
+                    .or_else(|| match action {
+                        crate::hosted_orchestrator::MutationAction::RepairTarget {
+                            failure,
+                            ..
+                        } if failure.category
+                            == crate::execution_graph::FailureCategory::ValidationFailure =>
+                        {
+                            Some(failure.id.clone())
+                        }
+                        _ => None,
+                    });
+                let intent = if target.validation_repair.is_some() {
+                    crate::execution_graph::SatisfiedIntent::ValidationRepair
+                } else if matches!(
+                    action,
+                    crate::hosted_orchestrator::MutationAction::RepairTarget { .. }
+                ) {
+                    crate::execution_graph::SatisfiedIntent::MutationFallback
+                } else {
+                    crate::execution_graph::SatisfiedIntent::OriginalImplementation
+                };
+                (node_id.clone(), intent, repair_failure_id)
+            }
+            Some(ExecutionDecision::RepairTarget {
+                node_id,
+                failure_id,
+                ..
+            }) => (
+                node_id.clone(),
+                crate::execution_graph::SatisfiedIntent::ValidationRepair,
+                Some(failure_id.clone()),
+            ),
+            _ => bail!("already-applied transition has no active mutation decision"),
+        };
+        let snapshot = self.build_execution_snapshot()?;
+        let node = snapshot.graph.node(&node_id).ok_or_else(|| {
+            crate::hosted_orchestrator::OrchestrationInvariantError::for_node(
+                "already_applied_node_did_not_converge",
+                node_id.clone(),
+                "already-applied transition refers to an unknown active node",
+            )
+        })?;
+        if node.status != crate::execution_graph::ExecutionNodeStatus::Running {
+            return Err(
+                crate::hosted_orchestrator::OrchestrationInvariantError::for_node(
+                    "already_applied_node_did_not_converge",
+                    node_id.clone(),
+                    format!("node is {:?}, expected Running", node.status),
+                )
+                .into(),
+            );
+        }
+        let attempt = node
+            .attempts
+            .last()
+            .map(|attempt| attempt.attempt)
+            .ok_or_else(|| {
+                crate::hosted_orchestrator::OrchestrationInvariantError::for_node(
+                    "already_applied_node_did_not_converge",
+                    node_id.clone(),
+                    "active node has no persisted attempt",
+                )
+            })?;
+        let transition = crate::execution_graph::AlreadyAppliedTransition {
+            node_id: node_id.clone(),
+            operation: probe.operation.clone(),
+            target_path: probe.target_path.clone(),
+            expected_result_hash: probe.expected_result_content_hash.clone(),
+            observed_result_hash: probe.target_content_hash.clone(),
+            repository_fingerprint: probe.repository_fingerprint.clone(),
+            completed_at: now_rfc3339(),
+        };
+        let semantic_id =
+            transition.semantic_id(&self.manifest.execution.execution_id.to_string(), attempt);
+        let revision_before = snapshot.graph.revision;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.already_applied_transition_started",
+                "node_id": node_id,
+                "attempt": attempt,
+                "operation": probe.operation.as_str(),
+                "target_path": probe.target_path,
+                "semantic_decision_hash": semantic_id,
+                "graph_revision_before": revision_before,
+            }),
+            "already-applied transition start",
+        );
+        self.append_execution_domain_event(
+            crate::execution_graph::ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                sequence: self.next_domain_event_sequence(),
+                execution_id: self.manifest.execution.execution_id.to_string(),
+                attempt,
+                transition: transition.clone(),
+                semantic_id: semantic_id.clone(),
+                satisfied_intent,
+                repair_failure_id,
+            },
+        )?;
+        self.current_decision = None;
+        self.persist_orchestration_checkpoint("already_applied_node_completed", false)?;
+        let graph = self
+            .notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .context("already-applied transition lost the execution graph")?;
+        if !graph.node(&node_id).is_some_and(|node| {
+            node.status == crate::execution_graph::ExecutionNodeStatus::Completed
+        }) {
+            return Err(
+                crate::hosted_orchestrator::OrchestrationInvariantError::for_node(
+                    "already_applied_node_did_not_converge",
+                    node_id.clone(),
+                    "node remained active after its durable successful transition",
+                )
+                .into(),
+            );
+        }
+        let revision_after = graph.revision;
+        let selected_next_node = graph.next_runnable_node().map(|node| node.id.to_string());
+        for (event_type, description) in [
+            (
+                "worker.already_applied_transition_persisted",
+                "already-applied transition persisted",
+            ),
+            (
+                "worker.node_completed_from_already_applied",
+                "node completed from already-applied evidence",
+            ),
+            (
+                "worker.next_ready_node_selected",
+                "next ready node selection",
+            ),
+        ] {
+            self.append_event_recoverable(
+                "progress",
+                json!({
+                    "event_type": event_type,
+                    "node_id": node_id,
+                    "attempt": attempt,
+                    "operation": transition.operation.as_str(),
+                    "target_path": transition.target_path,
+                    "semantic_decision_hash": semantic_id,
+                    "graph_revision_before": revision_before,
+                    "graph_revision_after": revision_after,
+                    "selected_next_node": selected_next_node,
+                }),
+                description,
+            );
+        }
+        Ok(())
+    }
+
     pub(in crate::hosted) fn prepare_active_target_context(
         &mut self,
     ) -> Result<TargetContextPreparationResult> {
@@ -4341,21 +4640,7 @@ impl<'a> GatewayAgent<'a> {
             return Ok(TargetContextPreparationResult::Prepared);
         }
         if inspection_outcome == crate::execution_graph::TargetInspectionOutcome::AlreadyApplied {
-            self.append_event_recoverable(
-                "progress",
-                json!({
-                    "event_type": "worker.target_operation_already_applied",
-                    "node_id": node_id,
-                    "operation": operation.as_str(),
-                    "target_path": target_path,
-                    "source_path": source_path,
-                    "repository_fingerprint": fingerprint,
-                    "process_health": "healthy",
-                    "mission_outcome": "continuing",
-                }),
-                "target operation already applied",
-            );
-            self.record_active_target_applied(&target_path)?;
+            self.record_active_target_already_applied(&probe)?;
             return Ok(TargetContextPreparationResult::Prepared);
         }
         let already_prepared = target_context_already_prepared(

@@ -208,7 +208,7 @@ pub struct OrchestrationInvariantError {
 }
 
 impl OrchestrationInvariantError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -216,7 +216,7 @@ impl OrchestrationInvariantError {
         }
     }
 
-    fn for_node(
+    pub(crate) fn for_node(
         code: impl Into<String>,
         node_id: ExecutionNodeId,
         message: impl Into<String>,
@@ -361,7 +361,8 @@ pub fn reconcile_execution(
                 RepairResult::MutationProduced { .. }
                     | RepairResult::AlreadySatisfiesRepairIntent { .. }
             )
-        ) {
+        ) || validation_repair_was_already_applied(snapshot, &failure.id)
+        {
             let validation_node = snapshot.graph.node(&failure.node_id).ok_or_else(|| {
                 OrchestrationInvariantError::for_node(
                     "validation_repair_node_missing",
@@ -587,6 +588,21 @@ fn latest_validation_repair_result<'a>(
                 ..
             } if repaired_failure_id == failure_id => Some(result),
             _ => None,
+        })
+}
+
+fn validation_repair_was_already_applied(
+    snapshot: &ExecutionSnapshot,
+    failure_id: &FailureId,
+) -> bool {
+    current_execution_epoch(&snapshot.events)
+        .iter()
+        .rev()
+        .any(|event| {
+            matches!(event, ExecutionDomainEvent::TargetOperationAlreadyApplied {
+            satisfied_intent: SatisfiedIntent::ValidationRepair,
+            repair_failure_id: Some(repaired_failure_id), ..
+        } if repaired_failure_id == failure_id)
         })
 }
 
@@ -2484,6 +2500,122 @@ mod tests {
         assert_eq!(
             state.budget.usage_for(&node).repair_attempts,
             before_repairs
+        );
+    }
+
+    #[test]
+    fn already_applied_validation_repair_clears_repair_selection_and_reruns_gate() {
+        let mut state = snapshot(&[target("source", "src/lib.rs")]);
+        let source_id = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_mutation())
+            .unwrap()
+            .id
+            .clone();
+        let validation_id = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind.is_validation())
+            .unwrap()
+            .id
+            .clone();
+        state
+            .graph
+            .set_node_status(&source_id, ExecutionNodeStatus::Applied)
+            .unwrap();
+        state
+            .graph
+            .set_node_status(&validation_id, ExecutionNodeStatus::Running)
+            .unwrap();
+        let validation_gate = state
+            .graph
+            .node(&validation_id)
+            .unwrap()
+            .validation
+            .clone()
+            .unwrap();
+        let validation_fingerprint = validation_gate.fingerprint("tree-1");
+        state
+            .append_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+                sequence: 1,
+                node_id: validation_id.clone(),
+                evidence: ValidationEvidenceRecord {
+                    evidence_id: "validation-evidence".into(),
+                    node_id: validation_id.clone(),
+                    gate_id: validation_gate.gate_id,
+                    fingerprint: validation_fingerprint.clone(),
+                    repository_fingerprint: "tree-1".into(),
+                    command: validation_gate.command,
+                    working_directory: validation_gate.working_directory,
+                    status: ValidationEvidenceStatus::Failed,
+                    exit_code: Some(1),
+                    output_summary: "focused assertion failed".into(),
+                    duration: std::time::Duration::from_millis(1),
+                },
+            })
+            .unwrap();
+        let mut failure = FailureRecord::new(
+            "validation-failure",
+            validation_id.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-1",
+            "focused assertion failed",
+        );
+        failure.target_path = Some("src/lib.rs".into());
+        state
+            .append_event(ExecutionDomainEvent::FailureRecorded {
+                sequence: 2,
+                failure: failure.clone(),
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::ValidationFailed {
+                sequence: 3,
+                node_id: validation_id.clone(),
+                failure_id: failure.id.clone(),
+                fingerprint: validation_fingerprint,
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::NodeStarted {
+                sequence: 4,
+                node_id: source_id.clone(),
+                attempt: 1,
+                started_at: "2026-08-05T10:00:00Z".into(),
+                repository_fingerprint: "tree-1".into(),
+            })
+            .unwrap();
+        let transition = AlreadyAppliedTransition {
+            node_id: source_id.clone(),
+            operation: TargetOperation::ModifyExisting,
+            target_path: "src/lib.rs".into(),
+            expected_result_hash: Some("expected".into()),
+            observed_result_hash: Some("expected".into()),
+            repository_fingerprint: RepositoryFingerprint::new("tree-1"),
+            completed_at: "2026-08-05T10:00:01Z".into(),
+        };
+        let semantic_id = transition.semantic_id("run-1", 1);
+        state
+            .append_event(ExecutionDomainEvent::TargetOperationAlreadyApplied {
+                sequence: 5,
+                execution_id: "run-1".into(),
+                attempt: 1,
+                transition,
+                semantic_id,
+                satisfied_intent: SatisfiedIntent::ValidationRepair,
+                repair_failure_id: Some(failure.id),
+            })
+            .unwrap();
+        assert_eq!(
+            state.graph.node(&source_id).unwrap().status,
+            ExecutionNodeStatus::Completed
+        );
+        assert!(
+            matches!(reconcile_execution(&state).unwrap(), ExecutionDecision::RunValidation { node_id, .. } if node_id == validation_id)
         );
     }
 

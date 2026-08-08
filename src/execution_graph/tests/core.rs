@@ -1758,3 +1758,152 @@
         incomplete_evidence.satisfied_assertions.clear();
         assert!(!incomplete_evidence.proves(&intent));
     }
+
+    #[test]
+    fn already_applied_atomically_completes_the_node_and_is_revision_idempotent() {
+        let mut create = target("src/generated.txt", "production");
+        create.operation = TargetOperation::CreateNew;
+        let graph = ExecutionGraph::from_targets(
+            "graph-already-applied",
+            MissionComplexity::Small,
+            "tree-before",
+            &[create],
+            &[gate("focused", ValidationGateType::FocusedTest)],
+            &MissionBudget::for_complexity(MissionComplexity::Small),
+        );
+        let node_id = graph.nodes().find(|node| node.kind.is_mutation()).unwrap().id.clone();
+        let mut snapshot = ExecutionSnapshot {
+            run_id: "execution-1".into(),
+            current_repository: RepositorySnapshot {
+                fingerprint: "tree-before".into(),
+                source_tree_hash: "tree-before".into(),
+                ..RepositorySnapshot::default()
+            },
+            graph,
+            budget: BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Small)),
+            ..ExecutionSnapshot::default()
+        };
+        snapshot.append_event(ExecutionDomainEvent::NodeStarted {
+            sequence: 1,
+            node_id: node_id.clone(),
+            attempt: 1,
+            started_at: "2026-08-05T10:00:00Z".into(),
+            repository_fingerprint: "tree-before".into(),
+        }).unwrap();
+        let transition = AlreadyAppliedTransition {
+            node_id: node_id.clone(),
+            operation: TargetOperation::CreateNew,
+            target_path: "src/generated.txt".into(),
+            expected_result_hash: Some("expected".into()),
+            observed_result_hash: Some("expected".into()),
+            repository_fingerprint: RepositoryFingerprint::new("tree-before"),
+            completed_at: "2026-08-05T10:00:01Z".into(),
+        };
+        let semantic_id = transition.semantic_id("execution-1", 1);
+        let event = ExecutionDomainEvent::TargetOperationAlreadyApplied {
+            sequence: 2,
+            execution_id: "execution-1".into(),
+            attempt: 1,
+            transition: transition.clone(),
+            semantic_id: semantic_id.clone(),
+            satisfied_intent: SatisfiedIntent::OriginalImplementation,
+            repair_failure_id: None,
+        };
+        let revision_before = snapshot.graph.revision();
+        snapshot.append_event(event).unwrap();
+        let node = snapshot.graph.node(&node_id).unwrap();
+        assert_eq!(node.status, ExecutionNodeStatus::Completed);
+        assert_eq!(node.attempts[0].outcome, Some(ExecutionNodeStatus::Completed));
+        assert_eq!(node.attempts[0].completed_at.as_deref(), Some("2026-08-05T10:00:01Z"));
+        assert_eq!(node.operation_evidence.len(), 1);
+        assert_eq!(node.operation_evidence[0].semantic_id, semantic_id);
+        assert_eq!(snapshot.graph.revision(), revision_before + 1);
+        assert!(snapshot.graph.active_node().is_none());
+        let validation = snapshot.graph.nodes().find(|node| node.kind.is_validation()).unwrap();
+        assert_eq!(validation.status, ExecutionNodeStatus::Ready);
+        let revision_after = snapshot.graph.revision();
+        let event_count = snapshot.events.len();
+        snapshot.append_event(ExecutionDomainEvent::TargetOperationAlreadyApplied {
+            sequence: 3,
+            execution_id: "execution-1".into(),
+            attempt: 1,
+            transition,
+            semantic_id,
+            satisfied_intent: SatisfiedIntent::OriginalImplementation,
+            repair_failure_id: None,
+        }).unwrap();
+        assert_eq!(snapshot.graph.revision(), revision_after);
+        assert_eq!(snapshot.events.len(), event_count);
+    }
+
+    #[test]
+    fn operation_reducer_rejects_early_or_conflicting_success_and_accepts_terminal_replay() {
+        let mut node = ExecutionNode {
+            id: ExecutionNodeId::new("source-1"),
+            status: ExecutionNodeStatus::Pending,
+            target: Some(target("src/lib.rs", "production")),
+            ..ExecutionNode::default()
+        };
+        let evidence = OperationEvidence {
+            semantic_id: "semantic-1".into(),
+            outcome: RepositoryOperationOutcome::AlreadyApplied,
+            operation: TargetOperation::ModifyExisting,
+            target_path: "src/lib.rs".into(),
+            repository_fingerprint: RepositoryFingerprint::new("tree"),
+            attempt: 1,
+            completed_at: "now".into(),
+            ..OperationEvidence::default()
+        };
+        assert_eq!(reduce_operation_outcome(&node, RepositoryOperationOutcome::AlreadyApplied, evidence.clone()).unwrap(), NodeTransition::InvalidTransition);
+        node.status = ExecutionNodeStatus::Running;
+        assert!(matches!(reduce_operation_outcome(&node, RepositoryOperationOutcome::Applied, evidence.clone()).unwrap(), NodeTransition::Completed(_)));
+        node.status = ExecutionNodeStatus::Completed;
+        node.operation_evidence.push(evidence.clone());
+        assert!(matches!(reduce_operation_outcome(&node, RepositoryOperationOutcome::AlreadyApplied, evidence.clone()).unwrap(), NodeTransition::NoOp(_)));
+        let mut conflicting = evidence;
+        conflicting.observed_result_hash = Some("different".into());
+        assert_eq!(reduce_operation_outcome(&node, RepositoryOperationOutcome::AlreadyApplied, conflicting).unwrap(), NodeTransition::StateConflict);
+    }
+
+    #[test]
+    fn deterministic_cycle_detection_is_bounded_and_lease_renewal_is_not_progress() {
+        let mut history = Vec::new();
+        let mut liveness = WorkerLiveness {
+            lease_renewed_at: Some("later".into()),
+            last_semantic_progress_at: Some("earlier".into()),
+        };
+        assert_eq!(observe_semantic_cycle(&mut history, "state", "decision", "probe", "t1"), 1);
+        liveness.lease_renewed_at = Some("latest".into());
+        assert_eq!(observe_semantic_cycle(&mut history, "state", "decision", "probe", "t2"), MAX_IDENTICAL_DETERMINISTIC_CYCLES);
+        assert_eq!(liveness.last_semantic_progress_at.as_deref(), Some("earlier"));
+        let cancellation = CancellationRequest {
+            initiator: CancellationInitiator::CycleGuardrail,
+            reason_code: "deterministic_orchestration_cycle".into(),
+            requested_at: "t2".into(),
+        };
+        assert_eq!(cancellation.initiator, CancellationInitiator::CycleGuardrail);
+        assert!(!OrchestrationCycleResult::default().made_semantic_progress());
+        for index in 3..=100 {
+            observe_semantic_cycle(&mut history, "state", "decision", "probe", &format!("t{index}"));
+        }
+        assert!(history.len() <= 8);
+        assert_eq!(history.last().unwrap().repeated_count, 100);
+    }
+
+    #[test]
+    fn setting_an_identical_node_status_is_a_pure_graph_no_op() {
+        let graph = ExecutionGraph::from_targets(
+            "graph-no-op",
+            MissionComplexity::Small,
+            "tree-before",
+            &[target("src/lib.rs", "production")],
+            &[],
+            &MissionBudget::for_complexity(MissionComplexity::Small),
+        );
+        let node_id = graph.nodes().find(|node| node.kind.is_mutation()).unwrap().id.clone();
+        let status = graph.node(&node_id).unwrap().status;
+        let revision = graph.revision();
+        let mut graph = graph;
+        assert_eq!(graph.set_node_status_if_changed(&node_id, status).unwrap(), GraphMutationResult::NoChange { current_revision: revision });
+        assert_eq!(graph.revision(), revision);
+    }

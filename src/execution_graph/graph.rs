@@ -274,16 +274,29 @@ impl ExecutionGraph {
         id: &ExecutionNodeId,
         status: ExecutionNodeStatus,
     ) -> Result<(), GraphInvariantError> {
+        self.set_node_status_if_changed(id, status)?;
+        Ok(())
+    }
+
+    pub fn set_node_status_if_changed(
+        &mut self,
+        id: &ExecutionNodeId,
+        status: ExecutionNodeStatus,
+    ) -> Result<GraphMutationResult, GraphInvariantError> {
+        let previous_revision = self.revision;
         let node = self
             .node_mut(id)
             .ok_or_else(|| GraphInvariantError::new(format!("unknown execution node `{id}`")))?;
+        if node.status == status {
+            return Ok(GraphMutationResult::NoChange { current_revision: previous_revision });
+        }
         node.status = status;
         if status.is_success() {
             self.dependency_satisfaction_overrides.remove(id);
         }
-        self.revision = self.revision.saturating_add(1);
-        self.refresh_readiness();
-        Ok(())
+        self.refresh_readiness_without_revision();
+        self.revision = previous_revision.saturating_add(1);
+        Ok(GraphMutationResult::Changed { new_revision: self.revision })
     }
 
     /// Applies a normal forward node-state transition atomically. Recovery and
@@ -329,6 +342,12 @@ impl ExecutionGraph {
     /// Materializes readiness from dependency state. It never changes active,
     /// completed, or failed nodes.
     pub fn refresh_readiness(&mut self) {
+        if self.refresh_readiness_without_revision() {
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
+    fn refresh_readiness_without_revision(&mut self) -> bool {
         let successful = self
             .nodes
             .iter()
@@ -354,8 +373,68 @@ impl ExecutionGraph {
                 _ => {}
             }
         }
-        if changed {
-            self.revision = self.revision.saturating_add(1);
+        changed
+    }
+
+    pub fn apply_already_applied_transition(
+        &mut self,
+        execution_id: &str,
+        attempt: u32,
+        transition: &AlreadyAppliedTransition,
+    ) -> Result<GraphMutationResult, TransitionError> {
+        let semantic_id = transition.semantic_id(execution_id, attempt);
+        let evidence = transition.evidence(semantic_id.clone(), attempt);
+        let node = self.node(&transition.node_id).ok_or_else(|| TransitionError::new(
+            "already_applied_node_unknown", format!("unknown execution node `{}`", transition.node_id)
+        ))?;
+        if node.target.as_ref().is_none_or(|target| {
+            target.effective_operation() != transition.operation
+                || target.effective_operation().destination_path(&target.path) != transition.target_path
+        }) {
+            return Err(TransitionError::new(
+                "already_applied_evidence_conflict",
+                format!("already-applied evidence does not match node `{}` operation target", transition.node_id),
+            ));
+        }
+        match reduce_operation_outcome(node, RepositoryOperationOutcome::AlreadyApplied, evidence.clone())? {
+            NodeTransition::NoOp(_) => Ok(GraphMutationResult::NoChange { current_revision: self.revision }),
+            NodeTransition::StateConflict => Err(TransitionError::new(
+                "already_applied_evidence_conflict",
+                format!("completed node `{}` has conflicting operation evidence", transition.node_id),
+            )),
+            NodeTransition::InvalidTransition => Err(TransitionError::new(
+                "already_applied_before_node_activation",
+                format!("node `{}` cannot complete before activation", transition.node_id),
+            )),
+            NodeTransition::Completed(_) => {
+                let mut next = self.clone();
+                let previous_revision = next.revision;
+                let node = next.node_mut(&transition.node_id).ok_or_else(|| TransitionError::new(
+                    "already_applied_node_unknown", format!("unknown execution node `{}`", transition.node_id)
+                ))?;
+                let active_attempt = node.attempts.last_mut().ok_or_else(|| TransitionError::new(
+                    "already_applied_attempt_missing", format!("active node `{}` has no persisted attempt", transition.node_id)
+                ))?;
+                if active_attempt.attempt != attempt {
+                    return Err(TransitionError::new(
+                        "already_applied_attempt_conflict",
+                        format!("active node `{}` attempt {} does not match transition attempt {attempt}", transition.node_id, active_attempt.attempt),
+                    ));
+                }
+                active_attempt.completed_at = Some(transition.completed_at.clone());
+                active_attempt.repository_fingerprint_after = Some(transition.repository_fingerprint.to_string());
+                active_attempt.outcome = Some(ExecutionNodeStatus::Completed);
+                node.status = ExecutionNodeStatus::Completed;
+                if !node.evidence_ids.contains(&semantic_id) { node.evidence_ids.push(semantic_id); }
+                node.operation_evidence.push(evidence);
+                next.dependency_satisfaction_overrides.remove(&transition.node_id);
+                next.refresh_readiness_without_revision();
+                next.revision = previous_revision.saturating_add(1);
+                next.validate_invariants().map_err(|error| TransitionError::new("already_applied_invariant_failed", error.to_string()))?;
+                let new_revision = next.revision;
+                *self = next;
+                Ok(GraphMutationResult::Changed { new_revision })
+            }
         }
     }
 

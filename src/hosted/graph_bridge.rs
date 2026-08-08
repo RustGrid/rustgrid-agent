@@ -58,6 +58,9 @@ pub(super) struct HostedOrchestrationCheckpoint {
     pub(super) budget: BudgetState,
     pub(super) cancellation: Option<CancellationState>,
     pub(super) publication: PublicationState,
+    pub(super) semantic_cycle_history: Vec<crate::execution_graph::SemanticCycleObservation>,
+    pub(super) worker_liveness: crate::execution_graph::WorkerLiveness,
+    pub(super) cycle_cancellation_request: Option<crate::execution_graph::CancellationRequest>,
     pub(super) complexity: Option<ComplexityAssessment>,
     /// Ephemeral handoff from pure topology construction to the immediately
     /// following GraphCreated event. The event persists the exact set.

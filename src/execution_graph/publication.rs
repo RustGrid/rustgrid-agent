@@ -49,9 +49,32 @@ pub struct CancellationState {
     pub reason: String,
     pub requested_by: Option<String>,
     #[serde(default)]
+    pub initiator: CancellationInitiator,
+    #[serde(default)]
+    pub reason_code: String,
+    #[serde(default)]
     pub active_validation_terminated: bool,
     #[serde(default)]
     pub checkpointed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationInitiator {
+    User,
+    TimeoutGuardrail,
+    CycleGuardrail,
+    Administrative,
+    Provider,
+    #[default]
+    System,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CancellationRequest {
+    pub initiator: CancellationInitiator,
+    pub reason_code: String,
+    pub requested_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]

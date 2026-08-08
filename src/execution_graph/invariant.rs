@@ -51,6 +51,28 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
+            if !node.operation_evidence.is_empty() && node.status != ExecutionNodeStatus::Completed {
+                return Err(GraphInvariantError::new(format!(
+                    "node `{}` has successful operation evidence without Completed status", node.id
+                )));
+            }
+            let mut operation_semantic_ids = BTreeSet::new();
+            for evidence in &node.operation_evidence {
+                if evidence.semantic_id.trim().is_empty() {
+                    return Err(GraphInvariantError::new(format!("node `{}` has operation evidence without semantic identity", node.id)));
+                }
+                if !operation_semantic_ids.insert(evidence.semantic_id.clone()) {
+                    return Err(GraphInvariantError::new(format!("node `{}` repeats operation evidence `{}`", node.id, evidence.semantic_id)));
+                }
+                if evidence.outcome == RepositoryOperationOutcome::AlreadyApplied
+                    && node.target.as_ref().is_none_or(|target| {
+                        target.effective_operation() != evidence.operation
+                            || target.effective_operation().destination_path(&target.path) != evidence.target_path
+                    })
+                {
+                    return Err(GraphInvariantError::new(format!("node `{}` has already-applied evidence for a different operation target", node.id)));
+                }
+            }
             if node.kind.is_mutation()
                 && node.budget.max_repair_attempts > 0
                 && node.budget.max_model_calls < 2

@@ -476,6 +476,8 @@ pub struct ExecutionNode {
     pub budget: NodeBudget,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub operation_evidence: Vec<OperationEvidence>,
 }
 
 impl ExecutionNode {

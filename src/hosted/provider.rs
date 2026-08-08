@@ -14,12 +14,70 @@ pub(super) fn execution_decision_idempotency_key(
     let node_attempt = node.map_or(0, |node| {
         u32::try_from(node.attempts.len()).unwrap_or(u32::MAX)
     });
+    let operation = node
+        .and_then(|node| node.target.as_ref())
+        .map(|target| target.effective_operation().as_str())
+        .unwrap_or("none");
+    let target_state = node.and_then(|node| {
+        snapshot.events.iter().rev().find_map(|event| match event {
+            crate::execution_graph::ExecutionDomainEvent::TargetContextPrepared {
+                node_id,
+                target_exists,
+                source_exists,
+                target_content_hash,
+                repository_fingerprint,
+                ..
+            } if node_id == &node.id => Some(format!(
+                "{target_exists:?}:{source_exists:?}:{}:{repository_fingerprint}",
+                target_content_hash.as_deref().unwrap_or_default(),
+            )),
+            _ => None,
+        })
+    });
+    let validation_revision = snapshot
+        .budget
+        .validation_repair_sessions
+        .values()
+        .map(|session| session.current_assertion_set_revision)
+        .max()
+        .unwrap_or_default();
+    let active_repair_intent = match decision {
+        ExecutionDecision::ExecuteTarget { target, .. } => target
+            .validation_repair
+            .as_ref()
+            .map(|repair| repair.repair_intent.repair_intent_id.as_str()),
+        ExecutionDecision::RepairTarget { context, .. } => context
+            .target
+            .validation_repair
+            .as_ref()
+            .map(|repair| repair.repair_intent.repair_intent_id.as_str()),
+        _ => None,
+    };
+    let remaining_required = snapshot
+        .remaining_required_nodes()
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let semantic_state_hash = sha256_text(&format!(
+        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
+        node_id,
+        node.map(|node| node.status),
+        operation,
+        target_state.as_deref().unwrap_or_default(),
+        snapshot.current_repository.fingerprint,
+        validation_revision,
+        active_repair_intent.unwrap_or_default(),
+        remaining_required,
+        snapshot.publication.status,
+    ));
     format!(
-        "{}:{}:{}:{}",
-        snapshot.graph.revision,
+        "{}:{}:{}:{}:{}",
+        snapshot.run_id,
         node_id,
         node_attempt,
         execution_decision_action_kind(decision),
+        semantic_state_hash,
     )
 }
 
