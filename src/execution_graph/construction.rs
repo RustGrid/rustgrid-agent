@@ -132,6 +132,7 @@ fn stable_node_id(kind: ExecutionNodeKind, label: &str, index: usize) -> Executi
     let prefix = match kind {
         ExecutionNodeKind::SourceMutation => "source",
         ExecutionNodeKind::TestMutation => "test",
+        ExecutionNodeKind::ValidationRepair => "validation-repair",
         ExecutionNodeKind::ValidationRepairSession => "validation-repair-session",
         ExecutionNodeKind::ValidationFocused => "validation-focused",
         ExecutionNodeKind::ValidationSuite => "validation-suite",
@@ -295,6 +296,7 @@ impl BudgetGroup {
             ExecutionNodeKind::Planning => Self::Planning,
             ExecutionNodeKind::SourceMutation
             | ExecutionNodeKind::TestMutation
+            | ExecutionNodeKind::ValidationRepair
             | ExecutionNodeKind::ValidationRepairSession => Self::Mutation,
             ExecutionNodeKind::ValidationFocused
             | ExecutionNodeKind::ValidationSuite

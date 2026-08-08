@@ -404,6 +404,7 @@ impl BudgetState {
                     budget,
                     status: ValidationRepairSessionStatus::Active,
                     attempted_targets: Vec::new(),
+                    repair_nodes: Vec::new(),
                     current_assertion_set_revision: current_revision,
                     stop_reason: None,
                     reallocated_model_calls: 0,

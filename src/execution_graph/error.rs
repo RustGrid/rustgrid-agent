@@ -1,5 +1,6 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphInvariantError {
+    pub code: String,
     pub message: String,
 }
 
@@ -12,6 +13,14 @@ pub enum GraphMutationResult {
 impl GraphInvariantError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
+            code: "graph_invariant_violated".into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
             message: message.into(),
         }
     }

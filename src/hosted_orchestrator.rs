@@ -188,13 +188,15 @@ impl ExecutionDecision {
     pub fn budget_node_id(&self) -> Option<&ExecutionNodeId> {
         match self {
             Self::ExecuteTarget {
+                node_id,
                 action: MutationAction::RepairTarget { failure, .. },
                 ..
-            } if failure.category == FailureCategory::ValidationFailure => Some(&failure.node_id),
+            } if failure.category == FailureCategory::ValidationFailure => Some(node_id),
             Self::RepairTarget {
+                node_id,
                 context: TargetRepairContext { failure, .. },
                 ..
-            } if failure.category == FailureCategory::ValidationFailure => Some(&failure.node_id),
+            } if failure.category == FailureCategory::ValidationFailure => Some(node_id),
             _ => self.node_id(),
         }
     }
@@ -247,7 +249,7 @@ impl std::error::Error for OrchestrationInvariantError {}
 
 impl From<GraphInvariantError> for OrchestrationInvariantError {
     fn from(error: GraphInvariantError) -> Self {
-        Self::new("orchestration_invariant_violation", error.to_string())
+        Self::new(error.code, error.message)
     }
 }
 
@@ -265,6 +267,7 @@ fn lifecycle_for_next_node(node: &ExecutionNode) -> Option<LifecycleState> {
     match node.kind {
         ExecutionNodeKind::SourceMutation
         | ExecutionNodeKind::TestMutation
+        | ExecutionNodeKind::ValidationRepair
         | ExecutionNodeKind::ValidationRepairSession => Some(LifecycleState::Implementation),
         ExecutionNodeKind::ValidationFocused
         | ExecutionNodeKind::ValidationSuite
@@ -418,10 +421,27 @@ pub fn reconcile_execution(
         }
         let attempted_targets = attempted_validation_repair_targets(snapshot, &failure.id);
         let candidates = validation_repair_candidates(snapshot, failure)?;
-        let next_target = candidates.iter().copied().find(|node| {
-            node.target
-                .as_ref()
-                .is_some_and(|target| !attempted_targets.contains(target.path.as_str()))
+        let active_target = snapshot
+            .budget
+            .repair_session_for_failure(&failure.id)
+            .and_then(|session| session.repair_nodes.last())
+            .and_then(|repair_node_id| snapshot.graph.node(repair_node_id))
+            .filter(|repair_node| {
+                repair_node.kind == ExecutionNodeKind::ValidationRepair
+                    && repair_node.status == ExecutionNodeStatus::Running
+            })
+            .and_then(|repair_node| repair_node.validation_repair.as_ref())
+            .and_then(|repair| {
+                snapshot
+                    .graph
+                    .node(&repair.originating_implementation_node_id)
+            });
+        let next_target = active_target.or_else(|| {
+            candidates.iter().copied().find(|node| {
+                node.target
+                    .as_ref()
+                    .is_some_and(|target| !attempted_targets.contains(target.path.as_str()))
+            })
         });
         let validation_budget_exhausted = validation_repair_session_exhausted(snapshot, failure);
         let mission_repair_calls_remaining =
@@ -493,10 +513,10 @@ pub fn reconcile_execution(
                 ),
             ));
         };
-        if validation_budget_exhausted
-            || repair_budget_exhausted(snapshot, target_node)
-            || mission_repair_calls_remaining < ValidationRepairBudget::MINIMUM_MODEL_CALLS
-            || mission_repair_cost_remaining == 0
+        if active_target.is_none()
+            && (validation_budget_exhausted
+                || mission_repair_calls_remaining < ValidationRepairBudget::MINIMUM_MODEL_CALLS
+                || mission_repair_cost_remaining == 0)
         {
             if snapshot.current_repository.has_changes() {
                 return incomplete_diff_decision(
@@ -942,11 +962,13 @@ fn decision_for_node(
                 gate,
             })
         }
-        ExecutionNodeKind::ValidationRepairSession => Err(OrchestrationInvariantError::for_node(
-            "repair_session_selected_as_runnable",
-            node.id.clone(),
-            "validation repair sessions are reconciled before ordinary runnable nodes",
-        )),
+        ExecutionNodeKind::ValidationRepair | ExecutionNodeKind::ValidationRepairSession => {
+            Err(OrchestrationInvariantError::for_node(
+                "repair_node_selected_as_ordinary_runnable",
+                node.id.clone(),
+                "validation repair nodes are reconciled from their active failure session before ordinary runnable nodes",
+            ))
+        }
         ExecutionNodeKind::DiffReview => Ok(ExecutionDecision::ReviewDiff {
             node_id: node.id.clone(),
         }),
@@ -1211,7 +1233,9 @@ fn repair_target_decision(
     node: &ExecutionNode,
     failure: &FailureRecord,
 ) -> Result<ExecutionDecision, OrchestrationInvariantError> {
-    if repair_budget_exhausted(snapshot, node) {
+    if failure.category != FailureCategory::ValidationFailure
+        && repair_budget_exhausted(snapshot, node)
+    {
         return Err(OrchestrationInvariantError::for_node(
             "target_repair_budget_exhausted",
             node.id.clone(),
@@ -1283,12 +1307,36 @@ fn repair_target_decision(
             },
             evidence_ids,
         };
+        let failure_revision = snapshot
+            .budget
+            .repair_session_for_failure(&failure.id)
+            .map(|session| session.current_assertion_set_revision)
+            .or_else(|| {
+                snapshot
+                    .budget
+                    .current_validation_failure_revision(
+                        failure.node_id.as_str(),
+                        &failure.repository_fingerprint,
+                    )
+                    .map(|revision| revision.revision)
+            })
+            .unwrap_or(1);
+        let repair_node_id =
+            validation_repair_node_id(&failure.id, failure_revision, &target.target);
+        let target_ref = RepositoryTargetRef {
+            target_id: target.target.mutation_target_id().to_string(),
+            path: target.target.path.clone(),
+        };
         target.validation_repair = Some(ValidationRepairContext {
             repair_intent,
             focused_validation_command: failure.validation_command.clone().unwrap_or_default(),
             assertion_failures: failure.assertion_failures.clone(),
             implicated_targets,
             selected_target: target.target.path.clone(),
+            target_ref,
+            originating_implementation_node_id: node.id.clone(),
+            repair_node_id: repair_node_id.clone(),
+            failure_revision,
             repository_fingerprint: snapshot.current_repository.fingerprint.clone(),
             accepted_implementation_intent: target.intent.clone(),
             existing_diff_paths: snapshot
@@ -1301,7 +1349,9 @@ fn repair_target_decision(
             attempted_targets,
             remaining_eligible_targets,
         });
+        target.node_id = repair_node_id;
     }
+    let decision_node_id = target.node_id.clone();
     let context_prepared = snapshot.events.iter().rev().any(|event| {
         matches!(
             event,
@@ -1314,7 +1364,7 @@ fn repair_target_decision(
                 target_content_hash,
                 accepted_intent_hash,
                 ..
-            } if node_id == &node.id
+            } if node_id == &decision_node_id
                 && target_path == &target.target.path
                 && operation == &target.target.effective_operation()
                 && source_path.as_deref() == target.target.effective_operation().source_path()
@@ -1326,9 +1376,9 @@ fn repair_target_decision(
     if failure.category == FailureCategory::ValidationFailure && !context_prepared {
         target.allowed_tools.clear();
         return Ok(ExecutionDecision::ExecuteTarget {
-            node_id: node.id.clone(),
+            node_id: decision_node_id.clone(),
             action: MutationAction::PrepareTargetContext {
-                node_id: node.id.clone(),
+                node_id: decision_node_id.clone(),
                 target: target.target.clone(),
             },
             target,
@@ -1370,9 +1420,9 @@ fn repair_target_decision(
         if !context_prepared {
             target.allowed_tools.clear();
             return Ok(ExecutionDecision::ExecuteTarget {
-                node_id: node.id.clone(),
+                node_id: decision_node_id.clone(),
                 action: MutationAction::PrepareTargetContext {
-                    node_id: node.id.clone(),
+                    node_id: decision_node_id.clone(),
                     target: target.target.clone(),
                 },
                 target,
@@ -1405,9 +1455,9 @@ fn repair_target_decision(
         });
     }
     Ok(ExecutionDecision::ExecuteTarget {
-        node_id: node.id.clone(),
+        node_id: decision_node_id.clone(),
         action: MutationAction::RepairTarget {
-            node_id: node.id.clone(),
+            node_id: decision_node_id,
             target: target.target.clone(),
             failure: Box::new(failure.clone()),
             fallback_policy,
@@ -2292,6 +2342,10 @@ mod tests {
                 sequence: 4,
                 validation_node_id: validation_node.clone(),
                 failure_id: failure.id.clone(),
+                repair_node_id: ExecutionNodeId::default(),
+                originating_implementation_node_id: ExecutionNodeId::default(),
+                target_ref: RepositoryTargetRef::default(),
+                failure_revision: 0,
                 repair_intent: ValidationRepairIntent::default(),
                 selected_target: "src/components/theme/ThemeProvider.tsx".into(),
                 implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
@@ -2340,6 +2394,10 @@ mod tests {
                 sequence: 6,
                 validation_node_id: validation_node.clone(),
                 failure_id: failure.id.clone(),
+                repair_node_id: ExecutionNodeId::default(),
+                originating_implementation_node_id: ExecutionNodeId::default(),
+                target_ref: RepositoryTargetRef::default(),
+                failure_revision: 0,
                 repair_intent: ValidationRepairIntent::default(),
                 selected_target: "src/components/theme/ThemeToggle.tsx".into(),
                 implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),

@@ -195,6 +195,14 @@ pub enum ExecutionDomainEvent {
         validation_node_id: ExecutionNodeId,
         failure_id: FailureId,
         #[serde(default)]
+        repair_node_id: RepairNodeId,
+        #[serde(default)]
+        originating_implementation_node_id: ExecutionNodeId,
+        #[serde(default)]
+        target_ref: RepositoryTargetRef,
+        #[serde(default)]
+        failure_revision: u64,
+        #[serde(default)]
         repair_intent: ValidationRepairIntent,
         selected_target: String,
         #[serde(default)]
@@ -538,8 +546,19 @@ impl ExecutionGraph {
                 let node = self.node_mut(node_id).ok_or_else(|| {
                     GraphInvariantError::new(format!("event refers to unknown node `{node_id}`"))
                 })?;
+                if node.kind.is_mutation()
+                    && node.status == ExecutionNodeStatus::Completed
+                    && !node.operation_evidence.is_empty()
+                {
+                    return Err(GraphInvariantError::with_code(
+                        "completed_implementation_node_reopened",
+                        format!(
+                            "node_started cannot reopen completed implementation node `{node_id}`"
+                        ),
+                    ));
+                }
                 node.status = ExecutionNodeStatus::Running;
-                if node.kind.is_mutation() {
+                if node.kind.is_repository_operation() {
                     node.repository_mutation_lifecycle =
                         Some(RepositoryMutationLifecycle::Proposed);
                 }
@@ -600,6 +619,7 @@ impl ExecutionGraph {
                 let target_path = operation.destination_path(&target.path).to_owned();
                 let attempt_number = attempt.attempt;
                 let fingerprint_before = attempt.repository_fingerprint_before.clone();
+                let validation_repair = node.validation_repair.clone();
                 let completion_time = if completed_at.is_empty() {
                     attempt.started_at.clone()
                 } else {
@@ -617,7 +637,7 @@ impl ExecutionGraph {
                     RepositoryOperationResult::Verified {
                         outcome: RepositoryOperationOutcome::Applied,
                         evidence: SuccessfulOperationEvidence::Applied {
-                            before: RepositoryFingerprint::new(fingerprint_before),
+                            before: RepositoryFingerprint::new(fingerprint_before.clone()),
                             after: RepositoryFingerprint::new(repository_fingerprint.clone()),
                         },
                         observed_result_hash: None,
@@ -627,12 +647,40 @@ impl ExecutionGraph {
                     },
                 )
                 .map_err(|error| GraphInvariantError::new(error.to_string()))?;
+                if let Some(repair) = validation_repair {
+                    let node = self.node_mut(node_id).ok_or_else(|| {
+                        GraphInvariantError::new(format!(
+                            "reduced validation repair node `{node_id}` disappeared"
+                        ))
+                    })?;
+                    let operation = node.operation_evidence.pop().ok_or_else(|| {
+                        GraphInvariantError::with_code(
+                            "validation_repair_operation_evidence_missing",
+                            format!("validation repair node `{node_id}` completed without operation evidence"),
+                        )
+                    })?;
+                    node.validation_repair_operation_evidence.push(
+                        ValidationRepairOperationEvidence {
+                            repair_node_id: node_id.clone(),
+                            validation_session_id: repair.validation_session_id,
+                            failure_revision: repair.failure_revision,
+                            target_id: repair.target.target_id,
+                            repository_fingerprint_before: fingerprint_before.into(),
+                            repository_fingerprint_after: operation.repository_fingerprint,
+                            verification_evidence_id: EvidenceId::new(operation.semantic_id),
+                        },
+                    );
+                    if let Some(metadata) = node.validation_repair.as_mut() {
+                        metadata.status = RepairNodeStatus::Completed;
+                    }
+                }
             }
             ExecutionDomainEvent::TargetOperationAlreadyApplied {
                 execution_id,
                 attempt,
                 transition,
                 semantic_id,
+                satisfied_intent,
                 ..
             } => {
                 if semantic_id != &transition.semantic_id(execution_id, *attempt) {
@@ -640,6 +688,36 @@ impl ExecutionGraph {
                 }
                 self.apply_already_applied_transition(execution_id, *attempt, transition)
                     .map_err(|error| GraphInvariantError::new(error.to_string()))?;
+                if *satisfied_intent == SatisfiedIntent::ValidationRepair
+                    && let Some(node) = self.node_mut(&transition.node_id)
+                    && let Some(repair) = node.validation_repair.clone()
+                {
+                    let operation = node.operation_evidence.pop().ok_or_else(|| {
+                        GraphInvariantError::with_code(
+                            "validation_repair_operation_evidence_missing",
+                            format!(
+                                "already-satisfied validation repair node `{}` has no operation evidence",
+                                transition.node_id
+                            ),
+                        )
+                    })?;
+                    node.validation_repair_operation_evidence.push(
+                        ValidationRepairOperationEvidence {
+                            repair_node_id: transition.node_id.clone(),
+                            validation_session_id: repair.validation_session_id,
+                            failure_revision: repair.failure_revision,
+                            target_id: repair.target.target_id,
+                            repository_fingerprint_before: transition
+                                .repository_fingerprint
+                                .clone(),
+                            repository_fingerprint_after: operation.repository_fingerprint,
+                            verification_evidence_id: EvidenceId::new(operation.semantic_id),
+                        },
+                    );
+                    if let Some(metadata) = node.validation_repair.as_mut() {
+                        metadata.status = RepairNodeStatus::Completed;
+                    }
+                }
             }
             ExecutionDomainEvent::MutationRejected {
                 node_id, failure, ..
@@ -972,7 +1050,9 @@ impl ExecutionGraph {
             | ExecutionDomainEvent::MutationRepairAllowanceConsumed { .. }
             | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
             | ExecutionDomainEvent::MutationRejected { .. }
-            | ExecutionDomainEvent::MutationSuperseded { .. } => node.kind.is_mutation(),
+            | ExecutionDomainEvent::MutationSuperseded { .. } => {
+                node.kind.is_repository_operation()
+            }
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {
                 failure.category.is_valid_for_node_kind(node.kind)
             }

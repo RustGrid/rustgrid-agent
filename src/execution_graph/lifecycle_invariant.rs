@@ -240,6 +240,20 @@ pub fn check_invariants(
 ) -> Result<(), InvariantViolation> {
     validate_lifecycle_invariant_definitions(&lifecycle_invariant_definitions())?;
 
+    if let Some(node) = graph.nodes().find(|node| {
+        node.kind.is_mutation()
+            && !node.operation_evidence.is_empty()
+            && node.status != ExecutionNodeStatus::Completed
+    }) {
+        return Err(violation(
+            "completed_implementation_node_reopened",
+            lifecycle,
+            trigger,
+            Some(node.id.clone()),
+            "implementation operation evidence is immutable after node completion",
+        ));
+    }
+
     for node in graph
         .nodes()
         .filter(|node| {
@@ -767,5 +781,334 @@ mod lifecycle_invariant_tests {
         )
         .unwrap_err();
         assert_eq!(stale.code, "current_validation_missing_at_completion");
+    }
+
+    fn snapshot_with_active_validation_repair() -> (
+        ExecutionSnapshot,
+        ExecutionNodeId,
+        ExecutionNodeId,
+        FailureId,
+    ) {
+        snapshot_with_active_validation_repair_after(SatisfiedIntent::OriginalImplementation)
+    }
+
+    fn snapshot_with_active_validation_repair_after(
+        implementation_intent: SatisfiedIntent,
+    ) -> (
+        ExecutionSnapshot,
+        ExecutionNodeId,
+        ExecutionNodeId,
+        FailureId,
+    ) {
+        let mut snapshot = snapshot_with_targets(vec![target("tests/behavior.rs", "test")]);
+        let implementation_node = complete_next_mutation(
+            &mut snapshot,
+            "tree-implemented",
+            implementation_intent,
+        );
+        let validation_node = snapshot
+            .graph
+            .nodes()
+            .find(|node| node.kind.is_validation())
+            .unwrap()
+            .id
+            .clone();
+        let validation_fingerprint = snapshot
+            .graph
+            .node(&validation_node)
+            .unwrap()
+            .validation
+            .as_ref()
+            .unwrap()
+            .fingerprint("tree-implemented");
+        let failure_id = FailureId::new("focused-validation-failure");
+        let failure = FailureRecord {
+            id: failure_id.clone(),
+            node_id: validation_node.clone(),
+            category: FailureCategory::ValidationFailure,
+            attempt: 1,
+            target_path: Some("tests/behavior.rs".into()),
+            repository_fingerprint: "tree-implemented".into(),
+            validation_command: Some("cargo test focused".into()),
+            message: "focused validation failed".into(),
+            ..FailureRecord::default()
+        };
+        let sequence = snapshot.next_event_sequence();
+        snapshot
+            .append_event(ExecutionDomainEvent::FailureRecorded {
+                sequence,
+                failure: failure.clone(),
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+                sequence: sequence + 1,
+                node_id: validation_node.clone(),
+                evidence: ValidationEvidenceRecord {
+                    evidence_id: "focused-validation-failed-evidence".into(),
+                    node_id: validation_node.clone(),
+                    gate_id: "focused".into(),
+                    fingerprint: validation_fingerprint.clone(),
+                    repository_fingerprint: "tree-implemented".into(),
+                    command: "cargo test focused".into(),
+                    working_directory: ".".into(),
+                    status: ValidationEvidenceStatus::Failed,
+                    ..ValidationEvidenceRecord::default()
+                },
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::ValidationFailed {
+                sequence: sequence + 2,
+                node_id: validation_node.clone(),
+                failure_id: failure_id.clone(),
+                fingerprint: validation_fingerprint,
+            })
+            .unwrap();
+        let revision = snapshot
+            .budget
+            .current_validation_failure_revision(validation_node.as_ref(), "tree-implemented")
+            .unwrap()
+            .revision;
+        let implementation = snapshot.graph.node(&implementation_node).unwrap();
+        let planned_target = implementation.target.as_ref().unwrap();
+        let repair_node_id = validation_repair_node_id(&failure_id, revision, planned_target);
+        snapshot
+            .append_event(ExecutionDomainEvent::ValidationRepairStarted {
+                sequence: sequence + 3,
+                validation_node_id: validation_node.clone(),
+                failure_id: failure_id.clone(),
+                repair_node_id: repair_node_id.clone(),
+                originating_implementation_node_id: implementation_node.clone(),
+                target_ref: RepositoryTargetRef {
+                    target_id: planned_target.mutation_target_id().to_string(),
+                    path: planned_target.path.clone(),
+                },
+                failure_revision: revision,
+                repair_intent: ValidationRepairIntent {
+                    repair_intent_id: "repair-focused-r1".into(),
+                    failed_validation_id: failure_id.to_string(),
+                    target: planned_target.path.clone(),
+                    ..ValidationRepairIntent::default()
+                },
+                selected_target: planned_target.path.clone(),
+                implicated_paths: vec![planned_target.path.clone()],
+                correction_contracts: Vec::new(),
+                requested_tool_policy: MutationFallbackPolicy::ForceReplaceFile,
+                repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
+            })
+            .unwrap();
+        (snapshot, implementation_node, repair_node_id, failure_id)
+    }
+
+    #[test]
+    fn completed_implementation_cannot_reopen_and_repair_uses_a_separate_attempt_ledger() {
+        let (mut snapshot, implementation_node, repair_node_id, _) =
+            snapshot_with_active_validation_repair();
+        let implementation_before = snapshot.graph.node(&implementation_node).unwrap().clone();
+        let repair = snapshot.graph.node(&repair_node_id).unwrap();
+        assert_eq!(implementation_before.status, ExecutionNodeStatus::Completed);
+        assert_eq!(implementation_before.attempts.len(), 1);
+        assert_eq!(repair.kind, ExecutionNodeKind::ValidationRepair);
+        assert_eq!(repair.status, ExecutionNodeStatus::Running);
+        assert_eq!(repair.attempts.len(), 1);
+        assert_eq!(repair.dependencies, vec![implementation_node.clone()]);
+        assert_eq!(
+            snapshot
+                .target_execution_state(&implementation_node)
+                .unwrap()
+                .repair_status,
+            RepairStatus::Running
+        );
+        assert!(snapshot
+            .graph
+            .implementation_barrier_proof("tree-implemented".into())
+            .satisfied);
+
+        let before_rejected_transition = snapshot.clone();
+        let error = snapshot
+            .append_event(ExecutionDomainEvent::NodeStarted {
+                sequence: snapshot.next_event_sequence(),
+                node_id: implementation_node.clone(),
+                attempt: 2,
+                started_at: "invalid-repair-start".into(),
+                repository_fingerprint: "tree-implemented".into(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "completed_implementation_node_reopened");
+        assert_eq!(snapshot, before_rejected_transition);
+        assert_eq!(
+            snapshot.graph.node(&implementation_node).unwrap(),
+            &implementation_before
+        );
+    }
+
+    #[test]
+    fn completed_source_and_test_implementation_statuses_are_monotonic() {
+        for (path, role) in [("src/behavior.rs", "source"), ("tests/behavior.rs", "test")] {
+            let mut snapshot = snapshot_with_targets(vec![target(path, role)]);
+            let implementation_node = complete_next_mutation(
+                &mut snapshot,
+                "tree-implemented",
+                SatisfiedIntent::OriginalImplementation,
+            );
+            let before = snapshot.clone();
+            let error = snapshot
+                .append_event(ExecutionDomainEvent::NodeStarted {
+                    sequence: snapshot.next_event_sequence(),
+                    node_id: implementation_node.clone(),
+                    attempt: 2,
+                    started_at: "invalid-later-repair".into(),
+                    repository_fingerprint: "tree-implemented".into(),
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "completed_implementation_node_reopened");
+            assert_eq!(snapshot, before);
+            assert_eq!(
+                snapshot.graph.node(&implementation_node).unwrap().status,
+                ExecutionNodeStatus::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn failed_validation_repair_blocks_only_the_repair_node() {
+        let (mut snapshot, implementation_node, repair_node_id, failure_id) =
+            snapshot_with_active_validation_repair();
+        let implementation_before = snapshot.graph.node(&implementation_node).unwrap().clone();
+        snapshot
+            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: snapshot.next_event_sequence(),
+                validation_node_id: snapshot
+                    .failures
+                    .get(&failure_id)
+                    .unwrap()
+                    .node_id
+                    .clone(),
+                failure_id,
+                result: RepairResult::NoMutation {
+                    diagnosis: None,
+                    reason: "no safe target-bound correction".into(),
+                    outcome: ValidationRepairMutationOutcome::NoValidRepair,
+                    unresolved: None,
+                },
+                attempt: Some(ValidationRepairAttempt {
+                    repair_intent_id: "repair-focused-r1".into(),
+                    target_path: "tests/behavior.rs".into(),
+                    outcome: ValidationRepairMutationOutcome::NoValidRepair,
+                    repository_fingerprint_before: "tree-implemented".into(),
+                    repository_fingerprint_after: "tree-implemented".into(),
+                    ..ValidationRepairAttempt::default()
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(
+            snapshot.graph.node(&implementation_node).unwrap(),
+            &implementation_before
+        );
+        let repair = snapshot.graph.node(&repair_node_id).unwrap();
+        assert_eq!(repair.status, ExecutionNodeStatus::FailedBlocking);
+        assert_eq!(
+            repair.validation_repair.as_ref().unwrap().status,
+            RepairNodeStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn implementation_fallback_completion_admits_an_independent_validation_repair() {
+        let (snapshot, implementation_node, repair_node_id, _) =
+            snapshot_with_active_validation_repair_after(SatisfiedIntent::MutationFallback);
+        let implementation = snapshot.graph.node(&implementation_node).unwrap();
+        let repair = snapshot.graph.node(&repair_node_id).unwrap();
+
+        assert_eq!(implementation.status, ExecutionNodeStatus::Completed);
+        assert_eq!(implementation.attempts.len(), 1);
+        assert_eq!(implementation.operation_evidence.len(), 1);
+        assert_eq!(repair.kind, ExecutionNodeKind::ValidationRepair);
+        assert_eq!(repair.status, ExecutionNodeStatus::Running);
+        assert_eq!(repair.attempts.len(), 1);
+        assert!(repair.operation_evidence.is_empty());
+    }
+
+    #[test]
+    fn repair_operation_preserves_implementation_evidence_and_stales_validation_only() {
+        let (mut snapshot, implementation_node, repair_node_id, failure_id) =
+            snapshot_with_active_validation_repair();
+        let implementation_before = snapshot.graph.node(&implementation_node).unwrap().clone();
+        snapshot.evidence.record_validation(ValidationEvidenceRecord {
+            evidence_id: "old-validation".into(),
+            node_id: snapshot
+                .graph
+                .nodes()
+                .find(|node| node.kind.is_validation())
+                .unwrap()
+                .id
+                .clone(),
+            repository_fingerprint: "tree-implemented".into(),
+            fingerprint: "focused:tree-implemented".into(),
+            status: ValidationEvidenceStatus::Passed,
+            ..ValidationEvidenceRecord::default()
+        });
+        let sequence = snapshot.next_event_sequence();
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationApplied {
+                sequence,
+                node_id: repair_node_id.clone(),
+                target_path: "tests/behavior.rs".into(),
+                repository_fingerprint: "tree-repaired".into(),
+                evidence_id: "repair-operation-evidence".into(),
+                completed_at: "repair-completed".into(),
+                satisfied_intent: SatisfiedIntent::ValidationRepair,
+                repair_failure_id: Some(failure_id.clone()),
+                created_target_evidence: None,
+            })
+            .unwrap();
+        snapshot
+            .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+                sequence: sequence + 1,
+                validation_node_id: snapshot
+                    .failures
+                    .get(&failure_id)
+                    .unwrap()
+                    .node_id
+                    .clone(),
+                failure_id,
+                result: RepairResult::MutationProduced {
+                    selected_target: "tests/behavior.rs".into(),
+                    repair_intent_id: "repair-focused-r1".into(),
+                },
+                attempt: Some(ValidationRepairAttempt {
+                    repair_intent_id: "repair-focused-r1".into(),
+                    target_path: "tests/behavior.rs".into(),
+                    failure_revision: 1,
+                    outcome: ValidationRepairMutationOutcome::MutationApplied,
+                    repository_fingerprint_before: "tree-implemented".into(),
+                    repository_fingerprint_after: "tree-repaired".into(),
+                    ..ValidationRepairAttempt::default()
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(
+            snapshot.graph.node(&implementation_node).unwrap(),
+            &implementation_before
+        );
+        let repair = snapshot.graph.node(&repair_node_id).unwrap();
+        assert_eq!(repair.status, ExecutionNodeStatus::Completed);
+        assert!(repair.operation_evidence.is_empty());
+        assert_eq!(repair.validation_repair_operation_evidence.len(), 1);
+        assert!(snapshot
+            .graph
+            .implementation_barrier_proof("tree-repaired".into())
+            .satisfied);
+        assert_eq!(
+            snapshot.evidence.validations["old-validation"].status,
+            ValidationEvidenceStatus::Superseded
+        );
+        assert!(matches!(
+            snapshot.target_revisions.last().map(|revision| &revision.producer),
+            Some(TargetRevisionProducer::ValidationRepair(node_id)) if node_id == &repair_node_id
+        ));
     }
 }

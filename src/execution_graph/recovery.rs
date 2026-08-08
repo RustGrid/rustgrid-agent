@@ -420,12 +420,85 @@ impl RepositoryOperationVerification {
 pub struct ImplementationBarrierProof {
     pub repository_fingerprint: RepositoryFingerprint,
     #[serde(default)]
+    pub satisfied_at: String,
+    #[serde(default)]
+    pub implementation_revision: u64,
+    #[serde(default)]
     pub required_nodes: Vec<ExecutionNodeId>,
     #[serde(default)]
     pub completed_nodes: Vec<ExecutionNodeId>,
     #[serde(default)]
     pub unresolved_nodes: Vec<ExecutionNodeId>,
     pub satisfied: bool,
+}
+
+pub const fn can_transition_implementation_status(
+    from: ExecutionNodeStatus,
+    to: ExecutionNodeStatus,
+) -> bool {
+    match from {
+        ExecutionNodeStatus::Completed => matches!(to, ExecutionNodeStatus::Completed),
+        ExecutionNodeStatus::Applied => matches!(to, ExecutionNodeStatus::Applied),
+        ExecutionNodeStatus::Skipped => matches!(to, ExecutionNodeStatus::Skipped),
+        _ => true,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairNodeStatus {
+    Pending,
+    Ready,
+    #[default]
+    Running,
+    Completed,
+    Failed,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairNodeMetadata {
+    pub repair_node_id: RepairNodeId,
+    pub target: RepositoryTargetRef,
+    pub originating_implementation_node_id: ExecutionNodeId,
+    pub validation_session_id: ValidationRepairSessionId,
+    pub failure_revision: u64,
+    pub status: RepairNodeStatus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ValidationRepairOperationEvidence {
+    pub repair_node_id: RepairNodeId,
+    pub validation_session_id: ValidationRepairSessionId,
+    pub failure_revision: u64,
+    pub target_id: TargetId,
+    pub repository_fingerprint_before: RepositoryFingerprint,
+    pub repository_fingerprint_after: RepositoryFingerprint,
+    pub verification_evidence_id: EvidenceId,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "producer", content = "node_id", rename_all = "snake_case")]
+pub enum TargetRevisionProducer {
+    InitialImplementation(ExecutionNodeId),
+    ValidationRepair(RepairNodeId),
+    DiffReviewRepair(RepairNodeId),
+}
+
+impl Default for TargetRevisionProducer {
+    fn default() -> Self {
+        Self::InitialImplementation(ExecutionNodeId::default())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TargetRevision {
+    pub target_id: TargetId,
+    pub revision: u64,
+    pub producer: TargetRevisionProducer,
+    pub repository_fingerprint: RepositoryFingerprint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -526,7 +599,7 @@ pub fn reduce_repository_operation(
             format!("unknown execution node `{node_id}`"),
         )
     })?;
-    if !node.kind.is_mutation()
+    if !node.kind.is_repository_operation()
         || node.target.as_ref().is_none_or(|target| {
             target.effective_operation() != intent.operation
                 || target.effective_operation().destination_path(&target.path)
@@ -538,43 +611,16 @@ pub fn reduce_repository_operation(
             format!("repository operation intent does not match mutation node `{node_id}`"),
         ));
     }
-    if node.status == ExecutionNodeStatus::Completed
+    if node.kind.is_mutation()
+        && node.status == ExecutionNodeStatus::Completed
         && intent.satisfied_intent == SatisfiedIntent::ValidationRepair
     {
-        if let Some(existing) = node
-            .operation_evidence
-            .iter()
-            .find(|existing| existing.semantic_id == evidence.semantic_id)
-        {
-            return if existing == &evidence {
-                Ok(GraphMutationResult::NoChange {
-                    current_revision: graph.revision,
-                })
-            } else {
-                Err(TransitionError::new(
-                    "repository_operation_evidence_conflict",
-                    format!("completed node `{node_id}` has conflicting validation-repair evidence"),
-                ))
-            };
-        }
-        let mut next = graph.clone();
-        let previous_revision = next.revision;
-        let node = next.node_mut(&node_id).ok_or_else(|| {
-            TransitionError::new(
-                "repository_operation_node_unknown",
-                format!("unknown execution node `{node_id}`"),
-            )
-        })?;
-        node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Verified);
-        node.evidence_ids.push(semantic_id);
-        node.operation_evidence.push(evidence);
-        next.revision = previous_revision.saturating_add(1);
-        next.validate_invariants().map_err(|error| {
-            TransitionError::new("repository_operation_invariant_failed", error.to_string())
-        })?;
-        let new_revision = next.revision;
-        *graph = next;
-        return Ok(GraphMutationResult::Changed { new_revision });
+        return Err(TransitionError::new(
+            "completed_implementation_node_reopened",
+            format!(
+                "validation repair cannot append operation evidence or attempts to completed implementation node `{node_id}`"
+            ),
+        ));
     }
     match reduce_operation_outcome(node, outcome, evidence.clone())? {
         NodeTransition::NoOp(_) => Ok(GraphMutationResult::NoChange {
@@ -843,6 +889,14 @@ pub struct ValidationRepairContext {
     #[serde(default)]
     pub implicated_targets: Vec<FileExcerpt>,
     pub selected_target: String,
+    #[serde(default)]
+    pub target_ref: RepositoryTargetRef,
+    #[serde(default)]
+    pub originating_implementation_node_id: ExecutionNodeId,
+    #[serde(default)]
+    pub repair_node_id: RepairNodeId,
+    #[serde(default)]
+    pub failure_revision: u64,
     pub repository_fingerprint: String,
     pub accepted_implementation_intent: String,
     #[serde(default)]
@@ -862,6 +916,19 @@ pub type ValidationAssertionId = String;
 pub type RepairSessionId = String;
 pub type ModelCallId = String;
 pub type MutationToolPolicy = MutationFallbackPolicy;
+
+pub fn validation_repair_node_id(
+    failure_id: &FailureId,
+    failure_revision: u64,
+    target: &PlannedTarget,
+) -> RepairNodeId {
+    ExecutionNodeId::new(format!(
+        "validation-repair:{}:{}:{}",
+        failure_id,
+        failure_revision,
+        target.mutation_target_id()
+    ))
+}
 
 /// Deterministic work owned by a validation gate. None of these counters may
 /// be used to admit a model-backed repository mutation.
@@ -967,6 +1034,8 @@ pub struct ValidationRepairSession {
     pub status: ValidationRepairSessionStatus,
     #[serde(default)]
     pub attempted_targets: Vec<ValidationRepairAttempt>,
+    #[serde(default)]
+    pub repair_nodes: Vec<RepairNodeId>,
     pub current_assertion_set_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<ValidationRepairStopReason>,
@@ -1259,6 +1328,7 @@ pub enum RepairStatus {
     #[default]
     NotRequired,
     Pending,
+    Running,
     CandidateApplied,
     AlreadySatisfied,
     Unresolved,
@@ -1364,6 +1434,7 @@ impl FailureCategory {
                     | ExecutionNodeKind::Planning
                     | ExecutionNodeKind::SourceMutation
                     | ExecutionNodeKind::TestMutation
+                    | ExecutionNodeKind::ValidationRepair
                     | ExecutionNodeKind::ValidationRepairSession
                     | ExecutionNodeKind::ValidationFocused
                     | ExecutionNodeKind::ValidationSuite

@@ -58,6 +58,11 @@ pub(super) struct HostedOrchestrationCheckpoint {
     pub(super) budget: BudgetState,
     pub(super) cancellation: Option<CancellationState>,
     pub(super) publication: PublicationState,
+    /// Durable target revision history, including revisions produced by
+    /// validation-repair nodes. Kept outside the graph so replay can prove
+    /// which operation produced the repository state presented to validation.
+    #[serde(default)]
+    pub(super) target_revisions: Vec<crate::execution_graph::TargetRevision>,
     pub(super) semantic_cycle_history: Vec<crate::execution_graph::SemanticCycleObservation>,
     pub(super) worker_liveness: crate::execution_graph::WorkerLiveness,
     pub(super) cycle_cancellation_request: Option<crate::execution_graph::CancellationRequest>,
@@ -213,7 +218,7 @@ fn remaining_work_item(node: &crate::execution_graph::ExecutionNode) -> Remainin
                 ),
             )
         }
-        ExecutionNodeKind::ValidationRepairSession => (
+        ExecutionNodeKind::ValidationRepair | ExecutionNodeKind::ValidationRepairSession => (
             "validation repair",
             "Repair the failed validation gate and rerun its current assertion set.".to_owned(),
         ),
@@ -807,6 +812,7 @@ impl HostedOrchestrationCheckpoint {
             budget: self.budget.clone(),
             cancellation: self.cancellation.clone(),
             publication: self.publication.clone(),
+            target_revisions: self.target_revisions.clone(),
         }
     }
 
@@ -821,6 +827,7 @@ impl HostedOrchestrationCheckpoint {
         self.budget = snapshot.budget.clone();
         self.cancellation = snapshot.cancellation.clone();
         self.publication = snapshot.publication.clone();
+        self.target_revisions = snapshot.target_revisions.clone();
     }
 
     pub(super) fn hosted_stage(&self) -> HostedExecutionStage {
@@ -859,7 +866,9 @@ impl HostedOrchestrationCheckpoint {
                     ExecutionPhase::Implementation
                 }
             }
-            Some(ExecutionNodeKind::ValidationRepairSession) => ExecutionPhase::Repair,
+            Some(
+                ExecutionNodeKind::ValidationRepair | ExecutionNodeKind::ValidationRepairSession,
+            ) => ExecutionPhase::Repair,
             Some(
                 ExecutionNodeKind::ValidationFocused
                 | ExecutionNodeKind::ValidationSuite
@@ -1448,6 +1457,7 @@ const fn node_kind_label(kind: ExecutionNodeKind) -> &'static str {
         ExecutionNodeKind::ValidationSuite => "validation_suite",
         ExecutionNodeKind::ValidationBuild => "validation_build",
         ExecutionNodeKind::ValidationLint => "validation_lint",
+        ExecutionNodeKind::ValidationRepair => "validation_repair",
         ExecutionNodeKind::ValidationRepairSession => "validation_repair_session",
         ExecutionNodeKind::DiffReview => "diff_review",
         ExecutionNodeKind::CompletionEvaluation => "completion_evaluation",

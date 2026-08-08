@@ -34,6 +34,28 @@ impl ExecutionGraph {
             )));
         }
         for node in &self.nodes {
+            if node.kind.is_mutation()
+                && !node.operation_evidence.is_empty()
+                && node.status != ExecutionNodeStatus::Completed
+            {
+                return Err(GraphInvariantError::with_code(
+                    "completed_implementation_node_reopened",
+                    format!(
+                        "implementation node `{}` retains successful operation evidence but has status {:?}",
+                        node.id, node.status
+                    ),
+                ));
+            }
+            if node.kind == ExecutionNodeKind::ValidationRepair
+                && node.validation_repair.is_none()
+            {
+                return Err(GraphInvariantError::with_code(
+                    "validation_repair_metadata_missing",
+                    format!("validation repair node `{}` has no repair identity", node.id),
+                ));
+            }
+        }
+        for node in &self.nodes {
             if node.id.is_empty() {
                 return Err(GraphInvariantError::new(
                     "execution node id must not be empty",

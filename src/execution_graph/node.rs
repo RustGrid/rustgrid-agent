@@ -6,6 +6,9 @@ pub enum ExecutionNodeKind {
     #[default]
     SourceMutation,
     TestMutation,
+    ValidationRepair,
+    /// Legacy session-owner node retained for checkpoint replay. New repairs
+    /// materialize a target-bound `ValidationRepair` node instead.
     ValidationRepairSession,
     ValidationFocused,
     ValidationSuite,
@@ -21,7 +24,10 @@ impl ExecutionNodeKind {
         match self {
             Self::Discovery => HostedExecutionStage::Discovery,
             Self::Planning => HostedExecutionStage::Planning,
-            Self::SourceMutation | Self::TestMutation | Self::ValidationRepairSession => {
+            Self::SourceMutation
+            | Self::TestMutation
+            | Self::ValidationRepair
+            | Self::ValidationRepairSession => {
                 HostedExecutionStage::Implementation
             }
             Self::ValidationFocused
@@ -35,6 +41,10 @@ impl ExecutionNodeKind {
 
     pub const fn is_mutation(self) -> bool {
         matches!(self, Self::SourceMutation | Self::TestMutation)
+    }
+
+    pub const fn is_repository_operation(self) -> bool {
+        self.is_mutation() || matches!(self, Self::ValidationRepair)
     }
 
     pub const fn is_validation(self) -> bool {
@@ -54,6 +64,7 @@ impl ExecutionNodeKind {
                 | Self::Planning
                 | Self::SourceMutation
                 | Self::TestMutation
+                | Self::ValidationRepair
                 | Self::ValidationRepairSession
                 | Self::DiffReview
                 | Self::CompletionEvaluation
@@ -112,6 +123,15 @@ impl ExecutionNodeStatus {
 
 pub type RepositoryPath = String;
 pub type ContentHash = String;
+pub type TargetId = String;
+pub type RepairNodeId = ExecutionNodeId;
+pub type ValidationRepairSessionId = RepairSessionId;
+
+#[derive(Clone, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+pub struct RepositoryTargetRef {
+    pub target_id: TargetId,
+    pub path: RepositoryPath,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -480,6 +500,10 @@ pub struct ExecutionNode {
     pub evidence_ids: Vec<String>,
     #[serde(default)]
     pub operation_evidence: Vec<OperationEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_repair_operation_evidence: Vec<ValidationRepairOperationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_repair: Option<ValidationRepairNodeMetadata>,
     /// Durable repository-operation phase for mutation nodes. This is a
     /// projection of domain events and is therefore replay-safe; legacy
     /// checkpoints omit it and reconstruct it as events are replayed.

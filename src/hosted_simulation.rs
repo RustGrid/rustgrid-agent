@@ -514,6 +514,76 @@ impl SimulationHarness {
                 action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                 target,
             } => {
+                if let Some(repair) = target.validation_repair.as_ref() {
+                    let failure_id =
+                        FailureId::new(repair.repair_intent.failed_validation_id.clone());
+                    let failure = self
+                        .snapshot
+                        .failures
+                        .get(&failure_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            SimulationError::new(
+                                "validation_repair_failure_missing",
+                                format!("simulation repair node `{node_id}` has no failure"),
+                            )
+                        })?;
+                    self.append(ExecutionDomainEvent::ValidationRepairStarted {
+                        sequence: self.sequence(),
+                        validation_node_id: failure.node_id,
+                        failure_id,
+                        repair_node_id: repair.repair_node_id.clone(),
+                        originating_implementation_node_id: repair
+                            .originating_implementation_node_id
+                            .clone(),
+                        target_ref: repair.target_ref.clone(),
+                        failure_revision: repair.failure_revision,
+                        repair_intent: repair.repair_intent.clone(),
+                        selected_target: target.target.path.clone(),
+                        implicated_paths: failure
+                            .assertion_failures
+                            .iter()
+                            .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                            .collect(),
+                        correction_contracts: repair.correction_contracts.clone(),
+                        requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+                        repository_fingerprint_before: RepositoryFingerprint::new(
+                            repair.repository_fingerprint.clone(),
+                        ),
+                    })?;
+                    let fingerprint = self.snapshot.current_repository.fingerprint.clone();
+                    let content = target.current_file_content.clone().unwrap_or_else(|| {
+                        format!("simulated current content for {}", target.target.path)
+                    });
+                    let evidence = crate::execution_graph::FileEvidence::capture(
+                        &target.target.path,
+                        &fingerprint,
+                        None,
+                        content,
+                        false,
+                    );
+                    self.append(ExecutionDomainEvent::RepositoryEvidenceRecorded {
+                        sequence: self.sequence(),
+                        evidence_id: evidence.evidence_id.clone(),
+                        repository_fingerprint: fingerprint.clone(),
+                        evidence: Some(evidence.clone()),
+                    })?;
+                    self.append(ExecutionDomainEvent::TargetContextPrepared {
+                        sequence: self.sequence(),
+                        node_id,
+                        target_path: target.target.path.clone(),
+                        operation: target.target.effective_operation(),
+                        source_path: None,
+                        target_exists: Some(true),
+                        source_exists: None,
+                        repository_fingerprint: RepositoryFingerprint::new(fingerprint),
+                        evidence_ids: vec![evidence.evidence_id],
+                        target_content_hash: Some(evidence.content_hash),
+                        source_content_hash: None,
+                        accepted_intent_hash: target.accepted_intent_hash,
+                    })?;
+                    return Ok(None);
+                }
                 if self.snapshot.graph.node(&node_id).is_none_or(|node| {
                     !matches!(
                         node.status,
@@ -823,17 +893,30 @@ impl SimulationHarness {
         target: PlannedTarget,
         repairing: bool,
     ) -> Result<(), SimulationError> {
-        let validation_repair = repairing
-            && self
-                .snapshot
-                .graph
-                .node(&node_id)
-                .is_some_and(|node| node.status == ExecutionNodeStatus::Completed)
-            && self
-                .snapshot
-                .failures
-                .unresolved()
-                .any(|failure| failure.category == FailureCategory::ValidationFailure);
+        let validation_repair_start =
+            self.snapshot
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    ExecutionDomainEvent::ValidationRepairStarted {
+                        validation_node_id,
+                        failure_id,
+                        repair_node_id,
+                        repair_intent,
+                        requested_tool_policy,
+                        repository_fingerprint_before,
+                        ..
+                    } if repair_node_id == &node_id => Some((
+                        validation_node_id.clone(),
+                        failure_id.clone(),
+                        repair_intent.clone(),
+                        *requested_tool_policy,
+                        repository_fingerprint_before.clone(),
+                    )),
+                    _ => None,
+                });
+        let validation_repair = repairing && validation_repair_start.is_some();
         if !repairing
             && let Some(MutationResult::AlreadyApplied { .. }) =
                 classify_mutation_request(&self.snapshot, &node_id)?
@@ -881,10 +964,40 @@ impl SimulationHarness {
                     } else {
                         SatisfiedIntent::OriginalImplementation
                     },
-                    repair_failure_id: None,
+                    repair_failure_id: validation_repair_start
+                        .as_ref()
+                        .map(|(_, failure_id, ..)| failure_id.clone()),
                     created_target_evidence: None,
                 })?;
-                if repairing {
+                if let Some((
+                    validation_node_id,
+                    failure_id,
+                    repair_intent,
+                    requested_tool_policy,
+                    repository_fingerprint_before,
+                )) = validation_repair_start
+                {
+                    self.append(ExecutionDomainEvent::ValidationRepairCompleted {
+                        sequence: self.sequence(),
+                        validation_node_id,
+                        failure_id,
+                        result: RepairResult::MutationProduced {
+                            selected_target: target.path.clone(),
+                            repair_intent_id: repair_intent.repair_intent_id.clone(),
+                        },
+                        attempt: Some(ValidationRepairAttempt {
+                            repair_intent_id: repair_intent.repair_intent_id,
+                            target_path: target.path.clone(),
+                            diagnosis: repair_intent.diagnosis,
+                            requested_tool_policy,
+                            outcome: ValidationRepairMutationOutcome::MutationApplied,
+                            repository_fingerprint_before,
+                            repository_fingerprint_after: after.clone().into(),
+                            ..ValidationRepairAttempt::default()
+                        }),
+                    })?;
+                    self.reset_failed_validation_nodes()?;
+                } else if repairing {
                     self.reset_failed_validation_nodes()?;
                 }
                 self.target_results.push(TargetResultRecord {
@@ -1648,27 +1761,54 @@ mod tests {
         let mission =
             ScriptedMission::new("validation repair event replay", MissionComplexity::Small)
                 .with_target(PlannedTarget {
-                    change_id: "parser-fix".to_owned(),
-                    path: "src/parser.rs".to_owned(),
+                    change_id: "source-a".to_owned(),
+                    path: "src/a.rs".to_owned(),
                     role: "production".to_owned(),
-                    intent: "repair parser behavior".to_owned(),
+                    intent: "implement source behavior A".to_owned(),
+                    acceptance_criteria_ids: vec!["ac-1".to_owned()],
+                    operation: Default::default(),
+                    new_file: false,
+                })
+                .with_target(PlannedTarget {
+                    change_id: "source-b".to_owned(),
+                    path: "src/b.rs".to_owned(),
+                    role: "production".to_owned(),
+                    intent: "implement source behavior B".to_owned(),
+                    acceptance_criteria_ids: vec!["ac-1".to_owned()],
+                    operation: Default::default(),
+                    new_file: false,
+                })
+                .with_target(PlannedTarget {
+                    change_id: "source-c".to_owned(),
+                    path: "src/c.rs".to_owned(),
+                    role: "production".to_owned(),
+                    intent: "implement source behavior C".to_owned(),
+                    acceptance_criteria_ids: vec!["ac-1".to_owned()],
+                    operation: Default::default(),
+                    new_file: false,
+                })
+                .with_target(PlannedTarget {
+                    change_id: "test-d".to_owned(),
+                    path: "tests/d.rs".to_owned(),
+                    role: "test".to_owned(),
+                    intent: "cover the combined behavior in test D".to_owned(),
                     acceptance_criteria_ids: vec!["ac-1".to_owned()],
                     operation: Default::default(),
                     new_file: false,
                 })
                 .with_validation_gate(ValidationGateSpec {
-                    gate_id: "parser-tests".to_owned(),
+                    gate_id: "focused-tests".to_owned(),
                     gate_type: ValidationGateType::TestSuite,
-                    command: "cargo test parser".to_owned(),
+                    command: "cargo test focused".to_owned(),
                     working_directory: String::new(),
                     required: true,
                     dependency_lock_hash: "lock-v1".to_owned(),
                     relevant_environment_fingerprint: "rust-stable".to_owned(),
                 })
                 .with_action(ScriptedAction::ValidationResult {
-                    gate_id: "parser-tests".to_owned(),
+                    gate_id: "focused-tests".to_owned(),
                     result: ScriptedValidationResult::RecoverableFailure {
-                        message: "focused parser assertion failed".to_owned(),
+                        message: "focused assertion for test D failed".to_owned(),
                     },
                 });
         let mut harness = SimulationHarness::new(mission);
@@ -1703,6 +1843,31 @@ mod tests {
                 ..
             }
         ));
+        let active_repair_checkpoint = serde_json::to_string(&harness.snapshot)
+            .expect("serialize active validation repair checkpoint");
+        let resumed: ExecutionSnapshot = serde_json::from_str(&active_repair_checkpoint)
+            .expect("deserialize active validation repair checkpoint");
+        let resumed_decision = reconcile_execution(&resumed).expect("resume validation repair");
+        let resumed_repair_node_id = match resumed_decision {
+            ExecutionDecision::ExecuteTarget {
+                node_id,
+                action: crate::hosted_orchestrator::MutationAction::RepairTarget { .. },
+                ..
+            } => node_id,
+            other => panic!("active checkpoint resumed at {other:?}, expected validation repair"),
+        };
+        assert_eq!(
+            resumed.graph.node(&resumed_repair_node_id).unwrap().kind,
+            ExecutionNodeKind::ValidationRepair
+        );
+        assert!(
+            resumed
+                .graph
+                .nodes()
+                .filter(|node| node.kind.is_mutation())
+                .all(|node| node.status == ExecutionNodeStatus::Completed
+                    && node.attempts.len() == 1)
+        );
         assert!(matches!(
             apply_next_decision(&mut harness),
             ExecutionDecision::ExecuteTarget {
@@ -1710,6 +1875,22 @@ mod tests {
                 ..
             }
         ));
+        let repaired_repository_fingerprint =
+            harness.snapshot.current_repository.fingerprint.clone();
+        assert!(matches!(
+            apply_next_decision(&mut harness),
+            ExecutionDecision::RunValidation { .. }
+        ));
+        assert_eq!(
+            harness.validation_runs.last().unwrap().fingerprint,
+            harness
+                .snapshot
+                .graph
+                .nodes()
+                .find_map(|node| node.validation.as_ref())
+                .unwrap()
+                .fingerprint(&repaired_repository_fingerprint)
+        );
         let persisted = harness.snapshot.clone();
         let suffix = persisted.events[checkpoint.events.len()..].to_vec();
 
@@ -1724,16 +1905,39 @@ mod tests {
                 .any(|event| matches!(event, ExecutionDomainEvent::FailureRecovered { .. }))
         );
         assert_eq!(persisted.failures.unresolved().count(), 0);
-        let implementation = persisted
+        let implementations = persisted
             .graph
             .nodes()
-            .find(|node| node.kind.is_mutation())
-            .expect("implementation node");
-        assert_eq!(implementation.status, ExecutionNodeStatus::Completed);
-        assert!(
-            implementation.operation_evidence.len() >= 2,
-            "validation repair evidence must not reopen implementation"
-        );
+            .filter(|node| node.kind.is_mutation())
+            .collect::<Vec<_>>();
+        assert_eq!(implementations.len(), 4);
+        assert!(implementations.iter().all(|node| {
+            node.status == ExecutionNodeStatus::Completed
+                && node.operation_evidence.len() == 1
+                && node.attempts.len() == 1
+        }));
+        let repair = persisted
+            .graph
+            .nodes()
+            .find(|node| node.kind == ExecutionNodeKind::ValidationRepair)
+            .expect("separate validation repair node");
+        assert_eq!(repair.status, ExecutionNodeStatus::Completed);
+        assert_eq!(repair.attempts.len(), 1);
+        assert_eq!(repair.validation_repair_operation_evidence.len(), 1);
+        assert!(repair.operation_evidence.is_empty());
+        assert_eq!(repair.target.as_ref().unwrap().path, "tests/d.rs");
+        let originating = persisted
+            .graph
+            .node(
+                &repair
+                    .validation_repair
+                    .as_ref()
+                    .unwrap()
+                    .originating_implementation_node_id,
+            )
+            .unwrap();
+        assert_eq!(originating.target.as_ref().unwrap().path, "tests/d.rs");
+        assert_eq!(originating.status, ExecutionNodeStatus::Completed);
 
         let encoded = serde_json::to_string(&suffix).expect("serialize domain event suffix");
         let replay_events: Vec<ExecutionDomainEvent> =
@@ -1746,5 +1950,6 @@ mod tests {
         assert_eq!(replayed.graph, persisted.graph);
         assert_eq!(replayed.failures, persisted.failures);
         assert_eq!(replayed.events, persisted.events);
+        assert_eq!(replayed.target_revisions, persisted.target_revisions);
     }
 }

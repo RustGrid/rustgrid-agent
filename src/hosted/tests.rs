@@ -503,7 +503,7 @@ fn mutation_action_forces_two_exact_path_mutation_tools() {
 
 #[test]
 fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
-    let node_id = crate::execution_graph::ExecutionNodeId::new("source-000");
+    let node_id = crate::execution_graph::ExecutionNodeId::new("validation-repair-000");
     let validation_node = crate::execution_graph::ExecutionNodeId::new("validation-focused-000");
     let target = crate::execution_graph::PlannedTarget {
         change_id: "theme-provider".into(),
@@ -559,7 +559,7 @@ fn validation_repair_exposes_bounded_mutation_or_typed_no_repair_tools() {
     );
     assert_eq!(
         decision.budget_node_id().unwrap().as_str(),
-        "validation-focused-000"
+        "validation-repair-000"
     );
 }
 

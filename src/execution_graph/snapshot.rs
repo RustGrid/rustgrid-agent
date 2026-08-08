@@ -10,6 +10,8 @@ pub struct ExecutionSnapshot {
     pub budget: BudgetState,
     pub cancellation: Option<CancellationState>,
     pub publication: PublicationState,
+    #[serde(default)]
+    pub target_revisions: Vec<TargetRevision>,
 }
 
 impl ExecutionSnapshot {
@@ -66,20 +68,6 @@ impl ExecutionSnapshot {
         {
             satisfied.extend(publication.dependencies.iter().cloned());
         }
-
-        // A validation failure can reopen an already-applied mutation without
-        // invalidating later applied mutation nodes. Preserve only dependency
-        // lineage while the explicit validation repair remains unresolved;
-        // the target itself still appears in remaining work and is selected
-        // by the orchestrator for repair.
-        satisfied.extend(
-            self.failures
-                .unresolved()
-                .filter(|failure| failure.category == FailureCategory::ValidationFailure)
-                .filter_map(|failure| failure.target_path.as_deref())
-                .filter_map(|path| self.graph.unique_mutation_node_for_target_path(path))
-                .map(|node| node.id.clone()),
-        );
 
         for node in self
             .graph
@@ -241,6 +229,18 @@ impl ExecutionSnapshot {
                     }))
         });
         let repair_status = validation_failure.map_or(RepairStatus::NotRequired, |failure| {
+            let active_repair_status = self
+                .graph
+                .nodes
+                .iter()
+                .filter(|candidate| candidate.kind == ExecutionNodeKind::ValidationRepair)
+                .find_map(|candidate| {
+                    candidate
+                        .validation_repair
+                        .as_ref()
+                        .filter(|repair| repair.originating_implementation_node_id == *node_id)
+                        .map(|_| candidate.status)
+                });
             let latest = current_execution_epoch(&self.events)
                 .iter()
                 .rev()
@@ -280,6 +280,20 @@ impl ExecutionSnapshot {
                     }
                 }
                 None if already_applied => RepairStatus::AlreadySatisfied,
+                None if active_repair_status == Some(ExecutionNodeStatus::Running) => {
+                    RepairStatus::Running
+                }
+                None
+                    if matches!(
+                        active_repair_status,
+                        Some(
+                            ExecutionNodeStatus::FailedRecoverable
+                                | ExecutionNodeStatus::FailedBlocking
+                        )
+                    ) =>
+                {
+                    RepairStatus::Unresolved
+                }
                 None => RepairStatus::Pending,
             }
         });
@@ -813,7 +827,14 @@ impl ExecutionSnapshot {
             }
         }
 
-        if let ExecutionDomainEvent::ValidationRepairStarted { failure_id, .. } = &event {
+        if let ExecutionDomainEvent::ValidationRepairStarted {
+            failure_id,
+            repair_node_id,
+            originating_implementation_node_id,
+            target_ref,
+            failure_revision,
+            ..
+        } = &event {
             let session = self
                 .budget
                 .repair_session_for_failure(failure_id)
@@ -823,23 +844,131 @@ impl ExecutionSnapshot {
                         "validation repair start did not materialize its repair session",
                     )
                 })?;
-            let session_node_id = ExecutionNodeId::new(session.session_id.clone());
-            if let Some(node) = self.graph.node_mut(&session_node_id) {
-                node.status = ExecutionNodeStatus::Running;
-                node.budget = session.budget.as_node_budget();
+            if repair_node_id.as_str().is_empty() {
+                // Legacy journals represented session ownership as a graph
+                // node. Preserve replay without using that shape for new
+                // target-bound repair work.
+                let session_node_id = ExecutionNodeId::new(session.session_id.clone());
+                if let Some(node) = self.graph.node_mut(&session_node_id) {
+                    node.status = ExecutionNodeStatus::Running;
+                    node.budget = session.budget.as_node_budget();
+                } else {
+                    self.graph.nodes.push(ExecutionNode {
+                        id: session_node_id,
+                        kind: ExecutionNodeKind::ValidationRepairSession,
+                        dependencies: Vec::new(),
+                        status: ExecutionNodeStatus::Running,
+                        required: false,
+                        budget: session.budget.as_node_budget(),
+                        ..ExecutionNode::default()
+                    });
+                }
             } else {
-                self.graph.nodes.push(ExecutionNode {
-                    id: session_node_id,
-                    kind: ExecutionNodeKind::ValidationRepairSession,
-                    // Ownership is represented by the session's typed
-                    // originating gate. A failed gate cannot satisfy a graph
-                    // edge, so making it a dependency would deadlock repair.
-                    dependencies: Vec::new(),
-                    status: ExecutionNodeStatus::Running,
-                    required: false,
-                    budget: session.budget.as_node_budget(),
-                    ..ExecutionNode::default()
-                });
+                let originating = self
+                    .graph
+                    .node(originating_implementation_node_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        GraphInvariantError::with_code(
+                            "validation_repair_origin_missing",
+                            format!(
+                                "validation repair `{repair_node_id}` refers to missing implementation node `{originating_implementation_node_id}`"
+                            ),
+                        )
+                    })?;
+                if !originating.kind.is_mutation()
+                    || originating.status != ExecutionNodeStatus::Completed
+                    || originating.operation_evidence.is_empty()
+                {
+                    return Err(GraphInvariantError::with_code(
+                        "validation_repair_origin_not_completed",
+                        format!(
+                            "validation repair `{repair_node_id}` requires completed implementation node `{originating_implementation_node_id}` with operation evidence"
+                        ),
+                    ));
+                }
+                if originating
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| {
+                        target.path != target_ref.path
+                            || target.mutation_target_id().as_str() != target_ref.target_id
+                    })
+                {
+                    return Err(GraphInvariantError::with_code(
+                        "validation_repair_target_mismatch",
+                        "validation repair target identity does not match its originating implementation node",
+                    ));
+                }
+                if *failure_revision == 0
+                    || *failure_revision != session.current_assertion_set_revision
+                {
+                    return Err(GraphInvariantError::with_code(
+                        "validation_repair_failure_revision_stale",
+                        format!(
+                            "validation repair `{repair_node_id}` revision {failure_revision} is not current revision {}",
+                            session.current_assertion_set_revision
+                        ),
+                    ));
+                }
+                if let Some(node) = self.graph.node_mut(repair_node_id) {
+                    if node.kind != ExecutionNodeKind::ValidationRepair
+                        || node.validation_repair.as_ref().is_none_or(|repair| {
+                            repair.originating_implementation_node_id
+                                != *originating_implementation_node_id
+                                || repair.failure_revision != *failure_revision
+                        })
+                    {
+                        return Err(GraphInvariantError::with_code(
+                            "validation_repair_node_identity_conflict",
+                            format!("repair node `{repair_node_id}` was replayed with conflicting identity"),
+                        ));
+                    }
+                    if node.status == ExecutionNodeStatus::Ready {
+                        node.status = ExecutionNodeStatus::Running;
+                    }
+                } else {
+                    let target = originating.target.clone().ok_or_else(|| {
+                        GraphInvariantError::with_code(
+                            "validation_repair_target_missing",
+                            "originating implementation node has no repository target",
+                        )
+                    })?;
+                    let started_at = format!("validation-repair-revision:{failure_revision}");
+                    self.graph.nodes.push(ExecutionNode {
+                        id: repair_node_id.clone(),
+                        kind: ExecutionNodeKind::ValidationRepair,
+                        dependencies: vec![originating_implementation_node_id.clone()],
+                        status: ExecutionNodeStatus::Running,
+                        required: false,
+                        target: Some(target),
+                        attempts: vec![NodeAttempt {
+                            attempt: 1,
+                            started_at,
+                            repository_fingerprint_before: self
+                                .current_repository
+                                .fingerprint
+                                .clone(),
+                            ..NodeAttempt::default()
+                        }],
+                        budget: session.budget.as_node_budget(),
+                        validation_repair: Some(ValidationRepairNodeMetadata {
+                            repair_node_id: repair_node_id.clone(),
+                            target: target_ref.clone(),
+                            originating_implementation_node_id:
+                                originating_implementation_node_id.clone(),
+                            validation_session_id: session.session_id.clone(),
+                            failure_revision: *failure_revision,
+                            status: RepairNodeStatus::Running,
+                        }),
+                        ..ExecutionNode::default()
+                    });
+                }
+                if let Some(session) = self.budget.repair_session_for_failure_mut(failure_id)
+                    && !session.repair_nodes.contains(repair_node_id)
+                {
+                    session.repair_nodes.push(repair_node_id.clone());
+                }
             }
             self.graph.revision = self.graph.revision.saturating_add(1);
         }
@@ -857,13 +986,52 @@ impl ExecutionSnapshot {
             _ => None,
         };
         if let Some(failure_id) = completed_repair_failure
-            && let Some(session) = self.budget.repair_session_for_failure(failure_id)
+            && let Some(session) = self.budget.repair_session_for_failure(failure_id).cloned()
         {
             let session_node_id = ExecutionNodeId::new(session.session_id.clone());
             if let Some(node) = self.graph.node_mut(&session_node_id)
+                && node.kind == ExecutionNodeKind::ValidationRepairSession
                 && node.status != ExecutionNodeStatus::Skipped
             {
                 node.status = ExecutionNodeStatus::Skipped;
+                self.graph.revision = graph_revision_before_event.saturating_add(1);
+            }
+            if let Some(repair_node_id) = session.repair_nodes.last()
+                && let Some(node) = self.graph.node_mut(repair_node_id)
+                && node.kind == ExecutionNodeKind::ValidationRepair
+            {
+                let successful = matches!(
+                    &event,
+                    ExecutionDomainEvent::TargetOperationAlreadyApplied { .. }
+                        | ExecutionDomainEvent::ValidationRepairCompleted {
+                            result: RepairResult::MutationProduced { .. }
+                                | RepairResult::AlreadySatisfiesRepairIntent { .. },
+                            ..
+                        }
+                );
+                if successful && node.status != ExecutionNodeStatus::Completed {
+                    node.status = ExecutionNodeStatus::Completed;
+                } else if !successful {
+                    node.status = ExecutionNodeStatus::FailedBlocking;
+                }
+                if let Some(repair) = node.validation_repair.as_mut() {
+                    repair.status = if successful {
+                        RepairNodeStatus::Completed
+                    } else {
+                        RepairNodeStatus::Blocked
+                    };
+                }
+                if let Some(attempt) = node.attempts.last_mut()
+                    && attempt.completed_at.is_none()
+                {
+                    attempt.completed_at = Some(format!(
+                        "validation-repair-revision:{}",
+                        node.validation_repair
+                            .as_ref()
+                            .map_or(0, |repair| repair.failure_revision)
+                    ));
+                    attempt.outcome = Some(node.status);
+                }
                 self.graph.revision = graph_revision_before_event.saturating_add(1);
             }
         }
@@ -1000,6 +1168,7 @@ impl ExecutionSnapshot {
                 evidence_id,
                 ..
             } => {
+                let node = self.graph.node(node_id).cloned();
                 let progress = self.graph.node(node_id).map_or(
                     ProgressEventKind::SourceMutationApplied,
                     |node| {
@@ -1019,7 +1188,13 @@ impl ExecutionSnapshot {
                     .insert(target_path.clone());
                 self.evidence.record(EvidenceRecord {
                     evidence_id: evidence_id.clone(),
-                    kind: EvidenceKind::Mutation,
+                    kind: if node.as_ref().is_some_and(|node| {
+                        node.kind == ExecutionNodeKind::ValidationRepair
+                    }) {
+                        EvidenceKind::RepositoryOperationVerification
+                    } else {
+                        EvidenceKind::Mutation
+                    },
                     node_id: Some(node_id.clone()),
                     repository_fingerprint: repository_fingerprint.clone(),
                     summary: format!("authoritative repository mutation applied `{target_path}`"),
@@ -1035,6 +1210,30 @@ impl ExecutionSnapshot {
                 );
                 self.evidence
                     .supersede_stale_validation(repository_fingerprint);
+                if let Some(node) = node
+                    && let Some(target) = node.target.as_ref()
+                {
+                    let target_id = target.mutation_target_id().to_string();
+                    let revision = self
+                        .target_revisions
+                        .iter()
+                        .filter(|existing| existing.target_id == target_id)
+                        .map(|existing| existing.revision)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    self.target_revisions.push(TargetRevision {
+                        target_id,
+                        revision,
+                        producer: if node.kind == ExecutionNodeKind::ValidationRepair {
+                            TargetRevisionProducer::ValidationRepair(node.id.clone())
+                        } else {
+                            TargetRevisionProducer::InitialImplementation(node.id.clone())
+                        },
+                        repository_fingerprint: repository_fingerprint.clone().into(),
+                        content_hash: None,
+                    });
+                }
             }
             ExecutionDomainEvent::TargetOperationAlreadyApplied {
                 sequence,
@@ -1045,6 +1244,7 @@ impl ExecutionSnapshot {
                 repair_failure_id,
                 ..
             } => {
+                let node = self.graph.node(&transition.node_id).cloned();
                 let progress = self.graph.node(&transition.node_id).map_or(
                     ProgressEventKind::SourceMutationApplied,
                     |node| if node.kind == ExecutionNodeKind::TestMutation {
@@ -1073,6 +1273,30 @@ impl ExecutionSnapshot {
                 {
                     session.status = ValidationRepairSessionStatus::ReadyForRerun;
                     session.stop_reason = None;
+                }
+                if let Some(node) = node
+                    && let Some(target) = node.target.as_ref()
+                {
+                    let target_id = target.mutation_target_id().to_string();
+                    let revision = self
+                        .target_revisions
+                        .iter()
+                        .filter(|existing| existing.target_id == target_id)
+                        .map(|existing| existing.revision)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    self.target_revisions.push(TargetRevision {
+                        target_id,
+                        revision,
+                        producer: if node.kind == ExecutionNodeKind::ValidationRepair {
+                            TargetRevisionProducer::ValidationRepair(node.id.clone())
+                        } else {
+                            TargetRevisionProducer::InitialImplementation(node.id.clone())
+                        },
+                        repository_fingerprint: transition.repository_fingerprint.clone(),
+                        content_hash: transition.observed_result_hash.clone(),
+                    });
                 }
             }
             ExecutionDomainEvent::MutationRejected { failure, .. } => {
@@ -1344,6 +1568,11 @@ impl ExecutionSnapshot {
             _ => {}
         }
         self.events.push(event);
+        // `append_event` reduces into a cloned snapshot, so validating here
+        // makes every domain event an atomic clone -> reduce -> validate ->
+        // commit transition. Invalid repair activation can never leak a
+        // partially mutated graph into the persisted checkpoint.
+        self.validate_invariants()?;
         Ok(())
     }
 

@@ -68,6 +68,24 @@ fn validate_critical_worker_event_fields(data: &Value) -> std::result::Result<()
             "repair_budget",
             "target_node_id",
         ],
+        "worker.validation_repair_node_created"
+        | "worker.validation_repair_node_started"
+        | "worker.validation_repair_target_linked"
+        | "worker.validation_repair_operation_verified"
+        | "worker.validation_repair_node_completed"
+        | "worker.originating_implementation_node_preserved" => &[
+            "repair_node_id",
+            "originating_implementation_node_id",
+            "target_id",
+            "target_path",
+            "validation_node_id",
+            "failure_id",
+            "failure_revision",
+            "implementation_status_before",
+            "implementation_status_after",
+            "repair_status_before",
+            "repair_status_after",
+        ],
         "worker.graph_invariant_violation" => {
             &["category", "code", "phase", "resumable", "node_id"]
         }
@@ -1988,6 +2006,56 @@ impl<'a> GatewayAgent<'a> {
             ExecutionDecision::ExecuteTarget {
                 node_id,
                 action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
+                target,
+            } if target.validation_repair.is_some() => {
+                let repair = target.validation_repair.clone().unwrap_or_default();
+                let failure_id = crate::execution_graph::FailureId::new(
+                    repair.repair_intent.failed_validation_id.clone(),
+                );
+                let failure = self
+                    .notebook
+                    .orchestration
+                    .failures
+                    .get(&failure_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(HostedInvariantFailure::in_phase(
+                            "validation_repair_failure_missing",
+                            "validation_repair",
+                            format!(
+                                "repair node `{node_id}` has no originating validation failure"
+                            ),
+                        ))
+                    })?;
+                Some(ExecutionDomainEvent::ValidationRepairStarted {
+                    sequence,
+                    validation_node_id: failure.node_id,
+                    failure_id,
+                    repair_node_id: repair.repair_node_id,
+                    originating_implementation_node_id: repair.originating_implementation_node_id,
+                    target_ref: repair.target_ref,
+                    failure_revision: repair.failure_revision,
+                    repair_intent: repair.repair_intent,
+                    selected_target: target.target.path.clone(),
+                    implicated_paths: failure
+                        .assertion_failures
+                        .iter()
+                        .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    correction_contracts: repair.correction_contracts,
+                    requested_tool_policy:
+                        crate::execution_graph::MutationFallbackPolicy::NoSafeFallback,
+                    repository_fingerprint_before:
+                        crate::execution_graph::RepositoryFingerprint::new(
+                            repair.repository_fingerprint,
+                        ),
+                })
+            }
+            ExecutionDecision::ExecuteTarget {
+                node_id,
+                action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. },
                 ..
             } => node_started(node_id, self),
             ExecutionDecision::ExecuteTarget {
@@ -2002,10 +2070,24 @@ impl<'a> GatewayAgent<'a> {
                 ..
             } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
                 let repair = context.validation_repair.clone().unwrap_or_default();
-                Some(ExecutionDomainEvent::ValidationRepairStarted {
+                let already_started = self
+                    .notebook
+                    .orchestration
+                    .graph
+                    .as_ref()
+                    .and_then(|graph| graph.node(&repair.repair_node_id))
+                    .is_some_and(|node| {
+                        node.kind == ExecutionNodeKind::ValidationRepair
+                            && node.status == crate::execution_graph::ExecutionNodeStatus::Running
+                    });
+                (!already_started).then_some(ExecutionDomainEvent::ValidationRepairStarted {
                     sequence,
                     validation_node_id: failure.node_id.clone(),
                     failure_id: failure.id.clone(),
+                    repair_node_id: repair.repair_node_id,
+                    originating_implementation_node_id: repair.originating_implementation_node_id,
+                    target_ref: repair.target_ref,
+                    failure_revision: repair.failure_revision,
                     repair_intent: repair.repair_intent,
                     selected_target: target.path.clone(),
                     implicated_paths: failure
@@ -2177,8 +2259,72 @@ impl<'a> GatewayAgent<'a> {
                 })
             }
         };
+        let started_validation_repair = event.as_ref().and_then(|event| match event {
+            ExecutionDomainEvent::ValidationRepairStarted {
+                validation_node_id,
+                failure_id,
+                repair_node_id,
+                originating_implementation_node_id,
+                target_ref,
+                failure_revision,
+                ..
+            } if !repair_node_id.as_str().is_empty() => Some((
+                validation_node_id.clone(),
+                failure_id.clone(),
+                repair_node_id.clone(),
+                originating_implementation_node_id.clone(),
+                target_ref.clone(),
+                *failure_revision,
+            )),
+            _ => None,
+        });
         if let Some(event) = event {
             self.append_execution_domain_event(event)?;
+        }
+        if let Some((
+            validation_node_id,
+            failure_id,
+            repair_node_id,
+            originating_implementation_node_id,
+            target_ref,
+            failure_revision,
+        )) = started_validation_repair
+        {
+            let common = json!({
+                "repair_node_id": repair_node_id,
+                "originating_implementation_node_id": originating_implementation_node_id,
+                "target_id": target_ref.target_id,
+                "target_path": target_ref.path,
+                "validation_node_id": validation_node_id,
+                "failure_id": failure_id,
+                "failure_revision": failure_revision,
+                "implementation_status_before": "completed",
+                "implementation_status_after": "completed",
+                "repair_status_before": "ready",
+                "repair_status_after": "running",
+            });
+            for (event_type, message) in [
+                (
+                    "worker.validation_repair_node_created",
+                    "validation repair node created",
+                ),
+                (
+                    "worker.validation_repair_node_started",
+                    "validation repair node started",
+                ),
+                (
+                    "worker.validation_repair_target_linked",
+                    "validation repair target linked",
+                ),
+                (
+                    "worker.originating_implementation_node_preserved",
+                    "originating implementation node preserved",
+                ),
+            ] {
+                let mut data = common.clone();
+                data["event_type"] = Value::String(event_type.into());
+                self.append_event_recoverable("validation", data, message);
+            }
         }
         if let ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
@@ -3313,7 +3459,13 @@ impl<'a> GatewayAgent<'a> {
         bind_validation_repair_model_call(&mut event, self.active_model_call_id.as_deref());
         let mut snapshot = self.build_execution_snapshot()?;
         snapshot.append_event(event).map_err(|error| {
-            if validation_repair_admission {
+            if error.code == "completed_implementation_node_reopened" {
+                anyhow!(HostedInvariantFailure::in_phase(
+                    "completed_implementation_node_reopened",
+                    "validation_repair",
+                    error.to_string(),
+                ))
+            } else if validation_repair_admission {
                 anyhow!(HostedRepairAccountingFailure::incompatible_scope(
                     error.to_string()
                 ))
@@ -4367,6 +4519,25 @@ impl<'a> GatewayAgent<'a> {
                         .as_ref()
                         .map(|repair| repair.repair_intent.diagnosis)
                         .unwrap_or_default(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_node_id.clone())
+                        .unwrap_or_default(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.originating_implementation_node_id.clone())
+                        .unwrap_or_default(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.target_ref.clone())
+                        .unwrap_or_default(),
+                    target
+                        .validation_repair
+                        .as_ref()
+                        .map_or(0, |repair| repair.failure_revision),
                 ))
             }
             Some(ExecutionDecision::RepairTarget {
@@ -4398,6 +4569,29 @@ impl<'a> GatewayAgent<'a> {
                         .as_ref()
                         .map(|repair| repair.repair_intent.diagnosis)
                         .unwrap_or_default(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.repair_node_id.clone())
+                        .unwrap_or_default(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.originating_implementation_node_id.clone())
+                        .unwrap_or_default(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map(|repair| repair.target_ref.clone())
+                        .unwrap_or_default(),
+                    context
+                        .target
+                        .validation_repair
+                        .as_ref()
+                        .map_or(0, |repair| repair.failure_revision),
                 ))
             }
             _ => None,
@@ -4543,6 +4737,10 @@ impl<'a> GatewayAgent<'a> {
             requested_tool_policy,
             repository_fingerprint_before,
             diagnosis,
+            repair_node_id,
+            originating_implementation_node_id,
+            target_ref,
+            failure_revision,
         )) = validation_repair
         {
             let session = self
@@ -4586,6 +4784,37 @@ impl<'a> GatewayAgent<'a> {
                     }),
                 },
             )?;
+            let common = json!({
+                "repair_node_id": repair_node_id,
+                "originating_implementation_node_id": originating_implementation_node_id,
+                "target_id": target_ref.target_id,
+                "target_path": target_ref.path,
+                "validation_node_id": validation_node_id,
+                "failure_id": failure_id,
+                "failure_revision": failure_revision,
+                "implementation_status_before": "completed",
+                "implementation_status_after": "completed",
+                "repair_status_before": "running",
+                "repair_status_after": "completed",
+            });
+            for (event_type, message) in [
+                (
+                    "worker.validation_repair_operation_verified",
+                    "validation repair operation verified",
+                ),
+                (
+                    "worker.validation_repair_node_completed",
+                    "validation repair node completed",
+                ),
+                (
+                    "worker.originating_implementation_node_preserved",
+                    "originating implementation node preserved",
+                ),
+            ] {
+                let mut data = common.clone();
+                data["event_type"] = Value::String(event_type.into());
+                self.append_event_recoverable("validation", data, message);
+            }
             self.append_event_recoverable(
                 "validation",
                 json!({
@@ -4740,6 +4969,7 @@ impl<'a> GatewayAgent<'a> {
         };
         let semantic_id =
             transition.semantic_id(&self.manifest.execution.execution_id.to_string(), attempt);
+        let validation_repair_failure_id = repair_failure_id.clone();
         let revision_before = snapshot.graph.revision;
         self.append_event_recoverable(
             "progress",
@@ -4849,6 +5079,48 @@ impl<'a> GatewayAgent<'a> {
                 }),
                 description,
             );
+        }
+        if satisfied_intent == crate::execution_graph::SatisfiedIntent::ValidationRepair
+            && let Some(metadata) = node_after.and_then(|node| node.validation_repair.as_ref())
+            && let Some(failure_id) = validation_repair_failure_id
+        {
+            let validation_node_id = self
+                .notebook
+                .orchestration
+                .failures
+                .get(&failure_id)
+                .map(|failure| failure.node_id.clone());
+            let common = json!({
+                "repair_node_id": metadata.repair_node_id,
+                "originating_implementation_node_id": metadata.originating_implementation_node_id,
+                "target_id": metadata.target.target_id,
+                "target_path": metadata.target.path,
+                "validation_node_id": validation_node_id,
+                "failure_id": failure_id,
+                "failure_revision": metadata.failure_revision,
+                "implementation_status_before": "completed",
+                "implementation_status_after": "completed",
+                "repair_status_before": "running",
+                "repair_status_after": "completed",
+            });
+            for (event_type, message) in [
+                (
+                    "worker.validation_repair_operation_verified",
+                    "validation repair operation verified",
+                ),
+                (
+                    "worker.validation_repair_node_completed",
+                    "validation repair node completed",
+                ),
+                (
+                    "worker.originating_implementation_node_preserved",
+                    "originating implementation node preserved",
+                ),
+            ] {
+                let mut data = common.clone();
+                data["event_type"] = Value::String(event_type.into());
+                self.append_event_recoverable("validation", data, message);
+            }
         }
         Ok(())
     }

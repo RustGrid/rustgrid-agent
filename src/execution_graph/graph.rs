@@ -356,6 +356,8 @@ impl ExecutionGraph {
             .collect::<Vec<_>>();
         ImplementationBarrierProof {
             repository_fingerprint,
+            satisfied_at: format!("graph-revision:{}", self.revision),
+            implementation_revision: self.revision,
             required_nodes,
             completed_nodes,
             satisfied: unresolved_nodes.is_empty(),
@@ -407,6 +409,17 @@ impl ExecutionGraph {
             .ok_or_else(|| GraphInvariantError::new(format!("unknown execution node `{id}`")))?;
         if node.status == status {
             return Ok(GraphMutationResult::NoChange { current_revision: previous_revision });
+        }
+        if node.kind.is_mutation()
+            && !node.operation_evidence.is_empty()
+            && !can_transition_implementation_status(node.status, status)
+        {
+            return Err(GraphInvariantError::with_code(
+                "completed_implementation_node_reopened",
+                format!(
+                    "completed implementation node `{id}` with successful operation evidence cannot transition to {status:?}"
+                ),
+            ));
         }
         node.status = status;
         if status.is_success() {
