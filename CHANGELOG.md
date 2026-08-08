@@ -5,6 +5,30 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.43 - 2026-08-09
+
+### Changed
+
+- Represent validation repair as a target-bound graph node with its own
+  lifecycle, attempt ledger, budget ownership, operation evidence, target
+  revision history, telemetry, and durable resume identity.
+- Project implementation completion, active validation repair, and validation
+  freshness independently so later repair work does not rewrite historical
+  implementation state.
+
+### Fixed
+
+- Keep completed source and test implementation nodes monotonic when a failed
+  validation gate selects the same repository target for repair.
+- Preserve the implementation barrier and completed-change projection while a
+  repair runs, stale only prior validation evidence after a repair mutation,
+  and rerun validation against the repaired repository fingerprint.
+- Reject contradictory completed-evidence states atomically with
+  `OrchestrationStateInvariantFailure / completed_implementation_node_reopened
+  / validation_repair` before persistence.
+- Resume an active validation-repair node after checkpoint replay without
+  replaying implementation or charging implementation-repair allocation.
+
 ## 1.4.42 - 2026-08-08
 
 ### Fixed
