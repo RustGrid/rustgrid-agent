@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.40 - 2026-08-08
+
+### Changed
+
+- Reduce every verified repository operation through one authoritative,
+  atomic graph transition before selecting another orchestration decision.
+- Persist mutation lifecycle from proposal and validation through unverified
+  application and deterministic verification, with replay-safe defaults for
+  older checkpoints.
+- Resolve mutation fallback and validation repair through independent,
+  owner-scoped budgets and retain separate planning, review, and artifact
+  repair namespaces.
+- Emit contract-validated repository reduction, implementation barrier,
+  repair-session, cycle reconciliation, and invariant telemetry.
+
+### Fixed
+
+- Complete active nodes and final attempts after verified modifications,
+  creations, deletions, moves, renames, and already-applied operations instead
+  of leaving successful work Ready, Running, or Superseded.
+- Prevent cycle recovery and partial-review dependency overrides from starting
+  validation while required source or test mutations remain incomplete.
+- Keep recovered failure status separate from execution-node status and
+  preserve completed implementation nodes during validation repair.
+- Classify repair-accounting and successful-mutation convergence defects with
+  typed, resumable orchestration failures instead of initialization or generic
+  infrastructure failures.
+
 ## 1.4.39 - 2026-08-08
 
 ### Changed

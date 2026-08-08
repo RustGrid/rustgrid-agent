@@ -1,6 +1,6 @@
 [package]
 name = "rustgrid-agent"
-version = "1.4.39"
+version = "1.4.40"
 edition = "2024"
 rust-version = "1.94"
 description = "Run Codex against RustGrid tickets and publish the result as a GitHub pull request"
