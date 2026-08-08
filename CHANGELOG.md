@@ -5,6 +5,34 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.39 - 2026-08-08
+
+### Changed
+
+- Represent already-satisfied repository operations as typed, immutable
+  evidence and converge them through the same execution graph as applied
+  mutations.
+- Derive orchestration decisions, externally reported phases, retry identity,
+  and terminal selection from canonical graph, repository, validation, and
+  publication state.
+- Track lease renewal independently from semantic progress and bound repeated
+  deterministic orchestration cycles with typed cancellation ownership.
+
+### Fixed
+
+- Advance downstream work after an operation is already applied instead of
+  repeatedly probing or dispatching the same mutation decision.
+- Reconcile stale active-node pointers without changing graph revision and
+  preserve useful partial diffs when later validation or infrastructure work
+  cannot complete.
+- Keep semantic decision identity stable across graph-revision-only changes,
+  deduplicate repeated decisions, and stop no-progress cycles after two
+  identical observations.
+- Preserve validation-repair intent, failure identity, and current repository
+  evidence when an already-applied repair proceeds directly to validation.
+- Update the pinned Node runtime image to 24.18.1, which contains upstream
+  fixes for the newly disclosed high-severity Node vulnerabilities.
+
 ## 1.4.38 - 2026-08-05
 
 ### Changed

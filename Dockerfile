@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 ARG RUST_BUILDER_IMAGE=rust:1.94-bookworm
-ARG NODE_RUNTIME_IMAGE=node:24-trixie-slim
+ARG NODE_RUNTIME_IMAGE=node:24.18.1-trixie-slim
 FROM ${RUST_BUILDER_IMAGE} AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

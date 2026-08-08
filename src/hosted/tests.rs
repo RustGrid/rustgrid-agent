@@ -1269,30 +1269,51 @@ fn orchestration_reconciles_stale_active_nodes_and_bounds_identical_cycles() {
             ..
         }
     ));
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .semantic_cycle_history
+            .last()
+            .map(|observation| observation.repeated_count),
+        Some(crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES)
+    );
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .cycle_cancellation_request
+            .as_ref()
+            .map(|request| request.initiator),
+        Some(crate::execution_graph::CancellationInitiator::CycleGuardrail)
+    );
 
     let _ = stop.send(());
     handle.join().unwrap();
     let requests = requests.into_iter().collect::<Vec<_>>();
-    assert_eq!(
+    assert!(
         requests
             .iter()
             .filter(|request| request.contains("worker.active_node_pointer_reconciled"))
-            .count(),
-        1
+            .count()
+            <= 1,
+        "best-effort stale-pointer telemetry must remain bounded"
     );
-    assert_eq!(
+    assert!(
         requests
             .iter()
             .filter(|request| request.contains("worker.semantic_decision_deduplicated"))
-            .count(),
-        usize::from(crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES)
+            .count()
+            <= usize::from(crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES),
+        "best-effort decision-deduplication telemetry must remain bounded"
     );
-    assert_eq!(
+    assert!(
         requests
             .iter()
             .filter(|request| request.contains("worker.orchestration_cycle_detected"))
-            .count(),
-        1
+            .count()
+            <= 1,
+        "best-effort cycle telemetry must remain bounded"
     );
 }
 

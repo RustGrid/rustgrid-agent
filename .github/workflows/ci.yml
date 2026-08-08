@@ -29,7 +29,7 @@ jobs:
           CODEX_VERSION: 0.144.4
           NPM_VERSION: 12.0.1
           RUST_BUILDER_IMAGE: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
-          NODE_RUNTIME_IMAGE: node:24-trixie-slim@sha256:ae91dcc111a68c9d2d81ff2a17bda61be126426176fde6fe7d08ab13b7f50573
+          NODE_RUNTIME_IMAGE: node:24.18.1-trixie-slim@sha256:ac39e4b5fcb2b1b34b20364fd58b2e898f3bb80731ee6f62a7536f9df3d6aadc
         run: |
           docker build \
             --build-arg "CODEX_VERSION=${CODEX_VERSION}" \
