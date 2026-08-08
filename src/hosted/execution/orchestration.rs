@@ -67,6 +67,7 @@ impl<'a> GatewayAgent<'a> {
         trusted_git_config: &[u8],
         running: &'a Arc<AtomicBool>,
         stop_reason: &'a Arc<Mutex<Option<HostedStopReason>>>,
+        lease_renewed_at: &'a Arc<Mutex<Option<String>>>,
         containment: &'a command::HostedProcessContainment,
         partial_run: Option<PartialRunContext>,
     ) -> Result<Self> {
@@ -301,6 +302,7 @@ impl<'a> GatewayAgent<'a> {
             trusted_git_config: trusted_git_config.to_vec(),
             running,
             stop_reason,
+            lease_renewed_at,
             containment,
             budget,
             phases,
@@ -2530,6 +2532,11 @@ impl<'a> GatewayAgent<'a> {
     pub(in crate::hosted) fn build_execution_snapshot(
         &mut self,
     ) -> Result<crate::execution_graph::ExecutionSnapshot> {
+        self.notebook.orchestration.worker_liveness.lease_renewed_at = self
+            .lease_renewed_at
+            .lock()
+            .expect("hosted lease renewal timestamp lock poisoned")
+            .clone();
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
         self.notebook.repository_fingerprint = fingerprint.clone();
         // Wall-clock admission is part of the immutable snapshot consumed by
@@ -2751,10 +2758,38 @@ impl<'a> GatewayAgent<'a> {
                 return Err(error);
             }
         };
-        self.notebook
-            .orchestration
-            .worker_liveness
-            .last_semantic_progress_at = Some(now_rfc3339());
+        let validation_changed = self.notebook.orchestration.domain_events
+            [snapshot.events.len().min(self.notebook.orchestration.domain_events.len())..]
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    crate::execution_graph::ExecutionDomainEvent::ValidationStarted { .. }
+                        | crate::execution_graph::ExecutionDomainEvent::ValidationPassed { .. }
+                        | crate::execution_graph::ExecutionDomainEvent::ValidationFailed { .. }
+                        | crate::execution_graph::ExecutionDomainEvent::ValidationRepairStarted { .. }
+                        | crate::execution_graph::ExecutionDomainEvent::ValidationRepairCompleted { .. }
+                        | crate::execution_graph::ExecutionDomainEvent::ValidationSuperseded { .. }
+                )
+            });
+        let cycle_result = crate::execution_graph::OrchestrationCycleResult {
+            graph_changed: self.notebook.orchestration.graph_revision != snapshot.graph.revision,
+            repository_changed: self.notebook.repository_fingerprint
+                != snapshot.current_repository.fingerprint,
+            validation_changed,
+            phase_changed: matches!(result.phase_decision, PhaseDecision::Transition(_)),
+            external_wait_scheduled: false,
+            terminal_selected: matches!(
+                result.decision,
+                ExecutionDecision::Finish { .. } | ExecutionDecision::StopForGuardrail { .. }
+            ),
+        };
+        if cycle_result.made_semantic_progress() {
+            self.notebook
+                .orchestration
+                .worker_liveness
+                .last_semantic_progress_at = Some(now_rfc3339());
+        }
         self.append_event_recoverable(
             "progress",
             json!({

@@ -227,8 +227,13 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
     let stop_reason = Arc::new(Mutex::new(None));
-    let supervisor =
-        HostedSupervisor::start(api.clone(), Arc::clone(&running), Arc::clone(&stop_reason));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let supervisor = HostedSupervisor::start(
+        api.clone(),
+        Arc::clone(&running),
+        Arc::clone(&stop_reason),
+        Arc::clone(&lease_renewed_at),
+    );
     let started_at = now_rfc3339();
     send_execution_telemetry(
         &api,
@@ -239,7 +244,14 @@ fn execute_github_actions_impl(execution_id: Uuid) -> Result<()> {
         1,
     );
 
-    let result = run_hosted_execution(&api, &manifest, &git_author, &running, &stop_reason);
+    let result = run_hosted_execution(
+        &api,
+        &manifest,
+        &git_author,
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+    );
     supervisor.stop();
     let terminal_at = now_rfc3339();
     match result {
@@ -804,6 +816,12 @@ fn reconcile_hosted_heartbeat(
     }
 }
 
+fn record_successful_lease_renewal(lease_renewed_at: &Mutex<Option<String>>) {
+    *lease_renewed_at
+        .lock()
+        .expect("hosted lease renewal timestamp lock poisoned") = Some(now_rfc3339());
+}
+
 impl HostedLeaseControlPlane for HostedApiClient {
     fn renew_execution_lease(&self) -> std::result::Result<(), HostedLeaseFailure> {
         self.heartbeat().map_err(|error| {
@@ -836,14 +854,16 @@ impl HostedSupervisor {
         api: HostedApiClient,
         running: Arc<AtomicBool>,
         stop_reason: Arc<Mutex<Option<HostedStopReason>>>,
+        lease_renewed_at: Arc<Mutex<Option<String>>>,
     ) -> Self {
-        Self::start_with(api, running, stop_reason)
+        Self::start_with(api, running, stop_reason, lease_renewed_at)
     }
 
     fn start_with<C: HostedLeaseControlPlane>(
         api: C,
         running: Arc<AtomicBool>,
         stop_reason: Arc<Mutex<Option<HostedStopReason>>>,
+        lease_renewed_at: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -858,8 +878,14 @@ impl HostedSupervisor {
                     thread::sleep(Duration::from_millis(250));
                     continue;
                 }
-                match reconcile_hosted_heartbeat(&mut failures, api.renew_execution_lease()) {
-                    HostedHeartbeatAction::Continue => {}
+                let renewal = api.renew_execution_lease();
+                let renewed = renewal.is_ok();
+                match reconcile_hosted_heartbeat(&mut failures, renewal) {
+                    HostedHeartbeatAction::Continue => {
+                        if renewed {
+                            record_successful_lease_renewal(&lease_renewed_at);
+                        }
+                    }
                     HostedHeartbeatAction::Stop(reason) => {
                         *stop_reason
                             .lock()
@@ -898,6 +924,7 @@ fn run_hosted_execution(
     git_author: &GithubActionsAuthor,
     running: &Arc<AtomicBool>,
     stop_reason: &Arc<Mutex<Option<HostedStopReason>>>,
+    lease_renewed_at: &Arc<Mutex<Option<String>>>,
 ) -> Result<HostedResult> {
     ensure_running(running)?;
     if let Err(error) = validate_hosted_provider_startup_contract(manifest) {
@@ -987,6 +1014,7 @@ fn run_hosted_execution(
         &trusted_git_config,
         running,
         stop_reason,
+        lease_renewed_at,
         &containment,
         partial_run,
     )

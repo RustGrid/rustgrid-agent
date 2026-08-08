@@ -571,7 +571,12 @@ fn all_required_mutations_applied(snapshot: &ExecutionSnapshot) -> bool {
         .nodes
         .iter()
         .filter(|node| node.required && node.kind.is_mutation())
-        .all(|node| node.status == ExecutionNodeStatus::Applied)
+        .all(|node| {
+            matches!(
+                node.status,
+                ExecutionNodeStatus::Applied | ExecutionNodeStatus::Completed
+            )
+        })
 }
 
 fn latest_validation_repair_result<'a>(
@@ -2946,6 +2951,15 @@ mod tests {
         ] {
             let mut state = snapshot(&[target("one", "src/one.rs")]);
             complete_node(&mut state, ExecutionNodeKind::SourceMutation);
+            if category == FailureCategory::InfrastructureFailure {
+                let mutation = state
+                    .graph
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.kind.is_mutation())
+                    .expect("mutation node");
+                mutation.status = ExecutionNodeStatus::Completed;
+            }
             state
                 .current_repository
                 .changed_paths

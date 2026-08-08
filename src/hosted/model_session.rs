@@ -44,6 +44,7 @@ pub(super) struct GatewayAgent<'a> {
     pub(super) trusted_git_config: Vec<u8>,
     pub(super) running: &'a Arc<AtomicBool>,
     pub(super) stop_reason: &'a Arc<Mutex<Option<HostedStopReason>>>,
+    pub(super) lease_renewed_at: &'a Arc<Mutex<Option<String>>>,
     pub(super) containment: &'a command::HostedProcessContainment,
     pub(super) budget: BudgetAudit,
     pub(super) phases: PhaseLedger,

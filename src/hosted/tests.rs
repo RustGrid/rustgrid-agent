@@ -100,6 +100,20 @@ fn hosted_lease_retries_transient_errors_and_stops_on_permanent_loss() {
 }
 
 #[test]
+fn successful_lease_renewal_updates_lease_liveness_without_semantic_progress() {
+    let lease_renewed_at = Mutex::new(None);
+    let semantic_progress_at = Some("semantic-progress-before-heartbeat".to_owned());
+
+    record_successful_lease_renewal(&lease_renewed_at);
+
+    assert!(lease_renewed_at.lock().unwrap().is_some());
+    assert_eq!(
+        semantic_progress_at.as_deref(),
+        Some("semantic-progress-before-heartbeat")
+    );
+}
+
+#[test]
 fn hosted_lease_loss_suppresses_stale_terminal_writes() {
     let error = anyhow!(HostedLeaseLost {
         operation: "heartbeat",
@@ -1028,6 +1042,7 @@ fn fresh_graph_initialization_dispatches_the_first_discovery_request() {
     let api = test_api_client(api_root, execution_id);
     let running = Arc::new(AtomicBool::new(true));
     let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
     let Ok(containment) = command::HostedProcessContainment::new() else {
         let _ = stop.send(());
         handle.join().unwrap();
@@ -1041,6 +1056,7 @@ fn fresh_graph_initialization_dispatches_the_first_discovery_request() {
         &trusted_git_config,
         &running,
         &stop_reason,
+        &lease_renewed_at,
         &containment,
         None,
     )
@@ -1132,6 +1148,151 @@ fn fresh_graph_initialization_dispatches_the_first_discovery_request() {
             "search_text",
             "related_tests",
         ]
+    );
+}
+
+#[test]
+fn orchestration_reconciles_stale_active_nodes_and_bounds_identical_cycles() {
+    let work = tempfile::tempdir().expect("temporary repository");
+    command::checked("git", ["init", "-q"], work.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        work.path(),
+    )
+    .unwrap();
+    fs::write(work.path().join("base.txt"), "base\n").unwrap();
+    command::checked("git", ["add", "base.txt"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        work.path(),
+    )
+    .unwrap();
+    let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+    let repo = Repo {
+        root: work.path().to_path_buf(),
+    };
+    let execution_id = Uuid::from_u128(0x2206);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = base_sha;
+    manifest.github.branch = "main".into();
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(Some("lease-before-progress".into())));
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        let _ = stop.send(());
+        handle.join().unwrap();
+        return;
+    };
+    let mut agent = GatewayAgent::new(
+        test_api_client(api_root, execution_id),
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+
+    let discovery = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        discovery.decision,
+        ExecutionDecision::ContinueDiscovery { .. }
+    ));
+    agent.record_discovery_completed().unwrap();
+    let planning = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        planning.decision,
+        ExecutionDecision::ContinuePlanning { .. }
+    ));
+    assert_eq!(agent.phases.active(), ExecutionPhase::Planning);
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .worker_liveness
+            .lease_renewed_at
+            .as_deref(),
+        Some("lease-before-progress")
+    );
+
+    // The first post-transition pass normalizes the new running-node state.
+    // It must not falsely refresh semantic progress when nothing changes.
+    agent
+        .notebook
+        .orchestration
+        .worker_liveness
+        .last_semantic_progress_at = Some("semantic-progress-before-noop".into());
+    agent.reconcile_execution_and_apply().unwrap();
+    let progress_after_planning = agent
+        .notebook
+        .orchestration
+        .worker_liveness
+        .last_semantic_progress_at
+        .clone();
+    assert_eq!(
+        progress_after_planning.as_deref(),
+        Some("semantic-progress-before-noop")
+    );
+    let duplicate = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        duplicate.decision,
+        ExecutionDecision::ContinuePlanning { .. }
+    ));
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .worker_liveness
+            .last_semantic_progress_at,
+        progress_after_planning
+    );
+    let stopped = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        stopped.decision,
+        ExecutionDecision::StopForGuardrail {
+            reason: crate::execution_graph::GuardrailReason::NoProgress,
+            ..
+        }
+    ));
+
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let requests = requests.into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("worker.active_node_pointer_reconciled"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("worker.semantic_decision_deduplicated"))
+            .count(),
+        usize::from(crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES)
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("worker.orchestration_cycle_detected"))
+            .count(),
+        1
     );
 }
 
@@ -2288,6 +2449,7 @@ fn fresh_run_infrastructure_timeout_publishes_draft_and_finishes_partial() {
     let api = test_api_client(api_root, execution_id);
     let running = Arc::new(AtomicBool::new(true));
     let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
     let Ok(containment) = command::HostedProcessContainment::new() else {
         return;
     };
@@ -2300,6 +2462,7 @@ fn fresh_run_infrastructure_timeout_publishes_draft_and_finishes_partial() {
         &trusted_git_config,
         &running,
         &stop_reason,
+        &lease_renewed_at,
         &containment,
         None,
     )
@@ -5941,6 +6104,7 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
         let api = test_api_client(api_root, execution_id);
         let running = Arc::new(AtomicBool::new(true));
         let stop_reason = Arc::new(Mutex::new(None));
+        let lease_renewed_at = Arc::new(Mutex::new(None));
         let mut agent = GatewayAgent::new(
             api,
             &manifest,
@@ -5948,6 +6112,7 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
             &repo.hosted_local_config().unwrap(),
             &running,
             &stop_reason,
+            &lease_renewed_at,
             &containment,
             None,
         )

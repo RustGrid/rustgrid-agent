@@ -40,6 +40,82 @@ fn graph(targets: &[GraphPlannedTarget]) -> ExecutionGraph {
     )
 }
 
+#[test]
+fn external_phase_and_stage_are_derived_from_canonical_graph_state() {
+    let mut execution_graph = graph(&[target("change", "src/lib.rs", "production")]);
+    for kind in [ExecutionNodeKind::Discovery, ExecutionNodeKind::Planning] {
+        execution_graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == kind)
+            .expect("graph node")
+            .status = ExecutionNodeStatus::Completed;
+    }
+    let mutation_id = execution_graph
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind.is_mutation())
+        .map(|node| {
+            node.status = ExecutionNodeStatus::Running;
+            node.id.clone()
+        })
+        .expect("mutation node");
+    execution_graph.refresh_readiness();
+    let mut checkpoint = HostedOrchestrationCheckpoint {
+        graph: Some(execution_graph),
+        ..HostedOrchestrationCheckpoint::default()
+    };
+    assert_eq!(
+        checkpoint.execution_phase(ExecutionPhase::Discovery),
+        ExecutionPhase::Implementation
+    );
+    assert_eq!(
+        checkpoint.hosted_stage(),
+        HostedExecutionStage::Implementation
+    );
+
+    checkpoint.failures.record(FailureRecord::new(
+        "mutation-failure",
+        mutation_id,
+        FailureCategory::MutationConflict,
+        1,
+        "tree-1",
+        "mutation needs repair",
+    ));
+    assert_eq!(
+        checkpoint.execution_phase(ExecutionPhase::Implementation),
+        ExecutionPhase::Repair
+    );
+
+    let graph = checkpoint.graph.as_mut().expect("graph");
+    graph
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind.is_mutation())
+        .expect("mutation node")
+        .status = ExecutionNodeStatus::Completed;
+    graph.refresh_readiness();
+    assert_eq!(
+        checkpoint.execution_phase(ExecutionPhase::Repair),
+        ExecutionPhase::Validation
+    );
+    assert_eq!(checkpoint.hosted_stage(), HostedExecutionStage::Validation);
+
+    let graph = checkpoint.graph.as_mut().expect("graph");
+    graph
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind.is_validation())
+        .expect("validation node")
+        .status = ExecutionNodeStatus::Passed;
+    graph.refresh_readiness();
+    assert_eq!(
+        checkpoint.execution_phase(ExecutionPhase::Validation),
+        ExecutionPhase::DiffReview
+    );
+    assert_eq!(checkpoint.hosted_stage(), HostedExecutionStage::Review);
+}
+
 fn notebook(phase: ExecutionPhase) -> WorkerNotebook {
     serde_json::from_value(json!({
         "schema_version": 1,

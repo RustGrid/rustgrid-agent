@@ -266,13 +266,20 @@ pub struct OrchestrationCycleResult {
     pub graph_changed: bool,
     pub repository_changed: bool,
     pub validation_changed: bool,
+    #[serde(default)]
+    pub phase_changed: bool,
     pub external_wait_scheduled: bool,
     pub terminal_selected: bool,
 }
 
 impl OrchestrationCycleResult {
     pub const fn made_semantic_progress(&self) -> bool {
-        self.graph_changed || self.repository_changed || self.validation_changed || self.external_wait_scheduled || self.terminal_selected
+        self.graph_changed
+            || self.repository_changed
+            || self.validation_changed
+            || self.phase_changed
+            || self.external_wait_scheduled
+            || self.terminal_selected
     }
 }
 
