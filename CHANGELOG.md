@@ -5,6 +5,32 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.41 - 2026-08-08
+
+### Changed
+
+- Separate repository-operation verification, implementation-barrier proof,
+  validation-gate results, review, completion, and publication evidence into
+  explicit lifecycle proof classes.
+- Evaluate lifecycle invariants only in the phases where their required
+  evidence can legally exist, with startup validation for invariant
+  dependencies and a deterministic next-phase resolver.
+- Persist one resumability decision containing the reason, next unresolved
+  node, and repository fingerprint across terminal projections and callbacks.
+- Emit structured invariant, future-evidence suppression, implementation
+  barrier, and next-implementation-node telemetry.
+
+### Fixed
+
+- Stop requiring automated validation immediately after an individual
+  repository operation is verified while other implementation targets remain.
+- Advance multi-target, mutation-fallback, and already-applied executions to
+  the next unresolved implementation node without replaying completed work.
+- Require current fingerprint-bound validation only for review, completion,
+  and publication decisions, and stale prior validation after later repairs.
+- Preserve the exact orchestration-state invariant category, specific failure
+  code, actual phase, and resumability in runtime and terminal reporting.
+
 ## 1.4.40 - 2026-08-08
 
 ### Changed
