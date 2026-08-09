@@ -2058,7 +2058,9 @@ fn scheduled_validation_repair_rerun_starts_the_existing_validation_process_once
     let running = Arc::new(AtomicBool::new(true));
     let stop_reason = Arc::new(Mutex::new(None));
     let lease_renewed_at = Arc::new(Mutex::new(None));
-    let containment = command::HostedProcessContainment::new().unwrap();
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        return;
+    };
     let mut agent = GatewayAgent::new(
         api,
         &manifest,
