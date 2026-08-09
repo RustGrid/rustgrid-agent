@@ -5,6 +5,17 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.45 - 2026-08-09
+
+### Fixed
+
+- Execute the originating validation command after a successful validation
+  repair by consuming its already-scheduled `RunValidation` handoff instead of
+  selecting the identical decision again before process launch.
+- Prevent a repaired validation gate from repeating `run_validation` until the
+  semantic cycle guardrail fires while preserving the existing initial
+  validation, repair, failure, and subsequent-gate flows.
+
 ## 1.4.44 - 2026-08-09
 
 ### Changed
