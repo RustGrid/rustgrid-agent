@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.46 - 2026-08-09
+
+### Fixed
+
+- Preserve a bounded, failure-weighted tail when large non-zero validation
+  output is summarized for validation diagnosis.
+- Keep failing test names, assertion details, and source locations available to
+  the existing validation parser instead of retaining only earlier passing-test
+  output.
+
 ## 1.4.45 - 2026-08-09
 
 ### Fixed
