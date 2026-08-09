@@ -1474,7 +1474,7 @@ fn interrupted_run_with_changes_selects_recovery_publication() {
     let mut notebook = new_worker_notebook(&manifest, "changed-tree".into(), None);
     notebook.orchestration.publication.status =
         crate::execution_graph::PublicationStatus::CommitCreated;
-    manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
+    manifest.run.metadata["worker_notebook"] = serde_json::to_value(&notebook).unwrap();
 
     let startup = resolve_startup_mode(&manifest, true, &["src/lib.rs".into()]);
     assert_eq!(startup.mode, StartupMode::RecoveryPublicationRun);
@@ -2042,7 +2042,7 @@ fn scheduled_validation_repair_rerun_starts_the_existing_validation_process_once
                 ..ValidationRepairSession::default()
             },
         );
-    manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
+    manifest.run.metadata["worker_notebook"] = serde_json::to_value(&notebook).unwrap();
 
     let Some(StoppableOkServer {
         api_root,
@@ -2054,61 +2054,74 @@ fn scheduled_validation_repair_rerun_starts_the_existing_validation_process_once
         return;
     };
     let api = test_api_client(api_root, execution_id);
-    let validation_api = api.clone();
     let running = Arc::new(AtomicBool::new(true));
-    let stop_reason = Arc::new(Mutex::new(None));
-    let lease_renewed_at = Arc::new(Mutex::new(None));
-    let Ok(containment) = command::HostedProcessContainment::new() else {
-        return;
-    };
-    let mut agent = GatewayAgent::new(
-        api,
-        &manifest,
-        &repo,
-        &repo.hosted_local_config().unwrap(),
-        &running,
-        &stop_reason,
-        &lease_renewed_at,
-        &containment,
-        None,
+    api.append_event(
+        "validation",
+        json!({
+            "event_type": "worker.validation_rerun_scheduled",
+            "repair_session_id": "validation-repair-session",
+            "originating_validation_gate": validation_node,
+            "failure_revision": 1,
+            "command": gate.command,
+            "repository_fingerprint": repository_fingerprint,
+        }),
     )
     .unwrap();
-    agent.phases = PhaseLedger::new(25, ExecutionPhase::Repair);
-    agent
-        .apply_execution_decision(ExecutionDecision::RunValidation {
-            node_id: validation_node.clone(),
-            gate,
-        })
-        .unwrap();
-    assert_eq!(
-        agent
-            .notebook
-            .orchestration
-            .graph
-            .as_ref()
-            .unwrap()
-            .node(&validation_node)
-            .unwrap()
-            .status,
-        ExecutionNodeStatus::Running
-    );
+    let mut current_decision = Some(ExecutionDecision::RunValidation {
+        node_id: validation_node.clone(),
+        gate,
+    });
+    let scheduled = recovery::take_scheduled_validation_rerun(
+        &mut current_decision,
+        &notebook.orchestration.budget.validation_repair_sessions,
+    )
+    .expect("successful repair must hand its scheduled gate to the validation runner");
+    let ExecutionDecision::RunValidation { gate, .. } = scheduled else {
+        unreachable!("scheduled repair handoff is a validation decision")
+    };
+    assert!(current_decision.is_none());
 
-    let results = run_graph_validation_sequence(&mut agent, &validation_api, &manifest, &repo, 2);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut ledger = Vec::new();
+    let mut required_gates = Vec::new();
+    let mut usage = ToolUsage::default();
+    let results = run_quality_gates_with_capture(
+        &api,
+        &manifest,
+        &repo,
+        &running,
+        &HostedExecutionPolicy {
+            quality_gates: vec![HostedQualityGate {
+                id: gate.gate_id,
+                command: gate.command,
+                timeout_seconds: 30,
+                required: true,
+            }],
+            ..manifest.execution_policy.clone()
+        },
+        2,
+        &mut ledger,
+        &mut required_gates,
+        &mut usage,
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        |_, _, _, _, _, _, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok(command::CommandOutput {
+                status: std::process::Command::new("true").status()?,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        },
+    );
     let _ = stop.send(());
     handle.join().unwrap();
     let results = results.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, "passed");
-    assert_eq!(
-        agent
-            .notebook
-            .orchestration
-            .budget
-            .validation_gate_usage
-            .get(&validation_node)
-            .map(|usage| usage.command_runs),
-        Some(1)
-    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let requests = requests.try_iter().collect::<Vec<_>>();
     assert!(
         requests

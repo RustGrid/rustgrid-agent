@@ -1390,26 +1390,16 @@ pub(super) fn run_graph_validation_sequence(
         .unwrap_or_else(|| manifest.execution_policy.quality_gates.len())
         .saturating_add(1);
     for _ in 0..maximum_steps {
-        let decision = match agent.current_decision.take() {
-            Some(ExecutionDecision::RunValidation { node_id, gate })
-                if agent
-                    .notebook
-                    .orchestration
-                    .budget
-                    .validation_repair_sessions
-                    .values()
-                    .any(|session| {
-                        session.originating_gate_id == node_id
-                            && session.status
-                                == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
-                    }) =>
-            {
-                ExecutionDecision::RunValidation { node_id, gate }
-            }
-            current => {
-                agent.current_decision = current;
-                agent.reconcile_execution_and_apply()?.decision
-            }
+        let decision = match take_scheduled_validation_rerun(
+            &mut agent.current_decision,
+            &agent
+                .notebook
+                .orchestration
+                .budget
+                .validation_repair_sessions,
+        ) {
+            Some(decision) => decision,
+            None => agent.reconcile_execution_and_apply()?.decision,
         };
         let (node_id, gate) = match decision {
             ExecutionDecision::RunValidation { node_id, gate } => (node_id, gate),
@@ -1721,4 +1711,29 @@ pub(super) fn run_graph_validation_sequence(
         }
     }
     bail!("hosted validation graph exceeded its deterministic gate bound")
+}
+
+pub(super) fn take_scheduled_validation_rerun(
+    current_decision: &mut Option<ExecutionDecision>,
+    sessions: &BTreeMap<
+        crate::execution_graph::RepairSessionId,
+        crate::execution_graph::ValidationRepairSession,
+    >,
+) -> Option<ExecutionDecision> {
+    let scheduled = current_decision.take();
+    match scheduled {
+        Some(ExecutionDecision::RunValidation { node_id, gate })
+            if sessions.values().any(|session| {
+                session.originating_gate_id == node_id
+                    && session.status
+                        == crate::execution_graph::ValidationRepairSessionStatus::ReadyForRerun
+            }) =>
+        {
+            Some(ExecutionDecision::RunValidation { node_id, gate })
+        }
+        current => {
+            *current_decision = current;
+            None
+        }
+    }
 }
