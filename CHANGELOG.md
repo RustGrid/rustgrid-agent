@@ -5,6 +5,35 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.44 - 2026-08-09
+
+### Changed
+
+- Define repository mutation as an execution-node capability shared by source,
+  test, validation-repair, and diff-review-repair operations instead of
+  branching reducers and tool routing on individual node kinds.
+- Resolve mutation events through an intent-neutral, target-bound context that
+  records the owning node, mutation intent, repository target, and target
+  revision producer.
+- Give validation-repair provider calls a durable reservation ledger so repair
+  attempts are charged only after admitted provider work completes and are
+  released without budget consumption when the call does not complete.
+- Emit structured capability, mutation ownership, repair admission, active
+  target, next target, and idempotent activation telemetry.
+
+### Fixed
+
+- Allow validation and diff-review repair nodes to own repository mutation
+  evidence and revisions without reopening or rewriting completed initial
+  implementation nodes.
+- Make validation-repair activation atomic and replay-idempotent so duplicate
+  delivery creates one repair node and event without consuming another attempt.
+- Preserve retry and resume identity when mutation capability contracts are
+  violated by reporting a structured `OrchestrationContractFailure` instead of
+  an unclassified orchestration failure.
+- Keep legacy journals replayable while enforcing capability, target identity,
+  lifecycle evidence, and repair-accounting invariants for new checkpoints.
+
 ## 1.4.43 - 2026-08-09
 
 ### Changed
