@@ -137,7 +137,7 @@ impl ExecutionGraph {
 
     pub fn unique_mutation_node_for_target_path(&self, path: &str) -> Option<&ExecutionNode> {
         let mut matches = self.nodes.iter().filter(|node| {
-            node.kind.is_mutation()
+            node.has_capability(NodeCapability::RepositoryMutation)
                 && node
                     .target
                     .as_ref()

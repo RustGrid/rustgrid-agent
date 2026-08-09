@@ -592,6 +592,9 @@ pub(super) fn hosted_failure_category(error: &anyhow::Error) -> &'static str {
     if let Some(failure) = error.downcast_ref::<PhasePersistenceFailure>() {
         return failure.category();
     }
+    if let Some(failure) = error.downcast_ref::<HostedInvariantFailure>() {
+        return failure.category();
+    }
     if error
         .downcast_ref::<HostedHttpError>()
         .is_some_and(|failure| failure.provider_contacted() == Some(true))

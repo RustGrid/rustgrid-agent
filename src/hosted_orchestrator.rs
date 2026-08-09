@@ -269,6 +269,7 @@ fn lifecycle_for_next_node(node: &ExecutionNode) -> Option<LifecycleState> {
         | ExecutionNodeKind::TestMutation
         | ExecutionNodeKind::ValidationRepair
         | ExecutionNodeKind::ValidationRepairSession => Some(LifecycleState::Implementation),
+        ExecutionNodeKind::DiffReviewRepair => Some(LifecycleState::DiffReview),
         ExecutionNodeKind::ValidationFocused
         | ExecutionNodeKind::ValidationSuite
         | ExecutionNodeKind::ValidationBuild
@@ -868,6 +869,7 @@ fn decision_for_node(
                 let mut target = snapshot.target_execution_context(
                     &node.id,
                     tools_for_target_operation(
+                        node.kind,
                         node.target.as_ref().expect("mutation node target"),
                     )?,
                 )?;
@@ -969,6 +971,11 @@ fn decision_for_node(
                 "validation repair nodes are reconciled from their active failure session before ordinary runnable nodes",
             ))
         }
+        ExecutionNodeKind::DiffReviewRepair => Err(OrchestrationInvariantError::for_node(
+            "repair_node_selected_as_ordinary_runnable",
+            node.id.clone(),
+            "diff-review repair nodes are reconciled from their active review session before ordinary runnable nodes",
+        )),
         ExecutionNodeKind::DiffReview => Ok(ExecutionDecision::ReviewDiff {
             node_id: node.id.clone(),
         }),
@@ -1242,9 +1249,17 @@ fn repair_target_decision(
             "target repair was requested after its node repair budget was exhausted",
         ));
     }
+    let producer_kind = if failure.category == FailureCategory::ValidationFailure {
+        ExecutionNodeKind::ValidationRepair
+    } else {
+        node.kind
+    };
     let mut target = snapshot.target_execution_context(
         &node.id,
-        tools_for_target_operation(node.target.as_ref().expect("mutation node target"))?,
+        tools_for_target_operation(
+            producer_kind,
+            node.target.as_ref().expect("mutation node target"),
+        )?,
     )?;
     if failure.category == FailureCategory::ValidationFailure {
         let correction_contracts = assertion_repair_contracts(failure);
@@ -1532,8 +1547,15 @@ fn assertion_repair_contracts(failure: &FailureRecord) -> Vec<AssertionRepairCon
 }
 
 fn tools_for_target_operation(
+    producer_kind: ExecutionNodeKind,
     target: &crate::execution_graph::PlannedTarget,
 ) -> Result<Vec<ToolKind>, OrchestrationInvariantError> {
+    if !producer_kind.has_capability(NodeCapability::RepositoryMutation) {
+        return Err(OrchestrationInvariantError::new(
+            "mutation_capability_contract_mismatch",
+            format!("node kind {producer_kind:?} cannot expose repository mutation tools"),
+        ));
+    }
     let operation = target.effective_operation();
     if let crate::execution_graph::TargetOperation::Rename {
         source,

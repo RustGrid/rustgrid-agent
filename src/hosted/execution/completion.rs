@@ -189,10 +189,7 @@ schema. Deterministic satisfied evidence is authoritative and cannot be downgrad
             let model_call = match self.phases.begin_graph_model_call() {
                 Ok(model_call) => model_call,
                 Err(error) => {
-                    self.notebook
-                        .orchestration
-                        .budget
-                        .release_model_call_reservation(&reservation);
+                    self.release_graph_model_call_reservation(&reservation);
                     return Err(error);
                 }
             };
@@ -209,10 +206,7 @@ schema. Deterministic satisfied evidence is authoritative and cannot be downgrad
             ) {
                 self.phases
                     .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
-                self.notebook
-                    .orchestration
-                    .budget
-                    .release_model_call_reservation(&reservation);
+                self.release_graph_model_call_reservation(&reservation);
                 return Err(error);
             }
             let registration = ai_call_registration(
@@ -231,10 +225,7 @@ schema. Deterministic satisfied evidence is authoritative and cannot be downgrad
                 Err(error) => {
                     self.phases
                         .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
-                    self.notebook
-                        .orchestration
-                        .budget
-                        .release_model_call_reservation(&reservation);
+                    self.release_graph_model_call_reservation(&reservation);
                     return Err(error);
                 }
             };
@@ -263,10 +254,7 @@ schema. Deterministic satisfied evidence is authoritative and cannot be downgrad
                     if budget_disposition == AiBudgetDisposition::Restore {
                         self.phases
                             .rollback_model_call(ExecutionPhase::CompletionEvaluation)?;
-                        self.notebook
-                            .orchestration
-                            .budget
-                            .release_model_call_reservation(&reservation);
+                        self.release_graph_model_call_reservation(&reservation);
                         if let Some(failure) = http.filter(|failure| {
                             failure.failure_class() == AiFailureClass::ProviderValidation
                         }) {

@@ -188,6 +188,7 @@ pub(super) fn failure_diagnostics(error: &anyhow::Error, cancelled: bool) -> Val
             "resumable": failure.resumable,
             "recoverable": failure.resumable,
             "resume_phase": failure.phase,
+            "resume_from_node": failure.resume_from_node,
             "recommended_action": "Resume from the next unresolved implementation node in the persisted execution graph.",
         });
     }

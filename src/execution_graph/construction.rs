@@ -134,6 +134,7 @@ fn stable_node_id(kind: ExecutionNodeKind, label: &str, index: usize) -> Executi
         ExecutionNodeKind::TestMutation => "test",
         ExecutionNodeKind::ValidationRepair => "validation-repair",
         ExecutionNodeKind::ValidationRepairSession => "validation-repair-session",
+        ExecutionNodeKind::DiffReviewRepair => "diff-review-repair",
         ExecutionNodeKind::ValidationFocused => "validation-focused",
         ExecutionNodeKind::ValidationSuite => "validation-suite",
         ExecutionNodeKind::ValidationBuild => "validation-build",
@@ -297,6 +298,7 @@ impl BudgetGroup {
             ExecutionNodeKind::SourceMutation
             | ExecutionNodeKind::TestMutation
             | ExecutionNodeKind::ValidationRepair
+            | ExecutionNodeKind::DiffReviewRepair
             | ExecutionNodeKind::ValidationRepairSession => Self::Mutation,
             ExecutionNodeKind::ValidationFocused
             | ExecutionNodeKind::ValidationSuite

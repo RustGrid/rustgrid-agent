@@ -1507,6 +1507,36 @@ fn provider_not_contacted_is_never_reported_as_ai_gateway_failure() {
 }
 
 #[test]
+fn mutation_capability_contract_failure_preserves_repair_resume_identity() {
+    let error = anyhow!(HostedInvariantFailure::for_node_in_phase(
+        "mutation_capability_contract_mismatch",
+        "repair",
+        "validation-repair-node-1",
+        "valid repair mutation event was rejected by its reducer",
+    ));
+    assert_eq!(
+        hosted_failure_category(&error),
+        "OrchestrationContractFailure"
+    );
+    let resumability =
+        resolve_failure_resumability(&error, false, "orchestration_execution_failed");
+    assert_eq!(
+        resumability.reason_code,
+        "mutation_capability_contract_mismatch"
+    );
+    assert_eq!(
+        resumability.resume_from_node.as_deref(),
+        Some("validation-repair-node-1")
+    );
+    assert!(matches!(
+        resumability.status,
+        Resumability::Resumable {
+            resume_phase: Some(ref phase)
+        } if phase == "repair"
+    ));
+}
+
+#[test]
 fn late_phase_persistence_failures_never_use_initialization_taxonomy() {
     for (kind, category, code, health) in [
         (

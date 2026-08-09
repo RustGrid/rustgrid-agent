@@ -238,6 +238,25 @@ pub enum SatisfiedIntent {
     MutationFallback,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationIntentKind {
+    #[default]
+    InitialImplementation,
+    MutationFallback,
+    ValidationRepair,
+    DiffReviewRepair,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MutationEventContext {
+    pub node_id: ExecutionNodeId,
+    pub intent_kind: MutationIntentKind,
+    pub target_id: TargetId,
+    pub target_path: RepositoryPath,
+    pub repository_fingerprint: RepositoryFingerprint,
+}
+
 impl SatisfiedIntent {
     pub const fn repair_intent_kind(self) -> Option<RepairIntentKind> {
         match self {
@@ -467,6 +486,15 @@ pub struct ValidationRepairNodeMetadata {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ActivateValidationRepair {
+    pub repair_session_id: ValidationRepairSessionId,
+    pub repair_node_id: RepairNodeId,
+    pub target_id: TargetId,
+    pub originating_implementation_node_id: ExecutionNodeId,
+    pub failure_revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ValidationRepairOperationEvidence {
     pub repair_node_id: RepairNodeId,
     pub validation_session_id: ValidationRepairSessionId,
@@ -481,6 +509,7 @@ pub struct ValidationRepairOperationEvidence {
 #[serde(tag = "producer", content = "node_id", rename_all = "snake_case")]
 pub enum TargetRevisionProducer {
     InitialImplementation(ExecutionNodeId),
+    MutationFallback(ExecutionNodeId),
     ValidationRepair(RepairNodeId),
     DiffReviewRepair(RepairNodeId),
 }
@@ -488,6 +517,19 @@ pub enum TargetRevisionProducer {
 impl Default for TargetRevisionProducer {
     fn default() -> Self {
         Self::InitialImplementation(ExecutionNodeId::default())
+    }
+}
+
+impl TargetRevisionProducer {
+    pub fn for_mutation_owner(node: &ExecutionNode, intent: SatisfiedIntent) -> Self {
+        match (node.kind, intent) {
+            (ExecutionNodeKind::ValidationRepair, _) => Self::ValidationRepair(node.id.clone()),
+            (ExecutionNodeKind::DiffReviewRepair, _) => {
+                Self::DiffReviewRepair(node.id.clone())
+            }
+            (_, SatisfiedIntent::MutationFallback) => Self::MutationFallback(node.id.clone()),
+            _ => Self::InitialImplementation(node.id.clone()),
+        }
     }
 }
 
@@ -599,7 +641,7 @@ pub fn reduce_repository_operation(
             format!("unknown execution node `{node_id}`"),
         )
     })?;
-    if !node.kind.is_repository_operation()
+    if !node.has_capability(NodeCapability::RepositoryMutation)
         || node.target.as_ref().is_none_or(|target| {
             target.effective_operation() != intent.operation
                 || target.effective_operation().destination_path(&target.path)
@@ -608,7 +650,7 @@ pub fn reduce_repository_operation(
     {
         return Err(TransitionError::new(
             "repository_operation_intent_conflict",
-            format!("repository operation intent does not match mutation node `{node_id}`"),
+            format!("repository operation intent does not match repository-mutation producer `{node_id}`"),
         ));
     }
     if node.kind.is_mutation()
@@ -1034,6 +1076,8 @@ pub struct ValidationRepairSession {
     pub status: ValidationRepairSessionStatus,
     #[serde(default)]
     pub attempted_targets: Vec<ValidationRepairAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_reservations: Vec<RepairAttemptReservation>,
     #[serde(default)]
     pub repair_nodes: Vec<RepairNodeId>,
     pub current_assertion_set_revision: u64,
@@ -1049,6 +1093,37 @@ pub struct ValidationRepairSession {
     pub context_rebuilds_consumed: u32,
     #[serde(default)]
     pub budget_inputs: ValidationRepairBudgetInputs,
+}
+
+pub type RepairAttemptId = String;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairAttemptReservationState {
+    #[default]
+    Reserved,
+    Consumed,
+    Released,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RepairAttemptReservation {
+    pub repair_session_id: ValidationRepairSessionId,
+    pub attempt_id: RepairAttemptId,
+    pub target_id: TargetId,
+    pub state: RepairAttemptReservationState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairTargetState {
+    #[default]
+    Candidate,
+    Selected,
+    AttemptReserved,
+    MutationExecuted,
+    Exhausted,
+    Resolved,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -1424,7 +1499,7 @@ impl FailureCategory {
     const fn is_valid_for_node_kind(self, kind: ExecutionNodeKind) -> bool {
         match self {
             Self::MutationConflict | Self::PlanRepositoryConflict | Self::TargetBlocked => {
-                kind.is_mutation()
+                kind.has_capability(NodeCapability::RepositoryMutation)
             }
             Self::ValidationFailure => kind.is_validation(),
             Self::ModelArtifactRecoverable => kind.requires_model(),
@@ -1435,6 +1510,7 @@ impl FailureCategory {
                     | ExecutionNodeKind::SourceMutation
                     | ExecutionNodeKind::TestMutation
                     | ExecutionNodeKind::ValidationRepair
+                    | ExecutionNodeKind::DiffReviewRepair
                     | ExecutionNodeKind::ValidationRepairSession
                     | ExecutionNodeKind::ValidationFocused
                     | ExecutionNodeKind::ValidationSuite

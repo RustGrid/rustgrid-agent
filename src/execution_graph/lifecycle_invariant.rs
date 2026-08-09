@@ -241,7 +241,7 @@ pub fn check_invariants(
     validate_lifecycle_invariant_definitions(&lifecycle_invariant_definitions())?;
 
     if let Some(node) = graph.nodes().find(|node| {
-        node.kind.is_mutation()
+        node.has_capability(NodeCapability::RepositoryMutation)
             && !node.operation_evidence.is_empty()
             && node.status != ExecutionNodeStatus::Completed
     }) {
@@ -257,22 +257,13 @@ pub fn check_invariants(
     for node in graph
         .nodes()
         .filter(|node| {
-            node.kind.is_mutation()
+            node.has_capability(NodeCapability::RepositoryMutation)
                 && node.status == ExecutionNodeStatus::Completed
                 && (node.repository_mutation_lifecycle
                     == Some(RepositoryMutationLifecycle::Verified)
                     || !node.operation_evidence.is_empty())
         })
     {
-        node.operation_evidence.last().ok_or_else(|| {
-            violation(
-                "verified_operation_missing_operation_evidence",
-                lifecycle,
-                trigger,
-                Some(node.id.clone()),
-                "completed implementation node has no repository-operation verification evidence",
-            )
-        })?;
         let attempt = node.attempts.last().ok_or_else(|| {
             violation(
                 "verified_operation_missing_completed_attempt",
@@ -282,15 +273,39 @@ pub fn check_invariants(
                 "completed implementation node has no attempt record",
             )
         })?;
-        let attempt_matches_operation_evidence = attempt
-            .repository_fingerprint_after
-            .as_deref()
-            .is_some_and(|fingerprint| {
-                node.operation_evidence.iter().any(|evidence| {
-                    evidence.repository_fingerprint.as_str() == fingerprint
-                        && attempt.completed_at.as_deref() == Some(evidence.completed_at.as_str())
-                })
-            });
+        let attempt_matches_operation_evidence =
+            attempt
+                .repository_fingerprint_after
+                .as_deref()
+                .is_some_and(|fingerprint| {
+                    if node.kind == ExecutionNodeKind::ValidationRepair {
+                        node.validation_repair_operation_evidence
+                            .iter()
+                            .any(|evidence| {
+                                evidence.repository_fingerprint_after.as_str() == fingerprint
+                            })
+                    } else {
+                        node.operation_evidence.iter().any(|evidence| {
+                            evidence.repository_fingerprint.as_str() == fingerprint
+                                && attempt.completed_at.as_deref()
+                                    == Some(evidence.completed_at.as_str())
+                        })
+                    }
+                });
+        let has_operation_evidence = if node.kind == ExecutionNodeKind::ValidationRepair {
+            !node.validation_repair_operation_evidence.is_empty()
+        } else {
+            !node.operation_evidence.is_empty()
+        };
+        if !has_operation_evidence {
+            return Err(violation(
+                "verified_operation_missing_operation_evidence",
+                lifecycle,
+                trigger,
+                Some(node.id.clone()),
+                "completed repository mutation producer has no verification evidence",
+            ));
+        }
         if attempt.completed_at.is_none()
             || attempt.outcome != Some(ExecutionNodeStatus::Completed)
             || !attempt_matches_operation_evidence
@@ -941,6 +956,111 @@ mod lifecycle_invariant_tests {
             snapshot.graph.node(&implementation_node).unwrap(),
             &implementation_before
         );
+    }
+
+    #[test]
+    fn validation_repair_capability_accepts_mutation_failure_without_reopening_origin() {
+        let (mut snapshot, implementation_node, repair_node_id, _) =
+            snapshot_with_active_validation_repair();
+        let implementation_before = snapshot.graph.node(&implementation_node).unwrap().clone();
+        let repair = snapshot.graph.node(&repair_node_id).unwrap().clone();
+        assert!(repair.has_capability(NodeCapability::RepositoryMutation));
+        assert!(repair.has_capability(NodeCapability::Repair));
+        let target_path = repair.target.as_ref().unwrap().path.clone();
+        let failure = FailureRecord {
+            id: FailureId::new("repair-mutation-rejected"),
+            node_id: repair_node_id.clone(),
+            category: FailureCategory::ToolRecoverable,
+            attempt: 1,
+            target_path: Some(target_path),
+            repository_fingerprint: "tree-implemented".into(),
+            message: "patch preflight rejected the proposed payload".into(),
+            ..FailureRecord::default()
+        };
+        snapshot
+            .append_event(ExecutionDomainEvent::MutationRejected {
+                sequence: snapshot.next_event_sequence(),
+                node_id: repair_node_id.clone(),
+                failure,
+            })
+            .expect("repair mutation rejection is a legal producer outcome");
+        assert_eq!(
+            snapshot.graph.node(&implementation_node).unwrap(),
+            &implementation_before
+        );
+        assert_eq!(
+            snapshot.graph.node(&repair_node_id).unwrap().status,
+            ExecutionNodeStatus::FailedRecoverable
+        );
+    }
+
+    #[test]
+    fn validation_repair_activation_replay_is_a_zero_cost_graph_no_op() {
+        let (mut snapshot, _, repair_node_id, _) = snapshot_with_active_validation_repair();
+        let started = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    ExecutionDomainEvent::ValidationRepairStarted {
+                        repair_node_id: existing,
+                        ..
+                    } if existing == &repair_node_id
+                )
+            })
+            .cloned()
+            .unwrap();
+        let event_count = snapshot.events.len();
+        let graph_revision = snapshot.graph.revision();
+        let session = snapshot
+            .graph
+            .node(&repair_node_id)
+            .unwrap()
+            .validation_repair
+            .as_ref()
+            .unwrap()
+            .validation_session_id
+            .clone();
+        let owner = ExecutionNodeId::new(session);
+        assert_eq!(snapshot.budget.usage_for(&owner).validation_repair_attempts, 0);
+
+        let replay = match started {
+            ExecutionDomainEvent::ValidationRepairStarted {
+                validation_node_id,
+                failure_id,
+                repair_node_id,
+                originating_implementation_node_id,
+                target_ref,
+                failure_revision,
+                repair_intent,
+                selected_target,
+                implicated_paths,
+                correction_contracts,
+                requested_tool_policy,
+                repository_fingerprint_before,
+                ..
+            } => ExecutionDomainEvent::ValidationRepairStarted {
+                sequence: snapshot.next_event_sequence(),
+                validation_node_id,
+                failure_id,
+                repair_node_id,
+                originating_implementation_node_id,
+                target_ref,
+                failure_revision,
+                repair_intent,
+                selected_target,
+                implicated_paths,
+                correction_contracts,
+                requested_tool_policy,
+                repository_fingerprint_before,
+            },
+            _ => unreachable!(),
+        };
+        snapshot.append_event(replay).unwrap();
+        assert_eq!(snapshot.events.len(), event_count);
+        assert_eq!(snapshot.graph.revision(), graph_revision);
+        assert_eq!(snapshot.budget.usage_for(&owner).validation_repair_attempts, 0);
     }
 
     #[test]

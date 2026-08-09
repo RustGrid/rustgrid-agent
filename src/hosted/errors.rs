@@ -24,6 +24,7 @@ pub(super) struct HostedInvariantFailure {
     pub(super) code: &'static str,
     pub(super) phase: &'static str,
     pub(super) resumable: bool,
+    pub(super) resume_from_node: Option<String>,
     pub(super) message: String,
 }
 
@@ -33,6 +34,7 @@ impl HostedInvariantFailure {
             code,
             phase: "orchestration",
             resumable: true,
+            resume_from_node: None,
             message: message.into(),
         }
     }
@@ -46,12 +48,32 @@ impl HostedInvariantFailure {
             code,
             phase,
             resumable: true,
+            resume_from_node: None,
             message: message.into(),
         }
     }
 
-    pub(super) const fn category(&self) -> &'static str {
-        "OrchestrationStateInvariantFailure"
+    pub(super) fn for_node_in_phase(
+        code: &'static str,
+        phase: &'static str,
+        node_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            phase,
+            resumable: true,
+            resume_from_node: Some(node_id.into()),
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn category(&self) -> &'static str {
+        if self.code == "mutation_capability_contract_mismatch" {
+            "OrchestrationContractFailure"
+        } else {
+            "OrchestrationStateInvariantFailure"
+        }
     }
 }
 
@@ -59,11 +81,12 @@ impl std::fmt::Display for HostedInvariantFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "category={} code={} phase={} resumable={}: {}",
+            "category={} code={} phase={} resumable={} resume_from_node={}: {}",
             self.category(),
             self.code,
             self.phase,
             self.resumable,
+            self.resume_from_node.as_deref().unwrap_or("none"),
             self.message
         )
     }

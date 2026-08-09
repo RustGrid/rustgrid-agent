@@ -310,6 +310,114 @@ pub enum ExecutionDomainEvent {
 }
 
 impl ExecutionDomainEvent {
+    pub fn mutation_context(
+        &self,
+        graph: &ExecutionGraph,
+    ) -> Result<Option<MutationEventContext>, GraphInvariantError> {
+        let Some(node_id) = (match self {
+            Self::TargetContextPrepared { node_id, .. }
+            | Self::TargetMutationIntentRecorded { node_id, .. }
+            | Self::TargetMutationProduced { node_id, .. }
+            | Self::MutationApplied { node_id, .. }
+            | Self::MutationRejected { node_id, .. }
+            | Self::MutationSuperseded { node_id, .. } => Some(node_id),
+            Self::TargetOperationAlreadyApplied { transition, .. } => Some(&transition.node_id),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let node = graph.node(node_id).ok_or_else(|| {
+            GraphInvariantError::new(format!("mutation event refers to unknown node `{node_id}`"))
+        })?;
+        if !node.has_capability(NodeCapability::RepositoryMutation) {
+            return Err(GraphInvariantError::with_code(
+                "mutation_capability_contract_mismatch",
+                format!(
+                    "event `{}` owner `{node_id}` lacks repository-mutation capability",
+                    self.event_type()
+                ),
+            ));
+        }
+        let target = node.target.as_ref().ok_or_else(|| {
+            GraphInvariantError::with_code(
+                "mutation_capability_contract_mismatch",
+                format!("mutation event owner `{node_id}` has no repository target"),
+            )
+        })?;
+        let event_target_path = match self {
+            Self::TargetContextPrepared { target_path, .. }
+            | Self::TargetMutationIntentRecorded { target_path, .. }
+            | Self::TargetMutationProduced { target_path, .. }
+            | Self::MutationApplied { target_path, .. } => Some(target_path.as_str()),
+            Self::MutationRejected { failure, .. } => failure.target_path.as_deref(),
+            Self::TargetOperationAlreadyApplied { transition, .. } => {
+                Some(transition.target_path.as_str())
+            }
+            Self::MutationSuperseded { .. } => None,
+            _ => unreachable!("mutation owner match is exhaustive"),
+        };
+        if event_target_path.is_some_and(|path| path != target.path) {
+            return Err(GraphInvariantError::with_code(
+                "mutation_capability_contract_mismatch",
+                format!(
+                    "event `{}` owner `{node_id}` does not match its target identity",
+                    self.event_type()
+                ),
+            ));
+        }
+        let satisfied_intent = match self {
+            Self::MutationApplied {
+                satisfied_intent, ..
+            }
+            | Self::TargetOperationAlreadyApplied {
+                satisfied_intent, ..
+            } => Some(*satisfied_intent),
+            _ => None,
+        };
+        let intent_kind = match (node.kind, satisfied_intent) {
+            (ExecutionNodeKind::ValidationRepair, _) => MutationIntentKind::ValidationRepair,
+            (ExecutionNodeKind::DiffReviewRepair, _) => MutationIntentKind::DiffReviewRepair,
+            (_, Some(SatisfiedIntent::MutationFallback)) => MutationIntentKind::MutationFallback,
+            _ => MutationIntentKind::InitialImplementation,
+        };
+        let repository_fingerprint = match self {
+            Self::TargetContextPrepared {
+                repository_fingerprint,
+                ..
+            }
+            | Self::TargetMutationIntentRecorded {
+                repository_fingerprint,
+                ..
+            }
+            | Self::TargetMutationProduced {
+                repository_fingerprint,
+                ..
+            } => repository_fingerprint.clone(),
+            Self::MutationApplied {
+                repository_fingerprint,
+                ..
+            } => RepositoryFingerprint::new(repository_fingerprint.clone()),
+            Self::MutationRejected { failure, .. } => {
+                RepositoryFingerprint::new(failure.repository_fingerprint.clone())
+            }
+            Self::MutationSuperseded {
+                repository_fingerprint,
+                ..
+            } => RepositoryFingerprint::new(repository_fingerprint.clone()),
+            Self::TargetOperationAlreadyApplied { transition, .. } => {
+                transition.repository_fingerprint.clone()
+            }
+            _ => unreachable!("mutation owner match is exhaustive"),
+        };
+        Ok(Some(MutationEventContext {
+            node_id: node_id.clone(),
+            intent_kind,
+            target_id: target.mutation_target_id().to_string(),
+            target_path: target.path.clone(),
+            repository_fingerprint,
+        }))
+    }
+
     pub const fn event_type(&self) -> &'static str {
         match self {
             Self::DiscoveryStarted { .. } => "discovery_started",
@@ -1051,12 +1159,14 @@ impl ExecutionGraph {
             | ExecutionDomainEvent::TargetMutationIntentRecorded { .. }
             | ExecutionDomainEvent::MutationRejected { .. }
             | ExecutionDomainEvent::MutationSuperseded { .. } => {
-                node.kind.is_repository_operation()
+                node.has_capability(NodeCapability::RepositoryMutation)
             }
             ExecutionDomainEvent::FailureRecorded { failure, .. } => {
                 failure.category.is_valid_for_node_kind(node.kind)
             }
-            ExecutionDomainEvent::FailureSuperseded { .. } => node.kind.is_mutation(),
+            ExecutionDomainEvent::FailureSuperseded { .. } => {
+                node.has_capability(NodeCapability::RepositoryMutation)
+            }
             ExecutionDomainEvent::ValidationStarted { .. }
             | ExecutionDomainEvent::ValidationEvidenceRecorded { .. }
             | ExecutionDomainEvent::ValidationPassed { .. }

@@ -4,7 +4,7 @@
 // Graph/model: ComplexityClassificationStage, ComplexityFactor,
 // ComplexityFactorKind, ComplexityInput, ComplexityAssessment,
 // MissionComplexity, MissionBudget, MissionBudgetOverride, AcceptedPlan,
-// PlannedTarget, ExecutionNode, ExecutionNodeKind, ExecutionNodeStatus,
+// PlannedTarget, ExecutionNode, ExecutionNodeKind, NodeCapability, ExecutionNodeStatus,
 // NodeAttempt, NodeBudget, NodeBudgetRemaining, DerivedExecutionCollections.
 // Validation/evidence: RepositorySnapshot, LineRange, FileEvidence,
 // FileExcerpt, EvidenceSummary, EvidenceKind, EvidenceRecord, EvidenceStore,
@@ -12,7 +12,9 @@
 // ValidationRetryPolicy, ValidationNodeBudget, ValidationEvidenceStatus,
 // ValidationEvidenceRecord.
 // Recovery/failure: ToolKind, TargetExecutionContext, MutationResult,
-// FailureCategory, FailureStatus, FailureRecord, FailureStore.
+// FailureCategory, FailureStatus, FailureRecord, FailureStore,
+// MutationIntentKind, MutationEventContext, RepairAttemptReservation,
+// RepairAttemptReservationState, RepairTargetState.
 // Accounting/publication: NodeBudgetUsage, BudgetState, ProgressWindow,
 // ProgressEventKind, ProgressEvent, PublicationMode, PublicationStatus,
 // PublicationState, CancellationState, MissionOutcome, GuardrailReason.

@@ -1049,7 +1049,7 @@ pub(super) fn resolve_failure_resumability(
                 resume_phase: Some(failure.phase.into()),
             },
             reason_code: failure.code.into(),
-            resume_from_node: None,
+            resume_from_node: failure.resume_from_node.clone(),
             repository_fingerprint: String::new(),
         };
     }

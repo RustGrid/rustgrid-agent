@@ -1925,6 +1925,171 @@
     }
 
     #[test]
+    fn repository_mutation_capability_is_the_shared_event_eligibility_authority() {
+        let mutation_kinds = [
+            ExecutionNodeKind::SourceMutation,
+            ExecutionNodeKind::TestMutation,
+            ExecutionNodeKind::ValidationRepair,
+            ExecutionNodeKind::DiffReviewRepair,
+        ];
+        for kind in mutation_kinds {
+            assert!(kind.has_capability(NodeCapability::RepositoryMutation));
+        }
+        assert!(ExecutionNodeKind::ValidationRepair.has_capability(NodeCapability::Repair));
+        assert!(ExecutionNodeKind::DiffReviewRepair.has_capability(NodeCapability::Repair));
+        assert!(!ExecutionNodeKind::ValidationFocused
+            .has_capability(NodeCapability::RepositoryMutation));
+
+        for kind in mutation_kinds {
+            let node_id = ExecutionNodeId::new(format!("producer-{kind:?}"));
+            let target = target("src/capability.rs", "production");
+            let graph = ExecutionGraph {
+                graph_id: "capability-matrix".into(),
+                nodes: vec![ExecutionNode {
+                    id: node_id.clone(),
+                    kind,
+                    target: Some(target.clone()),
+                    ..ExecutionNode::default()
+                }],
+                ..ExecutionGraph::default()
+            };
+            let failure = FailureRecord {
+                id: FailureId::new(format!("failure-{kind:?}")),
+                node_id: node_id.clone(),
+                category: FailureCategory::ToolRecoverable,
+                attempt: 1,
+                target_path: Some(target.path.clone()),
+                repository_fingerprint: "tree".into(),
+                message: "rejected".into(),
+                ..FailureRecord::default()
+            };
+            let events = vec![
+                ExecutionDomainEvent::TargetContextPrepared {
+                    sequence: 1,
+                    node_id: node_id.clone(),
+                    target_path: target.path.clone(),
+                    operation: TargetOperation::ModifyExisting,
+                    source_path: None,
+                    target_exists: Some(true),
+                    source_exists: None,
+                    repository_fingerprint: RepositoryFingerprint::new("tree"),
+                    target_content_hash: None,
+                    source_content_hash: None,
+                    accepted_intent_hash: "intent".into(),
+                    evidence_ids: Vec::new(),
+                },
+                ExecutionDomainEvent::TargetMutationIntentRecorded {
+                    sequence: 2,
+                    node_id: node_id.clone(),
+                    target_path: target.path.clone(),
+                    operation: TargetOperation::ModifyExisting,
+                    source_path: None,
+                    expected_result_content_hash: None,
+                    expected_source_content_hash: None,
+                    repository_fingerprint: RepositoryFingerprint::new("tree"),
+                    accepted_intent_hash: "intent".into(),
+                },
+                ExecutionDomainEvent::TargetMutationProduced {
+                    sequence: 3,
+                    node_id: node_id.clone(),
+                    target_path: target.path.clone(),
+                    expected_repository_fingerprint: RepositoryFingerprint::new("tree"),
+                    repository_fingerprint: RepositoryFingerprint::new("tree-next"),
+                    before_content_hash: None,
+                    after_content_hash: None,
+                },
+                ExecutionDomainEvent::MutationApplied {
+                    sequence: 4,
+                    node_id: node_id.clone(),
+                    target_path: target.path.clone(),
+                    repository_fingerprint: "tree-next".into(),
+                    evidence_id: "verified".into(),
+                    completed_at: "now".into(),
+                    satisfied_intent: if kind == ExecutionNodeKind::ValidationRepair {
+                        SatisfiedIntent::ValidationRepair
+                    } else {
+                        SatisfiedIntent::OriginalImplementation
+                    },
+                    repair_failure_id: None,
+                    created_target_evidence: None,
+                },
+                ExecutionDomainEvent::MutationRejected {
+                    sequence: 5,
+                    node_id: node_id.clone(),
+                    failure,
+                },
+            ];
+            for event in events {
+                let context = event
+                    .mutation_context(&graph)
+                    .expect("mutation-capable producer must accept every mutation event family")
+                    .expect("mutation context");
+                assert_eq!(context.node_id, node_id);
+                assert_eq!(context.target_path, target.path);
+            }
+        }
+    }
+
+    #[test]
+    fn validation_repair_attempt_is_consumed_only_after_reserved_provider_work() {
+        let failure_id = FailureId::new("repair-reservation-failure");
+        let gate_id = ExecutionNodeId::new("validation-focused");
+        let failure = FailureRecord::new(
+            failure_id.clone(),
+            gate_id,
+            FailureCategory::ValidationFailure,
+            1,
+            "tree",
+            "focused validation failed",
+        );
+        let mut budget = BudgetState::new(MissionBudget::for_complexity(MissionComplexity::Small));
+        budget.create_validation_failure_revision(&failure, 1);
+        let session = budget
+            .ensure_validation_repair_session(
+                &failure,
+                ValidationRepairBudgetInputs {
+                    failed_assertion_count: 1,
+                    implicated_target_count: 1,
+                    originating_gate_required: true,
+                    implicated_target_bytes: 1,
+                },
+            )
+            .unwrap()
+            .clone();
+        let owner = ExecutionNodeId::new(session.session_id.clone());
+        let repair_budget = session.budget.as_node_budget();
+        assert_eq!(budget.usage_for(&owner).validation_repair_attempts, 0);
+
+        budget
+            .reserve_validation_repair_attempt(&failure_id, "target-a".into())
+            .unwrap();
+        let released = budget
+            .reserve_model_call(&owner, &repair_budget, 1, Duration::ZERO)
+            .unwrap();
+        assert_eq!(budget.usage_for(&owner).validation_repair_attempts, 0);
+        budget.release_model_call_reservation(&released);
+        assert_eq!(budget.usage_for(&owner).validation_repair_attempts, 0);
+
+        budget
+            .reserve_validation_repair_attempt(&failure_id, "target-a".into())
+            .unwrap();
+        let consumed = budget
+            .reserve_model_call(&owner, &repair_budget, 1, Duration::ZERO)
+            .unwrap();
+        budget.consume_model_call_reservation(&consumed, 1, Duration::from_millis(1));
+        assert_eq!(budget.usage_for(&owner).validation_repair_attempts, 1);
+        let session = budget.repair_session_for_failure(&failure_id).unwrap();
+        assert_eq!(
+            session
+                .attempt_reservations
+                .iter()
+                .filter(|reservation| reservation.state == RepairAttemptReservationState::Consumed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn setting_an_identical_node_status_is_a_pure_graph_no_op() {
         let graph = ExecutionGraph::from_targets(
             "graph-no-op",

@@ -665,6 +665,30 @@ impl ExecutionSnapshot {
                 previous.sequence()
             )));
         }
+        if let ExecutionDomainEvent::ValidationRepairStarted {
+            repair_node_id,
+            originating_implementation_node_id,
+            target_ref,
+            failure_revision,
+            ..
+        } = &event
+            && !repair_node_id.as_str().is_empty()
+            && let Some(existing) = self.graph.node(repair_node_id)
+        {
+            let same_identity = existing.kind == ExecutionNodeKind::ValidationRepair
+                && existing.validation_repair.as_ref().is_some_and(|repair| {
+                    repair.originating_implementation_node_id
+                        == *originating_implementation_node_id
+                        && repair.target == *target_ref
+                        && repair.failure_revision == *failure_revision
+                });
+            if same_identity {
+                // Activation is one atomic, idempotent graph transition. A
+                // retried command neither appends duplicate lifecycle facts
+                // nor changes graph/accounting revisions.
+                return Ok(());
+            }
+        }
         if let ExecutionDomainEvent::ValidationRepairCompleted {
             failure_id,
             attempt: Some(attempt),
@@ -1058,10 +1082,6 @@ impl ExecutionSnapshot {
             }
             _ => {}
         }
-        if let ExecutionDomainEvent::ValidationRepairStarted { failure_id, .. } = &event {
-            let owner = ExecutionNodeId::new(BudgetState::repair_session_id(failure_id));
-            self.budget.record_validation_repair_attempt(owner);
-        }
         match &event {
             ExecutionDomainEvent::RepositoryEvidenceRecorded {
                 sequence,
@@ -1166,6 +1186,7 @@ impl ExecutionSnapshot {
                 target_path,
                 repository_fingerprint,
                 evidence_id,
+                satisfied_intent,
                 ..
             } => {
                 let node = self.graph.node(node_id).cloned();
@@ -1189,7 +1210,7 @@ impl ExecutionSnapshot {
                 self.evidence.record(EvidenceRecord {
                     evidence_id: evidence_id.clone(),
                     kind: if node.as_ref().is_some_and(|node| {
-                        node.kind == ExecutionNodeKind::ValidationRepair
+                        node.has_capability(NodeCapability::Repair)
                     }) {
                         EvidenceKind::RepositoryOperationVerification
                     } else {
@@ -1225,11 +1246,10 @@ impl ExecutionSnapshot {
                     self.target_revisions.push(TargetRevision {
                         target_id,
                         revision,
-                        producer: if node.kind == ExecutionNodeKind::ValidationRepair {
-                            TargetRevisionProducer::ValidationRepair(node.id.clone())
-                        } else {
-                            TargetRevisionProducer::InitialImplementation(node.id.clone())
-                        },
+                        producer: TargetRevisionProducer::for_mutation_owner(
+                            &node,
+                            *satisfied_intent,
+                        ),
                         repository_fingerprint: repository_fingerprint.clone().into(),
                         content_hash: None,
                     });
@@ -1289,11 +1309,10 @@ impl ExecutionSnapshot {
                     self.target_revisions.push(TargetRevision {
                         target_id,
                         revision,
-                        producer: if node.kind == ExecutionNodeKind::ValidationRepair {
-                            TargetRevisionProducer::ValidationRepair(node.id.clone())
-                        } else {
-                            TargetRevisionProducer::InitialImplementation(node.id.clone())
-                        },
+                        producer: TargetRevisionProducer::for_mutation_owner(
+                            &node,
+                            *satisfied_intent,
+                        ),
                         repository_fingerprint: transition.repository_fingerprint.clone(),
                         content_hash: transition.observed_result_hash.clone(),
                     });
@@ -1414,7 +1433,35 @@ impl ExecutionSnapshot {
                 let admission_rejection_reason = attempt
                     .as_ref()
                     .and_then(|attempt| attempt.admission_rejection_reason.as_deref());
+                let legacy_completion_consumes_attempt = attempt.is_none()
+                    && !matches!(
+                        result,
+                        RepairResult::NoMutation {
+                            outcome: ValidationRepairMutationOutcome::AdmissionRejected,
+                            ..
+                        }
+                    )
+                    && self
+                        .budget
+                        .repair_session_for_failure(failure_id)
+                        .is_some_and(|session| session.attempt_reservations.is_empty());
+                if legacy_completion_consumes_attempt
+                    && let Some(session) = self.budget.repair_session_for_failure(failure_id)
+                {
+                    let owner = ExecutionNodeId::new(session.session_id.clone());
+                    self.budget.record_validation_repair_attempt(owner);
+                }
                 if let Some(attempt) = attempt.clone() {
+                    let legacy_unreserved_provider_attempt = attempt.outcome
+                        != ValidationRepairMutationOutcome::AdmissionRejected
+                        && self
+                            .budget
+                            .repair_session_for_failure(failure_id)
+                            .is_some_and(|session| session.attempt_reservations.is_empty());
+                    if legacy_unreserved_provider_attempt {
+                        let owner = ExecutionNodeId::new(BudgetState::repair_session_id(failure_id));
+                        self.budget.record_validation_repair_attempt(owner);
+                    }
                     if attempt.outcome.consumes_repository_write_allowance() {
                         self.budget
                             .record_validation_repair_repository_write(failure_id)?;
@@ -1637,6 +1684,10 @@ impl ExecutionSnapshot {
         &self,
         event: &ExecutionDomainEvent,
     ) -> Result<(), GraphInvariantError> {
+        // Mutation ownership and eligibility are resolved from the producer
+        // node id carried by the event. This is the common contract shared by
+        // every mutation event family.
+        let _ = event.mutation_context(&self.graph)?;
         match event {
             ExecutionDomainEvent::GraphCreated { revision, .. } => {
                 if self.events.iter().rev().find_map(|event| match event {
@@ -2090,11 +2141,14 @@ impl ExecutionSnapshot {
                 failure.id, failure.node_id
             ))
         })?;
-        if mutation_only && !node.kind.is_mutation() {
-            return Err(GraphInvariantError::new(format!(
-                "mutation failure `{}` refers to non-mutation node `{}`",
-                failure.id, failure.node_id
-            )));
+        if mutation_only && !node.has_capability(NodeCapability::RepositoryMutation) {
+            return Err(GraphInvariantError::with_code(
+                "mutation_capability_contract_mismatch",
+                format!(
+                    "mutation failure `{}` refers to node `{}` without repository-mutation capability",
+                    failure.id, failure.node_id
+                ),
+            ));
         }
         if !failure.category.is_valid_for_node_kind(node.kind) {
             return Err(GraphInvariantError::new(format!(
@@ -2109,7 +2163,10 @@ impl ExecutionSnapshot {
             )));
         }
         if let Some(target_path) = failure.target_path.as_deref() {
-            let path_matches = if node.kind.is_mutation() {
+            // Mutation ownership is always the producer node carried by the
+            // event. Non-mutation failures such as validation may still cite
+            // an implicated planned target without owning that mutation.
+            let path_matches = if node.has_capability(NodeCapability::RepositoryMutation) {
                 node.target
                     .as_ref()
                     .is_some_and(|target| target.path == target_path)
@@ -2178,10 +2235,13 @@ impl ExecutionSnapshot {
                     failure.category
                 )));
             }
-            if !node.kind.is_mutation() {
-                return Err(GraphInvariantError::new(format!(
-                    "superseded failure `{failure_id}` must belong to a mutation node"
-                )));
+            if !node.has_capability(NodeCapability::RepositoryMutation) {
+                return Err(GraphInvariantError::with_code(
+                    "mutation_capability_contract_mismatch",
+                    format!(
+                        "superseded failure `{failure_id}` must belong to a repository-mutation-capable node"
+                    ),
+                ));
             }
         }
         Ok(())

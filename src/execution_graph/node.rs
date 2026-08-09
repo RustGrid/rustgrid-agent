@@ -15,7 +15,19 @@ pub enum ExecutionNodeKind {
     ValidationBuild,
     ValidationLint,
     DiffReview,
+    DiffReviewRepair,
     CompletionEvaluation,
+    Publication,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCapability {
+    RepositoryRead,
+    RepositoryMutation,
+    ValidationExecution,
+    Repair,
+    Review,
     Publication,
 }
 
@@ -34,9 +46,55 @@ impl ExecutionNodeKind {
             | Self::ValidationSuite
             | Self::ValidationBuild
             | Self::ValidationLint => HostedExecutionStage::Validation,
-            Self::DiffReview | Self::CompletionEvaluation => HostedExecutionStage::Review,
+            Self::DiffReview | Self::DiffReviewRepair | Self::CompletionEvaluation => {
+                HostedExecutionStage::Review
+            }
             Self::Publication => HostedExecutionStage::Publication,
         }
+    }
+
+    /// The single authority for the operation families a node kind may use.
+    /// Reducers and tool routing must consult this capability set rather than
+    /// maintaining parallel kind allow-lists.
+    pub const fn capabilities(self) -> &'static [NodeCapability] {
+        use NodeCapability as Capability;
+
+        match self {
+            Self::Discovery | Self::Planning | Self::CompletionEvaluation => {
+                &[Capability::RepositoryRead]
+            }
+            Self::SourceMutation | Self::TestMutation => &[
+                Capability::RepositoryRead,
+                Capability::RepositoryMutation,
+            ],
+            Self::ValidationRepair | Self::DiffReviewRepair => &[
+                Capability::RepositoryRead,
+                Capability::RepositoryMutation,
+                Capability::Repair,
+            ],
+            Self::ValidationRepairSession => &[Capability::Repair],
+            Self::ValidationFocused
+            | Self::ValidationSuite
+            | Self::ValidationBuild
+            | Self::ValidationLint => &[
+                Capability::RepositoryRead,
+                Capability::ValidationExecution,
+            ],
+            Self::DiffReview => &[Capability::RepositoryRead, Capability::Review],
+            Self::Publication => &[Capability::RepositoryRead, Capability::Publication],
+        }
+    }
+
+    pub const fn has_capability(self, capability: NodeCapability) -> bool {
+        let capabilities = self.capabilities();
+        let mut index = 0;
+        while index < capabilities.len() {
+            if capabilities[index] as u8 == capability as u8 {
+                return true;
+            }
+            index += 1;
+        }
+        false
     }
 
     pub const fn is_mutation(self) -> bool {
@@ -44,7 +102,7 @@ impl ExecutionNodeKind {
     }
 
     pub const fn is_repository_operation(self) -> bool {
-        self.is_mutation() || matches!(self, Self::ValidationRepair)
+        self.has_capability(NodeCapability::RepositoryMutation)
     }
 
     pub const fn is_validation(self) -> bool {
@@ -66,6 +124,7 @@ impl ExecutionNodeKind {
                 | Self::TestMutation
                 | Self::ValidationRepair
                 | Self::ValidationRepairSession
+                | Self::DiffReviewRepair
                 | Self::DiffReview
                 | Self::CompletionEvaluation
         )
@@ -526,6 +585,10 @@ impl ExecutionNode {
 
     pub fn is_successful(&self) -> bool {
         self.status.is_success()
+    }
+
+    pub const fn has_capability(&self, capability: NodeCapability) -> bool {
+        self.kind.has_capability(capability)
     }
 
     pub fn remaining_budget(&self, usage: &NodeBudgetUsage) -> NodeBudgetRemaining {

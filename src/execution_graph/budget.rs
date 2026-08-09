@@ -404,6 +404,7 @@ impl BudgetState {
                     budget,
                     status: ValidationRepairSessionStatus::Active,
                     attempted_targets: Vec::new(),
+                    attempt_reservations: Vec::new(),
                     repair_nodes: Vec::new(),
                     current_assertion_set_revision: current_revision,
                     stop_reason: None,
@@ -442,6 +443,60 @@ impl BudgetState {
         }
         session.attempted_targets.push(attempt);
         Ok(())
+    }
+
+    pub fn reserve_validation_repair_attempt(
+        &mut self,
+        failure_id: &FailureId,
+        target_id: TargetId,
+    ) -> Result<RepairAttemptReservation, GraphInvariantError> {
+        let session = self.repair_session_for_failure_mut(failure_id).ok_or_else(|| {
+            GraphInvariantError::new("validation repair attempt reservation has no session")
+        })?;
+        let active = session
+            .attempt_reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.state != RepairAttemptReservationState::Released
+            })
+            .count();
+        if active >= usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX) {
+            return Err(GraphInvariantError::new(format!(
+                "validation repair session `{}` cannot reserve beyond its {}-attempt budget",
+                session.session_id, session.budget.max_target_attempts
+            )));
+        }
+        let ordinal = session.attempt_reservations.len().saturating_add(1);
+        let reservation = RepairAttemptReservation {
+            repair_session_id: session.session_id.clone(),
+            attempt_id: format!("{}:attempt:{ordinal}", session.session_id),
+            target_id,
+            state: RepairAttemptReservationState::Reserved,
+        };
+        session.attempt_reservations.push(reservation.clone());
+        Ok(reservation)
+    }
+
+    fn reconcile_validation_repair_attempt_for_owner(
+        &mut self,
+        owner: &ExecutionNodeId,
+        state: RepairAttemptReservationState,
+    ) {
+        let reconciled = self
+            .validation_repair_sessions
+            .get_mut(owner.as_str())
+            .and_then(|session| {
+                session.attempt_reservations.iter_mut().find(|reservation| {
+                    reservation.state == RepairAttemptReservationState::Reserved
+                })
+            })
+            .map(|reservation| {
+                reservation.state = state;
+            })
+            .is_some();
+        if reconciled && state == RepairAttemptReservationState::Consumed {
+            self.record_validation_repair_attempt(owner.clone());
+        }
     }
 
     pub fn record_validation_repair_context_rebuild(
@@ -658,6 +713,51 @@ impl BudgetState {
                     session.session_id
                 )));
             }
+            let mut reservation_ids = BTreeSet::new();
+            let attempts_started = session
+                .attempt_reservations
+                .iter()
+                .filter(|reservation| {
+                    reservation.state != RepairAttemptReservationState::Released
+                })
+                .count();
+            let attempts_consumed = session
+                .attempt_reservations
+                .iter()
+                .filter(|reservation| {
+                    reservation.state == RepairAttemptReservationState::Consumed
+                })
+                .count();
+            let reservation_identity_invalid = session
+                .attempt_reservations
+                .iter()
+                .any(|reservation| {
+                    reservation.repair_session_id != session.session_id
+                        || reservation.attempt_id.is_empty()
+                        || !reservation_ids.insert(reservation.attempt_id.clone())
+                });
+            if reservation_identity_invalid
+                || attempts_consumed > attempts_started
+                || attempts_started
+                    > usize::try_from(session.budget.max_target_attempts).unwrap_or(usize::MAX)
+            {
+                return Err(GraphInvariantError::new(format!(
+                    "validation repair session `{}` has inconsistent attempt reservations",
+                    session.session_id
+                )));
+            }
+            if !session.attempt_reservations.is_empty() {
+                let owner = ExecutionNodeId::new(session.session_id.clone());
+                if usize::try_from(self.usage_for(&owner).validation_repair_attempts)
+                    .unwrap_or(usize::MAX)
+                    != attempts_consumed
+                {
+                    return Err(GraphInvariantError::new(format!(
+                        "validation repair session `{}` attempt usage does not match consumed reservations",
+                        session.session_id
+                    )));
+                }
+            }
         }
         for (node_id, usage) in &self.node_usage {
             let owned_budget;
@@ -841,6 +941,10 @@ impl BudgetState {
         usage.cost_micros_reserved = usage
             .cost_micros_reserved
             .saturating_sub(reservation.estimated_cost_micros);
+        self.reconcile_validation_repair_attempt_for_owner(
+            &reservation.node_id,
+            RepairAttemptReservationState::Released,
+        );
     }
 
     pub fn consume_model_call_reservation(
@@ -849,7 +953,22 @@ impl BudgetState {
         actual_cost_micros: u64,
         duration: Duration,
     ) {
-        self.release_model_call_reservation(reservation);
+        self.total_model_calls_reserved = self.total_model_calls_reserved.saturating_sub(1);
+        self.total_cost_micros_reserved = self
+            .total_cost_micros_reserved
+            .saturating_sub(reservation.estimated_cost_micros);
+        let usage = self
+            .node_usage
+            .entry(reservation.node_id.clone())
+            .or_default();
+        usage.model_calls_reserved = usage.model_calls_reserved.saturating_sub(1);
+        usage.cost_micros_reserved = usage
+            .cost_micros_reserved
+            .saturating_sub(reservation.estimated_cost_micros);
+        self.reconcile_validation_repair_attempt_for_owner(
+            &reservation.node_id,
+            RepairAttemptReservationState::Consumed,
+        );
         self.record_model_call(reservation.node_id.clone(), actual_cost_micros, duration);
     }
 

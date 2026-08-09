@@ -1273,10 +1273,7 @@ impl<'a> GatewayAgent<'a> {
             let model_call = match self.phases.begin_graph_model_call() {
                 Ok(model_call) => model_call,
                 Err(error) => {
-                    self.notebook
-                        .orchestration
-                        .budget
-                        .release_model_call_reservation(&reservation);
+                    self.release_graph_model_call_reservation(&reservation);
                     return Err(error);
                 }
             };
@@ -1302,10 +1299,7 @@ impl<'a> GatewayAgent<'a> {
                 }),
             ) {
                 self.phases.rollback_model_call(call_phase)?;
-                self.notebook
-                    .orchestration
-                    .budget
-                    .release_model_call_reservation(&reservation);
+                self.release_graph_model_call_reservation(&reservation);
                 return Err(error);
             }
             let execution_deadline = match hosted_execution_deadline(
@@ -1315,10 +1309,7 @@ impl<'a> GatewayAgent<'a> {
                 Ok(deadline) => deadline,
                 Err(error) => {
                     self.phases.rollback_model_call(call_phase)?;
-                    self.notebook
-                        .orchestration
-                        .budget
-                        .release_model_call_reservation(&reservation);
+                    self.release_graph_model_call_reservation(&reservation);
                     return Err(error);
                 }
             };
@@ -1340,10 +1331,7 @@ impl<'a> GatewayAgent<'a> {
                         .unwrap_or(AiBudgetDisposition::Unknown);
                     if budget_disposition == AiBudgetDisposition::Restore {
                         self.phases.rollback_model_call(call_phase)?;
-                        self.notebook
-                            .orchestration
-                            .budget
-                            .release_model_call_reservation(&reservation);
+                        self.release_graph_model_call_reservation(&reservation);
                         if http.is_some_and(|failure| {
                             failure.failure_class() == AiFailureClass::RegistrationConflict
                         }) {

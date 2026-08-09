@@ -222,6 +222,10 @@ fn remaining_work_item(node: &crate::execution_graph::ExecutionNode) -> Remainin
             "validation repair",
             "Repair the failed validation gate and rerun its current assertion set.".to_owned(),
         ),
+        ExecutionNodeKind::DiffReviewRepair => (
+            "diff review repair",
+            "Repair a diff-review finding using the active repository target.".to_owned(),
+        ),
         ExecutionNodeKind::DiffReview => (
             "diff review",
             "Review the final repository diff after required validation.".to_owned(),
@@ -869,6 +873,7 @@ impl HostedOrchestrationCheckpoint {
             Some(
                 ExecutionNodeKind::ValidationRepair | ExecutionNodeKind::ValidationRepairSession,
             ) => ExecutionPhase::Repair,
+            Some(ExecutionNodeKind::DiffReviewRepair) => ExecutionPhase::Repair,
             Some(
                 ExecutionNodeKind::ValidationFocused
                 | ExecutionNodeKind::ValidationSuite
@@ -1459,6 +1464,7 @@ const fn node_kind_label(kind: ExecutionNodeKind) -> &'static str {
         ExecutionNodeKind::ValidationLint => "validation_lint",
         ExecutionNodeKind::ValidationRepair => "validation_repair",
         ExecutionNodeKind::ValidationRepairSession => "validation_repair_session",
+        ExecutionNodeKind::DiffReviewRepair => "diff_review_repair",
         ExecutionNodeKind::DiffReview => "diff_review",
         ExecutionNodeKind::CompletionEvaluation => "completion_evaluation",
         ExecutionNodeKind::Publication => "publication",

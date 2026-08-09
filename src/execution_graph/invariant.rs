@@ -67,9 +67,9 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
-            if node.kind.is_mutation() && node.target.is_none() {
+            if node.has_capability(NodeCapability::RepositoryMutation) && node.target.is_none() {
                 return Err(GraphInvariantError::new(format!(
-                    "mutation node `{}` has no planned target",
+                    "repository-mutation-capable node `{}` has no planned target",
                     node.id
                 )));
             }
@@ -96,7 +96,7 @@ impl ExecutionGraph {
                     node.id
                 )));
             }
-            if node.kind.is_mutation()
+            if node.has_capability(NodeCapability::RepositoryMutation)
                 && node.status == ExecutionNodeStatus::Completed
                 && let Some(attempt) = node.attempts.last()
                 && (attempt.outcome == Some(ExecutionNodeStatus::Completed)

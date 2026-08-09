@@ -1202,6 +1202,61 @@ impl<'a> GatewayAgent<'a> {
         } else {
             None
         };
+        if reservation.is_some()
+            && self.current_model_call_purpose()
+                == Some(crate::execution_graph::ModelCallPurpose::ValidationRepairMutation)
+            && let Some(failure_id) = validation_repair_failure_id.as_ref()
+        {
+            let target_id = self
+                .notebook
+                .orchestration
+                .budget
+                .repair_session_for_failure(failure_id)
+                .and_then(|session| session.repair_nodes.last())
+                .and_then(|repair_node_id| {
+                    self.notebook
+                        .orchestration
+                        .graph
+                        .as_ref()
+                        .and_then(|graph| graph.node(repair_node_id))
+                })
+                .and_then(|node| node.target.as_ref())
+                .map(|target| target.mutation_target_id().to_string())
+                .unwrap_or_default();
+            let repair_reservation = self
+                .notebook
+                .orchestration
+                .budget
+                .reserve_validation_repair_attempt(failure_id, target_id);
+            match repair_reservation {
+                Ok(repair_reservation) => {
+                    let attempts_consumed_before = self
+                        .notebook
+                        .orchestration
+                        .budget
+                        .usage_for(&node_id)
+                        .validation_repair_attempts;
+                    self.append_event_recoverable(
+                        "repair",
+                        json!({
+                            "event_type": "worker.repair_attempt_reserved",
+                            "repair_session_id": repair_reservation.repair_session_id,
+                            "repair_attempt_id": repair_reservation.attempt_id,
+                            "target_id": repair_reservation.target_id,
+                            "attempts_consumed_before": attempts_consumed_before,
+                            "attempts_consumed_after": attempts_consumed_before,
+                        }),
+                        "validation repair provider attempt reserved",
+                    );
+                }
+                Err(_) => {
+                    if let Some(reservation) = reservation.as_ref() {
+                        self.release_graph_model_call_reservation(reservation);
+                    }
+                    return None;
+                }
+            }
+        }
         self.append_event_recoverable(
             "progress",
             model_call_admission_telemetry(&admission, &estimate),
@@ -1211,6 +1266,48 @@ impl<'a> GatewayAgent<'a> {
             return None;
         }
         reservation
+    }
+
+    pub(in crate::hosted) fn release_graph_model_call_reservation(
+        &mut self,
+        reservation: &crate::execution_graph::ModelCallReservation,
+    ) {
+        let repair_reservation = self
+            .notebook
+            .orchestration
+            .budget
+            .validation_repair_sessions
+            .get(reservation.node_id.as_str())
+            .and_then(|session| {
+                session.attempt_reservations.iter().find(|attempt| {
+                    attempt.state == crate::execution_graph::RepairAttemptReservationState::Reserved
+                })
+            })
+            .cloned();
+        let attempts_consumed = self
+            .notebook
+            .orchestration
+            .budget
+            .usage_for(&reservation.node_id)
+            .validation_repair_attempts;
+        self.notebook
+            .orchestration
+            .budget
+            .release_model_call_reservation(reservation);
+        if let Some(repair_reservation) = repair_reservation {
+            self.append_event_recoverable(
+                "repair",
+                json!({
+                    "event_type": "worker.repair_attempt_released",
+                    "repair_session_id": repair_reservation.repair_session_id,
+                    "repair_attempt_id": repair_reservation.attempt_id,
+                    "target_id": repair_reservation.target_id,
+                    "attempts_consumed_before": attempts_consumed,
+                    "attempts_consumed_after": attempts_consumed,
+                }),
+                "validation repair provider attempt released",
+            );
+        }
     }
 
     pub(in crate::hosted) fn effective_phase_model_call_limit(&self) -> usize {
@@ -1384,15 +1481,34 @@ impl<'a> GatewayAgent<'a> {
             .cost_guard
             .estimated_cost_micros
             .saturating_add(call_cost_micros);
+        let purpose = self.current_model_call_purpose();
         self.notebook
             .orchestration
             .budget
             .consume_model_call_reservation(reservation, call_cost_micros, duration);
-        if let Some(purpose) = self.current_model_call_purpose() {
+        if let Some(purpose) = purpose {
             self.notebook
                 .orchestration
                 .budget
                 .record_model_call_purpose(purpose);
+            if purpose == crate::execution_graph::ModelCallPurpose::ValidationRepairMutation {
+                let attempts_after = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .usage_for(&reservation.node_id)
+                    .validation_repair_attempts;
+                self.append_event_recoverable(
+                    "repair",
+                    json!({
+                        "event_type": "worker.repair_attempt_consumed",
+                        "repair_session_id": reservation.node_id.as_str(),
+                        "attempts_consumed_before": attempts_after.saturating_sub(1),
+                        "attempts_consumed_after": attempts_after,
+                    }),
+                    "validation repair provider attempt consumed",
+                );
+            }
         }
         if estimated {
             self.append_event_recoverable(
@@ -1552,15 +1668,35 @@ impl<'a> GatewayAgent<'a> {
                 self.cost_guard.usage_estimate_fallbacks.saturating_add(1);
         }
 
+        let purpose = self.current_model_call_purpose();
         self.notebook
             .orchestration
             .budget
             .consume_model_call_reservation(reservation, call_cost_micros, duration);
-        if let Some(purpose) = self.current_model_call_purpose() {
+        if let Some(purpose) = purpose {
             self.notebook
                 .orchestration
                 .budget
                 .record_model_call_purpose(purpose);
+            if purpose == crate::execution_graph::ModelCallPurpose::ValidationRepairMutation {
+                let attempts_after = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .usage_for(&reservation.node_id)
+                    .validation_repair_attempts;
+                self.append_event_recoverable(
+                    "repair",
+                    json!({
+                        "event_type": "worker.repair_attempt_consumed",
+                        "repair_session_id": reservation.node_id.as_str(),
+                        "attempts_consumed_before": attempts_after.saturating_sub(1),
+                        "attempts_consumed_after": attempts_after,
+                        "provider_call_failed": true,
+                    }),
+                    "failed validation repair provider attempt consumed",
+                );
+            }
         }
         self.append_event_recoverable(
             "progress",
@@ -2278,6 +2414,16 @@ impl<'a> GatewayAgent<'a> {
             )),
             _ => None,
         });
+        let repair_activation_was_present =
+            started_validation_repair
+                .as_ref()
+                .is_some_and(|(_, _, repair_node_id, _, _, _)| {
+                    self.notebook
+                        .orchestration
+                        .graph
+                        .as_ref()
+                        .is_some_and(|graph| graph.node(repair_node_id).is_some())
+                });
         if let Some(event) = event {
             self.append_execution_domain_event(event)?;
         }
@@ -2303,28 +2449,36 @@ impl<'a> GatewayAgent<'a> {
                 "repair_status_before": "ready",
                 "repair_status_after": "running",
             });
-            for (event_type, message) in [
-                (
-                    "worker.validation_repair_node_created",
-                    "validation repair node created",
-                ),
-                (
-                    "worker.validation_repair_node_started",
-                    "validation repair node started",
-                ),
-                (
-                    "worker.validation_repair_target_linked",
-                    "validation repair target linked",
-                ),
-                (
-                    "worker.originating_implementation_node_preserved",
-                    "originating implementation node preserved",
-                ),
-            ] {
-                let mut data = common.clone();
-                data["event_type"] = Value::String(event_type.into());
-                self.append_event_recoverable("validation", data, message);
-            }
+            let event_type = if repair_activation_was_present {
+                "worker.repair_node_activation_idempotent"
+            } else {
+                "worker.validation_repair_node_activated"
+            };
+            let mut data = common;
+            data["event_type"] = Value::String(event_type.into());
+            data["node_kind"] = Value::String("validation_repair".into());
+            data["capabilities"] = json!(["repository_read", "repository_mutation", "repair"]);
+            self.append_event_recoverable(
+                "validation",
+                data,
+                if repair_activation_was_present {
+                    "validation repair node activation replayed idempotently"
+                } else {
+                    "validation repair node activated atomically"
+                },
+            );
+            self.append_event_recoverable(
+                "validation",
+                json!({
+                    "event_type": "worker.node_capabilities_resolved",
+                    "node_id": repair_node_id,
+                    "node_kind": "validation_repair",
+                    "capabilities": ["repository_read", "repository_mutation", "repair"],
+                    "repair_session_id": crate::execution_graph::BudgetState::repair_session_id(&failure_id),
+                    "target_id": target_ref.target_id,
+                }),
+                "validation repair node capabilities resolved",
+            );
         }
         if let ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
@@ -2427,17 +2581,28 @@ impl<'a> GatewayAgent<'a> {
                 "validation repair contract built",
             );
             if !repair.attempted_targets.is_empty() {
+                let selects_next = repair
+                    .remaining_eligible_targets
+                    .contains(&repair.selected_target);
                 self.append_event_recoverable(
                     "validation",
                     json!({
-                        "event_type": "worker.validation_repair_next_target_selected",
+                        "event_type": if selects_next {
+                            "worker.validation_repair_next_target_selected"
+                        } else {
+                            "worker.validation_repair_active_target_confirmed"
+                        },
                         "failed_validation_id": repair.repair_intent.failed_validation_id,
                         "repair_intent_id": repair.repair_intent.repair_intent_id,
                         "selected_target": repair.selected_target,
                         "previous_targets": repair.attempted_targets,
                         "remaining_eligible_targets": repair.remaining_eligible_targets,
                     }),
-                    "validation repair next target selected",
+                    if selects_next {
+                        "validation repair next target selected"
+                    } else {
+                        "validation repair active target confirmed"
+                    },
                 );
             }
         }
@@ -3458,12 +3623,43 @@ impl<'a> GatewayAgent<'a> {
         );
         bind_validation_repair_model_call(&mut event, self.active_model_call_id.as_deref());
         let mut snapshot = self.build_execution_snapshot()?;
+        let mutation_owner = event.node_id().cloned();
+        let mutation_context = event.mutation_context(&snapshot.graph).map_err(|error| {
+            anyhow!(mutation_owner.as_ref().map_or_else(
+                || HostedInvariantFailure::in_phase(
+                    "mutation_capability_contract_mismatch",
+                    "repair",
+                    error.to_string(),
+                ),
+                |node_id| HostedInvariantFailure::for_node_in_phase(
+                    "mutation_capability_contract_mismatch",
+                    "repair",
+                    node_id.to_string(),
+                    error.to_string(),
+                )
+            ))
+        })?;
+        let mutation_event_family = event.event_type();
         snapshot.append_event(event).map_err(|error| {
             if error.code == "completed_implementation_node_reopened" {
                 anyhow!(HostedInvariantFailure::in_phase(
                     "completed_implementation_node_reopened",
                     "validation_repair",
                     error.to_string(),
+                ))
+            } else if error.code == "mutation_capability_contract_mismatch" {
+                anyhow!(mutation_owner.as_ref().map_or_else(
+                    || HostedInvariantFailure::in_phase(
+                        "mutation_capability_contract_mismatch",
+                        "repair",
+                        error.to_string(),
+                    ),
+                    |node_id| HostedInvariantFailure::for_node_in_phase(
+                        "mutation_capability_contract_mismatch",
+                        "repair",
+                        node_id.to_string(),
+                        error.to_string(),
+                    )
                 ))
             } else if validation_repair_admission {
                 anyhow!(HostedRepairAccountingFailure::incompatible_scope(
@@ -3477,6 +3673,38 @@ impl<'a> GatewayAgent<'a> {
         orchestration.replace_from_snapshot(&snapshot);
         orchestration.materialize_legacy_notebook(&mut self.notebook);
         self.notebook.orchestration = orchestration;
+        if let Some(context) = mutation_context {
+            let producer = self
+                .notebook
+                .orchestration
+                .graph
+                .as_ref()
+                .and_then(|graph| graph.node(&context.node_id));
+            let node_kind = producer.map(|node| node.kind);
+            let capabilities = producer.map(|node| node.kind.capabilities());
+            let common = json!({
+                "node_id": context.node_id,
+                "node_kind": node_kind,
+                "capabilities": capabilities,
+                "intent_kind": context.intent_kind,
+                "target_id": context.target_id,
+                "target_path": context.target_path,
+                "repository_fingerprint": context.repository_fingerprint,
+                "event_family": mutation_event_family,
+            });
+            for event_type in [
+                "worker.repository_mutation_capability_checked",
+                "worker.mutation_event_owner_resolved",
+            ] {
+                let mut data = common.clone();
+                data["event_type"] = Value::String(event_type.into());
+                self.append_event_recoverable(
+                    "repair",
+                    data,
+                    "repository mutation producer capability resolved",
+                );
+            }
+        }
         Ok(())
     }
 
