@@ -37,8 +37,8 @@ jobs:
 
       - name: Install RustGrid agent
         env:
-          RUSTGRID_AGENT_DOWNLOAD_URL: 'https://github.com/RustGrid/rustgrid-agent/releases/download/v1.4.44/rustgrid-agent-1.4.44-linux-x86_64.tar.gz'
-          RUSTGRID_AGENT_SHA256: 'bc77b6292659bb42e361da57550470e1b9571172c51e8e90259961b2cdca8dbd'
+          RUSTGRID_AGENT_DOWNLOAD_URL: 'https://github.com/RustGrid/rustgrid-agent/releases/download/v1.4.46/rustgrid-agent-1.4.46-linux-x86_64.tar.gz'
+          RUSTGRID_AGENT_SHA256: '4f3f6a1383547ad4394cbaf57c2d4c90a6667cfaf7fd2439ba4600705f5a9e3c'
         run: |
           set -euo pipefail
           archive_path="$RUNNER_TEMP/rustgrid-agent.tar.gz"
