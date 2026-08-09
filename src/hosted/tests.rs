@@ -2252,6 +2252,44 @@ Received: "light-blue"
 }
 
 #[test]
+fn failed_validation_summary_preserves_large_suite_failure_tail_for_parser() {
+    let mut stdout = String::new();
+    for index in 0..2_000 {
+        stdout.push_str(&format!(
+            " PASS  tests/passing-{index}.test.ts > passing suite > passes\n"
+        ));
+    }
+    stdout.push_str(
+        r#"
+ FAIL  tests/state-machine.test.ts > state machine > reaches the completed state
+AssertionError: expected 'running' to be 'completed'
+Expected: "completed"
+Received: "running"
+ ❯ tests/state-machine.test.ts:42:19
+"#,
+    );
+
+    let summary = validation_output_summary(&stdout, "", false, 16_000);
+    assert!(summary.len() <= 16_000);
+    let assertions = parse_validation_assertion_failures(
+        "npx vitest run",
+        &summary,
+        &[(
+            "tests/state-machine.test.ts".into(),
+            "expect(state).toBe('completed');".into(),
+        )],
+    );
+    assert_eq!(assertions.len(), 1);
+    assert_eq!(assertions[0].test_name, "reaches the completed state");
+    assert_eq!(assertions[0].source_line, Some(42));
+    assert!(
+        assertions[0]
+            .implicated_paths
+            .contains(&"tests/state-machine.test.ts".to_owned())
+    );
+}
+
+#[test]
 fn vitest_fallback_preserves_a_bounded_structured_failure_when_header_is_unknown() {
     let output = concat!(
         "\u{1b}[31m",

@@ -497,7 +497,6 @@ where
         };
         let (result, evidence_status, exit_code, stdout, stderr) = match output {
             Ok(output) => {
-                let combined = format!("{}\n{}", output.stdout, output.stderr);
                 let passed = output.status.success();
                 (
                     ValidationResult {
@@ -508,7 +507,12 @@ where
                         } else {
                             "failed".into()
                         },
-                        output: truncate_text(&combined, 16_000),
+                        output: validation_output_summary(
+                            &output.stdout,
+                            &output.stderr,
+                            passed,
+                            16_000,
+                        ),
                     },
                     if passed {
                         ValidationStatus::Passed
@@ -650,6 +654,40 @@ where
         }
     }
     Ok(results)
+}
+
+pub(in crate::hosted) fn validation_output_summary(
+    stdout: &str,
+    stderr: &str,
+    passed: bool,
+    maximum: usize,
+) -> String {
+    let combined = format!("{stdout}\n{stderr}");
+    if passed || combined.len() <= maximum {
+        return truncate_text(&combined, maximum);
+    }
+
+    let marker = "\n[validation output truncated; failure tail preserved]\n";
+    if maximum <= marker.len() {
+        return truncate_text(&combined, maximum);
+    }
+    let retained = maximum - marker.len();
+    let head_budget = retained / 4;
+    let tail_budget = retained - head_budget;
+    let mut head_end = head_budget;
+    while head_end > 0 && !combined.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = combined.len().saturating_sub(tail_budget);
+    while tail_start < combined.len() && !combined.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}{}{}",
+        &combined[..head_end],
+        marker,
+        &combined[tail_start..]
+    )
 }
 
 pub(in crate::hosted) fn classify_validation_gate(id: &str, command: &str) -> ValidationGateType {
