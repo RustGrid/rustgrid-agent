@@ -1918,6 +1918,219 @@ fn one_validation_infrastructure_retry_runs_without_a_model_call() {
 }
 
 #[test]
+fn scheduled_validation_repair_rerun_starts_the_existing_validation_process_once() {
+    use crate::execution_graph::{
+        BudgetState, ExecutionGraph, ExecutionNodeStatus, MissionBudget, MissionComplexity,
+        PlannedTarget as GraphTarget, ValidationGateSpec,
+        ValidationGateType as GraphValidationGateType, ValidationRepairBudget,
+        ValidationRepairSession, ValidationRepairSessionStatus,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    command::checked("git", ["init", "-q"], directory.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], directory.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        directory.path(),
+    )
+    .unwrap();
+    fs::write(directory.path().join("fixture.txt"), "before\n").unwrap();
+    command::checked("git", ["add", "fixture.txt"], directory.path()).unwrap();
+    command::checked(
+        "git",
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+        directory.path(),
+    )
+    .unwrap();
+    let base_sha = command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+    fs::write(directory.path().join("fixture.txt"), "after repair\n").unwrap();
+
+    let execution_id = Uuid::from_u128(0xa0229);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = base_sha.clone();
+    manifest.execution_policy.quality_gates = vec![HostedQualityGate {
+        id: "test".into(),
+        command: "true".into(),
+        timeout_seconds: 30,
+        required: true,
+    }];
+    let repo = Repo {
+        root: directory.path().to_path_buf(),
+    };
+    let repository_fingerprint = repository_state_fingerprint(&repo, &base_sha).unwrap();
+    let mission_budget = MissionBudget::for_complexity(MissionComplexity::Small);
+    let mut graph = ExecutionGraph::from_targets(
+        "validation-rerun",
+        MissionComplexity::Small,
+        &repository_fingerprint,
+        &[GraphTarget {
+            change_id: "repair-target".into(),
+            path: "fixture.txt".into(),
+            role: "production".into(),
+            intent: "repair the failed validation".into(),
+            acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
+            new_file: false,
+        }],
+        &[ValidationGateSpec {
+            gate_id: "test".into(),
+            gate_type: GraphValidationGateType::TestSuite,
+            command: "true".into(),
+            working_directory: directory.path().to_string_lossy().into_owned(),
+            required: true,
+            ..ValidationGateSpec::default()
+        }],
+        &mission_budget,
+    );
+    let mutation_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind.is_mutation())
+        .unwrap()
+        .id
+        .clone();
+    graph
+        .set_node_status(&mutation_node, ExecutionNodeStatus::Completed)
+        .unwrap();
+    let validation_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind.is_validation())
+        .unwrap()
+        .id
+        .clone();
+    let gate = graph
+        .node(&validation_node)
+        .unwrap()
+        .validation
+        .clone()
+        .unwrap();
+
+    let mut notebook = new_worker_notebook(&manifest, repository_fingerprint.clone(), None);
+    notebook.phase = ExecutionPhase::Repair;
+    notebook.orchestration.graph_revision = graph.revision;
+    notebook.orchestration.graph = Some(graph);
+    notebook.orchestration.legacy_import_completed = true;
+    notebook.orchestration.budget = BudgetState::new(mission_budget);
+    notebook
+        .orchestration
+        .budget
+        .validation_repair_sessions
+        .insert(
+            "validation-repair-session".into(),
+            ValidationRepairSession {
+                session_id: "validation-repair-session".into(),
+                failed_validation_id: "failed-test-r1".into(),
+                originating_gate_id: validation_node.clone(),
+                budget: ValidationRepairBudget {
+                    max_model_calls: 2,
+                    max_target_attempts: 1,
+                    max_repository_writes: 1,
+                    max_context_rebuilds: 1,
+                    max_cost_micros: 1,
+                },
+                status: ValidationRepairSessionStatus::ReadyForRerun,
+                current_assertion_set_revision: 1,
+                ..ValidationRepairSession::default()
+            },
+        );
+    manifest.run.metadata["worker_notebook"] = serde_json::to_value(notebook).unwrap();
+
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let api = test_api_client(api_root, execution_id);
+    let validation_api = api.clone();
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let containment = command::HostedProcessContainment::new().unwrap();
+    let mut agent = GatewayAgent::new(
+        api,
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    agent.phases = PhaseLedger::new(25, ExecutionPhase::Repair);
+    agent
+        .apply_execution_decision(ExecutionDecision::RunValidation {
+            node_id: validation_node.clone(),
+            gate,
+        })
+        .unwrap();
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .unwrap()
+            .node(&validation_node)
+            .unwrap()
+            .status,
+        ExecutionNodeStatus::Running
+    );
+
+    let results = run_graph_validation_sequence(&mut agent, &validation_api, &manifest, &repo, 2);
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let results = results.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, "passed");
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .budget
+            .validation_gate_usage
+            .get(&validation_node)
+            .map(|usage| usage.command_runs),
+        Some(1)
+    );
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.validation_rerun_scheduled"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.validation_process_started"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.validation_process_completed"))
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("worker.orchestration_cycle_detected"))
+    );
+}
+
+#[test]
 fn validation_failure_target_hint_requires_one_explicit_planned_path() {
     let targets = vec!["src/first.rs".to_owned(), "src/last.rs".to_owned()];
     assert_eq!(
