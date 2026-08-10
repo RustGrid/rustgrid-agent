@@ -3877,20 +3877,19 @@ impl<'a> GatewayAgent<'a> {
             _ => return Ok(()),
         };
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
-        let failure_id = crate::execution_graph::FailureId::new(format!(
-            "target-{}",
-            sha256_text(&format!("{node_id}\0{fingerprint}\0{detail}"))
-        ));
+        let attempt = self
+            .notebook
+            .orchestration
+            .budget
+            .usage_for(&node_id)
+            .mutation_fallback_attempts
+            .saturating_add(1);
+        let failure_id = active_target_failure_id(&node_id, &fingerprint, attempt, detail);
         let mut failure = crate::execution_graph::FailureRecord::new(
             failure_id,
             node_id.clone(),
             category,
-            self.notebook
-                .orchestration
-                .budget
-                .usage_for(&node_id)
-                .mutation_fallback_attempts
-                .saturating_add(1),
+            attempt,
             fingerprint,
             detail,
         );
@@ -6459,9 +6458,107 @@ impl<'a> GatewayAgent<'a> {
     }
 }
 
+fn active_target_failure_id(
+    node_id: &crate::execution_graph::ExecutionNodeId,
+    repository_fingerprint: &str,
+    attempt: u32,
+    detail: &str,
+) -> crate::execution_graph::FailureId {
+    crate::execution_graph::FailureId::new(format!(
+        "target-{}",
+        sha256_text(&format!(
+            "{node_id}\0{repository_fingerprint}\0{attempt}\0{detail}"
+        ))
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_mutation_attempt_failures_are_recorded_and_replay_idempotently() {
+        use crate::execution_graph::{
+            ExecutionDomainEvent, ExecutionGraph, ExecutionSnapshot, FailureCategory,
+            FailureRecord, MissionBudget, MissionComplexity, PlannedTarget,
+        };
+
+        let graph = ExecutionGraph::from_targets(
+            "mutation-failure-attempts",
+            MissionComplexity::Small,
+            "tree-1",
+            &[PlannedTarget {
+                change_id: "change-theme".into(),
+                path: "src/theme.rs".into(),
+                role: "production".into(),
+                intent: "update theme".into(),
+                acceptance_criteria_ids: vec!["ac-1".into()],
+                new_file: false,
+                operation: Default::default(),
+            }],
+            &[],
+            &MissionBudget::for_complexity(MissionComplexity::Small),
+        );
+        let node_id = graph
+            .nodes()
+            .find(|node| node.kind.is_mutation())
+            .expect("mutation node")
+            .id
+            .clone();
+        let initial = ExecutionSnapshot {
+            run_id: "mutation-failure-attempts".into(),
+            graph,
+            ..ExecutionSnapshot::default()
+        };
+        let detail = "replacement no longer matched";
+        let first_id = active_target_failure_id(&node_id, "tree-1", 1, detail);
+        let second_id = active_target_failure_id(&node_id, "tree-1", 2, detail);
+        assert_ne!(first_id, second_id);
+
+        let failure = |id, attempt| {
+            let mut failure = FailureRecord::new(
+                id,
+                node_id.clone(),
+                FailureCategory::MutationConflict,
+                attempt,
+                "tree-1",
+                detail,
+            );
+            failure.target_path = Some("src/theme.rs".into());
+            failure
+        };
+        let events = vec![
+            ExecutionDomainEvent::MutationRejected {
+                sequence: 1,
+                node_id: node_id.clone(),
+                failure: failure(first_id.clone(), 1),
+            },
+            ExecutionDomainEvent::FailureSuperseded {
+                sequence: 2,
+                node_id: node_id.clone(),
+                failure_id: first_id.clone(),
+                repository_fingerprint: "tree-1".into(),
+            },
+            ExecutionDomainEvent::MutationRejected {
+                sequence: 3,
+                node_id: node_id.clone(),
+                failure: failure(second_id.clone(), 2),
+            },
+        ];
+        let mut persisted = initial.clone();
+        for event in events.iter().cloned() {
+            persisted.append_event(event).expect("record failure event");
+        }
+        assert!(persisted.failures.get(&first_id).is_some());
+        assert!(persisted.failures.get(&second_id).is_some());
+
+        let mut replayed = initial;
+        for event in events {
+            replayed.append_event(event).expect("replay failure event");
+        }
+        assert_eq!(replayed.failures, persisted.failures);
+        assert_eq!(replayed.events, persisted.events);
+    }
 
     #[test]
     fn target_context_identity_is_idempotent_and_fingerprint_bound() {
