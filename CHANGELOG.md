@@ -5,6 +5,15 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.47 - 2026-08-10
+
+### Fixed
+
+- Include the structured mutation-fallback attempt ordinal in mutation failure
+  identity so separate attempts against the same target cannot collide.
+- Preserve strict duplicate failure protection and deterministic event replay
+  while allowing each legitimate mutation attempt to record its own failure.
+
 ## 1.4.46 - 2026-08-09
 
 ### Fixed
