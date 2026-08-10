@@ -5,6 +5,15 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.48 - 2026-08-10
+
+### Fixed
+
+- Enforce an active mutation fallback policy in persisted repair-target model
+  requests so only the permitted replacement tool is exposed and forced.
+- Preserve the normal mutation tool set before and after the bounded fallback
+  attempt while preventing a rejected patch tool from being selected again.
+
 ## 1.4.47 - 2026-08-10
 
 ### Fixed
