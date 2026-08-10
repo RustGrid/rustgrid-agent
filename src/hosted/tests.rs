@@ -695,6 +695,68 @@ fn forced_replacement_request_is_exactly_bound_and_passes_preflight() {
 }
 
 #[test]
+fn persisted_mutation_fallback_request_exposes_only_the_forced_replacement_tool() {
+    let target = mutation_fallback_target("fn current() {}\n");
+    let node_id = target.node_id.clone();
+    let initial = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::MutateTarget {
+            node_id: node_id.clone(),
+            target: target.target.clone(),
+            expected_repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                "repository-fingerprint",
+            ),
+        },
+        target: target.clone(),
+    };
+    let initial_tools = hosted_tools_for_action(ExecutionPhase::Implementation, Some(&initial));
+    assert!(
+        initial_tools
+            .iter()
+            .any(|tool| tool["name"] == "apply_patch")
+    );
+
+    let mut failure = crate::execution_graph::FailureRecord::new(
+        "failed-apply-patch",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        "repository-fingerprint",
+        "initial apply_patch mutation failed",
+    );
+    failure.code = Some(
+        MutationApplicationFailure::PatchContextMismatch
+            .as_str()
+            .into(),
+    );
+    failure.target_path = Some(target.target.path.clone());
+    let fallback = ExecutionDecision::RepairTarget {
+        node_id,
+        failure_id: failure.id.clone(),
+        context: crate::hosted_orchestrator::TargetRepairContext {
+            failure,
+            target,
+            next_repair_attempt: 1,
+            fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
+        },
+    };
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&fallback), 16_384);
+    let request = json!({
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&fallback)),
+        "tool_choice": profile.tool_choice(),
+    });
+    let tool_names = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, ["replace_file"]);
+    assert!(!tool_names.contains(&"apply_patch"));
+    assert_eq!(request["tool_choice"]["name"], "replace_file");
+}
+
+#[test]
 fn repair_preflight_requires_the_policy_in_the_actual_request_context() {
     let decision = mutation_fallback_decision(
         MutationFallbackPolicy::ForceReplaceFile,

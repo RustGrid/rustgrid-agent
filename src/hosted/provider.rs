@@ -913,6 +913,16 @@ impl ModelActionProfile {
                 forced_tool: fallback_policy.forced_tool(),
                 require_tool: true,
             },
+            Some(ExecutionDecision::RepairTarget { context, .. })
+                if context.fallback_policy.requires_provider_mutation() =>
+            {
+                Self {
+                    max_output_tokens: configured_max_output_tokens.min(4_096),
+                    reasoning_effort: "medium",
+                    forced_tool: context.fallback_policy.forced_tool(),
+                    require_tool: true,
+                }
+            }
             Some(ExecutionDecision::ExecuteTarget {
                 action:
                     crate::hosted_orchestrator::MutationAction::PrepareTargetContext { .. }
@@ -1034,6 +1044,9 @@ pub(super) fn hosted_tools_for_action(
                 | crate::hosted_orchestrator::MutationAction::RepairTarget { target, .. },
             ..
         }) => Some(target.path.as_str()),
+        Some(ExecutionDecision::RepairTarget { context, .. }) => {
+            Some(context.target.target.path.as_str())
+        }
         _ => None,
     };
     let allowed = match decision {
@@ -1075,6 +1088,11 @@ pub(super) fn hosted_tools_for_action(
             ..
         }) if fallback_policy.requires_provider_mutation() => {
             Some(fallback_policy.permitted_tools())
+        }
+        Some(ExecutionDecision::RepairTarget { context, .. })
+            if context.fallback_policy.requires_provider_mutation() =>
+        {
+            Some(context.fallback_policy.permitted_tools())
         }
         Some(ExecutionDecision::ExecuteTarget {
             action: crate::hosted_orchestrator::MutationAction::RepairTarget { failure, .. },
