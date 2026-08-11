@@ -2360,6 +2360,7 @@ impl<'a> GatewayAgent<'a> {
                     .append_event(
                         "tool",
                         json!({
+                            "event_type": "worker.authoritative_tool_checkpoint",
                             "tool": name,
                             "target": target,
                             "status": if result["ok"] == true { "completed" } else { "failed" },
