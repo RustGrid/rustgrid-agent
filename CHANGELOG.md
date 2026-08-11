@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.49 - 2026-08-11
+
+### Fixed
+
+- Classify the existing authoritative hosted tool checkpoint explicitly so a
+  completed validation-repair notebook receives the backend's bounded
+  checkpoint allowance instead of the generic event limit.
+- Allow verified validation repair to persist its checkpoint and continue into
+  the existing validation-rerun scheduling path.
+
 ## 1.4.48 - 2026-08-10
 
 ### Fixed
