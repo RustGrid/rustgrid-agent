@@ -6754,6 +6754,291 @@ fn remote_reconciliation_reestablishes_fingerprint_bound_graph_finalization() {
 }
 
 #[test]
+fn generic_hosted_golden_path_reaches_pull_request_and_preserves_canonical_success() {
+    use crate::execution_graph::{
+        ExecutionDomainEvent, ExecutionNodeStatus, MissionComplexity, MissionOutcome,
+        PlannedTarget as GraphPlannedTarget, PublicationStatus,
+        ValidationGateSpec as GraphValidationGateSpec,
+        ValidationGateType as GraphValidationGateType,
+    };
+    use crate::hosted_simulation::{
+        ScriptedMission, ScriptedValidationResult, SimulationHarness, SimulationPhase,
+    };
+
+    let target_path = "src/feature.rs";
+    let acceptance_criterion = "ac-external-review";
+    let mission = ScriptedMission::new("generic hosted golden path", MissionComplexity::Small)
+        .with_target(GraphPlannedTarget {
+            change_id: "implement-feature".into(),
+            path: target_path.into(),
+            role: "production implementation".into(),
+            intent: "implement the requested repository behavior".into(),
+            acceptance_criteria_ids: vec![acceptance_criterion.into()],
+            operation: crate::execution_graph::TargetOperation::ModifyExisting,
+            new_file: false,
+        })
+        .with_required_acceptance_criteria([acceptance_criterion])
+        .with_validation_gate(GraphValidationGateSpec {
+            gate_id: "focused".into(),
+            gate_type: GraphValidationGateType::FocusedTest,
+            command: "cargo test --test focused".into(),
+            working_directory: ".".into(),
+            required: true,
+            dependency_lock_hash: "generic-lock".into(),
+            relevant_environment_fingerprint: "generic-env".into(),
+        })
+        .with_validation_gate(GraphValidationGateSpec {
+            gate_id: "required".into(),
+            gate_type: GraphValidationGateType::TestSuite,
+            command: "cargo test".into(),
+            working_directory: ".".into(),
+            required: true,
+            dependency_lock_hash: "generic-lock".into(),
+            relevant_environment_fingerprint: "generic-env".into(),
+        })
+        .with_validation_gate(GraphValidationGateSpec {
+            gate_id: "build".into(),
+            gate_type: GraphValidationGateType::Build,
+            command: "cargo build".into(),
+            working_directory: ".".into(),
+            required: true,
+            dependency_lock_hash: "generic-lock".into(),
+            relevant_environment_fingerprint: "generic-env".into(),
+        })
+        .with_completion_outcome(MissionOutcome::PartialReviewable);
+
+    let report = SimulationHarness::new(mission)
+        .run()
+        .expect("generic hosted golden path");
+
+    assert_eq!(report.outcome, MissionOutcome::PartialReviewable);
+    assert!(report.snapshot.graph.implementation_barrier_satisfied());
+    assert!(
+        report
+            .snapshot
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.required && node.kind.is_mutation())
+            .all(|node| matches!(node.status, ExecutionNodeStatus::Completed))
+    );
+    for gate_id in ["focused", "required", "build"] {
+        assert_eq!(report.validation_run_count(gate_id), 1);
+        assert!(report.validation_runs.iter().any(|run| {
+            run.gate_id == gate_id && run.result == ScriptedValidationResult::Passed
+        }));
+    }
+    let phase_position = |phase| {
+        report
+            .phase_trace
+            .iter()
+            .position(|candidate| *candidate == phase)
+            .expect("golden-path phase")
+    };
+    let phases = [
+        SimulationPhase::Discovery,
+        SimulationPhase::Planning,
+        SimulationPhase::Implementation,
+        SimulationPhase::Validation,
+        SimulationPhase::DiffReview,
+        SimulationPhase::CompletionEvaluation,
+        SimulationPhase::Publication,
+        SimulationPhase::Terminal,
+    ];
+    assert!(
+        phases
+            .windows(2)
+            .all(|pair| phase_position(pair[0]) < phase_position(pair[1]))
+    );
+    assert!(report.has_only_legal_adjacent_transitions());
+    assert_eq!(
+        report.snapshot.publication.status,
+        PublicationStatus::PullRequestCreated
+    );
+    assert!(report.snapshot.publication.commit_sha.is_some());
+    assert!(report.snapshot.publication.branch.is_some());
+    assert!(report.snapshot.publication.pull_request_url.is_some());
+    for event_type in [
+        "discovery_completed",
+        "plan_accepted",
+        "validation_started",
+        "validation_passed",
+        "diff_reviewed",
+        "completion_evaluated",
+        "commit_created",
+        "branch_pushed",
+        "pull_request_created",
+        "run_finished",
+    ] {
+        assert!(
+            report
+                .snapshot
+                .events
+                .iter()
+                .any(|event| event.event_type() == event_type),
+            "golden path did not record {event_type}"
+        );
+    }
+    assert_eq!(
+        report
+            .snapshot
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionDomainEvent::ValidationStarted { .. }))
+            .count(),
+        3
+    );
+
+    let execution_id = Uuid::from_u128(0x600d_0000_0000_4000_8000_0000_0000_0001);
+    let completion = CompletionEvaluation {
+        status: CompletionStatus::Partial,
+        implementation_completeness: ImplementationCompleteness::Complete,
+        verification_readiness: VerificationReadiness::PendingManualReview,
+        evaluation_source: EvaluationSource::OrchestratorFallback,
+        confidence: 1.0,
+        criteria: vec![],
+        remaining_implementation_work: vec![],
+        remaining_automated_verification: vec![],
+        pending_external_review: vec![],
+        optional_follow_up: vec![],
+        review_checklist: vec![ReviewChecklistItem {
+            r#type: VerificationType::ProductApproval,
+            description: "A human reviewer approves the acceptance criterion.".into(),
+            status: "pending".into(),
+        }],
+        unrecovered_tool_failures: vec![],
+        summary: "Implementation and automated gates passed; external review remains.".into(),
+    };
+    let validation = [
+        ("focused", "cargo test --test focused"),
+        ("required", "cargo test"),
+        ("build", "cargo build"),
+    ]
+    .into_iter()
+    .map(|(id, command)| ValidationResult {
+        id: id.into(),
+        command: command.into(),
+        status: "passed".into(),
+        output: "passed".into(),
+    })
+    .collect::<Vec<_>>();
+    let result = HostedResult {
+        summary: "Implemented the generic ticket and published it for review.".into(),
+        branch: report.snapshot.publication.branch.clone().unwrap(),
+        commit: report.snapshot.publication.commit_sha.clone().unwrap(),
+        pull_request: PullRequestResult {
+            number: report.snapshot.publication.pull_request_number.unwrap(),
+            url: report
+                .snapshot
+                .publication
+                .pull_request_url
+                .clone()
+                .unwrap(),
+        },
+        validation,
+        completeness: completion,
+        terminal_telemetry: TerminalTelemetry {
+            phase_reached: Some(ExecutionPhase::Publication),
+            changed_paths: vec![target_path.into()],
+            notebook_revision: report.snapshot.graph.revision,
+            ..TerminalTelemetry::default()
+        },
+    };
+    let canonical =
+        resolve_published_terminal_result(execution_id, &result, "2026-08-11T08:00:00Z");
+    assert_eq!(
+        canonical.mission_outcome,
+        CanonicalMissionOutcome::PartialReviewable
+    );
+    assert_eq!(canonical.process_health, ProcessHealth::Healthy);
+    assert_eq!(
+        canonical.execution_status,
+        DomainExecutionStatus::NeedsContinuation
+    );
+    assert!(canonical.publication.is_published());
+    assert_eq!(canonical.process_exit_code(), 0);
+    assert!(
+        canonical
+            .completion
+            .remaining_implementation_work
+            .is_empty()
+    );
+    assert!(
+        canonical
+            .completion
+            .remaining_automated_verification
+            .is_empty()
+    );
+    assert!(canonical.completion.unrecovered_tool_failures.is_empty());
+    assert_eq!(
+        canonical.completion.review_checklist[0].r#type,
+        VerificationType::ProductApproval
+    );
+
+    let Some((api_root, requests, server)) = request_sequence_server(vec![
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+        ("200 OK", json!({})),
+    ]) else {
+        return;
+    };
+    let api = test_api_client(api_root, execution_id);
+    report_hosted_result(
+        &api,
+        execution_id,
+        "2026-08-11T07:55:00Z",
+        "2026-08-11T08:00:00Z",
+        &result,
+    )
+    .expect("missing callback transport must preserve canonical success");
+    server.join().unwrap();
+    let delivered = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(delivered.len(), 5);
+    let canonical_event: Value =
+        serde_json::from_str(delivered[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        canonical_event["data"]["mission_outcome"],
+        "partial_reviewable"
+    );
+    assert_eq!(canonical_event["data"]["process_health"], "healthy");
+    assert_eq!(canonical_event["data"]["status"], "partial_result");
+    assert!(canonical_event["data"]["pull_request_url"].is_string());
+    assert!(delivered[3].contains("worker.terminal_callback_outbox_persisted"));
+    assert!(delivered[4].contains("worker.terminal_callback_attempted"));
+
+    let reconciled = reconcile_terminal_execution(
+        Some(&canonical),
+        false,
+        CallbackStatus::FailedTransport,
+        &InfrastructureTerminalMetadata {
+            provider: "github_actions".into(),
+            workflow_run_id: Some("golden-path-run".into()),
+            workflow_job_id: Some("golden-path-job".into()),
+            workflow_status: "completed".into(),
+            workflow_conclusion: Some("success".into()),
+            runner_name: Some("hosted-runner".into()),
+            observed_at: "2026-08-11T08:00:01Z".into(),
+        },
+        true,
+        true,
+        false,
+    );
+    assert_eq!(
+        reconciled.decision,
+        InfrastructureReconciliationDecision::DomainResultPreserved
+    );
+    assert!(reconciled.domain_status_preserved);
+    assert_eq!(reconciled.anomaly_code, Some("final_callback_missing"));
+    assert_eq!(
+        reconciled.terminal_result_id,
+        Some(canonical.terminal_result_id)
+    );
+    assert_eq!(canonical.process_health, ProcessHealth::Healthy);
+}
+
+#[test]
 fn aops_226_producing_fixture_reviews_commits_pushes_creates_pr_and_exits_zero() {
     let fixture_started = Instant::now();
     let work = tempfile::tempdir().unwrap();
