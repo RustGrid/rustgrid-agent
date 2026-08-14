@@ -314,7 +314,7 @@ fn import_path_stems(content: &str) -> BTreeSet<String> {
 
 pub(super) fn validation_repair_target_hint(
     assertions: &[crate::execution_graph::ValidationAssertionFailure],
-    mutation_target_paths: &[String],
+    mutation_targets: &[crate::execution_graph::PlannedTarget],
     target_contents: &[(String, String)],
 ) -> Option<String> {
     let mut scores = BTreeMap::<String, usize>::new();
@@ -340,25 +340,52 @@ pub(super) fn validation_repair_target_hint(
             .split(|character: char| !character.is_alphanumeric() && character != '_')
             .find(|token| token.len() >= 5)
             .map(normalize_semantic_token);
-        for path in assertion
-            .implicated_paths
+        let imported_plan_supports_received = !assertion.received.is_empty()
+            && mutation_targets.iter().any(|target| {
+                !is_test_path(&target.path)
+                    && imported_stems.contains(&path_stem(&target.path))
+                    && planned_target_evidence(target)
+                        .contains(&assertion.received.to_ascii_lowercase())
+                    && (assertion.expected.is_empty()
+                        || !planned_target_evidence(target)
+                            .contains(&assertion.expected.to_ascii_lowercase()))
+            });
+        for target in mutation_targets
             .iter()
-            .filter(|path| mutation_target_paths.contains(path))
+            .filter(|target| assertion.implicated_paths.contains(&target.path))
         {
+            let path = &target.path;
             let content = target_contents
                 .iter()
                 .find(|(candidate, _)| candidate == path)
                 .map(|(_, content)| content.as_str())
                 .unwrap_or_default();
             let normalized_content = content.to_ascii_lowercase();
-            let source_preference = usize::from(!is_test_path(path)) * 4;
-            let direct_import = usize::from(imported_stems.contains(&path_stem(path))) * 6;
+            let target_evidence = planned_target_evidence(target);
+            let exact_test_location = path == &assertion.test_file
+                && (assertion.source_location == assertion.test_file
+                    || assertion
+                        .source_location
+                        .strip_prefix(&assertion.test_file)
+                        .is_some_and(|suffix| suffix.starts_with(':')));
+            let exact_assertion_line = exact_test_location
+                && assertion.source_line.is_some_and(|line| {
+                    usize::try_from(line)
+                        .ok()
+                        .and_then(|line| line.checked_sub(1))
+                        .and_then(|line| content.lines().nth(line))
+                        .is_some_and(|line| {
+                            !assertion.expected.is_empty() && line.contains(&assertion.expected)
+                        })
+                });
+            let source_preference = usize::from(!is_test_path(path)) * 3;
+            let direct_import = usize::from(imported_stems.contains(&path_stem(path))) * 9;
             let expected_evidence = usize::from(
                 !assertion.expected.is_empty() && content.contains(&assertion.expected),
             ) * 2;
             let received_evidence = usize::from(
                 !assertion.received.is_empty() && content.contains(&assertion.received),
-            ) * 2;
+            ) * 4;
             let paired_value_evidence =
                 usize::from(expected_evidence > 0 && received_evidence > 0) * 2;
             let semantic_overlap = semantic_tokens
@@ -372,14 +399,33 @@ pub(super) fn validation_repair_target_hint(
                     .as_ref()
                     .is_some_and(|token| normalized_content.contains(token)),
             ) * 4;
+            let plan_semantic_overlap = semantic_tokens
+                .iter()
+                .filter(|token| target_evidence.contains(token.as_str()))
+                .count()
+                .min(4)
+                * 4;
+            let planned_expected_behavior = usize::from(
+                !is_test_path(path)
+                    && direct_import > 0
+                    && !assertion.expected.is_empty()
+                    && target_evidence.contains(&assertion.expected.to_ascii_lowercase()),
+            ) * 24;
+            let planned_test_expectation =
+                usize::from(path == &assertion.test_file && imported_plan_supports_received) * 24;
             *scores.entry(path.clone()).or_default() += 1
+                + usize::from(exact_test_location) * 12
+                + usize::from(exact_assertion_line) * 8
                 + source_preference
                 + direct_import
                 + expected_evidence
                 + received_evidence
                 + paired_value_evidence
                 + semantic_overlap
-                + primary_semantic_overlap;
+                + primary_semantic_overlap
+                + plan_semantic_overlap
+                + planned_expected_behavior
+                + planned_test_expectation;
         }
     }
     scores
@@ -390,6 +436,10 @@ pub(super) fn validation_repair_target_hint(
                 .then_with(|| right_path.cmp(left_path))
         })
         .map(|(path, _)| path)
+}
+
+fn planned_target_evidence(target: &crate::execution_graph::PlannedTarget) -> String {
+    format!("{} {}", target.role, target.intent).to_ascii_lowercase()
 }
 
 pub(super) fn assertion_specificity(

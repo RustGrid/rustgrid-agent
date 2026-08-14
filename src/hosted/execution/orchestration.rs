@@ -3934,11 +3934,15 @@ impl<'a> GatewayAgent<'a> {
             .graph
             .as_ref()
             .context("validation failed before an execution graph was created")?;
-        let mutation_target_paths = graph
+        let mutation_targets = graph
             .nodes
             .iter()
             .filter(|node| node.kind.is_mutation())
-            .filter_map(|node| node.target.as_ref().map(|target| target.path.clone()))
+            .filter_map(|node| node.target.clone())
+            .collect::<Vec<_>>();
+        let mutation_target_paths = mutation_targets
+            .iter()
+            .map(|target| target.path.clone())
             .collect::<Vec<_>>();
         let evidence_paths = mutation_target_paths
             .iter()
@@ -4066,7 +4070,7 @@ impl<'a> GatewayAgent<'a> {
                 }
                 record.target_path = validation_repair_target_hint(
                     &record.assertion_failures,
-                    &mutation_target_paths,
+                    &mutation_targets,
                     &target_contents,
                 )
                 .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics));

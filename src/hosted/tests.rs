@@ -2486,10 +2486,23 @@ Received: "light-blue"
             .implicated_paths
             .contains(&"src/components/theme/ThemeToggle.tsx".to_owned())
     );
-    let targets = candidates
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
+    let targets = vec![
+        validation_repair_ranking_target(
+            "src/components/theme/ThemeProvider.tsx",
+            "implementation",
+            "apply the light-blue root class",
+        ),
+        validation_repair_ranking_target(
+            "src/components/theme/ThemeToggle.tsx",
+            "implementation",
+            "cycle through four themes ending in red",
+        ),
+        validation_repair_ranking_target(
+            "tests/theme-provider.test.tsx",
+            "test",
+            "cover the theme behavior",
+        ),
+    ];
     assert_eq!(
         validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
         Some("src/components/theme/ThemeToggle.tsx")
@@ -2603,10 +2616,23 @@ Received: "intermediate"
         output,
         &candidates,
     );
-    let targets = candidates
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
+    let targets = vec![
+        validation_repair_ranking_target(
+            "lib/catalog.ts",
+            "supporting data",
+            "list available states",
+        ),
+        validation_repair_ranking_target(
+            "lib/presenter.ts",
+            "implementation",
+            "advance the selected state to complete",
+        ),
+        validation_repair_ranking_target(
+            "checks/state-machine.spec.ts",
+            "test",
+            "cover state advancement",
+        ),
+    ];
     assert_eq!(
         validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
         Some("lib/presenter.ts")
@@ -2614,6 +2640,130 @@ Received: "intermediate"
     assert_eq!(
         structured_validation_paths(output),
         BTreeSet::from(["checks/state-machine.spec.ts".to_owned()])
+    );
+}
+
+fn validation_repair_ranking_target(
+    path: &str,
+    role: &str,
+    intent: &str,
+) -> crate::execution_graph::PlannedTarget {
+    crate::execution_graph::PlannedTarget {
+        change_id: format!("rank-{path}"),
+        path: path.into(),
+        role: role.into(),
+        intent: intent.into(),
+        ..crate::execution_graph::PlannedTarget::default()
+    }
+}
+
+#[test]
+fn validation_repair_ranking_prefers_exact_stale_test_expectation_over_unrelated_path() {
+    let output = r#"
+ FAIL  tests/example.test.ts > example > reports the current label
+AssertionError: expected 'current-label' to be 'legacy-label'
+Expected: "legacy-label"
+Received: "current-label"
+ ❯ tests/example.test.ts:4:21
+"#;
+    let candidates = vec![
+        (
+            "src/unrelated.ts".into(),
+            "export const labels = ['legacy-label', 'current-label'];".into(),
+        ),
+        (
+            "src/label.ts".into(),
+            "export const label = () => 'current-label';".into(),
+        ),
+        (
+            "tests/example.test.ts".into(),
+            "import { label } from '../src/label';\n\ntest('label', () => {\n  expect(label()).toBe('legacy-label');\n});"
+                .into(),
+        ),
+    ];
+    let assertions = parse_validation_assertion_failures(
+        "npx vitest run tests/example.test.ts",
+        output,
+        &candidates,
+    );
+    assert_eq!(assertions.len(), 1);
+    assert!(
+        assertions[0]
+            .implicated_paths
+            .contains(&"src/unrelated.ts".to_owned())
+    );
+    let targets = vec![
+        validation_repair_ranking_target(
+            "src/unrelated.ts",
+            "supporting catalog",
+            "retain unrelated labels",
+        ),
+        validation_repair_ranking_target(
+            "src/label.ts",
+            "implementation",
+            "preserve current-label behavior",
+        ),
+        validation_repair_ranking_target(
+            "tests/example.test.ts",
+            "test expectation",
+            "update the stale expectation for current-label behavior",
+        ),
+    ];
+    assert_eq!(
+        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        Some("tests/example.test.ts")
+    );
+}
+
+#[test]
+fn validation_repair_ranking_selects_implementation_for_wrong_behavior() {
+    let output = r#"
+ FAIL  tests/feature.test.ts > feature > enables the configured capability
+AssertionError: expected 'disabled' to be 'enabled'
+Expected: "enabled"
+Received: "disabled"
+ ❯ tests/feature.test.ts:4:23
+"#;
+    let candidates = vec![
+        (
+            "src/unrelated.ts".into(),
+            "export const states = ['enabled', 'disabled'];".into(),
+        ),
+        (
+            "src/feature.ts".into(),
+            "export const capability = () => 'disabled';".into(),
+        ),
+        (
+            "tests/feature.test.ts".into(),
+            "import { capability } from '../src/feature';\n\ntest('capability', () => {\n  expect(capability()).toBe('enabled');\n});"
+                .into(),
+        ),
+    ];
+    let assertions = parse_validation_assertion_failures(
+        "npx vitest run tests/feature.test.ts",
+        output,
+        &candidates,
+    );
+    let targets = vec![
+        validation_repair_ranking_target(
+            "src/unrelated.ts",
+            "supporting catalog",
+            "document possible states",
+        ),
+        validation_repair_ranking_target(
+            "src/feature.ts",
+            "implementation",
+            "return enabled for the configured capability",
+        ),
+        validation_repair_ranking_target(
+            "tests/feature.test.ts",
+            "test",
+            "cover configured capability behavior",
+        ),
+    ];
+    assert_eq!(
+        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        Some("src/feature.ts")
     );
 }
 
