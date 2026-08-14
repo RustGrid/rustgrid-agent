@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.51 - 2026-08-14
+
+### Fixed
+
+- Rank validation-repair targets using the existing planned target role and
+  intent together with parsed assertion locations and repository evidence.
+- Prefer the exact stale test expectation when the implemented behavior already
+  matches the observed value, while avoiding unrelated source files that merely
+  contain the same assertion values.
+
 ## 1.4.50 - 2026-08-14
 
 ### Fixed
