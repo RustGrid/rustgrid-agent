@@ -590,6 +590,9 @@ impl<'a> GatewayAgent<'a> {
     ) -> Result<Option<ImplementationOutcome>> {
         self.active_model_call_id = None;
         loop {
+            if active_mutation_fallback(self.current_decision.as_ref()).is_some() {
+                break;
+            }
             let graph_decision = self.reconcile_execution_and_apply()?;
             match graph_decision.decision {
                 ExecutionDecision::ExecuteTarget {

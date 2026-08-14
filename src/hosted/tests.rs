@@ -757,6 +757,189 @@ fn persisted_mutation_fallback_request_exposes_only_the_forced_replacement_tool(
 }
 
 #[test]
+fn active_mutation_fallback_reaches_the_serialized_provider_request() {
+    use crate::execution_graph::{
+        BudgetState, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionSnapshot,
+        FailureRecord, MissionBudget, MissionComplexity, RepositorySnapshot,
+    };
+
+    let work = tempfile::tempdir().unwrap();
+    command::checked("git", ["init", "-q"], work.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        work.path(),
+    )
+    .unwrap();
+    fs::create_dir_all(work.path().join("src")).unwrap();
+    let target_content = "fn current() {}\n";
+    fs::write(work.path().join("src/generic_target.rs"), target_content).unwrap();
+    command::checked("git", ["add", "."], work.path()).unwrap();
+    command::checked(
+        "git",
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+        work.path(),
+    )
+    .unwrap();
+
+    let execution_id = Uuid::from_u128(0xfa11_bacc_0000_4000_8000_0000_0000_0001);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+    let repo = Repo {
+        root: work.path().to_path_buf(),
+    };
+    let repository_fingerprint =
+        repository_state_fingerprint(&repo, &manifest.github.base_sha).unwrap();
+    let mission_budget = MissionBudget::for_complexity(MissionComplexity::Small);
+    let graph_target = mutation_fallback_target(target_content).target;
+    let mut graph = ExecutionGraph::from_targets(
+        "provider-boundary-fallback",
+        MissionComplexity::Small,
+        &repository_fingerprint,
+        std::slice::from_ref(&graph_target),
+        &[],
+        &mission_budget,
+    );
+    for kind in [ExecutionNodeKind::Discovery, ExecutionNodeKind::Planning] {
+        let node = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == kind)
+            .unwrap();
+        node.status = ExecutionNodeStatus::Completed;
+    }
+    let mutation_node = graph
+        .nodes
+        .iter_mut()
+        .find(|node| node.kind.is_mutation())
+        .unwrap();
+    mutation_node.status = ExecutionNodeStatus::FailedRecoverable;
+    let node_id = mutation_node.id.clone();
+    let mut failure = FailureRecord::new(
+        "failed-primary-apply-patch",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        repository_fingerprint.clone(),
+        "initial apply_patch mutation failed",
+    );
+    failure.code = Some(
+        MutationApplicationFailure::PatchContextMismatch
+            .as_str()
+            .into(),
+    );
+    failure.target_path = Some(graph_target.path.clone());
+    let mut snapshot = ExecutionSnapshot {
+        run_id: execution_id.to_string(),
+        current_repository: RepositorySnapshot {
+            fingerprint: repository_fingerprint.clone(),
+            source_tree_hash: repository_fingerprint.clone(),
+            ..RepositorySnapshot::default()
+        },
+        graph,
+        budget: BudgetState::new(mission_budget),
+        ..ExecutionSnapshot::default()
+    };
+    snapshot.failures.records.push(failure.clone());
+
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        return;
+    };
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let api = test_api_client(api_root, execution_id);
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let trusted_git_config = repo.hosted_local_config().unwrap();
+    let mut agent = GatewayAgent::new(
+        api,
+        &manifest,
+        &repo,
+        &trusted_git_config,
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    agent
+        .notebook
+        .orchestration
+        .replace_from_snapshot(&snapshot);
+    agent.notebook.repository_fingerprint = repository_fingerprint.clone();
+    agent.notebook.phase = ExecutionPhase::Implementation;
+    agent.phases = PhaseLedger::new(25, ExecutionPhase::Implementation);
+
+    let mut target = mutation_fallback_target(target_content);
+    target.node_id = node_id.clone();
+    target.repository_fingerprint = repository_fingerprint;
+    let fallback = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id,
+            target: graph_target,
+            failure: Box::new(failure),
+            fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
+        },
+        target,
+    };
+    let transition = agent.apply_execution_decision(fallback).unwrap();
+    assert_eq!(
+        transition.phase_decision,
+        PhaseDecision::Transition(ExecutionPhase::Repair)
+    );
+    assert_eq!(agent.phases.active(), ExecutionPhase::Repair);
+
+    let _ = agent.run_session(
+        "Active fallback policy: force_replace_file. Use only replace_file.",
+        true,
+    );
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let provider_request = requests
+        .try_iter()
+        .find(|request| {
+            request.starts_with(&format!(
+                "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
+            ))
+        })
+        .expect("fallback reached the real AI provider request boundary");
+    let payload: Value = serde_json::from_str(
+        provider_request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap(),
+    )
+    .unwrap();
+    let tool_names = payload["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(tool_names, ["replace_file"]);
+    assert!(!tool_names.contains(&"apply_patch"));
+    assert_eq!(payload["tool_choice"]["name"], "replace_file");
+}
+
+#[test]
 fn repair_preflight_requires_the_policy_in_the_actual_request_context() {
     let decision = mutation_fallback_decision(
         MutationFallbackPolicy::ForceReplaceFile,
