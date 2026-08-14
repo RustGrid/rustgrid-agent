@@ -5,6 +5,17 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.50 - 2026-08-14
+
+### Fixed
+
+- Preserve an active mutation fallback decision through the existing repair
+  transition so the immediately following provider request exposes and forces
+  only the policy-permitted `replace_file` tool.
+- Add a generic hosted golden-path regression covering implementation,
+  validation, review, pull-request publication, healthy partial reviewability,
+  and canonical-result preservation when terminal callback transport is absent.
+
 ## 1.4.49 - 2026-08-11
 
 ### Fixed
