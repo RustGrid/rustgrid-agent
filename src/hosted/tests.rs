@@ -760,7 +760,7 @@ fn persisted_mutation_fallback_request_exposes_only_the_forced_replacement_tool(
 fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     use crate::execution_graph::{
         BudgetState, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionSnapshot,
-        FailureRecord, MissionBudget, MissionComplexity, RepositorySnapshot,
+        MissionBudget, MissionComplexity, RepositorySnapshot,
     };
 
     let work = tempfile::tempdir().unwrap();
@@ -818,26 +818,11 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     }
     let mutation_node = graph
         .nodes
-        .iter_mut()
+        .iter()
         .find(|node| node.kind.is_mutation())
         .unwrap();
-    mutation_node.status = ExecutionNodeStatus::FailedRecoverable;
     let node_id = mutation_node.id.clone();
-    let mut failure = FailureRecord::new(
-        "failed-primary-apply-patch",
-        node_id.clone(),
-        crate::execution_graph::FailureCategory::MutationConflict,
-        1,
-        repository_fingerprint.clone(),
-        "initial apply_patch mutation failed",
-    );
-    failure.code = Some(
-        MutationApplicationFailure::PatchContextMismatch
-            .as_str()
-            .into(),
-    );
-    failure.target_path = Some(graph_target.path.clone());
-    let mut snapshot = ExecutionSnapshot {
+    let snapshot = ExecutionSnapshot {
         run_id: execution_id.to_string(),
         current_repository: RepositorySnapshot {
             fingerprint: repository_fingerprint.clone(),
@@ -848,17 +833,33 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         budget: BudgetState::new(mission_budget),
         ..ExecutionSnapshot::default()
     };
-    snapshot.failures.records.push(failure.clone());
 
     let Ok(containment) = command::HostedProcessContainment::new() else {
         return;
     };
+    let rejected_patch = serde_json::to_string(&json!({
+        "change_id": graph_target.change_id,
+        "path": graph_target.path,
+        "patch": "--- a/src/unrelated.rs\n+++ b/src/unrelated.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    }))
+    .unwrap();
     let Some(StoppableOkServer {
         api_root,
         requests,
         stop,
         handle,
-    }) = stoppable_ok_server()
+    }) = stoppable_ai_sequence_server(vec![
+        json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "initial-apply-patch",
+                "name": "apply_patch",
+                "arguments": rejected_patch,
+            }],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        }),
+        json!({"output": [], "usage": {"input_tokens": 100, "output_tokens": 1}}),
+    ])
     else {
         return;
     };
@@ -887,56 +888,60 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     agent.notebook.phase = ExecutionPhase::Implementation;
     agent.phases = PhaseLedger::new(25, ExecutionPhase::Implementation);
 
-    let mut target = mutation_fallback_target(target_content);
-    target.node_id = node_id.clone();
-    target.repository_fingerprint = repository_fingerprint;
-    let fallback = ExecutionDecision::ExecuteTarget {
-        node_id: node_id.clone(),
-        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
-            node_id,
-            target: graph_target,
-            failure: Box::new(failure),
-            fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
-        },
-        target,
-    };
-    let transition = agent.apply_execution_decision(fallback).unwrap();
-    assert_eq!(
-        transition.phase_decision,
-        PhaseDecision::Transition(ExecutionPhase::Repair)
-    );
-    assert_eq!(agent.phases.active(), ExecutionPhase::Repair);
-
-    let _ = agent.run_session(
-        "Active fallback policy: force_replace_file. Use only replace_file.",
-        true,
-    );
+    let _ = agent.run_session("Apply the accepted generic target mutation.", true);
     let _ = stop.send(());
     handle.join().unwrap();
-    let provider_request = requests
-        .try_iter()
-        .find(|request| {
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    let provider_payloads = requests
+        .iter()
+        .filter(|request| {
             request.starts_with(&format!(
                 "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
             ))
         })
-        .expect("fallback reached the real AI provider request boundary");
-    let payload: Value = serde_json::from_str(
-        provider_request
-            .split_once("\r\n\r\n")
-            .map(|(_, body)| body)
-            .unwrap(),
-    )
-    .unwrap();
-    let tool_names = payload["tools"]
+        .map(|request| {
+            serde_json::from_str::<Value>(
+                request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(provider_payloads.len(), 2);
+    let initial_tool_names = provider_payloads[0]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    assert_eq!(tool_names, ["replace_file"]);
-    assert!(!tool_names.contains(&"apply_patch"));
-    assert_eq!(payload["tool_choice"]["name"], "replace_file");
+    assert_eq!(initial_tool_names, ["apply_patch", "replace_file"]);
+    assert_eq!(provider_payloads[0]["tool_choice"], "required");
+
+    assert!(requests.iter().any(|request| {
+        request.contains("\"event_type\":\"worker.mutation_fallback_policy_selected\"")
+            && request.contains("\"selected_fallback_policy\":\"force_replace_file\"")
+            && request.contains("\"permitted_tools\":[\"replace_file\"]")
+            && request.contains("\"failure_category\":\"invalid_patch_target\"")
+    }));
+    let fallback_tool_names = provider_payloads[1]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(fallback_tool_names, ["replace_file"]);
+    assert!(!fallback_tool_names.contains(&"apply_patch"));
+    assert_eq!(provider_payloads[1]["tool_choice"]["name"], "replace_file");
+    assert_eq!(agent.phases.active(), ExecutionPhase::Repair);
+    assert_eq!(
+        agent
+            .current_decision
+            .as_ref()
+            .and_then(ExecutionDecision::node_id),
+        Some(&node_id)
+    );
 }
 
 #[test]
@@ -3750,6 +3755,55 @@ fn stoppable_ok_server() -> Option<StoppableOkServer> {
                     write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("test HTTP server should accept requests: {error}"),
+            }
+        }
+    });
+    Some(StoppableOkServer {
+        api_root: Url::parse(&format!("http://{address}/")).unwrap(),
+        requests: request_receiver,
+        stop: stop_sender,
+        handle,
+    })
+}
+
+fn stoppable_ai_sequence_server(ai_responses: Vec<Value>) -> Option<StoppableOkServer> {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("test HTTP server should bind: {error}"),
+    };
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (request_sender, request_receiver) = mpsc::channel();
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut ai_responses = VecDeque::from(ai_responses);
+        loop {
+            match stop_receiver.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request(&mut stream);
+                    let body = if request.contains("/ai/responses HTTP/1.1") {
+                        ai_responses.pop_front().unwrap_or_else(|| json!({}))
+                    } else {
+                        json!({})
+                    }
+                    .to_string();
+                    let _ = request_sender.send(request);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
                     )
                     .unwrap();
                 }

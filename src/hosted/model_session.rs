@@ -2392,9 +2392,14 @@ impl<'a> GatewayAgent<'a> {
             }
             self.observe_implementation_progress()?;
             self.reconcile_authoritative_target_state()?;
-            let phase_decision = self.reconcile_active_phase(
-                "implementation turn reconciled against authoritative target state",
-            )?;
+            let phase_decision =
+                if active_mutation_fallback(self.current_decision.as_ref()).is_some() {
+                    PhaseDecision::Stay
+                } else {
+                    self.reconcile_active_phase(
+                        "implementation turn reconciled against authoritative target state",
+                    )?
+                };
             if matches!(
                 phase_decision,
                 PhaseDecision::Transition(ExecutionPhase::Validation)
