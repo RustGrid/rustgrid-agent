@@ -5,6 +5,21 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.52 - 2026-08-15
+
+### Fixed
+
+- Preserve an active repository-mutation fallback decision through end-of-turn
+  reconciliation so the immediately following provider request cannot restore
+  the unrestricted mutation tool set.
+- Enforce `force_replace_file` at the serialized provider boundary by exposing
+  only `replace_file` with an explicit named tool choice after a rejected patch.
+
+### Dependencies
+
+- Update `base64` to 0.23.1, `clap` to 4.6.5, and `keyring` to 4.1.6.
+- Update `actions/attest` to the immutable commit for 4.2.2.
+
 ## 1.4.51 - 2026-08-14
 
 ### Fixed
