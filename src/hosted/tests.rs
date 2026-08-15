@@ -840,7 +840,7 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     let rejected_patch = serde_json::to_string(&json!({
         "change_id": graph_target.change_id,
         "path": graph_target.path,
-        "patch": "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn current() {}\n+fn first() {}\n--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn current() {}\n+fn second() {}\n",
+        "patch": "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn absent_context() {}\n+fn replacement() {}\n",
     }))
     .unwrap();
     let Some(StoppableOkServer {
@@ -888,28 +888,11 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     agent.notebook.phase = ExecutionPhase::Implementation;
     agent.phases = PhaseLedger::new(25, ExecutionPhase::Implementation);
 
-    let first_session_result =
-        agent.run_session("Apply the accepted generic target mutation.", true);
-    let mut captured_requests = requests.try_iter().collect::<Vec<_>>();
-    let first_session_provider_requests = captured_requests
-        .iter()
-        .filter(|request| {
-            request.starts_with(&format!(
-                "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
-            ))
-        })
-        .count();
-    let second_session_result = if first_session_provider_requests == 1 {
-        let result = agent.run_session("Continue the active mutation fallback.", true);
-        captured_requests.extend(requests.try_iter());
-        Some(result)
-    } else {
-        None
-    };
+    let session_result = agent.run_session("Apply the accepted generic target mutation.", true);
     let _ = stop.send(());
     handle.join().unwrap();
-    captured_requests.extend(requests.try_iter());
-    let provider_payloads = captured_requests
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    let provider_payloads = requests
         .iter()
         .filter(|request| {
             request.starts_with(&format!(
@@ -930,17 +913,11 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         provider_payloads.len(),
         2,
         "session ended before the fallback provider request: {}",
-        first_session_result
+        session_result
             .as_ref()
             .err()
             .map(|error| format!("{error:#}"))
-            .unwrap_or_else(|| {
-                second_session_result
-                    .as_ref()
-                    .and_then(|result| result.as_ref().err())
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "no session error".into())
-            })
+            .unwrap_or_else(|| "no session error".into())
     );
     let initial_tool_names = provider_payloads[0]["tools"]
         .as_array()
@@ -951,11 +928,11 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     assert_eq!(initial_tool_names, ["apply_patch", "replace_file"]);
     assert_eq!(provider_payloads[0]["tool_choice"], "required");
 
-    assert!(captured_requests.iter().any(|request| {
+    assert!(requests.iter().any(|request| {
         request.contains("\"event_type\":\"worker.mutation_fallback_policy_selected\"")
             && request.contains("\"selected_fallback_policy\":\"force_replace_file\"")
             && request.contains("\"permitted_tools\":[\"replace_file\"]")
-            && request.contains("\"failure_category\":\"invalid_patch_target\"")
+            && request.contains("\"failure_category\":\"patch_context_mismatch\"")
     }));
     let fallback_tool_names = provider_payloads[1]["tools"]
         .as_array()
