@@ -840,7 +840,7 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     let rejected_patch = serde_json::to_string(&json!({
         "change_id": graph_target.change_id,
         "path": graph_target.path,
-        "patch": "--- a/src/unrelated.rs\n+++ b/src/unrelated.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        "patch": "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn current() {}\n+fn first() {}\n--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn current() {}\n+fn second() {}\n",
     }))
     .unwrap();
     let Some(StoppableOkServer {
