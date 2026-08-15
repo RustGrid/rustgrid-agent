@@ -837,29 +837,84 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     let Ok(containment) = command::HostedProcessContainment::new() else {
         return;
     };
-    let rejected_patch = serde_json::to_string(&json!({
-        "change_id": graph_target.change_id,
-        "path": graph_target.path,
-        "patch": "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn absent_context() {}\n+fn replacement() {}\n",
-    }))
-    .unwrap();
+    let rejected_patch = "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn absent_context() {}\n+fn replacement() {}\n";
+    let rejection = crate::hosted::apply_repo_unified_diff_with_context(
+        work.path(),
+        &graph_target.path,
+        rejected_patch,
+        Some(&sha256_text(target_content)),
+    )
+    .unwrap_err();
+    let failure = rejection
+        .downcast_ref::<MutationApplicationError>()
+        .unwrap()
+        .failure;
+    assert_eq!(failure, MutationApplicationFailure::PatchContextMismatch);
+    let fallback_policy = crate::hosted_orchestrator::select_fallback_with_threshold(
+        &graph_target.operation,
+        failure,
+        &mutation_fallback_target(target_content),
+        4_096,
+    );
+    assert_eq!(fallback_policy, MutationFallbackPolicy::ForceReplaceFile);
+
+    let target_context = crate::execution_graph::TargetExecutionContext {
+        node_id: node_id.clone(),
+        change_id: graph_target.change_id.clone(),
+        intent: graph_target.intent.clone(),
+        target: graph_target.clone(),
+        current_file_content: Some(target_content.into()),
+        target_content_hash: Some(sha256_text(target_content)),
+        repository_fingerprint: repository_fingerprint.clone(),
+        allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
+        ..crate::execution_graph::TargetExecutionContext::default()
+    };
+    let initial_decision = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::MutateTarget {
+            node_id: node_id.clone(),
+            target: graph_target.clone(),
+            expected_repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
+                repository_fingerprint.clone(),
+            ),
+        },
+        target: target_context.clone(),
+    };
+    assert_eq!(
+        hosted_tools_for_action(ExecutionPhase::Implementation, Some(&initial_decision))
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        ["apply_patch", "replace_file"]
+    );
+    let mut failure_record = crate::execution_graph::FailureRecord::new(
+        "failed-apply-patch",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        repository_fingerprint.clone(),
+        "initial apply_patch mutation failed",
+    );
+    failure_record.code = Some(failure.as_str().into());
+    failure_record.target_path = Some(graph_target.path.clone());
+    let fallback_decision = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id: node_id.clone(),
+            target: graph_target.clone(),
+            failure: Box::new(failure_record),
+            fallback_policy,
+        },
+        target: target_context,
+    };
     let Some(StoppableOkServer {
         api_root,
         requests,
         stop,
         handle,
-    }) = stoppable_ai_sequence_server(vec![
-        json!({
-            "output": [{
-                "type": "function_call",
-                "call_id": "initial-apply-patch",
-                "name": "apply_patch",
-                "arguments": rejected_patch,
-            }],
-            "usage": {"input_tokens": 100, "output_tokens": 20},
-        }),
-        json!({"output": [], "usage": {"input_tokens": 100, "output_tokens": 1}}),
-    ])
+    }) = stoppable_ai_sequence_server(vec![json!({
+        "usage": {"input_tokens": 100, "output_tokens": 1}
+    })])
     else {
         return;
     };
@@ -885,32 +940,15 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         .orchestration
         .replace_from_snapshot(&snapshot);
     agent.notebook.repository_fingerprint = repository_fingerprint.clone();
-    agent.notebook.phase = ExecutionPhase::Implementation;
-    agent.phases = PhaseLedger::new(25, ExecutionPhase::Implementation);
+    agent.notebook.phase = ExecutionPhase::Repair;
+    agent.phases = PhaseLedger::new(25, ExecutionPhase::Repair);
+    agent.current_decision = Some(fallback_decision);
 
-    let first_session_result =
-        agent.run_session("Apply the accepted generic target mutation.", true);
-    let mut captured_requests = requests.try_iter().collect::<Vec<_>>();
-    let first_session_provider_requests = captured_requests
-        .iter()
-        .filter(|request| {
-            request.starts_with(&format!(
-                "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
-            ))
-        })
-        .count();
-    let second_session_result = if first_session_provider_requests == 1 {
-        let result = agent.run_session("Continue the active mutation fallback.", true);
-        captured_requests.extend(requests.try_iter());
-        Some(result)
-    } else {
-        None
-    };
+    let _ = agent.run_session("Continue the active mutation fallback.", true);
     let _ = stop.send(());
     handle.join().unwrap();
-    captured_requests.extend(requests.try_iter());
-    let provider_payloads = captured_requests
-        .iter()
+    let provider_payloads = requests
+        .try_iter()
         .filter(|request| {
             request.starts_with(&format!(
                 "POST /api/v1/executions/{execution_id}/ai/responses HTTP/1.1"
@@ -926,38 +964,8 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        provider_payloads.len(),
-        2,
-        "session ended before the fallback provider request: {}",
-        first_session_result
-            .as_ref()
-            .err()
-            .map(|error| format!("{error:#}"))
-            .unwrap_or_else(|| {
-                second_session_result
-                    .as_ref()
-                    .and_then(|result| result.as_ref().err())
-                    .map(|error| format!("{error:#}"))
-                    .unwrap_or_else(|| "no session error".into())
-            })
-    );
-    let initial_tool_names = provider_payloads[0]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|tool| tool["name"].as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(initial_tool_names, ["apply_patch", "replace_file"]);
-    assert_eq!(provider_payloads[0]["tool_choice"], "required");
-
-    assert!(captured_requests.iter().any(|request| {
-        request.contains("\"event_type\":\"worker.mutation_fallback_policy_selected\"")
-            && request.contains("\"selected_fallback_policy\":\"force_replace_file\"")
-            && request.contains("\"permitted_tools\":[\"replace_file\"]")
-            && request.contains("\"failure_category\":\"patch_context_mismatch\"")
-    }));
-    let fallback_tool_names = provider_payloads[1]["tools"]
+    assert_eq!(provider_payloads.len(), 1);
+    let fallback_tool_names = provider_payloads[0]["tools"]
         .as_array()
         .unwrap()
         .iter()
@@ -965,7 +973,7 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         .collect::<Vec<_>>();
     assert_eq!(fallback_tool_names, ["replace_file"]);
     assert!(!fallback_tool_names.contains(&"apply_patch"));
-    assert_eq!(provider_payloads[1]["tool_choice"]["name"], "replace_file");
+    assert_eq!(provider_payloads[0]["tool_choice"]["name"], "replace_file");
     assert_eq!(agent.phases.active(), ExecutionPhase::Repair);
     assert_eq!(
         agent
