@@ -888,7 +888,7 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     agent.notebook.phase = ExecutionPhase::Implementation;
     agent.phases = PhaseLedger::new(25, ExecutionPhase::Implementation);
 
-    let _ = agent.run_session("Apply the accepted generic target mutation.", true);
+    let session_result = agent.run_session("Apply the accepted generic target mutation.", true);
     let _ = stop.send(());
     handle.join().unwrap();
     let requests = requests.try_iter().collect::<Vec<_>>();
@@ -909,7 +909,16 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
             .unwrap()
         })
         .collect::<Vec<_>>();
-    assert_eq!(provider_payloads.len(), 2);
+    assert_eq!(
+        provider_payloads.len(),
+        2,
+        "session ended before the fallback provider request: {}",
+        session_result
+            .as_ref()
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| "no session error".into())
+    );
     let initial_tool_names = provider_payloads[0]["tools"]
         .as_array()
         .unwrap()
