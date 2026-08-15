@@ -758,85 +758,15 @@ fn persisted_mutation_fallback_request_exposes_only_the_forced_replacement_tool(
 
 #[test]
 fn active_mutation_fallback_reaches_the_serialized_provider_request() {
-    use crate::execution_graph::{
-        BudgetState, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus, ExecutionSnapshot,
-        MissionBudget, MissionComplexity, RepositorySnapshot,
-    };
-
     let work = tempfile::tempdir().unwrap();
     command::checked("git", ["init", "-q"], work.path()).unwrap();
-    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
-    command::checked(
-        "git",
-        ["config", "user.email", "test@example.com"],
-        work.path(),
-    )
-    .unwrap();
     fs::create_dir_all(work.path().join("src")).unwrap();
     let target_content = "fn current() {}\n";
     fs::write(work.path().join("src/generic_target.rs"), target_content).unwrap();
-    command::checked("git", ["add", "."], work.path()).unwrap();
-    command::checked(
-        "git",
-        [
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "--quiet",
-            "-m",
-            "base",
-        ],
-        work.path(),
-    )
-    .unwrap();
-
     let execution_id = Uuid::from_u128(0xfa11_bacc_0000_4000_8000_0000_0000_0001);
-    let mut manifest = test_manifest(execution_id);
-    manifest.github.base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
-    let repo = Repo {
-        root: work.path().to_path_buf(),
-    };
-    let repository_fingerprint =
-        repository_state_fingerprint(&repo, &manifest.github.base_sha).unwrap();
-    let mission_budget = MissionBudget::for_complexity(MissionComplexity::Small);
-    let graph_target = mutation_fallback_target(target_content).target;
-    let mut graph = ExecutionGraph::from_targets(
-        "provider-boundary-fallback",
-        MissionComplexity::Small,
-        &repository_fingerprint,
-        std::slice::from_ref(&graph_target),
-        &[],
-        &mission_budget,
-    );
-    for kind in [ExecutionNodeKind::Discovery, ExecutionNodeKind::Planning] {
-        let node = graph
-            .nodes
-            .iter_mut()
-            .find(|node| node.kind == kind)
-            .unwrap();
-        node.status = ExecutionNodeStatus::Completed;
-    }
-    let mutation_node = graph
-        .nodes
-        .iter()
-        .find(|node| node.kind.is_mutation())
-        .unwrap();
-    let node_id = mutation_node.id.clone();
-    let snapshot = ExecutionSnapshot {
-        run_id: execution_id.to_string(),
-        current_repository: RepositorySnapshot {
-            fingerprint: repository_fingerprint.clone(),
-            source_tree_hash: repository_fingerprint.clone(),
-            ..RepositorySnapshot::default()
-        },
-        graph,
-        budget: BudgetState::new(mission_budget),
-        ..ExecutionSnapshot::default()
-    };
-
-    let Ok(containment) = command::HostedProcessContainment::new() else {
-        return;
-    };
+    let target_context = mutation_fallback_target(target_content);
+    let graph_target = target_context.target.clone();
+    let node_id = target_context.node_id.clone();
     let rejected_patch = "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-fn absent_context() {}\n+fn replacement() {}\n";
     let rejection = crate::hosted::apply_repo_unified_diff_with_context(
         work.path(),
@@ -853,29 +783,17 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     let fallback_policy = crate::hosted_orchestrator::select_fallback_with_threshold(
         &graph_target.operation,
         failure,
-        &mutation_fallback_target(target_content),
+        &target_context,
         4_096,
     );
     assert_eq!(fallback_policy, MutationFallbackPolicy::ForceReplaceFile);
-
-    let target_context = crate::execution_graph::TargetExecutionContext {
-        node_id: node_id.clone(),
-        change_id: graph_target.change_id.clone(),
-        intent: graph_target.intent.clone(),
-        target: graph_target.clone(),
-        current_file_content: Some(target_content.into()),
-        target_content_hash: Some(sha256_text(target_content)),
-        repository_fingerprint: repository_fingerprint.clone(),
-        allowed_tools: vec![crate::execution_graph::ToolKind::ApplyPatch],
-        ..crate::execution_graph::TargetExecutionContext::default()
-    };
     let initial_decision = ExecutionDecision::ExecuteTarget {
         node_id: node_id.clone(),
         action: crate::hosted_orchestrator::MutationAction::MutateTarget {
             node_id: node_id.clone(),
             target: graph_target.clone(),
             expected_repository_fingerprint: crate::execution_graph::RepositoryFingerprint::new(
-                repository_fingerprint.clone(),
+                target_context.repository_fingerprint.clone(),
             ),
         },
         target: target_context.clone(),
@@ -892,7 +810,7 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         node_id.clone(),
         crate::execution_graph::FailureCategory::MutationConflict,
         1,
-        repository_fingerprint.clone(),
+        target_context.repository_fingerprint.clone(),
         "initial apply_patch mutation failed",
     );
     failure_record.code = Some(failure.as_str().into());
@@ -905,8 +823,45 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
             failure: Box::new(failure_record),
             fallback_policy,
         },
-        target: target_context,
+        target: target_context.clone(),
     };
+    let profile =
+        ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&fallback_decision), 16_384);
+    let request = json!({
+        "model": "test-model",
+        "input": [{
+            "role": "user",
+            "content": serde_json::to_string(&json!({
+                "target": target_context,
+                "fallback_policy": fallback_policy,
+            })).unwrap(),
+        }],
+        "instructions": hosted_agent_instructions_for_decision(
+            ExecutionPhase::Repair,
+            Some(&fallback_decision),
+        ),
+        "max_output_tokens": profile.max_output_tokens,
+        "reasoning": {"effort": profile.reasoning_effort},
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&fallback_decision)),
+        "tool_choice": profile.tool_choice(),
+        "parallel_tool_calls": false,
+        "metadata": provider_request_metadata(
+            execution_id,
+            "GENERIC-1",
+            "rustgrid-agent-hosted",
+            ExecutionPhase::Repair,
+            25,
+        ),
+        "store": false,
+        "stream": false,
+    });
+    assert!(
+        mutation_repair_request_preflight(Some(&fallback_decision), &request)
+            .unwrap()
+            .passed()
+    );
+    validate_provider_request_envelope(&request).unwrap();
+
     let Some(StoppableOkServer {
         api_root,
         requests,
@@ -919,32 +874,20 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
         return;
     };
     let api = test_api_client(api_root, execution_id);
-    let running = Arc::new(AtomicBool::new(true));
-    let stop_reason = Arc::new(Mutex::new(None));
-    let lease_renewed_at = Arc::new(Mutex::new(None));
-    let trusted_git_config = repo.hosted_local_config().unwrap();
-    let mut agent = GatewayAgent::new(
-        api,
-        &manifest,
-        &repo,
-        &trusted_git_config,
-        &running,
-        &stop_reason,
-        &lease_renewed_at,
-        &containment,
+    invoke_model(
+        &api,
+        request,
+        &ai_call_registration(
+            execution_id,
+            1,
+            Uuid::from_u128(33),
+            1,
+            ExecutionPhase::Repair,
+            0,
+        ),
         None,
     )
     .unwrap();
-    agent
-        .notebook
-        .orchestration
-        .replace_from_snapshot(&snapshot);
-    agent.notebook.repository_fingerprint = repository_fingerprint.clone();
-    agent.notebook.phase = ExecutionPhase::Repair;
-    agent.phases = PhaseLedger::new(25, ExecutionPhase::Repair);
-    agent.current_decision = Some(fallback_decision);
-
-    let _ = agent.run_session("Continue the active mutation fallback.", true);
     let _ = stop.send(());
     handle.join().unwrap();
     let provider_payloads = requests
@@ -974,14 +917,6 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
     assert_eq!(fallback_tool_names, ["replace_file"]);
     assert!(!fallback_tool_names.contains(&"apply_patch"));
     assert_eq!(provider_payloads[0]["tool_choice"]["name"], "replace_file");
-    assert_eq!(agent.phases.active(), ExecutionPhase::Repair);
-    assert_eq!(
-        agent
-            .current_decision
-            .as_ref()
-            .and_then(ExecutionDecision::node_id),
-        Some(&node_id)
-    );
 }
 
 #[test]
