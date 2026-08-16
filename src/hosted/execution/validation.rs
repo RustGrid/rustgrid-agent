@@ -7,7 +7,8 @@ impl<'a> GatewayAgent<'a> {
         self.api.append_event(
             "validation",
             json!({
-                "event_type": "worker.validation_ledger_checkpoint",
+                "event_type": "worker.execution_graph_checkpoint",
+                "reason": "validation_ledger_checkpoint",
                 "validation_evidence": self.notebook.validation_evidence,
                 "required_gates": self.notebook.required_gates,
                 "notebook": self.notebook,

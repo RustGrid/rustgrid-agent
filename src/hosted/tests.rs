@@ -2371,6 +2371,318 @@ fn scheduled_validation_repair_rerun_starts_the_existing_validation_process_once
 }
 
 #[test]
+fn hosted_failed_validation_checkpoint_continues_into_structured_failure_processing() {
+    use crate::execution_graph::{
+        BudgetState, ExecutionDomainEvent, ExecutionGraph, ExecutionNodeStatus, MissionBudget,
+        MissionComplexity, PlannedTarget as GraphTarget, ValidationGateSpec,
+        ValidationGateType as GraphValidationGateType,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    command::checked("git", ["init", "-q"], directory.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], directory.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        directory.path(),
+    )
+    .unwrap();
+    fs::create_dir_all(directory.path().join("src")).unwrap();
+    fs::create_dir_all(directory.path().join("tests")).unwrap();
+    fs::write(
+        directory.path().join("src/generic.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("tests/generic.test.ts"),
+        "expect(value()).toBe(2);\n",
+    )
+    .unwrap();
+    command::checked("git", ["add", "."], directory.path()).unwrap();
+    command::checked(
+        "git",
+        [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+        directory.path(),
+    )
+    .unwrap();
+
+    let execution_id = Uuid::from_u128(0xa0230);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha =
+        command::checked("git", ["rev-parse", "HEAD"], directory.path()).unwrap();
+    let command = "npm test -- tests/generic.test.ts";
+    manifest.execution_policy.quality_gates = vec![HostedQualityGate {
+        id: "focused-generic".into(),
+        command: command.into(),
+        timeout_seconds: 30,
+        required: true,
+    }];
+    let repo = Repo {
+        root: directory.path().to_path_buf(),
+    };
+    let repository_fingerprint =
+        repository_state_fingerprint(&repo, &manifest.github.base_sha).unwrap();
+    let mission_budget = MissionBudget::for_complexity(MissionComplexity::Small);
+    let mut graph = ExecutionGraph::from_targets(
+        "failed-validation-continuation",
+        MissionComplexity::Small,
+        &repository_fingerprint,
+        &[GraphTarget {
+            change_id: "generic-change".into(),
+            path: "src/generic.rs".into(),
+            role: "production implementation".into(),
+            intent: "return the expected generic value".into(),
+            acceptance_criteria_ids: vec!["ac-1".into()],
+            operation: Default::default(),
+            new_file: false,
+        }],
+        &[ValidationGateSpec {
+            gate_id: "focused-generic".into(),
+            gate_type: GraphValidationGateType::FocusedTest,
+            command: command.into(),
+            working_directory: directory.path().to_string_lossy().into_owned(),
+            required: true,
+            ..ValidationGateSpec::default()
+        }],
+        &mission_budget,
+    );
+    let prerequisite_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                crate::execution_graph::ExecutionNodeKind::Discovery
+                    | crate::execution_graph::ExecutionNodeKind::Planning
+            ) || node.kind.is_mutation()
+        })
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    for node_id in prerequisite_nodes {
+        graph
+            .set_node_status(&node_id, ExecutionNodeStatus::Completed)
+            .unwrap();
+    }
+    assert!(graph.implementation_barrier_satisfied());
+    let validation_node = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind.is_validation())
+        .unwrap()
+        .id
+        .clone();
+    graph
+        .set_node_status(&validation_node, ExecutionNodeStatus::Running)
+        .unwrap();
+    let gate = graph
+        .node(&validation_node)
+        .unwrap()
+        .validation
+        .clone()
+        .unwrap();
+    let mut notebook = new_worker_notebook(&manifest, repository_fingerprint.clone(), None);
+    notebook.phase = ExecutionPhase::Validation;
+    notebook.orchestration.graph_revision = graph.revision;
+    notebook.orchestration.graph = Some(graph);
+    notebook.orchestration.legacy_import_completed = true;
+    notebook.orchestration.budget = BudgetState::new(mission_budget);
+    manifest.run.metadata["worker_notebook"] = serde_json::to_value(&notebook).unwrap();
+
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let api = test_api_client(api_root, execution_id);
+    let running = Arc::new(AtomicBool::new(true));
+    let mut failed_ledger = Vec::new();
+    let mut required_gates = Vec::new();
+    let mut usage = ToolUsage::default();
+    let failure_output = r#"FAIL  tests/generic.test.ts > generic value > returns the expected value
+AssertionError: expected 1 to be 2
+Expected: 2
+Received: 1
+ ❯ tests/generic.test.ts:1:17
+ ❯ src/generic.rs:1:1"#;
+    let failed_results = run_quality_gates_with_capture(
+        &api,
+        &manifest,
+        &repo,
+        &running,
+        &manifest.execution_policy,
+        1,
+        &mut failed_ledger,
+        &mut required_gates,
+        &mut usage,
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        |_, _, _, _, _, _, _| {
+            Ok(command::CommandOutput {
+                status: std::process::Command::new("sh")
+                    .args(["-c", "exit 1"])
+                    .status()?,
+                stdout: failure_output.into(),
+                stderr: String::new(),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(failed_results[0].status, "failed");
+    assert_eq!(failed_ledger[0].exit_code, Some(1));
+    assert!(failed_ledger[0].stdout_summary.contains("AssertionError"));
+
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        let _ = stop.send(());
+        handle.join().unwrap();
+        return;
+    };
+    let mut agent = GatewayAgent::new(
+        api.clone(),
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    agent.phases = PhaseLedger::new(25, ExecutionPhase::Validation);
+    let evidence = recovery::canonical_validation_evidence_record(
+        validation_node.clone(),
+        &gate,
+        &repository_fingerprint,
+        &failed_results[0],
+        failed_ledger.last(),
+        1,
+        Duration::from_millis(1),
+    );
+    agent
+        .append_execution_domain_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+            sequence: agent.next_domain_event_sequence(),
+            node_id: validation_node.clone(),
+            evidence,
+        })
+        .unwrap();
+    agent.notebook.validation_evidence = failed_ledger;
+    agent.notebook.required_gates = required_gates;
+    agent.checkpoint_validation_ledger().unwrap();
+    agent
+        .record_validation_failures(&failed_results, 1)
+        .unwrap();
+
+    let failure = agent
+        .notebook
+        .orchestration
+        .failures
+        .unresolved_for_node(&validation_node)
+        .next()
+        .expect("failed validation must be reduced into a repairable failure");
+    assert!(!failure.assertion_failures.is_empty());
+    assert_eq!(failure.target_path.as_deref(), Some("src/generic.rs"));
+    assert!(
+        agent
+            .notebook
+            .orchestration
+            .budget
+            .current_validation_failure_revision(validation_node.as_str(), &repository_fingerprint,)
+            .is_some()
+    );
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .graph
+            .as_ref()
+            .unwrap()
+            .node(&validation_node)
+            .unwrap()
+            .status,
+        ExecutionNodeStatus::FailedRecoverable
+    );
+
+    let mut passed_ledger = Vec::new();
+    let mut passed_required_gates = Vec::new();
+    let passed_results = run_quality_gates_with_capture(
+        &api,
+        &manifest,
+        &repo,
+        &running,
+        &manifest.execution_policy,
+        1,
+        &mut passed_ledger,
+        &mut passed_required_gates,
+        &mut ToolUsage::default(),
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        Instant::now(),
+        MAX_HOSTED_EXECUTION_DURATION,
+        |_, _, _, _, _, _, _| {
+            Ok(command::CommandOutput {
+                status: std::process::Command::new("sh")
+                    .args(["-c", "exit 0"])
+                    .status()?,
+                stdout: "1 passed".into(),
+                stderr: String::new(),
+            })
+        },
+    )
+    .unwrap();
+    assert_eq!(passed_results[0].status, "passed");
+    assert_eq!(passed_ledger[0].status, ValidationStatus::Passed);
+    assert_eq!(passed_ledger[0].exit_code, Some(0));
+
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    assert!(requests.iter().any(|request| {
+        request.contains("worker.validation_process_completed")
+            && request.contains("\"exit_code\":1")
+            && request.contains("AssertionError")
+    }));
+    assert!(requests.iter().any(|request| {
+        request.contains("\"event_type\":\"worker.execution_graph_checkpoint\"")
+            && request.contains("\"reason\":\"validation_ledger_checkpoint\"")
+    }));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.validation_output_parsed"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.validation_failure_revision_created"))
+    );
+    assert!(requests.iter().any(|request| {
+        request.contains("worker.validation_process_completed")
+            && request.contains("\"exit_code\":0")
+    }));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("execution_event_invalid"))
+    );
+}
+
+#[test]
 fn validation_failure_target_hint_requires_one_explicit_planned_path() {
     let targets = vec!["src/first.rs".to_owned(), "src/last.rs".to_owned()];
     assert_eq!(
@@ -3725,6 +4037,7 @@ fn stoppable_ok_server() -> Option<StoppableOkServer> {
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     let request = read_http_request(&mut stream);
                     let _ = request_sender.send(request);
                     write!(
