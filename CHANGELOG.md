@@ -5,6 +5,17 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.54 - 2026-08-16
+
+### Fixed
+
+- Keep a validation-repair mutation on its active repair node and repository
+  target after a recoverable patch rejection instead of advancing to another
+  repair candidate.
+- Apply the existing bounded mutation fallback policy to that repair attempt,
+  including a serialized `replace_file`-only provider request, then continue
+  through repository verification and validation rerun.
+
 ## 1.4.53 - 2026-08-16
 
 ### Fixed
