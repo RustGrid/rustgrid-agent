@@ -429,7 +429,11 @@ pub fn reconcile_execution(
             .and_then(|repair_node_id| snapshot.graph.node(repair_node_id))
             .filter(|repair_node| {
                 repair_node.kind == ExecutionNodeKind::ValidationRepair
-                    && repair_node.status == ExecutionNodeStatus::Running
+                    && (repair_node.status == ExecutionNodeStatus::Running
+                        || repair_node.status == ExecutionNodeStatus::FailedRecoverable
+                            && snapshot.failures.unresolved_for_node(&repair_node.id).any(
+                                |failure| failure.category == FailureCategory::MutationConflict,
+                            ))
             })
             .and_then(|repair_node| repair_node.validation_repair.as_ref())
             .and_then(|repair| {
@@ -1410,13 +1414,23 @@ fn repair_target_decision(
         ));
     }
     let operation = target.target.effective_operation();
-    let typed_failure = failure
+    let mutation_failure = (failure.category == FailureCategory::ValidationFailure)
+        .then(|| {
+            snapshot
+                .failures
+                .unresolved_for_node(&decision_node_id)
+                .filter(|failure| failure.category == FailureCategory::MutationConflict)
+                .max_by_key(|failure| failure.attempt)
+        })
+        .flatten();
+    let fallback_failure = mutation_failure.unwrap_or(failure);
+    let typed_failure = fallback_failure
         .code
         .as_deref()
         .and_then(MutationApplicationFailure::from_code);
     let mut fallback_policy = typed_failure.map_or_else(
         || {
-            if failure.category == FailureCategory::MutationConflict {
+            if fallback_failure.category == FailureCategory::MutationConflict {
                 match operation {
                     TargetOperation::ModifyExisting => MutationFallbackPolicy::ForceReplaceFile,
                     TargetOperation::CreateNew => MutationFallbackPolicy::ForceCreateFile,
@@ -1462,7 +1476,7 @@ fn repair_target_decision(
         };
     }
     if fallback_policy == MutationFallbackPolicy::NoSafeFallback
-        && failure.category == FailureCategory::MutationConflict
+        && fallback_failure.category == FailureCategory::MutationConflict
     {
         return Ok(ExecutionDecision::StopForGuardrail {
             outcome: guardrail_outcome(snapshot),

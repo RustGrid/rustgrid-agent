@@ -2206,40 +2206,45 @@ impl<'a> GatewayAgent<'a> {
                 ..
             } if failure.category == crate::execution_graph::FailureCategory::ValidationFailure => {
                 let repair = context.validation_repair.clone().unwrap_or_default();
-                let already_started = self
+                let repair_status = self
                     .notebook
                     .orchestration
                     .graph
                     .as_ref()
                     .and_then(|graph| graph.node(&repair.repair_node_id))
-                    .is_some_and(|node| {
-                        node.kind == ExecutionNodeKind::ValidationRepair
-                            && node.status == crate::execution_graph::ExecutionNodeStatus::Running
-                    });
-                (!already_started).then_some(ExecutionDomainEvent::ValidationRepairStarted {
-                    sequence,
-                    validation_node_id: failure.node_id.clone(),
-                    failure_id: failure.id.clone(),
-                    repair_node_id: repair.repair_node_id,
-                    originating_implementation_node_id: repair.originating_implementation_node_id,
-                    target_ref: repair.target_ref,
-                    failure_revision: repair.failure_revision,
-                    repair_intent: repair.repair_intent,
-                    selected_target: target.path.clone(),
-                    implicated_paths: failure
-                        .assertion_failures
-                        .iter()
-                        .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                    correction_contracts: repair.correction_contracts,
-                    requested_tool_policy: *fallback_policy,
-                    repository_fingerprint_before:
-                        crate::execution_graph::RepositoryFingerprint::new(
-                            repair.repository_fingerprint,
-                        ),
-                })
+                    .filter(|node| node.kind == ExecutionNodeKind::ValidationRepair)
+                    .map(|node| node.status);
+                match repair_status {
+                    Some(crate::execution_graph::ExecutionNodeStatus::Running) => None,
+                    Some(crate::execution_graph::ExecutionNodeStatus::FailedRecoverable) => {
+                        node_started(&repair.repair_node_id, self)
+                    }
+                    _ => Some(ExecutionDomainEvent::ValidationRepairStarted {
+                        sequence,
+                        validation_node_id: failure.node_id.clone(),
+                        failure_id: failure.id.clone(),
+                        repair_node_id: repair.repair_node_id,
+                        originating_implementation_node_id: repair
+                            .originating_implementation_node_id,
+                        target_ref: repair.target_ref,
+                        failure_revision: repair.failure_revision,
+                        repair_intent: repair.repair_intent,
+                        selected_target: target.path.clone(),
+                        implicated_paths: failure
+                            .assertion_failures
+                            .iter()
+                            .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                        correction_contracts: repair.correction_contracts,
+                        requested_tool_policy: *fallback_policy,
+                        repository_fingerprint_before:
+                            crate::execution_graph::RepositoryFingerprint::new(
+                                repair.repository_fingerprint,
+                            ),
+                    }),
+                }
             }
             ExecutionDecision::ExecuteTarget { node_id, .. }
             | ExecutionDecision::RepairTarget { node_id, .. }

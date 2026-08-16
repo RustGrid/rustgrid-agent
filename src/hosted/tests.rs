@@ -920,6 +920,376 @@ fn active_mutation_fallback_reaches_the_serialized_provider_request() {
 }
 
 #[test]
+fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
+    use crate::execution_graph::{
+        BudgetState, ExecutionDomainEvent, ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus,
+        FailureCategory, FailureRecord, MissionBudget, MissionComplexity, NodeAttempt,
+        OperationEvidence, PlannedTarget, RepairResult, RepositoryFingerprint,
+        RepositoryMutationLifecycle, RepositoryOperationOutcome, RepositorySnapshot,
+        SatisfiedIntent, ValidationAssertionFailure, ValidationEvidenceRecord,
+        ValidationEvidenceStatus, ValidationGateSpec, ValidationGateType, ValidationRepairAttempt,
+        ValidationRepairMutationOutcome,
+    };
+
+    let targets = [
+        PlannedTarget {
+            change_id: "test-contract".into(),
+            path: "tests/generic.test.ts".into(),
+            role: "tests".into(),
+            intent: "correct the generic test expectation".into(),
+            acceptance_criteria_ids: vec!["criterion-1".into()],
+            operation: Default::default(),
+            new_file: false,
+        },
+        PlannedTarget {
+            change_id: "source-contract".into(),
+            path: "src/generic.ts".into(),
+            role: "production".into(),
+            intent: "preserve the generic implementation behavior".into(),
+            acceptance_criteria_ids: vec!["criterion-1".into()],
+            operation: Default::default(),
+            new_file: false,
+        },
+    ];
+    let gate = ValidationGateSpec {
+        gate_id: "focused".into(),
+        gate_type: ValidationGateType::FocusedTest,
+        command: "run focused tests".into(),
+        working_directory: ".".into(),
+        required: true,
+        ..ValidationGateSpec::default()
+    };
+    let budget = MissionBudget::for_complexity(MissionComplexity::Small);
+    let mut snapshot = crate::execution_graph::ExecutionSnapshot {
+        run_id: "validation-repair-fallback".into(),
+        current_repository: RepositorySnapshot {
+            fingerprint: "tree-implemented".into(),
+            source_tree_hash: "tree-implemented".into(),
+            changed_paths: targets.iter().map(|target| target.path.clone()).collect(),
+            ..RepositorySnapshot::default()
+        },
+        graph: ExecutionGraph::from_targets(
+            "validation-repair-fallback-graph",
+            MissionComplexity::Small,
+            "tree-before",
+            &targets,
+            &[gate],
+            &budget,
+        ),
+        budget: BudgetState::new(budget),
+        ..crate::execution_graph::ExecutionSnapshot::default()
+    };
+    for node in snapshot
+        .graph
+        .nodes
+        .iter_mut()
+        .filter(|node| node.kind.is_mutation())
+    {
+        node.status = ExecutionNodeStatus::Completed;
+        node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Verified);
+        let target = node.target.as_ref().unwrap();
+        node.attempts.push(NodeAttempt {
+            attempt: 1,
+            started_at: "implementation-started".into(),
+            completed_at: Some("implementation-completed".into()),
+            repository_fingerprint_before: "tree-before".into(),
+            repository_fingerprint_after: Some("tree-implemented".into()),
+            outcome: Some(ExecutionNodeStatus::Completed),
+            ..NodeAttempt::default()
+        });
+        node.operation_evidence.push(OperationEvidence {
+            semantic_id: format!("implemented:{}", node.id),
+            outcome: RepositoryOperationOutcome::Applied,
+            operation: target.operation.clone(),
+            target_path: target.path.clone(),
+            repository_fingerprint: RepositoryFingerprint::new("tree-implemented"),
+            attempt: 1,
+            completed_at: "implementation-completed".into(),
+            ..OperationEvidence::default()
+        });
+    }
+    snapshot.graph.refresh_readiness();
+    snapshot.evidence.capture_file(
+        "tests/generic.test.ts",
+        "tree-implemented",
+        None,
+        "expect(actual).toBe(expected);",
+        false,
+    );
+    snapshot.evidence.capture_file(
+        "src/generic.ts",
+        "tree-implemented",
+        None,
+        "export const actual = true;",
+        false,
+    );
+
+    let validation_node_id = snapshot
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::ValidationFocused)
+        .unwrap()
+        .id
+        .clone();
+    snapshot
+        .graph
+        .set_node_status(&validation_node_id, ExecutionNodeStatus::Running)
+        .unwrap();
+    let validation_gate = snapshot
+        .graph
+        .node(&validation_node_id)
+        .unwrap()
+        .validation
+        .clone()
+        .unwrap();
+    let validation_fingerprint = validation_gate.fingerprint("tree-implemented");
+    snapshot
+        .append_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+            sequence: snapshot.next_event_sequence(),
+            node_id: validation_node_id.clone(),
+            evidence: ValidationEvidenceRecord {
+                evidence_id: "failed-focused-validation".into(),
+                node_id: validation_node_id.clone(),
+                gate_id: validation_gate.gate_id,
+                fingerprint: validation_fingerprint.clone(),
+                repository_fingerprint: "tree-implemented".into(),
+                command: validation_gate.command,
+                working_directory: validation_gate.working_directory,
+                status: ValidationEvidenceStatus::Failed,
+                exit_code: Some(1),
+                output_summary: "generic expectation failed".into(),
+                duration: Duration::from_millis(1),
+            },
+        })
+        .unwrap();
+    let mut validation_failure = FailureRecord::new(
+        "generic-validation-failure",
+        validation_node_id.clone(),
+        FailureCategory::ValidationFailure,
+        1,
+        "tree-implemented",
+        "generic expectation failed",
+    );
+    validation_failure.target_path = Some("tests/generic.test.ts".into());
+    validation_failure.assertion_failures = vec![ValidationAssertionFailure {
+        test_file: "tests/generic.test.ts".into(),
+        test_name: "generic behavior".into(),
+        implicated_paths: vec!["tests/generic.test.ts".into(), "src/generic.ts".into()],
+        ..ValidationAssertionFailure::default()
+    }];
+    snapshot
+        .append_event(ExecutionDomainEvent::FailureRecorded {
+            sequence: snapshot.next_event_sequence(),
+            failure: validation_failure.clone(),
+        })
+        .unwrap();
+    snapshot
+        .append_event(ExecutionDomainEvent::ValidationFailed {
+            sequence: snapshot.next_event_sequence(),
+            node_id: validation_node_id.clone(),
+            failure_id: validation_failure.id.clone(),
+            fingerprint: validation_fingerprint,
+        })
+        .unwrap();
+
+    let initial = crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap();
+    let ExecutionDecision::ExecuteTarget {
+        node_id: repair_node_id,
+        action:
+            crate::hosted_orchestrator::MutationAction::PrepareTargetContext {
+                target: repair_target,
+                ..
+            },
+        target: initial_context,
+    } = initial
+    else {
+        panic!("expected validation repair target preparation");
+    };
+    assert_eq!(repair_target.path, "tests/generic.test.ts");
+    let repair = initial_context.validation_repair.clone().unwrap();
+    snapshot
+        .append_event(ExecutionDomainEvent::ValidationRepairStarted {
+            sequence: snapshot.next_event_sequence(),
+            validation_node_id: validation_node_id.clone(),
+            failure_id: validation_failure.id.clone(),
+            repair_node_id: repair.repair_node_id.clone(),
+            originating_implementation_node_id: repair.originating_implementation_node_id.clone(),
+            target_ref: repair.target_ref.clone(),
+            failure_revision: repair.failure_revision,
+            repair_intent: repair.repair_intent.clone(),
+            selected_target: repair_target.path.clone(),
+            implicated_paths: vec![repair_target.path.clone()],
+            correction_contracts: repair.correction_contracts.clone(),
+            requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+            repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
+        })
+        .unwrap();
+    snapshot
+        .append_event(ExecutionDomainEvent::TargetContextPrepared {
+            sequence: snapshot.next_event_sequence(),
+            node_id: repair_node_id.clone(),
+            target_path: repair_target.path.clone(),
+            operation: repair_target.operation.clone(),
+            source_path: repair_target.operation.source_path().map(str::to_owned),
+            target_exists: Some(true),
+            source_exists: None,
+            repository_fingerprint: RepositoryFingerprint::new("tree-implemented"),
+            target_content_hash: Some(sha256_text("expect(actual).toBe(expected);")),
+            source_content_hash: None,
+            accepted_intent_hash: sha256_text(&repair_target.intent),
+            evidence_ids: Vec::new(),
+        })
+        .unwrap();
+    assert!(matches!(
+        crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap(),
+        ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+                fallback_policy: MutationFallbackPolicy::NoSafeFallback,
+                ..
+            },
+            ..
+        }
+    ));
+
+    let mut mutation_failure = FailureRecord::new(
+        "repair-patch-rejected",
+        repair_node_id.clone(),
+        FailureCategory::MutationConflict,
+        1,
+        "tree-implemented",
+        "repair patch context did not match",
+    );
+    mutation_failure.code = Some(
+        MutationApplicationFailure::PatchContextMismatch
+            .as_str()
+            .into(),
+    );
+    mutation_failure.target_path = Some(repair_target.path.clone());
+    snapshot
+        .append_event(ExecutionDomainEvent::MutationRejected {
+            sequence: snapshot.next_event_sequence(),
+            node_id: repair_node_id.clone(),
+            failure: mutation_failure,
+        })
+        .unwrap();
+
+    let fallback = crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap();
+    assert!(matches!(
+        &fallback,
+        ExecutionDecision::ExecuteTarget {
+            node_id,
+            action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+                target,
+                fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
+                ..
+            },
+            ..
+        } if node_id == &repair_node_id && target.path == "tests/generic.test.ts"
+    ));
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&fallback), 16_384);
+    let provider_payload = json!({
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&fallback)),
+        "tool_choice": profile.tool_choice(),
+    });
+    assert_eq!(
+        provider_payload["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        ["replace_file"]
+    );
+    assert_eq!(provider_payload["tool_choice"]["name"], "replace_file");
+
+    let mut no_valid_repair = snapshot.clone();
+    no_valid_repair
+        .append_event(ExecutionDomainEvent::NodeStarted {
+            sequence: no_valid_repair.next_event_sequence(),
+            node_id: repair_node_id.clone(),
+            attempt: 2,
+            started_at: "fallback-started".into(),
+            repository_fingerprint: "tree-implemented".into(),
+        })
+        .unwrap();
+    no_valid_repair
+        .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+            sequence: no_valid_repair.next_event_sequence(),
+            validation_node_id: validation_node_id.clone(),
+            failure_id: validation_failure.id.clone(),
+            result: RepairResult::NoMutation {
+                diagnosis: None,
+                reason: "no valid correction for this target".into(),
+                outcome: ValidationRepairMutationOutcome::NoValidRepair,
+                unresolved: None,
+            },
+            attempt: None,
+        })
+        .unwrap();
+    let next_candidate = crate::hosted_orchestrator::reconcile_execution(&no_valid_repair).unwrap();
+    assert!(
+        matches!(
+            next_candidate,
+            ExecutionDecision::ExecuteTarget {
+            action: crate::hosted_orchestrator::MutationAction::PrepareTargetContext { ref target, .. },
+                ..
+            } if target.path == "src/generic.ts"
+        ),
+        "unexpected no-valid-repair decision: {next_candidate:?}"
+    );
+
+    snapshot
+        .append_event(ExecutionDomainEvent::NodeStarted {
+            sequence: snapshot.next_event_sequence(),
+            node_id: repair_node_id.clone(),
+            attempt: 2,
+            started_at: "fallback-started".into(),
+            repository_fingerprint: "tree-implemented".into(),
+        })
+        .unwrap();
+    snapshot
+        .append_event(ExecutionDomainEvent::MutationApplied {
+            sequence: snapshot.next_event_sequence(),
+            node_id: repair_node_id,
+            target_path: repair_target.path.clone(),
+            repository_fingerprint: "tree-repaired".into(),
+            evidence_id: "repair-operation-evidence".into(),
+            completed_at: "fallback-completed".into(),
+            satisfied_intent: SatisfiedIntent::ValidationRepair,
+            repair_failure_id: Some(validation_failure.id.clone()),
+            created_target_evidence: None,
+        })
+        .unwrap();
+    snapshot.current_repository.fingerprint = "tree-repaired".into();
+    snapshot.current_repository.source_tree_hash = "tree-repaired".into();
+    snapshot
+        .append_event(ExecutionDomainEvent::ValidationRepairCompleted {
+            sequence: snapshot.next_event_sequence(),
+            validation_node_id: validation_node_id.clone(),
+            failure_id: validation_failure.id,
+            result: RepairResult::MutationProduced {
+                selected_target: repair_target.path.clone(),
+                repair_intent_id: repair.repair_intent.repair_intent_id.clone(),
+            },
+            attempt: Some(ValidationRepairAttempt {
+                repair_intent_id: repair.repair_intent.repair_intent_id,
+                target_path: repair_target.path,
+                failure_revision: repair.failure_revision,
+                outcome: ValidationRepairMutationOutcome::MutationApplied,
+                repository_fingerprint_before: "tree-implemented".into(),
+                repository_fingerprint_after: "tree-repaired".into(),
+                ..ValidationRepairAttempt::default()
+            }),
+        })
+        .unwrap();
+    assert!(matches!(
+        crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap(),
+        ExecutionDecision::RunValidation { node_id, .. } if node_id == validation_node_id
+    ));
+}
+
+#[test]
 fn repair_preflight_requires_the_policy_in_the_actual_request_context() {
     let decision = mutation_fallback_decision(
         MutationFallbackPolicy::ForceReplaceFile,
