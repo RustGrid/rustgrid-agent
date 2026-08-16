@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.53 - 2026-08-16
+
+### Fixed
+
+- Persist completed validation evidence with the existing bounded execution
+  graph checkpoint event contract so a non-zero validation exit can continue
+  into structured failure diagnosis and validation repair.
+- Preserve the normal passing-validation path and the complete captured process
+  evidence while keeping backend event validation unchanged.
+
 ## 1.4.52 - 2026-08-15
 
 ### Fixed
