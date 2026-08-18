@@ -1152,13 +1152,23 @@ fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
         }
     ));
 
+    let first_failure_attempt =
+        active_target_failure_attempt(Some(&snapshot.graph), &snapshot.budget, &repair_node_id);
+    assert_eq!(first_failure_attempt, 1);
+    let mutation_failure_detail = "repair patch context did not match";
+    let first_failure_id = active_target_failure_id(
+        &repair_node_id,
+        "tree-implemented",
+        first_failure_attempt,
+        mutation_failure_detail,
+    );
     let mut mutation_failure = FailureRecord::new(
-        "repair-patch-rejected",
+        first_failure_id.clone(),
         repair_node_id.clone(),
         FailureCategory::MutationConflict,
-        1,
+        first_failure_attempt,
         "tree-implemented",
-        "repair patch context did not match",
+        mutation_failure_detail,
     );
     mutation_failure.code = Some(
         MutationApplicationFailure::PatchContextMismatch
@@ -1166,13 +1176,17 @@ fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
             .into(),
     );
     mutation_failure.target_path = Some(repair_target.path.clone());
-    snapshot
-        .append_event(ExecutionDomainEvent::MutationRejected {
-            sequence: snapshot.next_event_sequence(),
-            node_id: repair_node_id.clone(),
-            failure: mutation_failure,
-        })
-        .unwrap();
+    let before_first_failure = snapshot.clone();
+    let first_failure_event = ExecutionDomainEvent::MutationRejected {
+        sequence: snapshot.next_event_sequence(),
+        node_id: repair_node_id.clone(),
+        failure: mutation_failure,
+    };
+    snapshot.append_event(first_failure_event.clone()).unwrap();
+    let mut exact_replay = before_first_failure;
+    exact_replay.append_event(first_failure_event).unwrap();
+    assert_eq!(exact_replay.failures, snapshot.failures);
+    assert_eq!(exact_replay.events, snapshot.events);
 
     let fallback = crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap();
     assert!(matches!(
@@ -1248,6 +1262,40 @@ fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
             repository_fingerprint: "tree-implemented".into(),
         })
         .unwrap();
+    let fallback_failure_attempt =
+        active_target_failure_attempt(Some(&snapshot.graph), &snapshot.budget, &repair_node_id);
+    assert_eq!(fallback_failure_attempt, 2);
+    let fallback_failure_id = active_target_failure_id(
+        &repair_node_id,
+        "tree-implemented",
+        fallback_failure_attempt,
+        mutation_failure_detail,
+    );
+    assert_ne!(fallback_failure_id, first_failure_id);
+    let mut collision_probe = snapshot.clone();
+    let mut fallback_failure = FailureRecord::new(
+        fallback_failure_id.clone(),
+        repair_node_id.clone(),
+        FailureCategory::MutationConflict,
+        fallback_failure_attempt,
+        "tree-implemented",
+        mutation_failure_detail,
+    );
+    fallback_failure.code = Some(
+        MutationApplicationFailure::PatchContextMismatch
+            .as_str()
+            .into(),
+    );
+    fallback_failure.target_path = Some(repair_target.path.clone());
+    collision_probe
+        .append_event(ExecutionDomainEvent::MutationRejected {
+            sequence: collision_probe.next_event_sequence(),
+            node_id: repair_node_id.clone(),
+            failure: fallback_failure,
+        })
+        .expect("the fallback attempt must not collide with the first failure");
+    assert!(collision_probe.failures.get(&first_failure_id).is_some());
+    assert!(collision_probe.failures.get(&fallback_failure_id).is_some());
     snapshot
         .append_event(ExecutionDomainEvent::MutationApplied {
             sequence: snapshot.next_event_sequence(),

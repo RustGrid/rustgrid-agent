@@ -3882,13 +3882,11 @@ impl<'a> GatewayAgent<'a> {
             _ => return Ok(()),
         };
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;
-        let attempt = self
-            .notebook
-            .orchestration
-            .budget
-            .usage_for(&node_id)
-            .mutation_fallback_attempts
-            .saturating_add(1);
+        let attempt = active_target_failure_attempt(
+            self.notebook.orchestration.graph.as_ref(),
+            &self.notebook.orchestration.budget,
+            &node_id,
+        );
         let failure_id = active_target_failure_id(&node_id, &fingerprint, attempt, detail);
         let mut failure = crate::execution_graph::FailureRecord::new(
             failure_id,
@@ -6467,7 +6465,24 @@ impl<'a> GatewayAgent<'a> {
     }
 }
 
-fn active_target_failure_id(
+pub(in crate::hosted) fn active_target_failure_attempt(
+    graph: Option<&crate::execution_graph::ExecutionGraph>,
+    budget: &crate::execution_graph::BudgetState,
+    node_id: &crate::execution_graph::ExecutionNodeId,
+) -> u32 {
+    graph
+        .and_then(|graph| graph.node(node_id))
+        .and_then(|node| node.attempts.iter().map(|attempt| attempt.attempt).max())
+        .filter(|attempt| *attempt > 0)
+        .unwrap_or_else(|| {
+            budget
+                .usage_for(node_id)
+                .mutation_fallback_attempts
+                .saturating_add(1)
+        })
+}
+
+pub(in crate::hosted) fn active_target_failure_id(
     node_id: &crate::execution_graph::ExecutionNodeId,
     repository_fingerprint: &str,
     attempt: u32,
