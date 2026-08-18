@@ -5,6 +5,17 @@ Semantic Versioning.
 
 ## Unreleased
 
+## 1.4.55 - 2026-08-18
+
+### Fixed
+
+- Derive hosted repository-mutation failure identity from the active graph
+  node's semantic attempt ordinal so consecutive ValidationRepair mutation
+  attempts cannot collide.
+- Preserve deterministic exact-replay identity and existing duplicate-event
+  protection while allowing the bounded `replace_file` fallback to proceed
+  after an earlier `apply_patch` failure.
+
 ## 1.4.54 - 2026-08-16
 
 ### Fixed
