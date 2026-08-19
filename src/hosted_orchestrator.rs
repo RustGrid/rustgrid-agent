@@ -541,9 +541,10 @@ pub fn reconcile_execution(
     let next = select_next_node(snapshot, &effective_success);
 
     if let Some(node) = next {
-        if (node.status == ExecutionNodeStatus::FailedRecoverable
+        let should_stop_node = (node.status == ExecutionNodeStatus::FailedRecoverable
             && repair_budget_exhausted(snapshot, node))
-            || snapshot.budget.should_stop_node(&node.id, &node.budget)
+            || snapshot.budget.should_stop_node(&node.id, &node.budget);
+        if should_stop_node && !discovery_can_finalize_after_local_budget_exhaustion(snapshot, node)
         {
             return Ok(ExecutionDecision::StopForGuardrail {
                 outcome: guardrail_outcome(snapshot),
@@ -1830,6 +1831,12 @@ fn guardrail_outcome(snapshot: &ExecutionSnapshot) -> MissionOutcome {
 
 fn hard_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> bool {
     let usage = snapshot.budget.usage_for(&node.id);
+    node_spending_budget_exhausted(node, &usage)
+        || usage.mutation_fallback_attempts > node.budget.max_mutation_fallback_attempts
+        || mission_budget_exhausted(snapshot)
+}
+
+fn node_spending_budget_exhausted(node: &ExecutionNode, usage: &NodeBudgetUsage) -> bool {
     (node.budget.max_model_calls > 0
         && usage
             .model_calls_consumed
@@ -1837,10 +1844,36 @@ fn hard_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> 
             >= node.budget.max_model_calls)
         || (node.budget.max_cost_micros > 0 && usage.cost_micros >= node.budget.max_cost_micros)
         || (!node.budget.max_duration.is_zero() && usage.duration >= node.budget.max_duration)
-        || usage.mutation_fallback_attempts > node.budget.max_mutation_fallback_attempts
-        || snapshot.budget.total_model_calls >= snapshot.budget.mission.max_model_calls
-        || snapshot.budget.total_cost_micros >= snapshot.budget.mission.max_cost_micros
+}
+
+fn mission_budget_exhausted(snapshot: &ExecutionSnapshot) -> bool {
+    snapshot
+        .budget
+        .total_model_calls
+        .saturating_add(snapshot.budget.total_model_calls_reserved)
+        >= snapshot.budget.mission.max_model_calls
+        || snapshot
+            .budget
+            .total_cost_micros
+            .saturating_add(snapshot.budget.total_cost_micros_reserved)
+            >= snapshot.budget.mission.max_cost_micros
         || snapshot.budget.elapsed >= snapshot.budget.mission.max_duration
+}
+
+fn discovery_can_finalize_after_local_budget_exhaustion(
+    snapshot: &ExecutionSnapshot,
+    node: &ExecutionNode,
+) -> bool {
+    node.kind == ExecutionNodeKind::Discovery
+        && matches!(
+            node.status,
+            ExecutionNodeStatus::Ready
+                | ExecutionNodeStatus::Running
+                | ExecutionNodeStatus::Applied
+        )
+        && node_spending_budget_exhausted(node, &snapshot.budget.usage_for(&node.id))
+        && !mission_budget_exhausted(snapshot)
+        && discovery_evidence_is_sufficient(snapshot)
 }
 
 fn repair_budget_exhausted(snapshot: &ExecutionSnapshot, node: &ExecutionNode) -> bool {
@@ -1949,6 +1982,7 @@ pub fn classify_mutation_request(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
 
     fn target(change_id: &str, path: &str) -> PlannedTarget {
         PlannedTarget {
@@ -2398,6 +2432,165 @@ mod tests {
         assert_eq!(
             state.graph.next_runnable_node().map(|node| node.kind),
             Some(ExecutionNodeKind::Planning)
+        );
+    }
+
+    #[test]
+    fn productive_discovery_at_its_exact_node_budget_converges_to_planning() {
+        let mut state = discovery_snapshot();
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryStarted { sequence: 1 })
+            .expect("start discovery");
+        for path in [
+            "src/components/theme/ThemeProvider.tsx",
+            "src/components/theme/ThemeToggle.tsx",
+            "tests/theme-provider.test.tsx",
+            "package.json",
+        ] {
+            state.evidence.capture_file(
+                path,
+                "tree-1",
+                None,
+                format!("productive discovery evidence for {path}"),
+                false,
+            );
+        }
+        let discovery_id = ExecutionNodeId::new("discovery");
+        let discovery_budget = state
+            .graph
+            .node(&discovery_id)
+            .expect("discovery node")
+            .budget
+            .clone();
+        assert_eq!(discovery_budget.max_model_calls, 3);
+        for actual_cost_micros in [40_000, 45_000, 45_775] {
+            let reservation = state
+                .budget
+                .reserve_model_call(
+                    &discovery_id,
+                    &discovery_budget,
+                    actual_cost_micros,
+                    Duration::ZERO,
+                )
+                .expect("productive discovery call fits its signed budget");
+            state.budget.consume_model_call_reservation(
+                &reservation,
+                actual_cost_micros,
+                Duration::ZERO,
+            );
+        }
+        let discovery_usage = state.budget.usage_for(&discovery_id);
+        assert_eq!(discovery_usage.model_calls_consumed, 3);
+        assert_eq!(discovery_usage.model_calls_reserved, 0);
+        assert_eq!(discovery_usage.cost_micros, 130_775);
+        assert_eq!(discovery_usage.cost_micros_reserved, 0);
+        state
+            .validate_invariants()
+            .expect("exact node-budget exhaustion is a valid snapshot");
+        let rejected = state
+            .budget
+            .reserve_model_call(&discovery_id, &discovery_budget, 1, Duration::ZERO)
+            .expect_err("a fourth discovery call must remain forbidden");
+        assert_eq!(
+            rejected.rejection_reason,
+            Some("node_model_call_budget_exhausted")
+        );
+
+        assert!(matches!(
+            reconcile_execution(&state).expect("budget convergence decision"),
+            ExecutionDecision::ContinueDiscovery {
+                action: DiscoveryAction::FinalizeImpactMap { .. }
+            }
+        ));
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryCompleted {
+                sequence: 2,
+                repository_fingerprint: "tree-1".into(),
+            })
+            .expect("complete discovery through the canonical reducer");
+        assert!(matches!(
+            reconcile_execution(&state).expect("planning decision"),
+            ExecutionDecision::ContinuePlanning {
+                action: PlanningAction::BuildPlan { .. }
+            }
+        ));
+        assert_eq!(
+            state.graph.next_runnable_node().map(|node| node.kind),
+            Some(ExecutionNodeKind::Planning)
+        );
+        let planning_id = ExecutionNodeId::new("planning");
+        let planning_budget = state
+            .graph
+            .node(&planning_id)
+            .expect("planning node")
+            .budget
+            .clone();
+        let planning_reservation = state
+            .budget
+            .reserve_model_call(&planning_id, &planning_budget, 1, Duration::ZERO)
+            .expect("planning owns its own remaining admission");
+        assert_eq!(planning_reservation.node_id, planning_id);
+        assert_eq!(
+            state.budget.usage_for(&discovery_id).model_calls_reserved,
+            0
+        );
+        state
+            .budget
+            .release_model_call_reservation(&planning_reservation);
+
+        let mut invalid = state;
+        invalid
+            .budget
+            .record_model_call(discovery_id, 1, Duration::ZERO);
+        assert!(
+            invalid
+                .validate_invariants()
+                .expect_err("usage above the signed discovery budget remains invalid")
+                .to_string()
+                .contains("node `discovery` reservations exceed its signed budget")
+        );
+    }
+
+    #[test]
+    fn discovery_budget_exhaustion_without_required_evidence_remains_blocked() {
+        let mut state = discovery_snapshot();
+        state
+            .append_event(ExecutionDomainEvent::DiscoveryStarted { sequence: 1 })
+            .expect("start discovery");
+        let discovery_id = ExecutionNodeId::new("discovery");
+        let discovery_budget = state
+            .graph
+            .node(&discovery_id)
+            .expect("discovery node")
+            .budget
+            .clone();
+        for _ in 0..discovery_budget.max_model_calls {
+            let reservation = state
+                .budget
+                .reserve_model_call(&discovery_id, &discovery_budget, 1, Duration::ZERO)
+                .expect("discovery call fits");
+            state
+                .budget
+                .consume_model_call_reservation(&reservation, 1, Duration::ZERO);
+        }
+        assert!(
+            state
+                .budget
+                .reserve_model_call(&discovery_id, &discovery_budget, 1, Duration::ZERO)
+                .is_err(),
+            "a fourth discovery call must not be admitted"
+        );
+        assert_eq!(
+            reconcile_execution(&state).expect("insufficient discovery decision"),
+            ExecutionDecision::StopForGuardrail {
+                outcome: MissionOutcome::BlockedNoDiff,
+                reason: GuardrailReason::NodeBudgetExhausted,
+            }
+        );
+        assert_eq!(
+            state.graph.node(&discovery_id).map(|node| node.status),
+            Some(ExecutionNodeStatus::Running),
+            "budget exhaustion must not fabricate discovery completion"
         );
     }
 
