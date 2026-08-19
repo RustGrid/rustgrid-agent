@@ -1,0 +1,95 @@
+name: Candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    name: Build immutable Linux candidate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.94 --profile minimal --component clippy,rustfmt
+
+      - name: Use Rust toolchain
+        run: rustup default 1.94
+
+      - name: Run candidate checks
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked
+
+      - name: Build and verify candidate archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="${GITHUB_SHA,,}"
+          tag="candidate-${commit}"
+          archive="rustgrid-agent-${commit}-linux-x86_64.tar.gz"
+          staging="$(mktemp -d)"
+          extracted="$(mktemp -d)"
+          cargo build --locked --release
+          install -m 0755 target/release/rustgrid-agent "${staging}/rustgrid-agent"
+          tar -C "${staging}" -czf "${archive}" rustgrid-agent
+          tar -C "${extracted}" -xzf "${archive}"
+          "${extracted}/rustgrid-agent" --version
+          sha256sum "${archive}" > "${archive}.sha256"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest candidate archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.archive.outputs.archive }}
+
+      - name: Publish immutable candidate release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.archive.outputs.archive }}
+          TAG: ${{ steps.archive.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Candidate ${TAG} is already published"
+          else
+            gh release create "${TAG}" \
+              "${ARCHIVE}" \
+              "${ARCHIVE}.sha256#SHA-256 checksum" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease \
+              --title "rustgrid-agent candidate ${GITHUB_SHA}" \
+              --notes "Immutable hosted-execution candidate built from ${GITHUB_SHA}."
+          fi
+          checksum="$(cut -d ' ' -f 1 "${ARCHIVE}.sha256")"
+          published_digest="$(
+            gh release view "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq ".assets[] | select(.name == \"${ARCHIVE}\") | .digest"
+          )"
+          test "${published_digest}" = "sha256:${checksum}"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${ARCHIVE}"
+          {
+            echo "### Candidate artifact"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- URL: \`${download_url}\`"
+            echo "- SHA-256: \`${checksum}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
