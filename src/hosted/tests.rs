@@ -2004,10 +2004,15 @@ fn final_bounded_discovery_call_is_forced_to_ranked_candidate_reads() {
         "src/revoke_credentials.rs".into(),
         "package.json".into(),
     ];
+    notebook.blocking_unknowns = vec!["Ground the credential revocation path".into()];
 
-    let policy = bounded_discovery_read_policy(&notebook, repository.path(), 2, 3)
+    configure_active_discovery_node_budget(&mut notebook, 2);
+
+    let policy = bounded_discovery_read_policy(&notebook, repository.path())
         .expect("the final bounded call must deepen repository evidence");
-    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 3, 3).is_none());
+    assert_eq!(policy.calls_consumed, 2);
+    assert_eq!(policy.call_limit, 3);
+    assert_eq!(policy.calls_remaining, 1);
     assert_eq!(policy.tool, "read_files");
     assert_eq!(policy.paths[0], "src/revoke_credentials.rs");
     let tools = hosted_tools_for_bounded_discovery_read(&policy);
@@ -2023,6 +2028,37 @@ fn final_bounded_discovery_call_is_forced_to_ranked_candidate_reads() {
         "tool_choice": {"type": "function", "name": policy.tool},
     });
     assert_eq!(request["tool_choice"]["name"], "read_files");
+
+    let mut exhausted_notebook = notebook.clone();
+    configure_active_discovery_node_budget(&mut exhausted_notebook, 3);
+    assert!(bounded_discovery_read_policy(&exhausted_notebook, repository.path()).is_none());
+    let exhausted_discovery = exhausted_notebook
+        .orchestration
+        .graph
+        .as_ref()
+        .and_then(|graph| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Discovery)
+        })
+        .expect("discovery node")
+        .clone();
+    let fourth_call_admission = exhausted_notebook
+        .orchestration
+        .budget
+        .evaluate_model_call_admission(
+            &exhausted_discovery.id,
+            &exhausted_discovery.budget,
+            1,
+            0,
+            Duration::ZERO,
+        );
+    assert!(!fourth_call_admission.admitted);
+    assert_eq!(
+        fourth_call_admission.rejection_reason,
+        Some("node_model_call_budget_exhausted")
+    );
 
     for path in &policy.paths {
         let content = fs::read_to_string(repository.path().join(path)).unwrap();
@@ -2095,11 +2131,18 @@ fn bounded_discovery_does_not_force_unusable_candidate_reads() {
     notebook.discovery_paths_sampled =
         vec!["vendor/generated/client.rs".into(), "src/missing.rs".into()];
 
-    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 2, 3).is_none());
+    configure_active_discovery_node_budget(&mut notebook, 2);
+
+    assert!(bounded_discovery_read_policy(&notebook, repository.path()).is_none());
+    assert!(
+        hosted_tools_for_phase(ExecutionPhase::Discovery)
+            .iter()
+            .any(|tool| tool["name"] == "search_text")
+    );
 }
 
 #[test]
-fn bounded_discovery_does_not_force_reads_after_grounded_evidence_exists() {
+fn bounded_discovery_keeps_search_legal_for_inspected_files_with_unresolved_questions() {
     let repository = tempfile::tempdir().unwrap();
     fs::create_dir_all(repository.path().join("src")).unwrap();
     fs::write(repository.path().join("src/session.rs"), "session\n").unwrap();
@@ -2107,8 +2150,46 @@ fn bounded_discovery_does_not_force_reads_after_grounded_evidence_exists() {
     notebook.searches_completed = vec!["literal:.:session".into()];
     notebook.discovery_paths_sampled = vec!["src/session.rs".into()];
     notebook.files_inspected = vec!["src/session.rs".into()];
+    notebook.blocking_unknowns = vec!["Find the session revocation caller".into()];
 
-    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 2, 3).is_none());
+    configure_active_discovery_node_budget(&mut notebook, 2);
+
+    assert!(bounded_discovery_read_policy(&notebook, repository.path()).is_none());
+    assert!(
+        hosted_tools_for_phase(ExecutionPhase::Discovery)
+            .iter()
+            .any(|tool| tool["name"] == "search_text")
+    );
+}
+
+fn configure_active_discovery_node_budget(notebook: &mut WorkerNotebook, consumed_calls: u32) {
+    let mission_budget = crate::execution_graph::MissionBudget::for_complexity(
+        crate::execution_graph::MissionComplexity::Small,
+    );
+    let mut graph = crate::execution_graph::ExecutionGraph::bootstrap(
+        "bounded-discovery",
+        &notebook.repository_fingerprint,
+        crate::execution_graph::MissionComplexity::Small,
+        &mission_budget,
+    );
+    let discovery_id = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Discovery)
+        .map(|node| node.id.clone())
+        .expect("discovery node");
+    graph
+        .set_node_status(
+            &discovery_id,
+            crate::execution_graph::ExecutionNodeStatus::Running,
+        )
+        .expect("activate discovery node");
+    let mut budget = crate::execution_graph::BudgetState::new(mission_budget);
+    for _ in 0..consumed_calls {
+        budget.record_model_call(discovery_id.clone(), 1, Duration::ZERO);
+    }
+    notebook.orchestration.graph = Some(graph);
+    notebook.orchestration.budget = budget;
 }
 
 #[test]

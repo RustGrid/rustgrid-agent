@@ -1203,6 +1203,9 @@ pub(super) fn hosted_tools_for_action(
 pub(super) struct BoundedDiscoveryReadPolicy {
     pub(super) tool: &'static str,
     pub(super) paths: Vec<String>,
+    pub(super) calls_consumed: u32,
+    pub(super) call_limit: u32,
+    pub(super) calls_remaining: u32,
 }
 
 fn unusable_discovery_candidate(path: &str) -> bool {
@@ -1251,14 +1254,27 @@ fn discovery_candidate_score(notebook: &WorkerNotebook, path: &str) -> usize {
 pub(super) fn bounded_discovery_read_policy(
     notebook: &WorkerNotebook,
     repository_root: &Path,
-    calls_used: usize,
-    call_limit: usize,
 ) -> Option<BoundedDiscoveryReadPolicy> {
-    let calls_remaining = call_limit.saturating_sub(calls_used);
-    if notebook.impact_map_v2.is_some()
+    let discovery_node = notebook
+        .orchestration
+        .graph
+        .as_ref()?
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == crate::execution_graph::ExecutionNodeKind::Discovery
+                && node.status == crate::execution_graph::ExecutionNodeStatus::Running
+        })?;
+    let usage = notebook.orchestration.budget.usage_for(&discovery_node.id);
+    let calls_consumed = usage.model_calls_consumed;
+    let calls_remaining = discovery_node
+        .budget
+        .remaining(&usage)
+        .model_calls_remaining;
+    if notebook.phase != ExecutionPhase::Discovery
+        || notebook.impact_map_v2.is_some()
         || !notebook.files_inspected.is_empty()
         || notebook.searches_completed.is_empty()
-        || !notebook.blocking_unknowns.is_empty()
         || calls_remaining != 1
     {
         return None;
@@ -1298,6 +1314,9 @@ pub(super) fn bounded_discovery_read_policy(
             "read_file"
         },
         paths,
+        calls_consumed,
+        call_limit: discovery_node.budget.max_model_calls,
+        calls_remaining,
     })
 }
 

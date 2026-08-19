@@ -1074,14 +1074,7 @@ impl<'a> GatewayAgent<'a> {
                     action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
                 })
             )
-            .then(|| {
-                bounded_discovery_read_policy(
-                    &self.notebook,
-                    &self.repo.root,
-                    self.phases.phase_calls(ExecutionPhase::Discovery),
-                    self.phases.phase_limit(ExecutionPhase::Discovery),
-                )
-            })
+            .then(|| bounded_discovery_read_policy(&self.notebook, &self.repo.root))
             .flatten();
             let request_instructions = bounded_discovery_read.as_ref().map_or_else(
                 || hosted_agent_instructions_for_decision(active_phase, self.current_decision.as_ref()),
@@ -1124,12 +1117,10 @@ impl<'a> GatewayAgent<'a> {
                         "event_type": "worker.discovery_evidence_depth_policy_applied",
                         "tool": policy.tool,
                         "candidate_paths": policy.paths,
-                        "phase_calls_used": self.phases.phase_calls(ExecutionPhase::Discovery),
-                        "phase_calls_limit": self.phases.phase_limit(ExecutionPhase::Discovery),
-                        "model_calls_remaining": self
-                            .phases
-                            .phase_limit(ExecutionPhase::Discovery)
-                            .saturating_sub(self.phases.phase_calls(ExecutionPhase::Discovery)),
+                        "node_calls_consumed": policy.calls_consumed,
+                        "node_call_limit": policy.call_limit,
+                        "node_calls_remaining": policy.calls_remaining,
+                        "budget_source": "execution_graph_node",
                     }),
                     "bounded discovery evidence acquisition policy",
                 );
