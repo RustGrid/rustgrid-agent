@@ -2358,6 +2358,7 @@ fn duplicate_discovery_search_force_planning_uses_authoritative_transition() {
         "extensions": ["txt"],
         "mode": "literal",
         "context_lines": 0,
+        "reason": "Locate the repository behavior relevant to the ticket.",
     })
     .to_string();
     agent.execute_tool("search_text", &search).unwrap();
