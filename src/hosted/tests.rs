@@ -2428,6 +2428,277 @@ fn duplicate_discovery_search_force_planning_uses_authoritative_transition() {
 }
 
 #[test]
+fn duplicate_discovery_progress_converges_before_semantic_cycle_detection() {
+    let work = tempfile::tempdir().expect("temporary repository");
+    command::checked("git", ["init", "-q"], work.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        work.path(),
+    )
+    .unwrap();
+    fs::write(work.path().join("base.txt"), "revoke access\n").unwrap();
+    command::checked("git", ["add", "base.txt"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        work.path(),
+    )
+    .unwrap();
+    let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+    let repo = Repo {
+        root: work.path().to_path_buf(),
+    };
+    let execution_id = Uuid::from_u128(0x2333);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = base_sha;
+    manifest.github.branch = "main".into();
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        let _ = stop.send(());
+        handle.join().unwrap();
+        return;
+    };
+    let mut agent = GatewayAgent::new(
+        test_api_client(api_root, execution_id),
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        agent.reconcile_execution_and_apply().unwrap().decision,
+        ExecutionDecision::ContinueDiscovery { .. }
+    ));
+    agent.notebook.files_inspected = vec!["base.txt".into()];
+    let search = json!({
+        "path": ".",
+        "query": "revoke",
+        "extensions": ["txt"],
+        "mode": "literal",
+        "context_lines": 0,
+        "reason": "Locate the repository behavior relevant to the ticket.",
+    })
+    .to_string();
+    agent.execute_tool("search_text", &search).unwrap();
+    agent.record_tool_progress(
+        "search_text",
+        None,
+        Some("search-a"),
+        ToolProgressClass::Productive,
+        "new targeted repository search completed",
+        false,
+    );
+    agent.record_tool_progress(
+        "search_text",
+        None,
+        Some("search-a-equivalent"),
+        ToolProgressClass::Duplicate,
+        "repository search did not add new evidence",
+        false,
+    );
+    let snapshot = agent.build_execution_snapshot().unwrap();
+    let repeated = crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap();
+    agent.notebook.last_orchestration_decision_key = Some(execution_decision_idempotency_key(
+        &snapshot,
+        &agent.notebook,
+        &repeated,
+    ));
+    let calls_before = agent.phases.phase_calls(ExecutionPhase::Discovery);
+
+    let planning = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        planning.decision,
+        ExecutionDecision::ContinuePlanning { .. }
+    ));
+    assert_eq!(agent.phases.active(), ExecutionPhase::Planning);
+    assert_eq!(
+        agent.phases.phase_calls(ExecutionPhase::Discovery),
+        calls_before
+    );
+    let graph = agent.notebook.orchestration.graph.as_ref().unwrap();
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Discovery)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Completed)
+    );
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Planning)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Running)
+    );
+
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let requests = requests.into_iter().collect::<Vec<_>>();
+    let convergence = requests
+        .iter()
+        .position(|request| request.contains("worker.discovery_convergence_evaluated"))
+        .expect("deterministic discovery convergence evaluation");
+    let transition = requests
+        .iter()
+        .position(|request| {
+            request.contains("worker.phase_transition_preflight_passed")
+                && request.contains("\"from_phase\":\"discovery\"")
+                && request.contains("\"phase\":\"planning\"")
+                && request.contains("\"decision\":\"build_plan\"")
+        })
+        .expect("authoritative discovery-to-planning transition");
+    assert!(convergence < transition);
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("deterministic_orchestration_cycle"))
+    );
+}
+
+#[test]
+fn duplicate_discovery_without_evidence_preserves_no_progress_guardrail() {
+    let work = tempfile::tempdir().expect("temporary repository");
+    command::checked("git", ["init", "-q"], work.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        work.path(),
+    )
+    .unwrap();
+    fs::write(work.path().join("base.txt"), "base\n").unwrap();
+    command::checked("git", ["add", "base.txt"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        work.path(),
+    )
+    .unwrap();
+    let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+    let repo = Repo {
+        root: work.path().to_path_buf(),
+    };
+    let execution_id = Uuid::from_u128(0x2334);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = base_sha;
+    manifest.github.branch = "main".into();
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        let _ = stop.send(());
+        handle.join().unwrap();
+        return;
+    };
+    let mut agent = GatewayAgent::new(
+        test_api_client(api_root, execution_id),
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        agent.reconcile_execution_and_apply().unwrap().decision,
+        ExecutionDecision::ContinueDiscovery { .. }
+    ));
+    agent.record_tool_progress(
+        "search_text",
+        None,
+        Some("empty-search"),
+        ToolProgressClass::Duplicate,
+        "repository search did not add new evidence",
+        false,
+    );
+    let snapshot = agent.build_execution_snapshot().unwrap();
+    let repeated = crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap();
+    agent.notebook.last_orchestration_decision_key = Some(execution_decision_idempotency_key(
+        &snapshot,
+        &agent.notebook,
+        &repeated,
+    ));
+
+    assert!(matches!(
+        agent.reconcile_execution_and_apply().unwrap().decision,
+        ExecutionDecision::ContinueDiscovery { .. }
+    ));
+    let stopped = agent.reconcile_execution_and_apply().unwrap();
+    assert!(matches!(
+        stopped.decision,
+        ExecutionDecision::StopForGuardrail {
+            outcome: OrchestratedMissionOutcome::BlockedNoDiff,
+            reason: crate::execution_graph::GuardrailReason::NoProgress,
+        }
+    ));
+    let graph = agent.notebook.orchestration.graph.as_ref().unwrap();
+    assert_ne!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Discovery)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Completed)
+    );
+    assert_ne!(agent.phases.active(), ExecutionPhase::Planning);
+    assert!(agent.impact_map.is_none());
+    assert_eq!(
+        agent
+            .notebook
+            .orchestration
+            .cycle_cancellation_request
+            .as_ref()
+            .map(|request| request.reason_code.as_str()),
+        Some("deterministic_orchestration_cycle")
+    );
+
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let requests = requests.into_iter().collect::<Vec<_>>();
+    assert!(requests.iter().any(|request| {
+        request.contains("worker.discovery_convergence_evaluated")
+            && request.contains("preserve_no_progress_guardrail")
+    }));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("worker.orchestration_cycle_detected"))
+    );
+}
+
+#[test]
 fn force_planning_preflight_rejects_a_graph_without_a_planning_node() {
     let budget = crate::execution_graph::MissionBudget::for_complexity(
         crate::execution_graph::MissionComplexity::Small,

@@ -3247,6 +3247,9 @@ impl<'a> GatewayAgent<'a> {
             self.notebook.last_orchestration_decision_key.as_deref(),
             &decision_key,
         ) {
+            if self.try_converge_discovery_after_no_progress()? {
+                return self.reconcile_execution_and_apply();
+            }
             let observed_at = now_rfc3339();
             let semantic_state_hash = decision_key
                 .rsplit(':')
@@ -3815,6 +3818,44 @@ impl<'a> GatewayAgent<'a> {
         };
         preflight_discovery_force_planning(&self.build_execution_snapshot()?, &event)?;
         self.append_execution_domain_event(event)
+    }
+
+    fn try_converge_discovery_after_no_progress(&mut self) -> Result<bool> {
+        let duplicate_discovery_operation = self.phases.active() == ExecutionPhase::Discovery
+            && self.notebook.tool_progress.last().is_some_and(|record| {
+                record.execution_attempt == self.manifest.execution.attempt_number
+                    && record.phase == ExecutionPhase::Discovery
+                    && record.class == ToolProgressClass::Duplicate
+            });
+        if !duplicate_discovery_operation {
+            return Ok(false);
+        }
+
+        let impact_map_available = self.impact_map.is_some()
+            || self.accept_deterministic_impact_map_if_available(
+                "duplicate_discovery_operation_convergence",
+            )?;
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.discovery_convergence_evaluated",
+                "reason_code": "duplicate_discovery_operation",
+                "impact_map_available": impact_map_available,
+                "action": if impact_map_available {
+                    "complete_discovery"
+                } else {
+                    "preserve_no_progress_guardrail"
+                },
+                "model_call_consumed": false,
+            }),
+            "duplicate discovery convergence evaluation",
+        );
+        if !impact_map_available {
+            return Ok(false);
+        }
+
+        self.record_discovery_force_planning()?;
+        Ok(true)
     }
 
     pub(in crate::hosted) fn record_discovery_failure(&mut self, detail: &str) -> Result<()> {
