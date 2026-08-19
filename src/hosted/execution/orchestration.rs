@@ -3779,6 +3779,18 @@ impl<'a> GatewayAgent<'a> {
         )
     }
 
+    pub(in crate::hosted) fn record_discovery_force_planning(&mut self) -> Result<()> {
+        let event = crate::execution_graph::ExecutionDomainEvent::DiscoveryCompleted {
+            sequence: self.next_domain_event_sequence(),
+            repository_fingerprint: repository_state_fingerprint(
+                self.repo,
+                &self.manifest.github.base_sha,
+            )?,
+        };
+        preflight_discovery_force_planning(&self.build_execution_snapshot()?, &event)?;
+        self.append_execution_domain_event(event)
+    }
+
     pub(in crate::hosted) fn record_discovery_failure(&mut self, detail: &str) -> Result<()> {
         let node_id = self.graph_node_id(crate::execution_graph::ExecutionNodeKind::Discovery)?;
         let fingerprint = repository_state_fingerprint(self.repo, &self.manifest.github.base_sha)?;

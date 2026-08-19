@@ -2293,6 +2293,191 @@ fn orchestration_reconciles_stale_active_nodes_and_bounds_identical_cycles() {
 }
 
 #[test]
+fn duplicate_discovery_search_force_planning_uses_authoritative_transition() {
+    let work = tempfile::tempdir().expect("temporary repository");
+    command::checked("git", ["init", "-q"], work.path()).unwrap();
+    command::checked("git", ["config", "user.name", "Test"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["config", "user.email", "test@example.com"],
+        work.path(),
+    )
+    .unwrap();
+    fs::write(work.path().join("base.txt"), "revoke access\n").unwrap();
+    command::checked("git", ["add", "base.txt"], work.path()).unwrap();
+    command::checked(
+        "git",
+        ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
+        work.path(),
+    )
+    .unwrap();
+    let base_sha = command::checked("git", ["rev-parse", "HEAD"], work.path()).unwrap();
+    let repo = Repo {
+        root: work.path().to_path_buf(),
+    };
+    let execution_id = Uuid::from_u128(0x2332);
+    let mut manifest = test_manifest(execution_id);
+    manifest.github.base_sha = base_sha;
+    manifest.github.branch = "main".into();
+    let Some(StoppableOkServer {
+        api_root,
+        requests,
+        stop,
+        handle,
+    }) = stoppable_ok_server()
+    else {
+        return;
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let lease_renewed_at = Arc::new(Mutex::new(None));
+    let Ok(containment) = command::HostedProcessContainment::new() else {
+        let _ = stop.send(());
+        handle.join().unwrap();
+        return;
+    };
+    let mut agent = GatewayAgent::new(
+        test_api_client(api_root, execution_id),
+        &manifest,
+        &repo,
+        &repo.hosted_local_config().unwrap(),
+        &running,
+        &stop_reason,
+        &lease_renewed_at,
+        &containment,
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        agent.reconcile_execution_and_apply().unwrap().decision,
+        ExecutionDecision::ContinueDiscovery { .. }
+    ));
+    let search = json!({
+        "path": ".",
+        "query": "revoke",
+        "extensions": ["txt"],
+        "mode": "literal",
+        "context_lines": 0,
+    })
+    .to_string();
+    agent.execute_tool("search_text", &search).unwrap();
+    let duplicate = agent.execute_tool("search_text", &search).unwrap_err();
+    assert!(duplicate.to_string().contains("duplicate_search_rejected"));
+
+    let graph = agent.notebook.orchestration.graph.as_ref().unwrap();
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Discovery)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Completed)
+    );
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Planning)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Ready)
+    );
+    assert!(matches!(
+        agent
+            .reconcile_active_phase("force-planning guardrail")
+            .unwrap(),
+        PhaseDecision::Transition(ExecutionPhase::Planning)
+    ));
+    assert_eq!(agent.phases.active(), ExecutionPhase::Planning);
+    let graph = agent.notebook.orchestration.graph.as_ref().unwrap();
+    assert_eq!(
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == crate::execution_graph::ExecutionNodeKind::Planning)
+            .map(|node| node.status),
+        Some(crate::execution_graph::ExecutionNodeStatus::Running)
+    );
+
+    let _ = stop.send(());
+    handle.join().unwrap();
+    let requests = requests.into_iter().collect::<Vec<_>>();
+    let guardrail = requests
+        .iter()
+        .position(|request| {
+            request.contains("worker.guardrail")
+                && request.contains("search_loop_detected")
+                && request.contains("force_planning")
+        })
+        .expect("force-planning guardrail event");
+    let transition = requests
+        .iter()
+        .position(|request| {
+            request.contains("worker.phase_transition_preflight_passed")
+                && request.contains("\"from_phase\":\"discovery\"")
+                && request.contains("\"phase\":\"planning\"")
+                && request.contains("continue_planning")
+        })
+        .expect("authoritative discovery-to-planning transition preflight");
+    assert!(guardrail < transition);
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("deterministic_orchestration_cycle"))
+    );
+}
+
+#[test]
+fn force_planning_preflight_rejects_a_graph_without_a_planning_node() {
+    let budget = crate::execution_graph::MissionBudget::for_complexity(
+        crate::execution_graph::MissionComplexity::Small,
+    );
+    let mut snapshot = crate::execution_graph::ExecutionSnapshot {
+        run_id: "missing-planning".into(),
+        current_repository: crate::execution_graph::RepositorySnapshot {
+            fingerprint: "tree-1".into(),
+            source_tree_hash: "tree-1".into(),
+            ..crate::execution_graph::RepositorySnapshot::default()
+        },
+        graph: crate::execution_graph::ExecutionGraph::bootstrap(
+            "missing-planning",
+            "tree-1",
+            crate::execution_graph::MissionComplexity::Small,
+            &budget,
+        ),
+        budget: crate::execution_graph::BudgetState::new(budget),
+        ..crate::execution_graph::ExecutionSnapshot::default()
+    };
+    snapshot
+        .graph
+        .nodes
+        .retain(|node| node.kind != crate::execution_graph::ExecutionNodeKind::Planning);
+    snapshot.graph.refresh_readiness();
+    let graph_before = snapshot.graph.clone();
+    let error = preflight_discovery_force_planning(
+        &snapshot,
+        &crate::execution_graph::ExecutionDomainEvent::DiscoveryCompleted {
+            sequence: 1,
+            repository_fingerprint: "tree-1".into(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<HostedInvariantFailure>()
+            .map(|failure| failure.code),
+        Some("force_planning_transition_unavailable")
+    );
+    assert_eq!(snapshot.graph, graph_before);
+    assert!(
+        snapshot
+            .graph
+            .nodes
+            .iter()
+            .all(|node| node.kind != crate::execution_graph::ExecutionNodeKind::Planning)
+    );
+}
+
+#[test]
 fn recovery_publication_with_no_diff_is_a_successful_no_op() {
     let snapshot = crate::execution_graph::ExecutionSnapshot::default();
     assert_eq!(

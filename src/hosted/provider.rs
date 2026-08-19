@@ -108,6 +108,29 @@ pub(super) fn orchestration_decision_is_new(
     last_applied_key != Some(candidate_key)
 }
 
+pub(super) fn preflight_discovery_force_planning(
+    snapshot: &crate::execution_graph::ExecutionSnapshot,
+    event: &crate::execution_graph::ExecutionDomainEvent,
+) -> Result<()> {
+    let mut candidate = snapshot.clone();
+    candidate.append_event(event.clone()).map_err(|error| {
+        anyhow!(HostedInvariantFailure::in_phase(
+            "force_planning_transition_invalid",
+            "discovery",
+            error.to_string(),
+        ))
+    })?;
+    let decision = reconcile_execution(&candidate).map_err(anyhow::Error::new)?;
+    if !matches!(decision, ExecutionDecision::ContinuePlanning { .. }) {
+        return Err(anyhow!(HostedInvariantFailure::in_phase(
+            "force_planning_transition_unavailable",
+            "discovery",
+            "the discovery guardrail cannot legally activate planning from the current graph",
+        )));
+    }
+    Ok(())
+}
+
 pub(super) const fn execution_decision_action_kind(decision: &ExecutionDecision) -> &'static str {
     match decision {
         ExecutionDecision::ContinueDiscovery {

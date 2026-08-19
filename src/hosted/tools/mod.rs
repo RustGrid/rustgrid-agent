@@ -408,15 +408,19 @@ impl<'a> GatewayAgent<'a> {
                     .unwrap_or("literal");
                 let signature = SearchSignature::new(query, path, &extensions, mode, context_lines);
                 if let Err(error) = self.search_guard.validate(&signature) {
+                    let force_planning = self.phases.active() == ExecutionPhase::Discovery;
                     self.emit_guardrail(
                         "search_loop_detected",
-                        if self.phases.active() == ExecutionPhase::Discovery {
+                        if force_planning {
                             "force_planning"
                         } else {
                             "reject_search"
                         },
                         &error.to_string(),
                     )?;
+                    if force_planning {
+                        self.record_discovery_force_planning()?;
+                    }
                     return Err(error);
                 }
                 let discovery_coverage = localized_discovery_coverage(&self.notebook);

@@ -1922,6 +1922,18 @@ impl<'a> GatewayAgent<'a> {
                         json!({"ok": true, "output": truncate_text(&output, MAX_TOOL_OUTPUT_BYTES)})
                     }
                     Err(error) => {
+                        if error
+                            .downcast_ref::<HostedInvariantFailure>()
+                            .is_some_and(|failure| {
+                                matches!(
+                                    failure.code,
+                                    "force_planning_transition_invalid"
+                                        | "force_planning_transition_unavailable"
+                                )
+                            })
+                        {
+                            return Err(error);
+                        }
                         if name == "record_impact_map"
                             && matches!(
                                 self.phases.active(),
