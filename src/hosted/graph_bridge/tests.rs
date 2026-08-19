@@ -721,9 +721,149 @@ fn accepted_plan_rebuild_preserves_pre_plan_usage_attempts_and_evidence() {
             .model_calls_consumed,
         1
     );
-    assert_ne!(
+    assert_eq!(
         discovery.budget, provisional_discovery_budget,
-        "accepted-plan classification must replace provisional node budgets"
+        "accepted-plan reconstruction must retain the budget that owned pre-plan usage"
+    );
+}
+
+#[test]
+fn accepted_plan_rebuild_keeps_reconciled_discovery_usage_with_its_original_budget_owner() {
+    let manifest = hosted_manifest();
+    let mut checkpoint = HostedOrchestrationCheckpoint::bootstrap(&manifest, "tree-before-plan");
+    let discovery_id = ExecutionNodeId::new("discovery");
+    let planning_id = ExecutionNodeId::new("planning");
+    let (discovery_budget, planning_budget) = {
+        let graph = checkpoint.graph.as_ref().expect("bootstrap graph");
+        (
+            graph
+                .node(&discovery_id)
+                .expect("discovery node")
+                .budget
+                .clone(),
+            graph
+                .node(&planning_id)
+                .expect("planning node")
+                .budget
+                .clone(),
+        )
+    };
+    assert_eq!(discovery_budget.max_model_calls, 3);
+    assert_eq!(discovery_budget.max_cost_micros, 350_000);
+    assert_eq!(planning_budget.max_model_calls, 2);
+    assert_eq!(planning_budget.max_cost_micros, 300_000);
+
+    for actual_cost_micros in [36_645, 36_645] {
+        let reservation = checkpoint
+            .budget
+            .reserve_model_call(
+                &discovery_id,
+                &discovery_budget,
+                actual_cost_micros,
+                Duration::ZERO,
+            )
+            .expect("discovery reservation");
+        checkpoint.budget.consume_model_call_reservation(
+            &reservation,
+            actual_cost_micros,
+            Duration::ZERO,
+        );
+    }
+    let planning_reservation = checkpoint
+        .budget
+        .reserve_model_call(&planning_id, &planning_budget, 50_000, Duration::ZERO)
+        .expect("planning reservation");
+    assert_eq!(
+        checkpoint
+            .budget
+            .usage_for(&discovery_id)
+            .model_calls_reserved,
+        0
+    );
+    assert_eq!(
+        checkpoint
+            .budget
+            .usage_for(&planning_id)
+            .model_calls_reserved,
+        1
+    );
+    checkpoint
+        .budget
+        .consume_model_call_reservation(&planning_reservation, 50_000, Duration::ZERO);
+
+    checkpoint.rebuild_from_plan(&manifest, &accepted_plan(), "tree-before-plan");
+    let graph = checkpoint.graph.as_ref().expect("accepted-plan graph");
+    assert_eq!(
+        graph.node(&discovery_id).expect("discovery node").budget,
+        discovery_budget
+    );
+    assert_eq!(
+        graph.node(&planning_id).expect("planning node").budget,
+        planning_budget
+    );
+    let discovery_usage = checkpoint.budget.usage_for(&discovery_id);
+    assert_eq!(discovery_usage.model_calls_consumed, 2);
+    assert_eq!(discovery_usage.model_calls_reserved, 0);
+    assert_eq!(discovery_usage.cost_micros, 73_290);
+    assert_eq!(discovery_usage.cost_micros_reserved, 0);
+    let planning_usage = checkpoint.budget.usage_for(&planning_id);
+    assert_eq!(planning_usage.model_calls_consumed, 1);
+    assert_eq!(planning_usage.model_calls_reserved, 0);
+
+    let snapshot = checkpoint.snapshot(
+        "pre-plan-budget-owner",
+        RepositorySnapshot {
+            fingerprint: "tree-before-plan".to_owned(),
+            source_tree_hash: "tree-before-plan".to_owned(),
+            ..RepositorySnapshot::default()
+        },
+    );
+    snapshot
+        .validate_invariants()
+        .expect("reconciled pre-plan usage remains inside its original signed node budgets");
+
+    let budget_before_replay = checkpoint.budget.clone();
+    checkpoint.reconcile_plan_topology(&manifest, &accepted_plan(), "tree-before-plan");
+    assert_eq!(checkpoint.budget, budget_before_replay);
+    assert_eq!(
+        checkpoint
+            .budget
+            .usage_for(&discovery_id)
+            .model_calls_reserved,
+        0,
+        "re-materializing the accepted plan must not resurrect a reconciled reservation"
+    );
+}
+
+#[test]
+fn snapshot_still_rejects_genuinely_outstanding_node_reservations_over_budget() {
+    let mission = MissionBudget {
+        max_model_calls: 3,
+        max_cost_micros: 1_000_000,
+        max_duration: Duration::from_secs(60),
+        max_target_repair_rounds: 0,
+    };
+    let mut graph =
+        ExecutionGraph::bootstrap("outstanding", "tree-1", MissionComplexity::Tiny, &mission);
+    let discovery_id = ExecutionNodeId::new("discovery");
+    let discovery = graph.node_mut(&discovery_id).expect("discovery node");
+    discovery.budget.max_model_calls = 2;
+    let discovery_budget = discovery.budget.clone();
+    let mut budget = BudgetState::new(mission);
+    let outstanding = budget
+        .reserve_model_call(&discovery_id, &discovery_budget, 10_000, Duration::ZERO)
+        .expect("first call reservation fits");
+    assert_eq!(outstanding.node_id, discovery_id);
+    budget.record_model_call(discovery_id.clone(), 10_000, Duration::ZERO);
+    budget.record_model_call(discovery_id.clone(), 10_000, Duration::ZERO);
+
+    let error = budget
+        .validate_invariants(&graph)
+        .expect_err("consumed plus genuinely outstanding calls must remain bounded");
+    assert!(
+        error
+            .to_string()
+            .contains("node `discovery` reservations exceed its signed budget")
     );
 }
 

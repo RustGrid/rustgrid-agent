@@ -1270,6 +1270,7 @@ fn preserve_pre_plan_graph_progress(
         else {
             continue;
         };
+        replacement_node.budget.clone_from(&previous_node.budget);
         replacement_node.attempts = previous_node.attempts.clone();
         replacement_node.evidence_ids = previous_node.evidence_ids.clone();
         preserved.insert(replacement_node.id.clone());
@@ -1337,6 +1338,12 @@ fn preserve_unchanged_graph_progress(
         if payload_unchanged
             && (mutation_progress_is_repository_scoped || dependency_lineage_unchanged)
         {
+            if matches!(
+                node.kind,
+                ExecutionNodeKind::Discovery | ExecutionNodeKind::Planning
+            ) {
+                node.budget.clone_from(&previous_node.budget);
+            }
             if previous_node.validation.is_some() {
                 node.validation.clone_from(&previous_node.validation);
             }
