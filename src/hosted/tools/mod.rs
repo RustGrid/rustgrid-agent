@@ -454,12 +454,10 @@ impl<'a> GatewayAgent<'a> {
                     format!("{mode}:{path}:{query}"),
                 );
                 for matched_path in &result.matched_paths {
-                    if !localized_discovery_core_path(matched_path) {
-                        push_unique(
-                            &mut self.notebook.discovery_paths_sampled,
-                            matched_path.clone(),
-                        );
-                    }
+                    push_unique(
+                        &mut self.notebook.discovery_paths_sampled,
+                        matched_path.clone(),
+                    );
                 }
                 if self.tool_usage.searches == 4 && self.impact_map.is_none() {
                     self.emit_guardrail(

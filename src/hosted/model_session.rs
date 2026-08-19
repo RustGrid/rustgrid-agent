@@ -1042,17 +1042,44 @@ impl<'a> GatewayAgent<'a> {
                 self.current_decision.as_ref(),
                 u64::try_from(self.manifest.ai_gateway.maximum_output_tokens).unwrap_or_default(),
             );
+            let bounded_discovery_read = matches!(
+                self.current_decision.as_ref(),
+                Some(ExecutionDecision::ContinueDiscovery {
+                    action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository { .. },
+                })
+            )
+            .then(|| {
+                bounded_discovery_read_policy(
+                    &self.notebook,
+                    &self.repo.root,
+                    self.phases.phase_calls(ExecutionPhase::Discovery),
+                    self.phases.phase_limit(ExecutionPhase::Discovery),
+                )
+            })
+            .flatten();
+            let request_instructions = bounded_discovery_read.as_ref().map_or_else(
+                || hosted_agent_instructions_for_decision(active_phase, self.current_decision.as_ref()),
+                |policy| format!(
+                    "The bounded discovery budget has one call remaining and credible candidate files are already known. Acquire grounded repository evidence now with the forced `{}` tool using only the ranked candidate paths {:?}. Prefer the smallest relevant subset, do not perform another search, and do not mutate the repository.",
+                    policy.tool, policy.paths
+                ),
+            );
+            let request_tools = bounded_discovery_read.as_ref().map_or_else(
+                || hosted_tools_for_action(active_phase, self.current_decision.as_ref()),
+                hosted_tools_for_bounded_discovery_read,
+            );
+            let request_tool_choice = bounded_discovery_read.as_ref().map_or_else(
+                || action_profile.tool_choice(),
+                |policy| json!({"type": "function", "name": policy.tool}),
+            );
             let mut request = json!({
                 "model": self.manifest.ai_gateway.model,
                 "input": input,
-                "instructions": hosted_agent_instructions_for_decision(
-                    active_phase,
-                    self.current_decision.as_ref(),
-                ),
+                "instructions": request_instructions,
                 "max_output_tokens": action_profile.max_output_tokens,
                 "reasoning": {"effort": action_profile.reasoning_effort},
-                "tools": hosted_tools_for_action(active_phase, self.current_decision.as_ref()),
-                "tool_choice": action_profile.tool_choice(),
+                "tools": request_tools,
+                "tool_choice": request_tool_choice,
                 "parallel_tool_calls": false,
                 "metadata": provider_request_metadata(
                     self.manifest.execution.execution_id,
@@ -1064,6 +1091,23 @@ impl<'a> GatewayAgent<'a> {
                 "store": false,
                 "stream": false
             });
+            if let Some(policy) = bounded_discovery_read.as_ref() {
+                self.append_event_recoverable(
+                    "progress",
+                    json!({
+                        "event_type": "worker.discovery_evidence_depth_policy_applied",
+                        "tool": policy.tool,
+                        "candidate_paths": policy.paths,
+                        "phase_calls_used": self.phases.phase_calls(ExecutionPhase::Discovery),
+                        "phase_calls_limit": self.phases.phase_limit(ExecutionPhase::Discovery),
+                        "model_calls_remaining": self
+                            .phases
+                            .phase_limit(ExecutionPhase::Discovery)
+                            .saturating_sub(self.phases.phase_calls(ExecutionPhase::Discovery)),
+                    }),
+                    "bounded discovery evidence acquisition policy",
+                );
+            }
             fit_request_to_input_ceiling(
                 &mut request,
                 &initial,

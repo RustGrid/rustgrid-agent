@@ -1818,6 +1818,150 @@ fn productive_discovery_searches_advance_semantic_cycle_state() {
 }
 
 #[test]
+fn final_bounded_discovery_call_is_forced_to_ranked_candidate_reads() {
+    let repository = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repository.path().join("src")).unwrap();
+    fs::create_dir_all(repository.path().join("tests")).unwrap();
+    fs::write(
+        repository.path().join("src/revoke_credentials.rs"),
+        "pub fn revoke_credentials() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.path().join("src/session.rs"),
+        "pub struct Session;\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.path().join("tests/revoke_credentials.rs"),
+        "#[test] fn revokes_credentials() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.path().join("package.json"),
+        r#"{"scripts":{"test":"cargo test"}}"#,
+    )
+    .unwrap();
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+    notebook.goal = "Revoke credentials and invalidate active sessions".into();
+    notebook.files_inspected.clear();
+    notebook.read_ranges_inspected.clear();
+    notebook.impact_evidence.clear();
+    notebook.searches_completed = vec!["literal:.:revoke".into(), "literal:.:credentials".into()];
+    notebook.discovery_paths_sampled = vec![
+        "src/session.rs".into(),
+        "tests/revoke_credentials.rs".into(),
+        "src/revoke_credentials.rs".into(),
+        "package.json".into(),
+    ];
+
+    let policy = bounded_discovery_read_policy(&notebook, repository.path(), 2, 3)
+        .expect("the final bounded call must deepen repository evidence");
+    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 3, 3).is_none());
+    assert_eq!(policy.tool, "read_files");
+    assert_eq!(policy.paths[0], "src/revoke_credentials.rs");
+    let tools = hosted_tools_for_bounded_discovery_read(&policy);
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "read_files");
+    assert_eq!(
+        tools[0]["parameters"]["properties"]["paths"]["items"]["enum"],
+        json!(policy.paths)
+    );
+    assert!(tools.iter().all(|tool| tool["name"] != "search_text"));
+    let request = json!({
+        "tools": tools,
+        "tool_choice": {"type": "function", "name": policy.tool},
+    });
+    assert_eq!(request["tool_choice"]["name"], "read_files");
+
+    for path in &policy.paths {
+        let content = fs::read_to_string(repository.path().join(path)).unwrap();
+        push_unique(&mut notebook.files_inspected, path.clone());
+        notebook.orchestration.evidence.capture_file(
+            path,
+            &notebook.repository_fingerprint,
+            None,
+            content,
+            false,
+        );
+    }
+    let progress = new_tool_progress_record(
+        1,
+        3,
+        ExecutionPhase::Discovery,
+        "read_files",
+        None,
+        Some("bounded-candidate-read"),
+        ToolProgressClass::Productive,
+        "batch read returned repository content",
+        false,
+    );
+    assert!(!notebook.files_inspected.is_empty());
+    assert!(!notebook.orchestration.evidence.files.is_empty());
+    assert_eq!(progress.class, ToolProgressClass::Productive);
+
+    let budget = crate::execution_graph::MissionBudget::for_complexity(
+        crate::execution_graph::MissionComplexity::Small,
+    );
+    let snapshot = crate::execution_graph::ExecutionSnapshot {
+        run_id: "bounded-discovery".into(),
+        current_repository: crate::execution_graph::RepositorySnapshot {
+            fingerprint: notebook.repository_fingerprint.clone(),
+            source_tree_hash: notebook.repository_fingerprint.clone(),
+            ..crate::execution_graph::RepositorySnapshot::default()
+        },
+        graph: crate::execution_graph::ExecutionGraph::bootstrap(
+            "bounded-discovery",
+            &notebook.repository_fingerprint,
+            crate::execution_graph::MissionComplexity::Small,
+            &budget,
+        ),
+        evidence: notebook.orchestration.evidence.clone(),
+        budget: crate::execution_graph::BudgetState::new(budget),
+        ..crate::execution_graph::ExecutionSnapshot::default()
+    };
+    assert!(matches!(
+        crate::hosted_orchestrator::reconcile_execution(&snapshot).unwrap(),
+        ExecutionDecision::ContinueDiscovery {
+            action: crate::hosted_orchestrator::DiscoveryAction::FinalizeImpactMap { .. },
+        }
+    ));
+}
+
+#[test]
+fn bounded_discovery_does_not_force_unusable_candidate_reads() {
+    let repository = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repository.path().join("vendor/generated")).unwrap();
+    fs::write(
+        repository.path().join("vendor/generated/client.rs"),
+        "generated client\n",
+    )
+    .unwrap();
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+    notebook.files_inspected.clear();
+    notebook.read_ranges_inspected.clear();
+    notebook.impact_evidence.clear();
+    notebook.searches_completed = vec!["literal:.:credential".into()];
+    notebook.discovery_paths_sampled =
+        vec!["vendor/generated/client.rs".into(), "src/missing.rs".into()];
+
+    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 2, 3).is_none());
+}
+
+#[test]
+fn bounded_discovery_does_not_force_reads_after_grounded_evidence_exists() {
+    let repository = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repository.path().join("src")).unwrap();
+    fs::write(repository.path().join("src/session.rs"), "session\n").unwrap();
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+    notebook.searches_completed = vec!["literal:.:session".into()];
+    notebook.discovery_paths_sampled = vec!["src/session.rs".into()];
+    notebook.files_inspected = vec!["src/session.rs".into()];
+
+    assert!(bounded_discovery_read_policy(&notebook, repository.path(), 2, 3).is_none());
+}
+
+#[test]
 fn exact_discovery_search_replay_keeps_semantic_state_and_cycle_detection_stable() {
     let budget = crate::execution_graph::MissionBudget::for_complexity(
         crate::execution_graph::MissionComplexity::Small,

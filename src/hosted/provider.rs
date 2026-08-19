@@ -1195,6 +1195,128 @@ pub(super) fn hosted_tools_for_action(
     selected
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BoundedDiscoveryReadPolicy {
+    pub(super) tool: &'static str,
+    pub(super) paths: Vec<String>,
+}
+
+fn unusable_discovery_candidate(path: &str) -> bool {
+    let normalized = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    [
+        "/node_modules/",
+        "/vendor/",
+        "/target/",
+        "/dist/",
+        "/build/",
+        "/generated/",
+        "/.next/",
+        "/coverage/",
+    ]
+    .iter()
+    .any(|segment| normalized.contains(segment))
+        || normalized.ends_with(".min.js")
+        || normalized.ends_with(".min.css")
+        || normalized.ends_with(".lock")
+}
+
+fn discovery_candidate_score(notebook: &WorkerNotebook, path: &str) -> usize {
+    let path_lower = path.to_ascii_lowercase();
+    let semantic_terms = std::iter::once(notebook.goal.as_str())
+        .chain(notebook.acceptance_criteria.iter().map(String::as_str))
+        .chain(notebook.searches_completed.iter().map(String::as_str))
+        .flat_map(|value| {
+            value
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|term| term.len() >= 4)
+        });
+    let semantic_matches = semantic_terms
+        .filter(|term| path_lower.contains(&term.to_ascii_lowercase()))
+        .count();
+    let source_preference = match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt") => 4,
+        Some("toml" | "json" | "yaml" | "yml") => 2,
+        _ => 1,
+    };
+    semantic_matches.saturating_mul(10) + source_preference
+}
+
+pub(super) fn bounded_discovery_read_policy(
+    notebook: &WorkerNotebook,
+    repository_root: &Path,
+    calls_used: usize,
+    call_limit: usize,
+) -> Option<BoundedDiscoveryReadPolicy> {
+    let calls_remaining = call_limit.saturating_sub(calls_used);
+    if notebook.impact_map_v2.is_some()
+        || !notebook.files_inspected.is_empty()
+        || notebook.searches_completed.is_empty()
+        || !notebook.blocking_unknowns.is_empty()
+        || calls_remaining != 1
+    {
+        return None;
+    }
+
+    let mut candidates = notebook
+        .discovery_paths_sampled
+        .iter()
+        .filter(|path| !unusable_discovery_candidate(path))
+        .filter(|path| {
+            safe_repo_path(repository_root, path, false)
+                .ok()
+                .filter(|resolved| resolved.is_file())
+                .and_then(|resolved| fs::metadata(&resolved).ok())
+                .is_some_and(|metadata| metadata.len() <= MAX_MODEL_FILE_BYTES as u64)
+                && safe_repo_path(repository_root, path, false)
+                    .ok()
+                    .and_then(|resolved| fs::read_to_string(resolved).ok())
+                    .is_some()
+        })
+        .map(|path| (discovery_candidate_score(notebook, path), path.clone()))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left_score, left_path), (right_score, right_path)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    let paths = candidates
+        .into_iter()
+        .map(|(_, path)| path)
+        .take(6)
+        .collect::<Vec<_>>();
+    (!paths.is_empty()).then_some(BoundedDiscoveryReadPolicy {
+        tool: if paths.len() > 1 {
+            "read_files"
+        } else {
+            "read_file"
+        },
+        paths,
+    })
+}
+
+pub(super) fn hosted_tools_for_bounded_discovery_read(
+    policy: &BoundedDiscoveryReadPolicy,
+) -> Vec<Value> {
+    let mut tools = hosted_tools_for_phase(ExecutionPhase::Discovery)
+        .into_iter()
+        .filter(|tool| tool["name"] == policy.tool)
+        .collect::<Vec<_>>();
+    for tool in &mut tools {
+        let path_schema = if policy.tool == "read_files" {
+            tool.pointer_mut("/parameters/properties/paths/items")
+        } else {
+            tool.pointer_mut("/parameters/properties/path")
+        };
+        if let Some(path_schema) = path_schema.and_then(Value::as_object_mut) {
+            path_schema.insert("enum".into(), json!(policy.paths));
+        }
+    }
+    tools
+}
+
 pub(super) fn active_mutation_fallback(
     decision: Option<&ExecutionDecision>,
 ) -> Option<(
