@@ -3212,6 +3212,7 @@ impl<'a> GatewayAgent<'a> {
             }), "stale active node pointer reconciled");
         }
         let mut decision = reconcile_execution(&snapshot).map_err(anyhow::Error::new)?;
+        let mut output_budget_has_no_safe_fallback = false;
         if let ExecutionDecision::ExecuteTarget {
             action:
                 crate::hosted_orchestrator::MutationAction::RepairTarget {
@@ -3228,7 +3229,7 @@ impl<'a> GatewayAgent<'a> {
                 .as_deref()
                 .and_then(MutationApplicationFailure::from_code)
         {
-            *fallback_policy = crate::hosted_orchestrator::refine_fallback_for_replacement_threshold(
+            *fallback_policy = crate::hosted_orchestrator::refine_fallback_for_output_budget(
                 *fallback_policy,
                 &target.target.effective_operation(),
                 failure_category,
@@ -3240,6 +3241,16 @@ impl<'a> GatewayAgent<'a> {
                         crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
                     )
                     .min(MAX_MODEL_FILE_BYTES),
+                u64::try_from(self.manifest.ai_gateway.maximum_output_tokens)
+                    .unwrap_or_default()
+                    .min(MAX_MUTATION_PROVIDER_OUTPUT_TOKENS),
+            );
+            output_budget_has_no_safe_fallback =
+                *fallback_policy == MutationFallbackPolicy::NoSafeFallback;
+        }
+        if output_budget_has_no_safe_fallback {
+            decision = crate::hosted_orchestrator::no_executable_mutation_fallback_decision(
+                snapshot.current_repository.has_changes(),
             );
         }
         let decision_key = execution_decision_idempotency_key(&snapshot, &self.notebook, &decision);

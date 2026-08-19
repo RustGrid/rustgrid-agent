@@ -659,6 +659,156 @@ fn large_targets_use_one_bounded_patch_specific_recovery_policy() {
 }
 
 #[test]
+fn large_mutation_fallback_selects_only_output_feasible_patch_retry() {
+    let target = mutation_fallback_target(&"large source line\n".repeat(1_200));
+    let operation = crate::execution_graph::TargetOperation::ModifyExisting;
+    assert!(!crate::hosted_orchestrator::replacement_fits_provider_output(&target, 4_096));
+    let policy = crate::hosted_orchestrator::refine_fallback_for_output_budget(
+        MutationFallbackPolicy::ForceReplaceFile,
+        &operation,
+        MutationApplicationFailure::InvalidPatchTarget,
+        &target,
+        crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+        4_096,
+    );
+    assert_eq!(
+        policy,
+        MutationFallbackPolicy::RetryPatchWithNormalizedPayload
+    );
+
+    let node_id = target.node_id.clone();
+    let mut failure = crate::execution_graph::FailureRecord::new(
+        "malformed-large-patch",
+        node_id.clone(),
+        crate::execution_graph::FailureCategory::MutationConflict,
+        1,
+        target.repository_fingerprint.clone(),
+        "patch_must_contain_exactly_one_complete_file_section",
+    );
+    failure.code = Some(
+        MutationApplicationFailure::InvalidPatchTarget
+            .as_str()
+            .into(),
+    );
+    failure.target_path = Some(target.target.path.clone());
+    let decision = ExecutionDecision::ExecuteTarget {
+        node_id: node_id.clone(),
+        action: crate::hosted_orchestrator::MutationAction::RepairTarget {
+            node_id,
+            target: target.target.clone(),
+            failure: Box::new(failure),
+            fallback_policy: policy,
+        },
+        target,
+    };
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&decision), 8_000);
+    let request = json!({
+        "max_output_tokens": profile.max_output_tokens,
+        "input": [{
+            "role": "user",
+            "content": serde_json::to_string(&json!({
+                "target": match &decision {
+                    ExecutionDecision::ExecuteTarget { target, .. } => target,
+                    _ => unreachable!(),
+                },
+                "fallback_policy": policy,
+            })).unwrap(),
+        }],
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision)),
+        "tool_choice": profile.tool_choice(),
+    });
+    assert_eq!(request["max_output_tokens"], 4_096);
+    assert_eq!(
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        ["apply_patch"]
+    );
+    assert_eq!(request["tool_choice"]["name"], "apply_patch");
+    assert!(
+        hosted_agent_instructions_for_decision(ExecutionPhase::Repair, Some(&decision))
+            .contains("exactly one complete file section")
+    );
+    assert!(
+        mutation_repair_request_preflight(Some(&decision), &request)
+            .unwrap()
+            .passed()
+    );
+    let complete_patch_invocation = json!({
+        "change_id": "generic-change",
+        "path": "src/generic_target.rs",
+        "patch": "--- a/src/generic_target.rs\n+++ b/src/generic_target.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    });
+    assert!(
+        serde_json::to_vec(&complete_patch_invocation)
+            .unwrap()
+            .len()
+            < 4_096 * 3
+    );
+}
+
+#[test]
+fn small_replacement_fallback_remains_output_feasible_and_preferred() {
+    let target = mutation_fallback_target("small target\n");
+    assert!(crate::hosted_orchestrator::replacement_fits_provider_output(&target, 4_096));
+    assert_eq!(
+        crate::hosted_orchestrator::select_fallback_with_output_budget(
+            &crate::execution_graph::TargetOperation::ModifyExisting,
+            MutationApplicationFailure::InvalidPatchTarget,
+            &target,
+            crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+            4_096,
+        ),
+        MutationFallbackPolicy::ForceReplaceFile
+    );
+}
+
+#[test]
+fn output_limited_replacement_with_no_safe_retry_is_explicitly_rejected() {
+    let target = mutation_fallback_target(&"large source line\n".repeat(1_200));
+    assert_eq!(
+        crate::hosted_orchestrator::select_fallback_with_output_budget(
+            &crate::execution_graph::TargetOperation::ModifyExisting,
+            MutationApplicationFailure::ReplacementContentInvalid,
+            &target,
+            crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
+            4_096,
+        ),
+        MutationFallbackPolicy::NoSafeFallback
+    );
+    assert!(matches!(
+        crate::hosted_orchestrator::no_executable_mutation_fallback_decision(false),
+        ExecutionDecision::StopForGuardrail {
+            outcome: OrchestratedMissionOutcome::BlockedNoDiff,
+            reason: crate::execution_graph::GuardrailReason::NodeBudgetExhausted,
+        }
+    ));
+}
+
+#[test]
+fn provider_argument_diagnostics_distinguish_output_truncation_from_malformed_json() {
+    let eof_error = serde_json::from_str::<Value>(r#"{"content":"unterminated"#)
+        .map_err(anyhow::Error::new)
+        .unwrap_err();
+    let truncated =
+        provider_tool_arguments_invalid_event(&eof_error, "replace_file", 4_096, 4_096).unwrap();
+    assert_eq!(truncated["json_error_category"], "unexpected_eof");
+    assert_eq!(truncated["likely_output_truncation"], true);
+
+    let malformed_error = serde_json::from_str::<Value>(r#"{"content":]}"#)
+        .map_err(anyhow::Error::new)
+        .unwrap_err();
+    let malformed =
+        provider_tool_arguments_invalid_event(&malformed_error, "replace_file", 100, 4_096)
+            .unwrap();
+    assert_eq!(malformed["json_error_category"], "malformed_json");
+    assert_eq!(malformed["likely_output_truncation"], false);
+}
+
+#[test]
 fn forced_replacement_request_is_exactly_bound_and_passes_preflight() {
     let decision = mutation_fallback_decision(
         MutationFallbackPolicy::ForceReplaceFile,

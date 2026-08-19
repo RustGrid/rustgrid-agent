@@ -1207,6 +1207,14 @@ pub fn select_fallback_with_threshold(
             .current_file_content
             .as_ref()
             .is_some_and(|content| content.len() <= replacement_threshold_bytes);
+    select_fallback_with_replacement_eligibility(operation, failure, replacement_eligible)
+}
+
+fn select_fallback_with_replacement_eligibility(
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    replacement_eligible: bool,
+) -> MutationFallbackPolicy {
     match failure {
         MutationApplicationFailure::RepositoryChangedSinceContext => {
             MutationFallbackPolicy::RebuildTargetContext
@@ -1251,6 +1259,46 @@ pub fn select_fallback_with_threshold(
     }
 }
 
+pub fn replacement_fits_provider_output(
+    target: &TargetExecutionContext,
+    maximum_output_tokens: u64,
+) -> bool {
+    let Some(content) = target.current_file_content.as_ref() else {
+        return false;
+    };
+    let Ok(serialized_arguments) = serde_json::to_vec(&serde_json::json!({
+        "path": target.target.path,
+        "content": content,
+    })) else {
+        return false;
+    };
+    let available_bytes = usize::try_from(maximum_output_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(3);
+    let safe_available_bytes = available_bytes.saturating_mul(3) / 4;
+    let estimated_modified_arguments = serialized_arguments
+        .len()
+        .saturating_add(serialized_arguments.len() / 4)
+        .saturating_add(512);
+    estimated_modified_arguments <= safe_available_bytes
+}
+
+pub fn select_fallback_with_output_budget(
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    target: &TargetExecutionContext,
+    replacement_threshold_bytes: usize,
+    maximum_output_tokens: u64,
+) -> MutationFallbackPolicy {
+    let replacement_eligible = matches!(operation, TargetOperation::ModifyExisting)
+        && target
+            .current_file_content
+            .as_ref()
+            .is_some_and(|content| content.len() <= replacement_threshold_bytes)
+        && replacement_fits_provider_output(target, maximum_output_tokens);
+    select_fallback_with_replacement_eligibility(operation, failure, replacement_eligible)
+}
+
 pub fn refine_fallback_for_replacement_threshold(
     selected_policy: MutationFallbackPolicy,
     operation: &TargetOperation,
@@ -1262,6 +1310,38 @@ pub fn refine_fallback_for_replacement_threshold(
         select_fallback_with_threshold(operation, failure, target, replacement_threshold_bytes)
     } else {
         selected_policy
+    }
+}
+
+pub fn refine_fallback_for_output_budget(
+    selected_policy: MutationFallbackPolicy,
+    operation: &TargetOperation,
+    failure: MutationApplicationFailure,
+    target: &TargetExecutionContext,
+    replacement_threshold_bytes: usize,
+    maximum_output_tokens: u64,
+) -> MutationFallbackPolicy {
+    if failure.uses_replacement_threshold() {
+        select_fallback_with_output_budget(
+            operation,
+            failure,
+            target,
+            replacement_threshold_bytes,
+            maximum_output_tokens,
+        )
+    } else {
+        selected_policy
+    }
+}
+
+pub fn no_executable_mutation_fallback_decision(repository_has_changes: bool) -> ExecutionDecision {
+    ExecutionDecision::StopForGuardrail {
+        outcome: if repository_has_changes {
+            MissionOutcome::PartialReviewable
+        } else {
+            MissionOutcome::BlockedNoDiff
+        },
+        reason: GuardrailReason::NodeBudgetExhausted,
     }
 }
 

@@ -937,6 +937,8 @@ pub(super) struct ModelActionProfile {
     pub(super) require_tool: bool,
 }
 
+pub(super) const MAX_MUTATION_PROVIDER_OUTPUT_TOKENS: u64 = 4_096;
+
 impl ModelActionProfile {
     pub(super) fn for_decision(
         phase: ExecutionPhase,
@@ -951,7 +953,8 @@ impl ModelActionProfile {
                     },
                 ..
             }) if fallback_policy.requires_provider_mutation() => Self {
-                max_output_tokens: configured_max_output_tokens.min(4_096),
+                max_output_tokens: configured_max_output_tokens
+                    .min(MAX_MUTATION_PROVIDER_OUTPUT_TOKENS),
                 reasoning_effort: "medium",
                 forced_tool: fallback_policy.forced_tool(),
                 require_tool: true,
@@ -960,7 +963,8 @@ impl ModelActionProfile {
                 if context.fallback_policy.requires_provider_mutation() =>
             {
                 Self {
-                    max_output_tokens: configured_max_output_tokens.min(4_096),
+                    max_output_tokens: configured_max_output_tokens
+                        .min(MAX_MUTATION_PROVIDER_OUTPUT_TOKENS),
                     reasoning_effort: "medium",
                     forced_tool: context.fallback_policy.forced_tool(),
                     require_tool: true,
@@ -1696,6 +1700,18 @@ pub(super) fn hosted_agent_instructions_for_decision(
         }) if *fallback_policy == MutationFallbackPolicy::ForceReplaceFile => format!(
             "Repair exactly `{}` under active fallback policy `force_replace_file` with one forced `replace_file` call. Use the exact current target content, content hash, repository fingerprint, accepted implementation intent, and rejected-mutation diagnostic in the authoritative input. The rejected patch was not applied. Return the complete desired file content, preserve unrelated behavior, and do not emit another patch or inspect another path. Original failure category: {:?}.",
             target.path, failure.code
+        ),
+        Some(ExecutionDecision::ExecuteTarget {
+            action:
+                crate::hosted_orchestrator::MutationAction::RepairTarget {
+                    target,
+                    fallback_policy: MutationFallbackPolicy::RetryPatchWithNormalizedPayload,
+                    ..
+                },
+            ..
+        }) => format!(
+            "Repair exactly `{}` with one forced `apply_patch` call. Emit one complete unified diff containing exactly one complete file section for that exact path. Use the authoritative current content, target hash, accepted intent, and previous malformed-patch diagnostic. Do not use full-file replacement, inspect or modify another path, or repeat the rejected patch payload.",
+            target.path
         ),
         Some(ExecutionDecision::ExecuteTarget {
             action:

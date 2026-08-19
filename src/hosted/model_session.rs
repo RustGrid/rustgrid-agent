@@ -165,6 +165,32 @@ pub(super) fn model_call_admission_telemetry(
     })
 }
 
+pub(super) fn provider_tool_arguments_invalid_event(
+    error: &anyhow::Error,
+    tool: &str,
+    output_tokens: u64,
+    maximum_output_tokens: u64,
+) -> Option<Value> {
+    let json_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<serde_json::Error>())?;
+    let output_limit_reached = maximum_output_tokens > 0 && output_tokens >= maximum_output_tokens;
+    Some(json!({
+        "event_type": "worker.provider_tool_arguments_invalid",
+        "tool": tool,
+        "json_error_category": if json_error.is_eof() {
+            "unexpected_eof"
+        } else {
+            "malformed_json"
+        },
+        "output_tokens": output_tokens,
+        "maximum_output_tokens": maximum_output_tokens,
+        "output_limit_reached": output_limit_reached,
+        "likely_output_truncation": json_error.is_eof() && output_limit_reached,
+        "arguments_accepted": false,
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HostedWallClockBoundary {
     BeforeValidation,
@@ -1978,6 +2004,24 @@ impl<'a> GatewayAgent<'a> {
                         {
                             return Err(error);
                         }
+                        if let Some(event) = provider_tool_arguments_invalid_event(
+                            &error,
+                            &name,
+                            response
+                                .pointer("/usage/output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                            request
+                                .get("max_output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default(),
+                        ) {
+                            self.append_event_recoverable(
+                                "progress",
+                                event,
+                                "provider tool arguments JSON diagnostic",
+                            );
+                        }
                         if name == "record_impact_map"
                             && matches!(
                                 self.phases.active(),
@@ -2564,7 +2608,7 @@ impl GatewayAgent<'_> {
                 _ => None,
             })
             .map_or(MutationFallbackPolicy::NoSafeFallback, |target| {
-                crate::hosted_orchestrator::select_fallback_with_threshold(
+                crate::hosted_orchestrator::select_fallback_with_output_budget(
                     &target_operation,
                     application.failure,
                     target,
@@ -2575,6 +2619,9 @@ impl GatewayAgent<'_> {
                             crate::hosted_orchestrator::DEFAULT_MUTATION_REPLACEMENT_THRESHOLD_BYTES,
                         )
                         .min(MAX_MODEL_FILE_BYTES),
+                    u64::try_from(self.manifest.ai_gateway.maximum_output_tokens)
+                        .unwrap_or_default()
+                        .min(MAX_MUTATION_PROVIDER_OUTPUT_TOKENS),
                 )
             });
         let repair_strategy = fallback_policy.as_str().to_owned();
