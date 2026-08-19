@@ -2562,7 +2562,9 @@ fn duplicate_discovery_progress_converges_before_semantic_cycle_detection() {
         .collect::<Vec<_>>();
     let convergence = events
         .iter()
-        .position(|body| body["data"]["event_type"] == "worker.discovery_convergence_evaluated")
+        .position(|body| {
+            body["data"]["event_type"] == "worker.discovery_convergence_evaluation_started"
+        })
         .expect("deterministic discovery convergence evaluation");
     let transition = events
         .iter()

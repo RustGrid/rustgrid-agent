@@ -3831,6 +3831,15 @@ impl<'a> GatewayAgent<'a> {
             return Ok(false);
         }
 
+        self.append_event_recoverable(
+            "progress",
+            json!({
+                "event_type": "worker.discovery_convergence_evaluation_started",
+                "reason_code": "duplicate_discovery_operation",
+                "model_call_consumed": false,
+            }),
+            "duplicate discovery convergence evaluation started",
+        );
         let impact_map_available = self.impact_map.is_some()
             || self.accept_deterministic_impact_map_if_available(
                 "duplicate_discovery_operation_convergence",
@@ -3854,7 +3863,9 @@ impl<'a> GatewayAgent<'a> {
             return Ok(false);
         }
 
-        self.record_discovery_force_planning()?;
+        if self.phases.active() == ExecutionPhase::Discovery {
+            self.record_discovery_force_planning()?;
+        }
         Ok(true)
     }
 
