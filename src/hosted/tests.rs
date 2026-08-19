@@ -2416,7 +2416,7 @@ fn duplicate_discovery_search_force_planning_uses_authoritative_transition() {
             request.contains("worker.phase_transition_preflight_passed")
                 && request.contains("\"from_phase\":\"discovery\"")
                 && request.contains("\"phase\":\"planning\"")
-                && request.contains("continue_planning")
+                && request.contains("\"decision\":\"build_plan\"")
         })
         .expect("authoritative discovery-to-planning transition preflight");
     assert!(guardrail < transition);
