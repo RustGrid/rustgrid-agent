@@ -9899,6 +9899,135 @@ fn hosted_context_keeps_only_recent_turns_after_notebook_checkpointing() {
 }
 
 #[test]
+fn mutation_fallback_materializes_only_active_target_and_linked_evidence() {
+    let target_content = "active target content\n".repeat(80);
+    let mut target = mutation_fallback_target(&target_content);
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Repair);
+    notebook.repository_fingerprint = target.repository_fingerprint.clone();
+    let mut planned_change = test_planned_change();
+    planned_change.change_id = target.change_id.clone();
+    planned_change.targets[0].path = target.target.path.clone();
+    planned_change.targets[0].role = target.target.role.clone();
+    planned_change.targets.push(PlannedTarget {
+        path: "src/unrelated_target.rs".into(),
+        role: "unrelated target".into(),
+        operation: Default::default(),
+        new_file: false,
+        status: IntendedChangeStatus::Planned,
+    });
+    notebook.planned_changes = vec![planned_change];
+    notebook.intended_changes = intended_changes_from_plan(&notebook.planned_changes);
+    notebook.files_inspected = vec![target.target.path.clone(), "src/unrelated_target.rs".into()];
+
+    let linked_marker = "explicitly-linked-support";
+    let linked_id = notebook.orchestration.evidence.capture_file(
+        "src/shared_contract.rs",
+        target.repository_fingerprint.clone(),
+        None,
+        format!("{linked_marker}\n{}", "support\n".repeat(120)),
+        false,
+    );
+    target.dependency_evidence = vec![notebook.orchestration.evidence.summary(&linked_id).unwrap()];
+    for index in 0..6 {
+        notebook.orchestration.evidence.capture_file(
+            format!("tests/unrelated-{index}.test.ts"),
+            target.repository_fingerprint.clone(),
+            None,
+            format!(
+                "unrelated-discovery-body-{index}\n{}",
+                "passing output\n".repeat(2_500)
+            ),
+            false,
+        );
+    }
+
+    let mut context =
+        implementation_start_context_from_notebook(&notebook, "source-tree".into(), 2, false, 1, 0);
+    context.current_target = Some(ImplementationTarget {
+        change_id: target.change_id.clone(),
+        path: target.target.path.clone(),
+        role: target.target.role.clone(),
+        new_file: false,
+        intent: target.intent.clone(),
+        acceptance_criteria: target.acceptance_criteria_ids.clone(),
+        status: IntendedChangeStatus::Planned,
+    });
+    context.cached_current_file_content = target.current_file_content.clone();
+    context.target_content_hash = target.target_content_hash.clone();
+    context.repository_fingerprint = target.repository_fingerprint.clone();
+    context.mutation_repair = Some(MutationDiagnosticArtifact {
+        tool: "apply_patch".into(),
+        rejected_mutation_payload: "previous-target-failure".into(),
+        raw_patch_hash: None,
+        target_path: target.target.path.clone(),
+        normalized_paths: vec![target.target.path.clone()],
+        target_content_hash: target.target_content_hash.clone(),
+        repository_fingerprint: target.repository_fingerprint.clone(),
+        git_apply_check_result: None,
+        failure_category: MutationApplicationFailure::InvalidPatchTarget,
+        repair_strategy: "use the active forced replacement fallback".into(),
+        fallback_policy: MutationFallbackPolicy::ForceReplaceFile,
+        rejected_mutation: None,
+        attempt_accounting: TargetAttemptAccounting::default(),
+        strategy_fingerprint: None,
+        mutation_attempt: 1,
+        repair_attempt: 1,
+    });
+    scope_implementation_context_to_active_target(&mut context, &notebook, &target);
+
+    let decision = mutation_fallback_decision(
+        MutationFallbackPolicy::ForceReplaceFile,
+        MutationApplicationFailure::InvalidPatchTarget,
+    );
+    let profile = ModelActionProfile::for_decision(ExecutionPhase::Repair, Some(&decision), 16_384);
+    let serialized_context = serde_json::to_string(&context).unwrap();
+    let initial = json!({"role": "user", "content": serialized_context});
+    let mut request = json!({
+        "model": "test-model",
+        "input": [initial.clone()],
+        "tools": hosted_tools_for_action(ExecutionPhase::Repair, Some(&decision)),
+        "tool_choice": profile.tool_choice(),
+    });
+    let mut turns = VecDeque::new();
+    fit_request_to_input_ceiling(&mut request, &initial, &mut turns, 64 * 1024).unwrap();
+    let payload = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        context.cached_current_file_content.as_deref(),
+        Some(target_content.as_str())
+    );
+    assert!(payload.contains("previous-target-failure"));
+    assert!(payload.contains(linked_marker));
+    assert!(!payload.contains("unrelated-discovery-body"));
+    assert_eq!(
+        request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>(),
+        ["replace_file"]
+    );
+    assert_eq!(context.related_test_evidence.len(), 1);
+    assert_eq!(notebook.orchestration.evidence.files.len(), 7);
+
+    context.cached_current_file_content = Some("minimum-target-context\n".repeat(8_000));
+    let oversized = serde_json::to_string(&context).unwrap();
+    let oversized_initial = json!({"role": "user", "content": oversized});
+    request["input"] = json!([oversized_initial.clone()]);
+    assert!(
+        fit_request_to_input_ceiling(
+            &mut request,
+            &oversized_initial,
+            &mut VecDeque::new(),
+            64 * 1024,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("hosted agent context exceeds the execution input-token ceiling")
+    );
+}
+
+#[test]
 fn implementation_context_is_phase_specific_and_below_eight_thousand_tokens() {
     let mut notebook = test_discovery_notebook(ExecutionPhase::Implementation);
     notebook.architecture_findings = vec!["historical-payload-marker ".repeat(20_000)];

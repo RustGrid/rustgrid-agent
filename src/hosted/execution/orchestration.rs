@@ -17,6 +17,48 @@ struct TargetContextIdentity<'a> {
     accepted_intent_hash: &'a str,
 }
 
+pub(in crate::hosted) fn scope_implementation_context_to_active_target(
+    context: &mut ImplementationStartContext,
+    notebook: &WorkerNotebook,
+    target: &crate::execution_graph::TargetExecutionContext,
+) {
+    context.cached_nearby_context = target
+        .nearby_context
+        .iter()
+        .filter(|excerpt| target.target_content_hash.as_ref() != Some(&excerpt.content_hash))
+        .cloned()
+        .collect();
+    context.dependency_evidence = target.dependency_evidence.clone();
+
+    let dependency_evidence_ids = target
+        .dependency_evidence
+        .iter()
+        .map(|evidence| evidence.evidence_id.as_str())
+        .collect::<BTreeSet<_>>();
+    context.related_test_evidence = dependency_evidence_ids
+        .into_iter()
+        .filter_map(|evidence_id| notebook.orchestration.evidence.files.get(evidence_id))
+        .filter(|evidence| {
+            evidence.repository_fingerprint == target.repository_fingerprint
+                && evidence.path != target.target.path
+        })
+        .map(crate::execution_graph::FileExcerpt::from)
+        .collect();
+
+    let linked_paths = target
+        .dependency_evidence
+        .iter()
+        .filter_map(|evidence| evidence.path.as_deref())
+        .chain(std::iter::once(target.target.path.as_str()))
+        .collect::<BTreeSet<_>>();
+    context
+        .exact_files_already_read
+        .retain(|path| linked_paths.contains(path.as_str()));
+    context
+        .missing_file_contents
+        .retain(|path| path == &target.target.path);
+}
+
 fn validate_critical_worker_event_fields(data: &Value) -> std::result::Result<(), String> {
     let Some(object) = data.as_object() else {
         return Ok(());
@@ -2914,30 +2956,14 @@ impl<'a> GatewayAgent<'a> {
                     .cloned()
             })
             .flatten();
-            context.cached_nearby_context = target.nearby_context.clone();
+            scope_implementation_context_to_active_target(&mut context, &self.notebook, target);
             context.graph_node_id = Some(target.node_id.clone());
-            context.dependency_evidence = target.dependency_evidence.clone();
             context.relevant_impact_areas = self
                 .notebook
                 .impact_map
                 .iter()
                 .filter(|area| area.candidate_paths.contains(&target.target.path))
                 .cloned()
-                .collect();
-            context.related_test_evidence = self
-                .notebook
-                .orchestration
-                .evidence
-                .files
-                .values()
-                .filter(|evidence| {
-                    evidence.repository_fingerprint == self.notebook.repository_fingerprint && {
-                        let path = evidence.path.to_ascii_lowercase();
-                        path.contains("test") || path.contains("spec")
-                    }
-                })
-                .map(crate::execution_graph::FileExcerpt::from)
-                .take(4)
                 .collect();
             context.allowed_tools = target.allowed_tools.clone();
             context.remaining_node_budget = Some(target.remaining_node_budget.clone());
