@@ -2554,24 +2554,30 @@ fn duplicate_discovery_progress_converges_before_semantic_cycle_detection() {
     let _ = stop.send(());
     handle.join().unwrap();
     let requests = requests.into_iter().collect::<Vec<_>>();
-    let convergence = requests
+    let events = requests
         .iter()
-        .position(|request| request.contains("worker.discovery_convergence_evaluated"))
+        .filter_map(|request| request.split_once("\r\n\r\n").map(|(_, body)| body))
+        .filter_map(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|body| body.get("event_type") == Some(&json!("progress")))
+        .collect::<Vec<_>>();
+    let convergence = events
+        .iter()
+        .position(|body| body["data"]["event_type"] == "worker.discovery_convergence_evaluated")
         .expect("deterministic discovery convergence evaluation");
-    let transition = requests
+    let transition = events
         .iter()
-        .position(|request| {
-            request.contains("worker.phase_transition_preflight_passed")
-                && request.contains("\"from_phase\":\"discovery\"")
-                && request.contains("\"phase\":\"planning\"")
-                && request.contains("\"decision\":\"build_plan\"")
+        .position(|body| {
+            body["data"]["event_type"] == "worker.phase_transition_preflight_passed"
+                && body["data"]["from_phase"] == "discovery"
+                && body["data"]["phase"] == "planning"
+                && body["data"]["decision"] == "build_plan"
         })
         .expect("authoritative discovery-to-planning transition");
     assert!(convergence < transition);
     assert!(
-        !requests
+        !events
             .iter()
-            .any(|request| request.contains("deterministic_orchestration_cycle"))
+            .any(|body| body["data"]["reason_code"] == "deterministic_orchestration_cycle")
     );
 }
 
