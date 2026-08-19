@@ -692,24 +692,22 @@ fn validation_repair_candidates<'a>(
     failure: &FailureRecord,
 ) -> Result<Vec<&'a ExecutionNode>, OrchestrationInvariantError> {
     let mut ranked_paths = Vec::new();
-    if let Some(path) = failure.target_path.as_ref() {
+    if let Some(path) = failure.target_path.as_ref()
+        && validation_repair_candidate_is_executable(snapshot, failure, path)
+    {
         ranked_paths.push(path.clone());
     }
     for assertion in &failure.assertion_failures {
-        let test_repair_supported = matches!(
-            assertion.diagnosis,
-            Some(
-                ValidationRepairDiagnosis::TestExpectationDefect | ValidationRepairDiagnosis::Both
-            )
-        );
         ranked_paths.extend(
             assertion
                 .implicated_paths
                 .iter()
-                .filter(|path| test_repair_supported || path.as_str() != assertion.test_file)
+                .filter(|path| validation_repair_candidate_is_executable(snapshot, failure, path))
                 .cloned(),
         );
-        if test_repair_supported && !assertion.test_file.is_empty() {
+        if !assertion.test_file.is_empty()
+            && validation_repair_candidate_is_executable(snapshot, failure, &assertion.test_file)
+        {
             ranked_paths.push(assertion.test_file.clone());
         }
     }
@@ -744,6 +742,33 @@ fn validation_repair_candidates<'a>(
         candidates.extend(matching);
     }
     Ok(candidates)
+}
+
+fn validation_repair_candidate_is_executable(
+    snapshot: &ExecutionSnapshot,
+    failure: &FailureRecord,
+    target_path: &str,
+) -> bool {
+    if !failure
+        .assertion_failures
+        .iter()
+        .any(|assertion| assertion.test_file == target_path)
+    {
+        return true;
+    }
+    failure.test_repair_eligibility.iter().any(|decision| {
+        decision.target_path == target_path
+            && decision.eligible
+            && decision.repair_intent_id == validation_repair_intent_id(failure)
+            && decision.repair_session_id == BudgetState::repair_session_id(&failure.id)
+            && snapshot
+                .budget
+                .current_validation_failure_revision(
+                    failure.node_id.as_str(),
+                    &failure.repository_fingerprint,
+                )
+                .is_some_and(|revision| revision.revision == decision.failure_revision)
+    })
 }
 
 fn incomplete_diff_decision(
@@ -1342,6 +1367,32 @@ fn repair_target_decision(
             .unwrap_or(1);
         let repair_node_id =
             validation_repair_node_id(&failure.id, failure_revision, &target.target);
+        let test_repair_eligibility = failure
+            .assertion_failures
+            .iter()
+            .any(|assertion| assertion.test_file == target.target.path)
+            .then(|| {
+                snapshot
+                    .graph
+                    .node(&repair_node_id)
+                    .and_then(|node| node.validation_repair.as_ref())
+                    .and_then(|repair| repair.test_repair_eligibility.clone())
+                    .or_else(|| {
+                        failure
+                            .test_repair_eligibility
+                            .iter()
+                            .find(|decision| decision.target_path == target.target.path)
+                            .cloned()
+                    })
+                    .ok_or_else(|| {
+                        OrchestrationInvariantError::for_node(
+                            "test_repair_eligibility_missing",
+                            node.id.clone(),
+                            "a test target cannot enter active validation repair without a persisted eligibility decision",
+                        )
+                    })
+            })
+            .transpose()?;
         let target_ref = RepositoryTargetRef {
             target_id: target.target.mutation_target_id().to_string(),
             path: target.target.path.clone(),
@@ -1356,6 +1407,7 @@ fn repair_target_decision(
             originating_implementation_node_id: node.id.clone(),
             repair_node_id: repair_node_id.clone(),
             failure_revision,
+            test_repair_eligibility,
             repository_fingerprint: snapshot.current_repository.fingerprint.clone(),
             accepted_implementation_intent: target.intent.clone(),
             existing_diff_paths: snapshot
@@ -1495,11 +1547,76 @@ fn repair_target_decision(
     })
 }
 
-fn validation_repair_intent_id(failure: &FailureRecord) -> IntentId {
+pub(crate) fn validation_repair_intent_id(failure: &FailureRecord) -> IntentId {
     format!(
         "validation-repair:{}:{}",
         failure.id, failure.repository_fingerprint
     )
+}
+
+pub(crate) fn evaluate_test_repair_eligibility(
+    target_path: &str,
+    assertions: &[ValidationAssertionFailure],
+    specification_evidence: &[(String, String)],
+    failure_revision: u64,
+    repair_intent_id: &str,
+    repair_session_id: &str,
+) -> TestRepairEligibilityDecision {
+    let supporting_specification_evidence_ids = assertions
+        .iter()
+        .filter(|assertion| assertion.test_file == target_path)
+        .flat_map(|assertion| {
+            specification_evidence
+                .iter()
+                .filter(move |(_, specification)| {
+                    specification_proves_stale_test_expectation(specification, assertion)
+                })
+                .map(|(evidence_id, _)| EvidenceId::new(evidence_id.clone()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let eligible = !supporting_specification_evidence_ids.is_empty();
+    TestRepairEligibilityDecision {
+        target_path: target_path.to_owned(),
+        eligible,
+        reason_code: if eligible {
+            "test_expectation_conflicts_with_specification"
+        } else {
+            "test_repair_requires_specification_evidence"
+        }
+        .to_owned(),
+        supporting_specification_evidence_ids,
+        failure_revision,
+        repair_intent_id: repair_intent_id.to_owned(),
+        repair_session_id: repair_session_id.to_owned(),
+    }
+}
+
+fn specification_proves_stale_test_expectation(
+    specification: &str,
+    assertion: &ValidationAssertionFailure,
+) -> bool {
+    let expected = normalized_specification_text(&assertion.expected);
+    let received = normalized_specification_text(&assertion.received);
+    if expected.is_empty() || received.is_empty() || expected == received {
+        return false;
+    }
+    let specification = normalized_specification_text(specification);
+    let explicitly_rejects_expected = ["not", "instead of", "rather than", "must not"]
+        .iter()
+        .any(|prefix| specification.contains(&format!("{prefix} {expected}")));
+    specification.contains(&received)
+        && (!specification.contains(&expected) || explicitly_rejects_expected)
+}
+
+fn normalized_specification_text(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn repair_diagnosis(failure: &FailureRecord) -> ValidationRepairDiagnosis {
@@ -1880,6 +1997,267 @@ mod tests {
             budget: BudgetState::new(budget),
             ..ExecutionSnapshot::default()
         }
+    }
+
+    fn validation_repair_eligibility_snapshot(
+        specification: &str,
+    ) -> (ExecutionSnapshot, FailureRecord) {
+        let targets = [
+            target("selector", "src/project-selector.tsx"),
+            target("selector-test", "tests/project-selector.test.tsx"),
+        ];
+        let mut state = snapshot(&targets);
+        state.current_repository = RepositorySnapshot {
+            fingerprint: "tree-implemented".into(),
+            source_tree_hash: "tree-implemented".into(),
+            changed_paths: targets.iter().map(|target| target.path.clone()).collect(),
+            ..RepositorySnapshot::default()
+        };
+        for node in state
+            .graph
+            .nodes
+            .iter_mut()
+            .filter(|node| node.kind.is_mutation())
+        {
+            let planned = node.target.clone().expect("mutation target");
+            node.status = ExecutionNodeStatus::Completed;
+            node.repository_mutation_lifecycle = Some(RepositoryMutationLifecycle::Verified);
+            node.attempts.push(NodeAttempt {
+                attempt: 1,
+                started_at: "implementation-started".into(),
+                completed_at: Some("implementation-completed".into()),
+                repository_fingerprint_before: "tree-1".into(),
+                repository_fingerprint_after: Some("tree-implemented".into()),
+                outcome: Some(ExecutionNodeStatus::Completed),
+                ..NodeAttempt::default()
+            });
+            node.operation_evidence.push(OperationEvidence {
+                semantic_id: format!("implemented:{}", node.id),
+                outcome: RepositoryOperationOutcome::Applied,
+                operation: planned.operation.clone(),
+                target_path: planned.path,
+                repository_fingerprint: RepositoryFingerprint::new("tree-implemented"),
+                attempt: 1,
+                completed_at: "implementation-completed".into(),
+                ..OperationEvidence::default()
+            });
+        }
+        state.graph.refresh_readiness();
+        state.evidence.capture_file(
+            "src/project-selector.tsx",
+            "tree-implemented",
+            None,
+            "export const selectedProject = () => 'current-project';",
+            false,
+        );
+        state.evidence.capture_file(
+            "tests/project-selector.test.tsx",
+            "tree-implemented",
+            None,
+            "expect(selectedProject()).toBe('legacy-project');",
+            false,
+        );
+        let validation_node = state
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == ExecutionNodeKind::ValidationSuite)
+            .expect("validation node")
+            .id
+            .clone();
+        state
+            .graph
+            .set_node_status(&validation_node, ExecutionNodeStatus::Running)
+            .unwrap();
+        let mut failure = FailureRecord::new(
+            "project-selector-validation-failure",
+            validation_node.clone(),
+            FailureCategory::ValidationFailure,
+            1,
+            "tree-implemented",
+            "project selector expectation failed",
+        );
+        failure.target_path = Some("tests/project-selector.test.tsx".into());
+        failure.assertion_failures = vec![ValidationAssertionFailure {
+            test_file: "tests/project-selector.test.tsx".into(),
+            test_name: "selects the current project".into(),
+            expected: "legacy-project".into(),
+            received: "current-project".into(),
+            implicated_paths: vec![
+                "tests/project-selector.test.tsx".into(),
+                "src/project-selector.tsx".into(),
+            ],
+            ..ValidationAssertionFailure::default()
+        }];
+        let repair_intent_id = validation_repair_intent_id(&failure);
+        let repair_session_id = BudgetState::repair_session_id(&failure.id);
+        failure.test_repair_eligibility = vec![evaluate_test_repair_eligibility(
+            "tests/project-selector.test.tsx",
+            &failure.assertion_failures,
+            &[("ac-1".into(), specification.into())],
+            1,
+            &repair_intent_id,
+            &repair_session_id,
+        )];
+        failure.validation_repair_selection_status =
+            ValidationRepairSelectionStatus::CandidateSelected;
+        state
+            .append_event(ExecutionDomainEvent::FailureRecorded {
+                sequence: 1,
+                failure: failure.clone(),
+            })
+            .unwrap();
+        let validation_gate = state
+            .graph
+            .node(&validation_node)
+            .and_then(|node| node.validation.as_ref())
+            .expect("validation gate")
+            .clone();
+        let validation_fingerprint = validation_gate.fingerprint("tree-implemented");
+        state
+            .append_event(ExecutionDomainEvent::ValidationEvidenceRecorded {
+                sequence: 2,
+                node_id: validation_node.clone(),
+                evidence: ValidationEvidenceRecord {
+                    evidence_id: "project-selector-validation-evidence".into(),
+                    node_id: validation_node.clone(),
+                    gate_id: validation_gate.gate_id,
+                    fingerprint: validation_fingerprint.clone(),
+                    repository_fingerprint: "tree-implemented".into(),
+                    command: validation_gate.command,
+                    working_directory: validation_gate.working_directory,
+                    status: ValidationEvidenceStatus::Failed,
+                    exit_code: Some(1),
+                    output_summary: "project selector expectation failed".into(),
+                    ..ValidationEvidenceRecord::default()
+                },
+            })
+            .unwrap();
+        state
+            .append_event(ExecutionDomainEvent::ValidationFailed {
+                sequence: 3,
+                node_id: validation_node,
+                failure_id: failure.id.clone(),
+                fingerprint: validation_fingerprint,
+            })
+            .unwrap();
+        (state, failure)
+    }
+
+    #[test]
+    fn ineligible_validation_repair_test_is_skipped_before_activation() {
+        let (state, failure) = validation_repair_eligibility_snapshot(
+            "the selector must preserve repository ordering",
+        );
+        let decision = &failure.test_repair_eligibility[0];
+        assert!(!decision.eligible);
+        assert_eq!(
+            decision.reason_code,
+            "test_repair_requires_specification_evidence"
+        );
+        assert!(matches!(
+            reconcile_execution(&state).unwrap(),
+            ExecutionDecision::ExecuteTarget {
+                action: MutationAction::PrepareTargetContext { ref target, .. },
+                target: ref context,
+                ..
+            } if target.path == "src/project-selector.tsx"
+                && context.validation_repair.as_ref().is_some_and(|repair| repair.test_repair_eligibility.is_none())
+        ));
+    }
+
+    #[test]
+    fn eligible_validation_repair_test_persists_one_authoritative_authorization() {
+        let (mut state, failure) =
+            validation_repair_eligibility_snapshot("the selector must return current-project");
+        let initial = reconcile_execution(&state).unwrap();
+        let ExecutionDecision::ExecuteTarget {
+            node_id,
+            action: MutationAction::PrepareTargetContext { target, .. },
+            target: context,
+        } = initial
+        else {
+            panic!("expected test repair preparation");
+        };
+        assert_eq!(target.path, "tests/project-selector.test.tsx");
+        let repair = context.validation_repair.expect("repair contract");
+        let eligibility = repair
+            .test_repair_eligibility
+            .clone()
+            .expect("persisted test eligibility");
+        assert!(eligibility.authorizes(
+            &target.path,
+            repair.failure_revision,
+            &repair.repair_intent.repair_intent_id,
+            &BudgetState::repair_session_id(&failure.id),
+        ));
+        state
+            .append_event(ExecutionDomainEvent::ValidationRepairStarted {
+                sequence: state.next_event_sequence(),
+                validation_node_id: failure.node_id.clone(),
+                failure_id: failure.id.clone(),
+                repair_node_id: repair.repair_node_id.clone(),
+                originating_implementation_node_id: repair
+                    .originating_implementation_node_id
+                    .clone(),
+                target_ref: repair.target_ref.clone(),
+                failure_revision: repair.failure_revision,
+                repair_intent: repair.repair_intent.clone(),
+                selected_target: target.path.clone(),
+                implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
+                correction_contracts: repair.correction_contracts.clone(),
+                test_repair_eligibility: Some(eligibility.clone()),
+                requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+                repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
+            })
+            .unwrap();
+        let persisted = state
+            .graph
+            .node(&node_id)
+            .and_then(|node| node.validation_repair.as_ref())
+            .and_then(|repair| repair.test_repair_eligibility.as_ref())
+            .expect("repair node eligibility");
+        assert_eq!(persisted, &eligibility);
+        assert!(context.allowed_tools.is_empty());
+        assert!(
+            tools_for_target_operation(ExecutionNodeKind::ValidationRepair, &target)
+                .unwrap()
+                .contains(&ToolKind::ApplyPatch)
+        );
+    }
+
+    #[test]
+    fn active_validation_repair_test_without_eligibility_is_rejected() {
+        let (mut state, failure) =
+            validation_repair_eligibility_snapshot("the selector must return current-project");
+        let ExecutionDecision::ExecuteTarget {
+            action: MutationAction::PrepareTargetContext { target, .. },
+            target: context,
+            ..
+        } = reconcile_execution(&state).unwrap()
+        else {
+            panic!("expected test repair preparation");
+        };
+        let repair = context.validation_repair.expect("repair contract");
+        let error = state
+            .append_event(ExecutionDomainEvent::ValidationRepairStarted {
+                sequence: state.next_event_sequence(),
+                validation_node_id: failure.node_id,
+                failure_id: failure.id,
+                repair_node_id: repair.repair_node_id,
+                originating_implementation_node_id: repair.originating_implementation_node_id,
+                target_ref: repair.target_ref,
+                failure_revision: repair.failure_revision,
+                repair_intent: repair.repair_intent,
+                selected_target: target.path,
+                implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
+                correction_contracts: repair.correction_contracts,
+                test_repair_eligibility: None,
+                requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
+                repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "test_repair_eligibility_missing");
     }
 
     fn discovery_snapshot() -> ExecutionSnapshot {
@@ -2386,6 +2764,7 @@ mod tests {
                 selected_target: "src/components/theme/ThemeProvider.tsx".into(),
                 implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
                 correction_contracts: Vec::new(),
+                test_repair_eligibility: None,
                 requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
                 repository_fingerprint_before: RepositoryFingerprint::new(
                     "tree-after-four-mutations",
@@ -2438,6 +2817,7 @@ mod tests {
                 selected_target: "src/components/theme/ThemeToggle.tsx".into(),
                 implicated_paths: failure.assertion_failures[0].implicated_paths.clone(),
                 correction_contracts: Vec::new(),
+                test_repair_eligibility: None,
                 requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
                 repository_fingerprint_before: RepositoryFingerprint::new(
                     "tree-after-four-mutations",

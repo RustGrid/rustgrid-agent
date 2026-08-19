@@ -209,6 +209,8 @@ pub enum ExecutionDomainEvent {
         implicated_paths: Vec<String>,
         #[serde(default)]
         correction_contracts: Vec<AssertionRepairContract>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        test_repair_eligibility: Option<TestRepairEligibilityDecision>,
         #[serde(default)]
         requested_tool_policy: MutationToolPolicy,
         #[serde(default)]

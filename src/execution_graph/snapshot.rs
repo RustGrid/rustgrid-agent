@@ -670,6 +670,7 @@ impl ExecutionSnapshot {
             originating_implementation_node_id,
             target_ref,
             failure_revision,
+            test_repair_eligibility,
             ..
         } = &event
             && !repair_node_id.as_str().is_empty()
@@ -681,6 +682,7 @@ impl ExecutionSnapshot {
                         == *originating_implementation_node_id
                         && repair.target == *target_ref
                         && repair.failure_revision == *failure_revision
+                        && repair.test_repair_eligibility == *test_repair_eligibility
                 });
             if same_identity {
                 // Activation is one atomic, idempotent graph transition. A
@@ -756,8 +758,12 @@ impl ExecutionSnapshot {
         if let ExecutionDomainEvent::ValidationRepairStarted {
             validation_node_id,
             failure_id,
+            repair_intent,
+            selected_target,
+            failure_revision,
             implicated_paths,
             correction_contracts,
+            test_repair_eligibility,
             ..
         } = &event
         {
@@ -771,6 +777,30 @@ impl ExecutionSnapshot {
                     "validation repair refers to unknown failure `{failure_id}`"
                 ))
             })?;
+            let selected_target_is_test = failure
+                .assertion_failures
+                .iter()
+                .any(|assertion| assertion.test_file == *selected_target);
+            if selected_target_is_test {
+                let decision = test_repair_eligibility.as_ref().ok_or_else(|| {
+                    GraphInvariantError::with_code(
+                        "test_repair_eligibility_missing",
+                        "an active validation repair test target requires persisted eligibility",
+                    )
+                })?;
+                let expected_session_id = BudgetState::repair_session_id(failure_id);
+                if !decision.authorizes(
+                    selected_target,
+                    *failure_revision,
+                    &repair_intent.repair_intent_id,
+                    &expected_session_id,
+                ) {
+                    return Err(GraphInvariantError::with_code(
+                        "test_repair_eligibility_mismatch",
+                        "validation repair test activation does not match its authoritative eligibility decision",
+                    ));
+                }
+            }
             let implicated_targets = implicated_paths
                 .iter()
                 .chain(
@@ -857,6 +887,7 @@ impl ExecutionSnapshot {
             originating_implementation_node_id,
             target_ref,
             failure_revision,
+            test_repair_eligibility,
             ..
         } = &event {
             let session = self
@@ -983,6 +1014,7 @@ impl ExecutionSnapshot {
                                 originating_implementation_node_id.clone(),
                             validation_session_id: session.session_id.clone(),
                             failure_revision: *failure_revision,
+                            test_repair_eligibility: test_repair_eligibility.clone(),
                             status: RepairNodeStatus::Running,
                         }),
                         ..ExecutionNode::default()

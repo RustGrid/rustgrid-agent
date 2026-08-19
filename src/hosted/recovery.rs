@@ -316,6 +316,7 @@ pub(super) fn validation_repair_target_hint(
     assertions: &[crate::execution_graph::ValidationAssertionFailure],
     mutation_targets: &[crate::execution_graph::PlannedTarget],
     target_contents: &[(String, String)],
+    test_repair_eligibility: &[crate::execution_graph::TestRepairEligibilityDecision],
 ) -> Option<String> {
     let mut scores = BTreeMap::<String, usize>::new();
     let highest_specificity = assertions
@@ -353,6 +354,12 @@ pub(super) fn validation_repair_target_hint(
         for target in mutation_targets
             .iter()
             .filter(|target| assertion.implicated_paths.contains(&target.path))
+            .filter(|target| {
+                target.path != assertion.test_file
+                    || test_repair_eligibility
+                        .iter()
+                        .any(|decision| decision.target_path == target.path && decision.eligible)
+            })
         {
             let path = &target.path;
             let content = target_contents

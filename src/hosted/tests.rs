@@ -1075,9 +1075,23 @@ fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
     validation_failure.assertion_failures = vec![ValidationAssertionFailure {
         test_file: "tests/generic.test.ts".into(),
         test_name: "generic behavior".into(),
+        expected: "false".into(),
+        received: "true".into(),
         implicated_paths: vec!["tests/generic.test.ts".into(), "src/generic.ts".into()],
         ..ValidationAssertionFailure::default()
     }];
+    validation_failure.test_repair_eligibility = vec![
+        crate::hosted_orchestrator::evaluate_test_repair_eligibility(
+            "tests/generic.test.ts",
+            &validation_failure.assertion_failures,
+            &[("ac-1".into(), "generic behavior must remain true".into())],
+            1,
+            &crate::hosted_orchestrator::validation_repair_intent_id(&validation_failure),
+            &crate::execution_graph::BudgetState::repair_session_id(&validation_failure.id),
+        ),
+    ];
+    validation_failure.validation_repair_selection_status =
+        crate::execution_graph::ValidationRepairSelectionStatus::CandidateSelected;
     snapshot
         .append_event(ExecutionDomainEvent::FailureRecorded {
             sequence: snapshot.next_event_sequence(),
@@ -1121,6 +1135,7 @@ fn validation_repair_mutation_fallback_keeps_target_and_reaches_rerun() {
             selected_target: repair_target.path.clone(),
             implicated_paths: vec![repair_target.path.clone()],
             correction_contracts: repair.correction_contracts.clone(),
+            test_repair_eligibility: repair.test_repair_eligibility.clone(),
             requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
             repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
         })
@@ -3214,7 +3229,7 @@ Received: "light-blue"
         ),
     ];
     assert_eq!(
-        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        validation_repair_target_hint(&assertions, &targets, &candidates, &[]).as_deref(),
         Some("src/components/theme/ThemeToggle.tsx")
     );
 }
@@ -3344,7 +3359,7 @@ Received: "intermediate"
         ),
     ];
     assert_eq!(
-        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        validation_repair_target_hint(&assertions, &targets, &candidates, &[]).as_deref(),
         Some("lib/presenter.ts")
     );
     assert_eq!(
@@ -3419,8 +3434,13 @@ Received: "current-label"
             "update the stale expectation for current-label behavior",
         ),
     ];
+    let eligibility = [crate::execution_graph::TestRepairEligibilityDecision {
+        target_path: "tests/example.test.ts".into(),
+        eligible: true,
+        ..Default::default()
+    }];
     assert_eq!(
-        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        validation_repair_target_hint(&assertions, &targets, &candidates, &eligibility).as_deref(),
         Some("tests/example.test.ts")
     );
 }
@@ -3472,7 +3492,7 @@ Received: "disabled"
         ),
     ];
     assert_eq!(
-        validation_repair_target_hint(&assertions, &targets, &candidates).as_deref(),
+        validation_repair_target_hint(&assertions, &targets, &candidates, &[]).as_deref(),
         Some("src/feature.ts")
     );
 }

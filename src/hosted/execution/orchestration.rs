@@ -2181,6 +2181,7 @@ impl<'a> GatewayAgent<'a> {
                         .into_iter()
                         .collect(),
                     correction_contracts: repair.correction_contracts,
+                    test_repair_eligibility: repair.test_repair_eligibility,
                     requested_tool_policy:
                         crate::execution_graph::MutationFallbackPolicy::NoSafeFallback,
                     repository_fingerprint_before:
@@ -2238,6 +2239,7 @@ impl<'a> GatewayAgent<'a> {
                             .into_iter()
                             .collect(),
                         correction_contracts: repair.correction_contracts,
+                        test_repair_eligibility: repair.test_repair_eligibility,
                         requested_tool_policy: *fallback_policy,
                         repository_fingerprint_before:
                             crate::execution_graph::RepositoryFingerprint::new(
@@ -4071,12 +4073,69 @@ impl<'a> GatewayAgent<'a> {
                         record.assertion_failures.push(fallback);
                     }
                 }
+                let failure_revision = self
+                    .notebook
+                    .orchestration
+                    .budget
+                    .next_validation_failure_revision(node_id.as_str());
+                let repair_intent_id =
+                    crate::hosted_orchestrator::validation_repair_intent_id(&record);
+                let repair_session_id =
+                    crate::execution_graph::BudgetState::repair_session_id(&failure_id);
+                record.test_repair_eligibility = record
+                    .assertion_failures
+                    .iter()
+                    .map(|assertion| assertion.test_file.clone())
+                    .filter(|path| !path.is_empty())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .filter_map(|test_path| {
+                        let target = mutation_targets
+                            .iter()
+                            .find(|target| target.path == test_path)?;
+                        let specification_evidence = self
+                            .notebook
+                            .acceptance_criteria_v2
+                            .iter()
+                            .filter(|criterion| {
+                                target.acceptance_criteria_ids.contains(&criterion.id)
+                            })
+                            .map(|criterion| (criterion.id.clone(), criterion.text.clone()))
+                            .collect::<Vec<_>>();
+                        Some(
+                            crate::hosted_orchestrator::evaluate_test_repair_eligibility(
+                                &test_path,
+                                &record.assertion_failures,
+                                &specification_evidence,
+                                failure_revision,
+                                &repair_intent_id,
+                                &repair_session_id,
+                            ),
+                        )
+                    })
+                    .collect();
                 record.target_path = validation_repair_target_hint(
                     &record.assertion_failures,
                     &mutation_targets,
                     &target_contents,
+                    &record.test_repair_eligibility,
                 )
-                .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics));
+                .or_else(|| validation_failure_target_hint(&mutation_target_paths, &diagnostics))
+                .filter(|path| {
+                    !record
+                        .assertion_failures
+                        .iter()
+                        .any(|assertion| assertion.test_file == *path)
+                        || record
+                            .test_repair_eligibility
+                            .iter()
+                            .any(|decision| decision.target_path == *path && decision.eligible)
+                });
+                record.validation_repair_selection_status = if record.target_path.is_some() {
+                    crate::execution_graph::ValidationRepairSelectionStatus::CandidateSelected
+                } else {
+                    crate::execution_graph::ValidationRepairSelectionStatus::NoValidRepair
+                };
                 if let Some(assertion) = record
                     .assertion_failures
                     .iter()

@@ -546,6 +546,7 @@ impl SimulationHarness {
                             .flat_map(|assertion| assertion.implicated_paths.iter().cloned())
                             .collect(),
                         correction_contracts: repair.correction_contracts.clone(),
+                        test_repair_eligibility: repair.test_repair_eligibility.clone(),
                         requested_tool_policy: MutationFallbackPolicy::NoSafeFallback,
                         repository_fingerprint_before: RepositoryFingerprint::new(
                             repair.repository_fingerprint.clone(),

@@ -909,6 +909,7 @@ mod lifecycle_invariant_tests {
                 selected_target: planned_target.path.clone(),
                 implicated_paths: vec![planned_target.path.clone()],
                 correction_contracts: Vec::new(),
+                test_repair_eligibility: None,
                 requested_tool_policy: MutationFallbackPolicy::ForceReplaceFile,
                 repository_fingerprint_before: RepositoryFingerprint::new("tree-implemented"),
             })
@@ -1037,6 +1038,7 @@ mod lifecycle_invariant_tests {
                 selected_target,
                 implicated_paths,
                 correction_contracts,
+                test_repair_eligibility,
                 requested_tool_policy,
                 repository_fingerprint_before,
                 ..
@@ -1052,6 +1054,7 @@ mod lifecycle_invariant_tests {
                 selected_target,
                 implicated_paths,
                 correction_contracts,
+                test_repair_eligibility,
                 requested_tool_policy,
                 repository_fingerprint_before,
             },

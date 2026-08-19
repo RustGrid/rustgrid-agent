@@ -482,6 +482,8 @@ pub struct ValidationRepairNodeMetadata {
     pub originating_implementation_node_id: ExecutionNodeId,
     pub validation_session_id: ValidationRepairSessionId,
     pub failure_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_repair_eligibility: Option<TestRepairEligibilityDecision>,
     pub status: RepairNodeStatus,
 }
 
@@ -939,6 +941,8 @@ pub struct ValidationRepairContext {
     pub repair_node_id: RepairNodeId,
     #[serde(default)]
     pub failure_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_repair_eligibility: Option<TestRepairEligibilityDecision>,
     pub repository_fingerprint: String,
     pub accepted_implementation_intent: String,
     #[serde(default)]
@@ -958,6 +962,44 @@ pub type ValidationAssertionId = String;
 pub type RepairSessionId = String;
 pub type ModelCallId = String;
 pub type MutationToolPolicy = MutationFallbackPolicy;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TestRepairEligibilityDecision {
+    pub target_path: RepositoryPath,
+    pub eligible: bool,
+    pub reason_code: String,
+    #[serde(default)]
+    pub supporting_specification_evidence_ids: Vec<EvidenceId>,
+    pub failure_revision: u64,
+    pub repair_intent_id: IntentId,
+    pub repair_session_id: RepairSessionId,
+}
+
+impl TestRepairEligibilityDecision {
+    pub fn authorizes(
+        &self,
+        target_path: &str,
+        failure_revision: u64,
+        repair_intent_id: &str,
+        repair_session_id: &str,
+    ) -> bool {
+        self.eligible
+            && self.target_path == target_path
+            && self.failure_revision == failure_revision
+            && self.repair_intent_id == repair_intent_id
+            && self.repair_session_id == repair_session_id
+            && !self.supporting_specification_evidence_ids.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationRepairSelectionStatus {
+    #[default]
+    Unassessed,
+    CandidateSelected,
+    NoValidRepair,
+}
 
 pub fn validation_repair_node_id(
     failure_id: &FailureId,
@@ -1776,6 +1818,10 @@ pub struct FailureRecord {
     pub validation_command: Option<String>,
     #[serde(default)]
     pub assertion_failures: Vec<ValidationAssertionFailure>,
+    #[serde(default)]
+    pub test_repair_eligibility: Vec<TestRepairEligibilityDecision>,
+    #[serde(default)]
+    pub validation_repair_selection_status: ValidationRepairSelectionStatus,
     #[serde(default)]
     pub resolved_repository_fingerprint: Option<String>,
 }

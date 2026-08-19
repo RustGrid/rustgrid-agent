@@ -160,16 +160,25 @@ impl<'a> GatewayAgent<'a> {
                 .assertion_failures
                 .iter()
                 .any(|assertion| assertion.test_file == path);
-            if test_only_target
-                && !matches!(
-                    repair.repair_intent.diagnosis,
-                    crate::execution_graph::ValidationRepairDiagnosis::TestExpectationDefect
-                        | crate::execution_graph::ValidationRepairDiagnosis::Both
-                )
-            {
-                bail!(
-                    "test_repair_requires_specification_evidence: `{path}` is not eligible under the active repair diagnosis"
-                );
+            if test_only_target {
+                let expected_session_id =
+                    crate::execution_graph::BudgetState::repair_session_id(&failure.id);
+                let eligible = repair
+                    .test_repair_eligibility
+                    .as_ref()
+                    .is_some_and(|decision| {
+                        decision.authorizes(
+                            path,
+                            repair.failure_revision,
+                            &repair.repair_intent.repair_intent_id,
+                            &expected_session_id,
+                        )
+                    });
+                if !eligible {
+                    bail!(
+                        "test_repair_requires_specification_evidence: `{path}` is not eligible under the persisted repair contract"
+                    );
+                }
             }
         }
         if let Some(already_applied) = classify_hosted_mutation_preflight(

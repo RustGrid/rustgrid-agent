@@ -318,6 +318,13 @@ impl BudgetState {
         created
     }
 
+    pub fn next_validation_failure_revision(&self, validation_id: &str) -> u64 {
+        self.validation_failure_revisions
+            .get(validation_id)
+            .and_then(|revisions| revisions.last())
+            .map_or(1, |prior| prior.revision.saturating_add(1))
+    }
+
     pub fn current_validation_failure_revision(
         &self,
         validation_id: &str,
