@@ -1770,6 +1770,7 @@ impl<'a> GatewayAgent<'a> {
                     )?;
                 }
                 let target = tool_target(&arguments);
+                let outcome_semantic_identity = tool_outcome_semantic_identity(&name, &arguments);
                 let change_id = tool_change_id(&arguments);
                 let before_sha256 = target
                     .as_deref()
@@ -2329,6 +2330,7 @@ impl<'a> GatewayAgent<'a> {
                 self.record_tool_progress(
                     &name,
                     target.clone(),
+                    outcome_semantic_identity.as_deref(),
                     progress_class,
                     progress_detail,
                     verified_repository_progress,

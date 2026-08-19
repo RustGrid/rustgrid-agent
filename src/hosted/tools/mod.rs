@@ -315,6 +315,7 @@ impl<'a> GatewayAgent<'a> {
                     self.record_tool_progress(
                         "read_file",
                         Some(failed.path.clone()),
+                        None,
                         read_error_progress_class(
                             failed.error_code.as_deref().unwrap_or("read_failed"),
                         ),
@@ -336,6 +337,7 @@ impl<'a> GatewayAgent<'a> {
                     self.record_tool_progress(
                         "read_file",
                         Some(succeeded.path.clone()),
+                        None,
                         if new_evidence {
                             ToolProgressClass::Productive
                         } else {
@@ -1411,6 +1413,43 @@ pub(in crate::hosted) fn tool_target(arguments: &str) -> Option<String> {
         .get("path")?
         .as_str()
         .map(|path| truncate_text(path, 4_096))
+}
+
+pub(in crate::hosted) fn tool_outcome_semantic_identity(
+    name: &str,
+    arguments: &str,
+) -> Option<String> {
+    if name != "search_text" {
+        return None;
+    }
+    let object = serde_json::from_str::<Value>(arguments).ok()?;
+    let query = object.get("query")?.as_str()?;
+    let path = object.get("path")?.as_str()?;
+    let extensions = object
+        .get("extensions")
+        .and_then(Value::as_array)
+        .map(|extensions| {
+            extensions
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("literal");
+    let context_lines = object
+        .get("context_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        .min(5);
+    Some(
+        SearchSignature::new(query, path, &extensions, mode, context_lines)
+            .semantic_identity()
+            .to_owned(),
+    )
 }
 
 pub(in crate::hosted) fn tool_change_id(arguments: &str) -> Option<String> {

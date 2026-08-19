@@ -801,6 +801,7 @@ impl<'a> GatewayAgent<'a> {
         &mut self,
         tool: &str,
         target: Option<String>,
+        semantic_identity: Option<&str>,
         class: ToolProgressClass,
         detail: impl Into<String>,
         repository_progress: bool,
@@ -811,6 +812,7 @@ impl<'a> GatewayAgent<'a> {
             self.phases.active(),
             tool,
             target,
+            semantic_identity,
             class,
             detail,
             repository_progress,
@@ -3214,7 +3216,7 @@ impl<'a> GatewayAgent<'a> {
                     .min(MAX_MODEL_FILE_BYTES),
             );
         }
-        let decision_key = execution_decision_idempotency_key(&snapshot, &decision);
+        let decision_key = execution_decision_idempotency_key(&snapshot, &self.notebook, &decision);
         if !orchestration_decision_is_new(
             self.notebook.last_orchestration_decision_key.as_deref(),
             &decision_key,

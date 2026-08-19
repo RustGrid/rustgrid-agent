@@ -1670,6 +1670,7 @@ fn cost_rejection_telemetry_exposes_the_complete_failed_inequality() {
 
 #[test]
 fn orchestration_decision_key_changes_only_after_reconciliation_input_changes() {
+    let notebook = test_discovery_notebook(ExecutionPhase::Discovery);
     let budget = crate::execution_graph::MissionBudget::for_complexity(
         crate::execution_graph::MissionComplexity::Small,
     );
@@ -1687,22 +1688,229 @@ fn orchestration_decision_key_changes_only_after_reconciliation_input_changes() 
             inspection_scope: crate::hosted_orchestrator::InspectionScope::default(),
         },
     };
-    let first = execution_decision_idempotency_key(&snapshot, &decision);
+    let first = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
     assert_eq!(
         first,
-        execution_decision_idempotency_key(&snapshot, &decision)
+        execution_decision_idempotency_key(&snapshot, &notebook, &decision)
     );
     assert!(!orchestration_decision_is_new(Some(&first), &first));
     snapshot.graph.revision += 1;
-    let after_revision_only = execution_decision_idempotency_key(&snapshot, &decision);
+    let after_revision_only = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
     assert_eq!(first, after_revision_only);
     snapshot.current_repository.fingerprint = "tree-2".into();
-    let after_repository_change = execution_decision_idempotency_key(&snapshot, &decision);
+    let after_repository_change =
+        execution_decision_idempotency_key(&snapshot, &notebook, &decision);
     assert_ne!(first, after_repository_change);
     assert!(orchestration_decision_is_new(
         Some(&first),
         &after_repository_change
     ));
+}
+
+#[test]
+fn productive_discovery_searches_advance_semantic_cycle_state() {
+    let budget = crate::execution_graph::MissionBudget::for_complexity(
+        crate::execution_graph::MissionComplexity::Small,
+    );
+    let snapshot = crate::execution_graph::ExecutionSnapshot {
+        graph: crate::execution_graph::ExecutionGraph::bootstrap(
+            "graph",
+            "tree",
+            crate::execution_graph::MissionComplexity::Small,
+            &budget,
+        ),
+        ..crate::execution_graph::ExecutionSnapshot::default()
+    };
+    let decision = ExecutionDecision::ContinueDiscovery {
+        action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository {
+            inspection_scope: crate::hosted_orchestrator::InspectionScope::default(),
+        },
+    };
+    let search_a_arguments = json!({
+        "path": "src/",
+        "query": "revoke",
+        "mode": "literal",
+        "extensions": ["rs"],
+        "context_lines": 2,
+    })
+    .to_string();
+    let search_b_arguments = json!({
+        "path": "src",
+        "query": "revoked",
+        "mode": "literal",
+        "extensions": [".rs"],
+        "context_lines": 2,
+    })
+    .to_string();
+    let search_a_identity =
+        tool_outcome_semantic_identity("search_text", &search_a_arguments).unwrap();
+    let search_b_identity =
+        tool_outcome_semantic_identity("search_text", &search_b_arguments).unwrap();
+    let search_a_progress = new_tool_progress_record(
+        1,
+        1,
+        ExecutionPhase::Discovery,
+        "search_text",
+        Some("src/".into()),
+        Some(&search_a_identity),
+        ToolProgressClass::Productive,
+        "new targeted repository search completed",
+        false,
+    );
+    let search_b_progress = new_tool_progress_record(
+        1,
+        2,
+        ExecutionPhase::Discovery,
+        "search_text",
+        Some("src".into()),
+        Some(&search_b_identity),
+        ToolProgressClass::Productive,
+        "new targeted repository search completed",
+        false,
+    );
+    assert_ne!(
+        search_a_progress.outcome_signature,
+        search_b_progress.outcome_signature
+    );
+
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+    notebook.searches_completed = vec!["literal:src:revoke".into()];
+    notebook.impact_evidence =
+        impact_map::evidence_catalog(&notebook.files_inspected, &notebook.searches_completed);
+    let state_after_a = discovery_semantic_state_hash(&notebook);
+    let key_after_a = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
+
+    notebook
+        .searches_completed
+        .push("literal:src:revoked".into());
+    notebook.impact_evidence =
+        impact_map::evidence_catalog(&notebook.files_inspected, &notebook.searches_completed);
+    let state_after_b = discovery_semantic_state_hash(&notebook);
+    let key_after_b = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
+    assert_ne!(state_after_a, state_after_b);
+    assert!(orchestration_decision_is_new(
+        Some(&key_after_a),
+        &key_after_b
+    ));
+
+    let mut history = Vec::new();
+    let decision_hash = sha256_text("continue_discovery:inspect_repository");
+    assert_eq!(
+        crate::execution_graph::observe_semantic_cycle(
+            &mut history,
+            &state_after_a,
+            &decision_hash,
+            "continue_discovery",
+            "after-search-a",
+        ),
+        1
+    );
+    assert_eq!(
+        crate::execution_graph::observe_semantic_cycle(
+            &mut history,
+            &state_after_b,
+            &decision_hash,
+            "continue_discovery",
+            "after-search-b",
+        ),
+        1
+    );
+}
+
+#[test]
+fn exact_discovery_search_replay_keeps_semantic_state_and_cycle_detection_stable() {
+    let budget = crate::execution_graph::MissionBudget::for_complexity(
+        crate::execution_graph::MissionComplexity::Small,
+    );
+    let snapshot = crate::execution_graph::ExecutionSnapshot {
+        graph: crate::execution_graph::ExecutionGraph::bootstrap(
+            "graph",
+            "tree",
+            crate::execution_graph::MissionComplexity::Small,
+            &budget,
+        ),
+        ..crate::execution_graph::ExecutionSnapshot::default()
+    };
+    let decision = ExecutionDecision::ContinueDiscovery {
+        action: crate::hosted_orchestrator::DiscoveryAction::InspectRepository {
+            inspection_scope: crate::hosted_orchestrator::InspectionScope::default(),
+        },
+    };
+    let arguments = json!({
+        "path": "src/",
+        "query": "revoke",
+        "mode": "literal",
+        "extensions": ["rs"],
+        "context_lines": 2,
+    })
+    .to_string();
+    let identity = tool_outcome_semantic_identity("search_text", &arguments).unwrap();
+    let first = new_tool_progress_record(
+        1,
+        1,
+        ExecutionPhase::Discovery,
+        "search_text",
+        Some("src/".into()),
+        Some(&identity),
+        ToolProgressClass::Productive,
+        "new targeted repository search completed",
+        false,
+    );
+    let replay = new_tool_progress_record(
+        1,
+        2,
+        ExecutionPhase::Discovery,
+        "search_text",
+        Some("src/".into()),
+        Some(&identity),
+        ToolProgressClass::Duplicate,
+        "new targeted repository search completed",
+        false,
+    );
+    assert_eq!(first.outcome_signature, replay.outcome_signature);
+
+    let mut notebook = test_discovery_notebook(ExecutionPhase::Discovery);
+    push_unique(
+        &mut notebook.searches_completed,
+        "literal:src:revoke".into(),
+    );
+    notebook.impact_evidence =
+        impact_map::evidence_catalog(&notebook.files_inspected, &notebook.searches_completed);
+    let state_before_replay = discovery_semantic_state_hash(&notebook);
+    let key_before_replay = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
+    push_unique(
+        &mut notebook.searches_completed,
+        "literal:src:revoke".into(),
+    );
+    notebook.impact_evidence =
+        impact_map::evidence_catalog(&notebook.files_inspected, &notebook.searches_completed);
+    let state_after_replay = discovery_semantic_state_hash(&notebook);
+    let key_after_replay = execution_decision_idempotency_key(&snapshot, &notebook, &decision);
+    assert_eq!(state_before_replay, state_after_replay);
+    assert_eq!(key_before_replay, key_after_replay);
+
+    let mut history = Vec::new();
+    let decision_hash = sha256_text("continue_discovery:inspect_repository");
+    assert_eq!(
+        crate::execution_graph::observe_semantic_cycle(
+            &mut history,
+            &state_before_replay,
+            &decision_hash,
+            "continue_discovery",
+            "first-observation",
+        ),
+        1
+    );
+    assert_eq!(
+        crate::execution_graph::observe_semantic_cycle(
+            &mut history,
+            &state_after_replay,
+            &decision_hash,
+            "continue_discovery",
+            "replay-observation",
+        ),
+        crate::execution_graph::MAX_IDENTICAL_DETERMINISTIC_CYCLES
+    );
 }
 
 #[test]
@@ -6016,6 +6224,7 @@ fn guided_recovery_context_and_admission_are_confined_to_the_current_target() {
         ExecutionPhase::Implementation,
         "read_file",
         Some(paths[0].into()),
+        None,
         ToolProgressClass::RecoverableFailure,
         "line_range_invalid: valid line range is 1-87; retry that exact range",
         false,
@@ -6125,6 +6334,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             ExecutionPhase::Implementation,
             "read_file",
             Some("present.ts".into()),
+            None,
             ToolProgressClass::Productive,
             "new repository content inspected",
             false,
@@ -6135,6 +6345,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             ExecutionPhase::Implementation,
             "read_file",
             Some("missing.ts".into()),
+            None,
             read_error_progress_class(error_code),
             &detail,
             false,
@@ -6145,6 +6356,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             ExecutionPhase::Implementation,
             "read_file",
             Some("missing.ts".into()),
+            None,
             read_error_progress_class(error_code),
             &detail,
             false,
@@ -6154,6 +6366,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             4,
             ExecutionPhase::Implementation,
             "report_write_progress",
+            None,
             None,
             informational_write_progress_semantics().0,
             "ready to write",
@@ -6173,6 +6386,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             ExecutionPhase::Implementation,
             "read_file",
             Some("present.ts".into()),
+            None,
             ToolProgressClass::RecoverableFailure,
             "line_range_invalid: valid line range is 1-1",
             false,
@@ -6183,6 +6397,7 @@ fn live_progress_records_classify_reads_repeated_failures_and_informational_repo
             ExecutionPhase::Implementation,
             "read_file",
             Some("present.ts".into()),
+            None,
             ToolProgressClass::Productive,
             "recovered exact range",
             false,

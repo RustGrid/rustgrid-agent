@@ -145,6 +145,7 @@ pub(super) fn new_tool_progress_record(
     phase: ExecutionPhase,
     tool: &str,
     target: Option<String>,
+    semantic_identity: Option<&str>,
     class: ToolProgressClass,
     detail: impl Into<String>,
     repository_progress: bool,
@@ -152,7 +153,7 @@ pub(super) fn new_tool_progress_record(
     let detail = truncate_text(&detail.into(), 1_000);
     let outcome_signature = sha256_text(&format!(
         "{tool}\0{}\0{detail}",
-        target.as_deref().unwrap_or_default()
+        semantic_identity.or(target.as_deref()).unwrap_or_default()
     ));
     ToolProgressRecord {
         execution_attempt,

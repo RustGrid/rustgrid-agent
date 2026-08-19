@@ -496,6 +496,10 @@ impl SearchSignature {
             normalized_extensions.join(",")
         ))
     }
+
+    pub(super) fn semantic_identity(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Default)]

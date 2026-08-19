@@ -3,6 +3,7 @@ use super::*;
 
 pub(super) fn execution_decision_idempotency_key(
     snapshot: &crate::execution_graph::ExecutionSnapshot,
+    notebook: &WorkerNotebook,
     decision: &ExecutionDecision,
 ) -> String {
     let node = decision
@@ -59,8 +60,11 @@ pub(super) fn execution_decision_idempotency_key(
         .map(|node| node.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    let discovery_state_hash = matches!(decision, ExecutionDecision::ContinueDiscovery { .. })
+        .then(|| discovery_semantic_state_hash(notebook))
+        .unwrap_or_default();
     let semantic_state_hash = sha256_text(&format!(
-        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
+        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{}",
         node_id,
         node.map(|node| node.status),
         operation,
@@ -70,6 +74,7 @@ pub(super) fn execution_decision_idempotency_key(
         active_repair_intent.unwrap_or_default(),
         remaining_required,
         snapshot.publication.status,
+        discovery_state_hash,
     ));
     format!(
         "{}:{}:{}:{}:{}",
@@ -78,6 +83,21 @@ pub(super) fn execution_decision_idempotency_key(
         node_attempt,
         execution_decision_action_kind(decision),
         semantic_state_hash,
+    )
+}
+
+pub(super) fn discovery_semantic_state_hash(notebook: &WorkerNotebook) -> String {
+    sha256_text(
+        &serde_json::to_string(&json!({
+            "searches_completed": notebook.searches_completed,
+            "files_inspected": notebook.files_inspected,
+            "read_ranges_inspected": notebook.read_ranges_inspected,
+            "discovery_paths_sampled": notebook.discovery_paths_sampled,
+            "impact_evidence": notebook.impact_evidence,
+            "impact_map": notebook.impact_map_v2,
+            "impact_map_artifact_sha256": notebook.impact_map_artifact.artifact_sha256,
+        }))
+        .expect("discovery semantic state is serializable"),
     )
 }
 
