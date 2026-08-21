@@ -8,6 +8,10 @@ pub mod credentials;
 pub mod error;
 mod execution;
 pub mod execution_graph;
+// Protocol v1 is intentionally compiled but not routed to production while its
+// conformance suite and backend contract are built phase by phase.
+#[allow(dead_code)]
+mod execution_protocol;
 mod executor;
 mod finalization;
 pub mod git;

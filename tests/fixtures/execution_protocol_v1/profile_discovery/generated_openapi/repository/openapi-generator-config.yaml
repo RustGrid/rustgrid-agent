@@ -1,0 +1,6 @@
+generatorName: typescript-fetch
+inputSpec: spec/openapi.yaml
+outputDir: generated/openapi-client
+additionalProperties:
+  supportsES6: true
+

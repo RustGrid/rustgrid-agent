@@ -1,0 +1,8 @@
+{
+  "name": "execution-protocol-implementation-context-fixture",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}
