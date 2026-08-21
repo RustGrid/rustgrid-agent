@@ -4,6 +4,10 @@ Protocol v1 is not eligible for real missions until this suite passes. The
 suite tests the protocol, adapters, and serialized provider boundary separately
 so a lifecycle test cannot pass by mocking away the contract under test.
 
+Phase 8 is not complete. Its first checked-in repository artifact is a
+schema-foundation/checkpoint-summary fixture only; it does not yet drive the
+reducer or satisfy any row of the required fixture matrix end to end.
+
 ## Test layers
 
 1. **Reducer conformance** uses pure state/event fixtures and asserts exact
@@ -50,6 +54,24 @@ out-of-order domain events fail the fixture.
 
 Common event abbreviations below are descriptive only; fixtures use full
 versioned names.
+
+### Current Phase 8 foundation artifact
+
+`canonical/tiny_static_change` is intentionally labeled
+`fixture_scope = "schema_foundation"`; its expected-event document is labeled
+`trace_kind = "checkpoint_summary"`. The strict fixture loader currently
+proves bounded files and collections, relative contained paths, symlink and
+unknown-entry rejection, content and repository-tree hashes, semantic hashes,
+and tamper detection across the manifest, scripts, summary, result, and tiny
+repository.
+
+The expected-event file is a human-reviewable checkpoint summary. It is not a
+serialized `ProtocolEventEnvelope` stream, is not replayed through strict
+`reduce`, and does not prove the expected terminal result. Consequently this
+artifact is not yet fixture 1's canonical reducer trace, is not Golden A, and
+does not make the matrix 1/20 complete. Promotion accounting begins only when
+the fixture executes the strict decision/reduction implementation and matches
+the full schema-v2 causal event stream and canonical result.
 
 ## Required fixture matrix
 
@@ -259,7 +281,26 @@ Required properties:
     with a different valid observation from that attempt;
 38. review and publication convergence map through the canonical typed table,
     while hosted lease loss suppresses writes and cannot masquerade as a review
-    failure or terminal proof.
+    failure or terminal proof;
+39. compatibility-scaffold roots are rejected by strict decision, reduction,
+    restore, and runner entry points before any effect or write;
+40. a strict root contains the exact requested discovery goal and validation
+    and finalization policies, and repository-profile initialization is the
+    only legal revision-zero event before reducer-owned goal, profile proof,
+    and `Profiling -> Discovery` progression;
+41. private event schema v2 has exactly one causal root, every later cause is a
+    previously committed event, correlation is stable, and node ownership
+    equals the payload-derived owner; changing any field changes identity or is
+    rejected;
+42. pre-freeze private event schema v1 and snapshots missing
+    `protocol_mode` are rejected rather than defaulted or silently migrated;
+43. every external effect has an authority-fenced durable intent before
+    invocation; its committed observation carries the exact typed intent ID
+    and safe request digest in semantic identity; and an indeterminate result
+    reconciles that same intent before any replacement dispatch; and
+44. `Finished` is impossible before the exact `CanonicalResultRecorded` event
+    is committed, while callback delivery replay/retry/failure in its separate
+    projection cannot mutate that result.
 
 ## Adapter-contract assertions
 
@@ -367,9 +408,25 @@ artifact from a real store, call hosted Git/GitHub or the control plane, own
 lease/cancellation or terminal CAS, deliver a callback/outbox record, route a
 production provider/event, publish a live branch/PR, or prove a positive no-op.
 
+The post-Phase-7 foundation tests add strict-root and wire-contract coverage:
+compatibility rejection at strict entry points; root-bound goal and policies;
+profile-first initialization; causal schema-v2 identity and restore rejection;
+authority-fenced compare-and-swap behavior; intent-before-effect and
+indeterminate reconciliation; terminal-event-before-`Finished`; and a separate
+post-terminal delivery projection with exact result/event binding, bounded
+retry, replay, and tamper rejection. These tests use deterministic in-memory
+ports. They do not prove a durable backend store, a live lease/cancellation
+source, actual provider/Git/GitHub execution, or callback transport.
+
+The first Phase 8 loader fixture adds only the
+`schema_foundation`/`checkpoint_summary` checks described above. It must not be
+reported as a reducer trace or as completion of fixture 1.
+
 Important gaps that Protocol v1 must close rather than relabel as covered:
 
-- checked-in synthetic repository fixtures;
+- full strict reducer traces and expected-result derivation for all 20
+  checked-in repositories, including promotion of the tiny foundation summary
+  into the real fixture 1 trace;
 - one full repaired Golden B suffix through the real Git/GitHub adapter contract;
 - end-to-end Golden C;
 - real durable mutation-artifact store/provider/filesystem adapter contracts;

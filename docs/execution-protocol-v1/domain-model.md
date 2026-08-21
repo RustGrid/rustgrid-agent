@@ -9,9 +9,13 @@ after backend contract review.
 ```rust
 struct ExecutionState {
     protocol_version: ProtocolVersion,
+    protocol_mode: ExecutionProtocolModeV1,
     aggregate_revision: u64,
     execution: ExecutionIdentity,
     objective: MissionObjective,
+    requested_discovery_goal: Option<DiscoveryGoal>,
+    validation_policy: Option<ValidationPolicyV1>,
+    finalization_policy: Option<FinalizationPolicyV1>,
     repository: RepositoryState,
     profile: Option<RepositoryProfile>,
     plan: Option<AcceptedPlan>,
@@ -45,6 +49,56 @@ The event append transaction is:
 
 An exact replay returns the already-committed revision and does not repeat
 progress, spending, mutation, or publication.
+
+### Strict root and initialization authority
+
+`ExecutionProtocolModeV1` separates a `CompatibilityScaffold` used by the
+pre-freeze private suite from `StrictV1`. Compatibility aggregates may still
+exercise old reducer fixtures, but strict `decide`, strict `reduce`, and the
+transaction runner reject them. The mode is required serialized state; a
+missing mode is not defaulted during restore.
+
+A strict revision-zero root contains `Some` values for the exact requested
+`DiscoveryGoal`, `ValidationPolicyV1`, and `FinalizationPolicyV1`. Bootstrap
+validates their intrinsic authority, budget and identity structure, and binds
+the finalization publication base to the initial repository revision. Once a
+repository profile is present, the validation policy is also validated
+against that exact profile immediately.
+
+Profile acquisition is not modeled as an unfenced provider or repository
+effect in this foundation slice. A dedicated initialization transaction
+accepts a separately trusted profile only for a pristine strict aggregate,
+checks its current repository revision and signed validation-policy binding,
+and uses an authority-fenced CAS to append `RepositoryProfileRecorded`. From
+that point, only strict reducer decisions may record the root-bound goal,
+record the derived repository-profile proof, and advance `Profiling` to
+`Discovery`.
+
+### Authority-fenced runner contract
+
+The runner depends on narrow store and effect ports. One atomic load returns:
+
+- the event stream and replayed strict aggregate;
+- an execution-attempt authority fence containing execution/attempt,
+  lease-epoch status, and cancellation revision/status; and
+- zero or one unresolved effect intent.
+
+All writes compare both aggregate revision and authority. A `Perform` decision
+is converted to a durable intent that binds the triggering event, aggregate
+and repository revisions, effect kind, safe request digest, and fence before
+the adapter is called. Definite completion resolves the intent together with
+the validated observation event. Indeterminate completion retains that exact
+intent for reconciliation, so recovery cannot synthesize a new request or
+repeat an effect merely because the worker restarted. Raw provider payloads,
+credentials, and secret material are not persisted in the intent.
+
+Confirmed lease loss suppresses further writes. Cancellation is deliberately
+fail closed until the domain reducer has an explicit cancellation transition;
+the runner does not forge `Canceled`. A `Finish` decision similarly becomes a
+CAS append of `CanonicalResultRecorded`; `Finished` is observable only on a
+later step after that event is committed. These are private contracts and
+in-memory tests around injected ports, not a real durable store, lease/cancel
+control-plane implementation, effect adapter, or production route.
 
 ## Identities and repository revisions
 
@@ -943,6 +997,7 @@ Every stored event uses a common envelope:
 ```rust
 struct EventEnvelope<T> {
     protocol_version: u16,
+    event_schema_version: u16, // exactly 2 for the frozen private wire
     event_id: EventId,
     execution_id: ExecutionId,
     execution_attempt: u32,
@@ -951,12 +1006,36 @@ struct EventEnvelope<T> {
     causation_id: Option<EventId>,
     correlation_id: CorrelationId,
     node_id: Option<NodeId>,
+    effect_observation: Option<EffectObservationBinding>,
     repository_revision: RepositoryRevisionId,
     semantic_identity: ContentHash,
     occurred_at: Timestamp, // metadata, never reducer identity
     payload: T,
 }
 ```
+
+Schema v2 has no inferred causal metadata. Exactly event sequence 1 has no
+cause. Every later envelope must name an event already committed earlier in
+the same execution-attempt aggregate. Correlation is stable from the first
+event through the entire stream. Node ownership is computed from the payload
+and current aggregate: node-owned events must name that exact node, while
+aggregate-level events must carry explicit `null`. The causal fields are part
+of semantic identity, event ID derivation, canonical envelope hashing, and
+full-log replay validation.
+
+An event that atomically resolves an effect outbox intent additionally carries
+`EffectObservationBinding { effect_intent_id, request_digest }`. Both values
+are non-secret, strict, and semantic-identity-bearing. The durable store must
+compare the complete binding and event coordinates with the unresolved intent
+inside the same observation commit; after resolution, replay retains that
+typed association without parsing a semantic key. Ordinary reducer events
+carry explicit `null`.
+
+This deliberately invalidates the private pre-freeze schema-v1 envelope.
+Likewise, a private snapshot without the required `protocol_mode` is rejected.
+Strict deserialization does not default absent fields or infer a cause,
+correlation, or owner. There is no silent wire migration; fixtures are
+regenerated, and any future importer must be explicit and separately tested.
 
 Minimum domain event families:
 
@@ -991,8 +1070,10 @@ Minimum domain event families:
   `PushIntentPersisted`, `PushObserved`, `PullRequestIntentPersisted`,
   `PullRequestObserved`, `CompletionRecorded`, `ConvergenceEvaluated`;
 - control/terminal: `ConvergenceEvaluated`, `CycleObserved`,
-  `CancellationRequested`, `CanonicalResultRecorded`,
-  `TerminalCallbackAttempted`, `TerminalCallbackAcknowledged`.
+  `CancellationRequested`, `CanonicalResultRecorded`.
+
+Callback intents and observations belong to the separate post-terminal
+delivery projection described below, not to this domain-event family.
 
 Telemetry is a projection of committed events plus adapter observations. For
 every provider request it includes authorized tool names, actual serialized
@@ -1004,6 +1085,25 @@ effects are linked as consequences and never overwrite the first fatal blocker.
 `Display`, `Debug`, events, and source chains accept only redacted safe values.
 Secrets, raw authorization headers, provider bodies, repository credentials,
 and expanded secret environment values are prohibited schema fields.
+
+### Post-terminal delivery read model
+
+Terminal delivery has its own event stream and projection, outside
+`ExecutionState`. Its root is a replay-validated strict terminal aggregate
+supplied by the runner/store boundary. The projection binds the exact terminal
+event ID/hash, canonical-result hash, execution attempt, callback payload hash,
+and idempotency key. The pure projection does not prove that an external store
+physically committed the stream; the production durable-store adapter must
+establish that precondition. It persists each attempt intent before send and
+models acknowledgement, definite failure, indeterminate delivery, bounded
+retry, and same-attempt reconciliation.
+
+No delivery event is accepted by the mission reducer. Delivery status cannot
+change the canonical result, repository revision, process health, remaining
+work, or first fatal blocker. This separation makes a callback outage visible
+without converting successful engineering into mission failure. The private
+projection supplies serialization/replay rules only; a real durable delivery
+store, callback transport, and backend integration remain deferred.
 
 ## Cycle and convergence model
 

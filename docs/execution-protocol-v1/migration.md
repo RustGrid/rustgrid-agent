@@ -65,12 +65,30 @@ checkpoint, provider-reservation, completion, and continuation contracts.
 - Changing the default requires a backend configuration rollout, not an AgentOps
   unsigned input.
 
+Inside the private Protocol v1 implementation, `protocol_mode` is a separate
+required root field. `CompatibilityScaffold` preserves pre-freeze private tests
+only. `StrictV1` is the sole production-eligible mode and binds the requested
+`DiscoveryGoal`, validation policy, and finalization/publication policy at
+revision zero. Strict decision, reduction, restore, and runner paths reject a
+compatibility root before dispatch. This internal distinction does not enable
+backend routing or change the signed manifest contract by itself.
+
 ### Events and checkpoints
 
 Protocol v1 uses a separate event namespace/schema and one aggregate snapshot.
 The backend must accept and validate these events before a v1 worker is
 deployed. Event IDs use a new namespace so a legacy semantic event cannot
 collide with a v1 event.
+
+The foundation freeze sets the private domain-event envelope to schema v2.
+Exactly the first event has no cause; every later event names an already
+committed prior event, correlation remains stable for the execution attempt,
+and node ownership equals the reducer-derived payload owner. Those fields are
+required and identity-bearing. Pre-freeze private schema-v1 events and private
+snapshots without `protocol_mode` are deliberately rejected. They are test-only
+wire artifacts, so this change uses fixture regeneration rather than a serde
+default or silent migration. Any future persisted-private-data importer must
+be explicit, one-way, and independently fixture-tested.
 
 Legacy notebook and graph readers remain available in a read-only
 `legacy_checkpoint` adapter. A one-time import may be built later only for
@@ -102,6 +120,12 @@ the complete validated materialized snapshot, not replay only its event list.
   control-plane trust boundaries.
 - Preserve current completion behavior until the backend accepts the v1
   terminal taxonomy and callback-health fields.
+- Keep callback delivery outside mission truth. The private delivery projection
+  binds the exact event and result hashes from a replay-validated strict
+  terminal aggregate; the future durable store must prove that aggregate was
+  physically committed. A durable outbox, callback transport, and backend
+  acknowledgement route must land before it can replace existing completion
+  delivery.
 - Preserve the current AI call identity contract during legacy execution. Its
   semantic index is execution-attempt scoped, so changing engines mid-attempt
   could submit a different payload under an existing identity.
@@ -516,11 +540,35 @@ and adapter-local terminal replacement logic.
 
 ### Phase 8: complete conformance suite
 
+Status: foundation started; Phase 8 is not complete.
+
+The current foundation checkpoint freezes `StrictV1` versus
+`CompatibilityScaffold`, strict root-bound goal/validation/finalization
+authority, the profile-first reducer-owned initialization sequence, causal
+domain-event schema v2, the authority-fenced CAS/outbox runner contract, and a
+separate post-terminal delivery projection. The runner persists an effect
+intent before invocation, reconciles an indeterminate result against the same
+intent, persists the exact intent ID and safe request digest on the resolving
+observation envelope, and persists `CanonicalResultRecorded` before it can report
+`Finished`. These implementations are exercised against deterministic
+in-memory ports only.
+
+The checked-in `tiny_static_change` artifact is labeled
+`fixture_scope = "schema_foundation"`, and its expected events are labeled
+`trace_kind = "checkpoint_summary"`. It proves fixture loading, containment,
+hashing, schema, and tamper rejection only. It is not reduced as a canonical
+event stream, does not prove its result, and does not count as fixture 1 or as
+1/20 completion.
+
 Land all 20 checked-in fixture repositories, state/tool properties, Golden A-D,
 backend wire fixtures, secret scanning, and deterministic semantic-event hashes.
 Run repeated seeded CI and package-source compilation.
 
-No production routing is enabled until this phase passes.
+Still required are complete strict schema-v2 reducer traces and derived results
+for all 20 fixtures, property generation, real durable store and outbox
+contracts, control-plane authority integration, real provider/process/Git/
+GitHub adapter contracts and production wiring, backend wire fixtures, and
+callback delivery. No production routing is enabled until this phase passes.
 
 ### Phase 9: production migration
 
@@ -585,6 +633,7 @@ documented minimum supported checkpoint version.
 | Risk | Consequence | Mitigation / release gate |
 | --- | --- | --- |
 | Event/backend schema drift | Hosted `execution_event_invalid` at a new boundary | Backend contract fixtures and backend-first deployment; exact protocol/schema negotiation. |
+| Pre-freeze private wire is mistaken for supported persistence | Schema-v1 events or mode-less snapshots are silently assigned authority they never carried | Deliberate strict rejection; regenerate private fixtures; require an explicit one-way importer if any persisted private data must later be retained. |
 | Two engines create operational ambiguity | Wrong worker resumes a checkpoint | Immutable persisted engine version; worker capability negotiation; no fallback reinterpretation. |
 | Shadow translation is lossy | False confidence from divergence data | Shadow only states with complete fact translation; mark unsupported states explicitly; never dispatch shadow effects. |
 | Event volume or source evidence grows excessively | Storage/cost regression or source exposure | Safe summaries/hashes in events, content-addressed bounded artifacts, retention policy, size tests. |
@@ -595,6 +644,7 @@ documented minimum supported checkpoint version.
 | Model quality remains variable | Safe but frequent blocked missions | Measure semantic completion separately; improve content prompts only after protocol correctness; no lifecycle relaxation. |
 | Publication retries duplicate side effects | Duplicate branches/PRs | Persist intent and observed IDs; reconcile Git/GitHub before retry; force-with-lease. |
 | Lease/cancellation races emit stale results | Authority violation | Check lease/cancellation before and after every effect; lease loss suppresses writes; terminal CAS. |
+| In-memory runner/delivery tests are mistaken for operational durability | Restart may repeat an effect or lose terminal acknowledgement | Production durable event/outbox CAS, atomic authority reads, reconciliation adapters, callback transport, and crash-window tests are Phase 8/9 gates. |
 | Legacy removal breaks old recovery | Lost resumability | Versioned replay corpus, retention window, explicit archive/migration tool, delayed deletion. |
 | Temporary parallel code increases maintenance cost | Slower delivery and inconsistent fixes | Phase deadlines, v1-only feature rule after canary, tracked removal metrics, no bidirectional sync. |
 | Conformance passes while real adapters differ | Production-only failures | Real serialized provider/process/Git/backend contract layers in addition to pure simulation. |

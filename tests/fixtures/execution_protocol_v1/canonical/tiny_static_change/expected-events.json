@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "trace_kind": "checkpoint_summary",
+  "events": [
+    {
+      "sequence": 1,
+      "family": "profile",
+      "event_type": "repository_profile_recorded",
+      "semantic_key": "tiny_static_change:profile",
+      "semantic_fields": {
+        "ecosystem": "unknown",
+        "generated_path_count": 0
+      },
+      "semantic_hash": "41a73e6d02ff406ce59e9960ce9c7dbbb39a6ef9fb3697e46c89d085c85fc0de"
+    },
+    {
+      "sequence": 2,
+      "family": "discovery",
+      "event_type": "search_completed",
+      "semantic_key": "tiny_static_change:search",
+      "semantic_fields": {
+        "match_count": 1,
+        "query": "status old"
+      },
+      "semantic_hash": "8709c8870a25edb08ce1f806e3b29f5e60be35f525af25600d613a192a6c2d21"
+    },
+    {
+      "sequence": 3,
+      "family": "discovery",
+      "event_type": "candidates_recorded",
+      "semantic_key": "tiny_static_change:candidates",
+      "semantic_fields": {
+        "candidate_count": 1,
+        "path": "index.txt"
+      },
+      "semantic_hash": "083abd517f37dace432d4e483f8f0087810c3f62bd7f5387e6480f66f6c9a769"
+    },
+    {
+      "sequence": 4,
+      "family": "evidence",
+      "event_type": "file_evidence_recorded",
+      "semantic_key": "tiny_static_change:file_evidence",
+      "semantic_fields": {
+        "path": "index.txt",
+        "range": "1:1"
+      },
+      "semantic_hash": "4e770b1e912e963596ef6a894e9e1246ca0126f80431ca988b2f1c984e71b90f"
+    },
+    {
+      "sequence": 5,
+      "family": "discovery",
+      "event_type": "impact_map_accepted",
+      "semantic_key": "tiny_static_change:impact_map",
+      "semantic_fields": {
+        "criterion_count": 1,
+        "path": "index.txt"
+      },
+      "semantic_hash": "b3f670fd12dcaec15f01ba947b2aa7ea2c30cc78b5f216da25f40b089bc9530d"
+    },
+    {
+      "sequence": 6,
+      "family": "planning",
+      "event_type": "plan_accepted",
+      "semantic_key": "tiny_static_change:plan",
+      "semantic_fields": {
+        "operation": "modify_existing",
+        "target_count": 1
+      },
+      "semantic_hash": "e0f3e8a67f55650248bf973ad1e4b5cf2a313b952343d27eea4305e92b4f9bcf"
+    },
+    {
+      "sequence": 7,
+      "family": "implementation",
+      "event_type": "target_context_prepared",
+      "semantic_key": "tiny_static_change:context",
+      "semantic_fields": {
+        "complete_content": true,
+        "path": "index.txt"
+      },
+      "semantic_hash": "76b66ab10799639f30866b69d6930aca22910aee2b7d952aec9d904ffe1ccbe3"
+    },
+    {
+      "sequence": 8,
+      "family": "budget",
+      "event_type": "model_call_reserved",
+      "semantic_key": "tiny_static_change:mutation_reservation",
+      "semantic_fields": {
+        "action_class": "mutation",
+        "reservation_count": 1
+      },
+      "semantic_hash": "2140a2adc4fedece36fab8e8e25730822a6c903c40f53da0bcdd7f8d0b1e9ab0"
+    },
+    {
+      "sequence": 9,
+      "family": "mutation",
+      "event_type": "candidate_recorded",
+      "semantic_key": "tiny_static_change:candidate",
+      "semantic_fields": {
+        "operation": "modify_existing",
+        "path": "index.txt"
+      },
+      "semantic_hash": "50ddb6405855200f9694b359b420cc335fa3456d2d4d550972bb9a4970ae77ad"
+    },
+    {
+      "sequence": 10,
+      "family": "mutation",
+      "event_type": "application_observed",
+      "semantic_key": "tiny_static_change:application",
+      "semantic_fields": {
+        "path": "index.txt",
+        "status": "applied"
+      },
+      "semantic_hash": "4bea38eaa1acc401ea6fddb0092e6783c2366ca99a48b56759bde8c1e8848fee"
+    },
+    {
+      "sequence": 11,
+      "family": "mutation",
+      "event_type": "mutation_verified",
+      "semantic_key": "tiny_static_change:verified",
+      "semantic_fields": {
+        "path": "index.txt",
+        "status": "verified"
+      },
+      "semantic_hash": "a77c00ae428839431fe82d333c286259d82355c0aeed33f1b472d577c517351e"
+    },
+    {
+      "sequence": 12,
+      "family": "graph",
+      "event_type": "implementation_barrier_satisfied",
+      "semantic_key": "tiny_static_change:barrier",
+      "semantic_fields": {
+        "implementation_node_count": 1
+      },
+      "semantic_hash": "17e96d198090b47519f010d60e2d5b528cbf4fa9c5ca37dce01a1832004fadc9"
+    },
+    {
+      "sequence": 13,
+      "family": "validation",
+      "event_type": "validation_evidence_recorded",
+      "semantic_key": "tiny_static_change:focused_validation",
+      "semantic_fields": {
+        "gate": "focused",
+        "status": "passed"
+      },
+      "semantic_hash": "ab7876566a272f89f408cad2daa093f9daea0aca4eb42b9574ad166e649d3cbb"
+    },
+    {
+      "sequence": 14,
+      "family": "review",
+      "event_type": "diff_review_recorded",
+      "semantic_key": "tiny_static_change:review",
+      "semantic_fields": {
+        "blocking_finding_count": 0,
+        "path_count": 1
+      },
+      "semantic_hash": "7fb6d716be230d20a7eed60ee5a8a0c3c15e9e087551b3e55b91e7f77ba5200a"
+    },
+    {
+      "sequence": 15,
+      "family": "review",
+      "event_type": "completion_evaluation_recorded",
+      "semantic_key": "tiny_static_change:completion",
+      "semantic_fields": {
+        "criterion_count": 1,
+        "status": "complete"
+      },
+      "semantic_hash": "499db56a3defcb9584cec9d17d7af1fb6a63d00fc8bb485d62452583ee83e70e"
+    },
+    {
+      "sequence": 16,
+      "family": "review",
+      "event_type": "publication_eligibility_evaluated",
+      "semantic_key": "tiny_static_change:eligibility",
+      "semantic_fields": {
+        "decision": "granted",
+        "predicate_count": 12
+      },
+      "semantic_hash": "620744fcdf98f8092f67c05b717708d1831c6794e7b54f5a5df4135813d8a2f4"
+    },
+    {
+      "sequence": 17,
+      "family": "publication",
+      "event_type": "commit_observed",
+      "semantic_key": "tiny_static_change:commit",
+      "semantic_fields": {
+        "status": "created"
+      },
+      "semantic_hash": "5174c4029325b36e8af2d903eb76e8e47dc650b21faa47d298625450bf1154ee"
+    },
+    {
+      "sequence": 18,
+      "family": "publication",
+      "event_type": "push_observed",
+      "semantic_key": "tiny_static_change:push",
+      "semantic_fields": {
+        "status": "pushed"
+      },
+      "semantic_hash": "96cb0f2a160ec43ac01a75af9e81ba51d53c3685d4d64ce17a773ac5668c92b9"
+    },
+    {
+      "sequence": 19,
+      "family": "publication",
+      "event_type": "pull_request_observed",
+      "semantic_key": "tiny_static_change:pull_request",
+      "semantic_fields": {
+        "draft": false,
+        "status": "created"
+      },
+      "semantic_hash": "c474ad7b99a23ef9ddc45331de7dad30c884f59831a35f6565ae18adea1a899e"
+    },
+    {
+      "sequence": 20,
+      "family": "terminal",
+      "event_type": "canonical_result_recorded",
+      "semantic_key": "tiny_static_change:terminal",
+      "semantic_fields": {
+        "outcome": "succeeded",
+        "reason_code": "publication_succeeded"
+      },
+      "semantic_hash": "65610b796b2c075b751e8086d2a7f553f28ece161497e31c5a7e4745176fd646"
+    }
+  ],
+  "semantic_hash": "16cdea2b624f2efdf32d5d47bdd0ce02f15ca93919e08bb3bb0d3d1f70052be6"
+}

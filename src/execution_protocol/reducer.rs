@@ -81,6 +81,60 @@ pub(crate) fn decide(state: &ExecutionState) -> Result<ProtocolDecision, Protoco
     })
 }
 
+/// Production runner entry point. Compatibility-scaffold aggregates remain
+/// available to the side-by-side fixture suite but cannot drive real effects.
+pub(crate) fn decide_strict_v1(
+    state: &ExecutionState,
+) -> Result<ProtocolDecision, ProtocolViolation> {
+    state.validate_strict_bootstrap_contract()?;
+    validate_state(state)?;
+    if state.stage() == ProtocolStage::Profiling {
+        let Some(profile) = state.repository_profile.as_ref() else {
+            return decide(state);
+        };
+        let requested_goal = state.requested_discovery_goal.as_ref().ok_or(
+            ProtocolViolation::DiscoveryContract {
+                code: "strict_v1_discovery_goal_missing",
+            },
+        )?;
+        if state.discovery.is_none() {
+            return Ok(ProtocolDecision::Emit {
+                event: DiscoveryEvent::GoalRecorded {
+                    goal: requested_goal.clone(),
+                }
+                .into(),
+            });
+        }
+        let profile_proof = strict_repository_profile_proof(profile);
+        match state.proofs.get(&profile_proof.id) {
+            None => {
+                return Ok(ProtocolDecision::Emit {
+                    event: EvidenceEvent::ProofRecorded {
+                        proof: profile_proof,
+                    }
+                    .into(),
+                });
+            }
+            Some(recorded) if recorded != &profile_proof => {
+                return Err(ProtocolViolation::InvalidProof {
+                    proof_id: profile_proof.id,
+                    code: "strict_v1_repository_profile_proof_mismatch",
+                });
+            }
+            Some(_) => {}
+        }
+        return Ok(ProtocolDecision::Emit {
+            event: LifecycleEvent::PositionAdvanced {
+                from: ProtocolStage::Profiling,
+                to: ProtocolStage::Discovery,
+                proof_id: profile_proof.id,
+            }
+            .into(),
+        });
+    }
+    decide(state)
+}
+
 fn decide_phase7_review(state: &ExecutionState) -> Result<ProtocolDecision, ProtocolViolation> {
     let review = state
         .review
@@ -2670,6 +2724,27 @@ pub(crate) fn repository_profile_proof_hash(profile_id: &RepositoryProfileId) ->
     ])
 }
 
+fn strict_repository_profile_proof(profile: &RepositoryProfile) -> ProofRecord {
+    let detail_hash = repository_profile_proof_hash(&profile.profile_id);
+    ProofRecord {
+        id: ProofId::new(format!(
+            "proof:epv1:{}",
+            stable_sha256(&[
+                "execution-protocol-v1:strict-repository-profile-proof",
+                profile.profile_id.as_str(),
+                profile.repository_revision.as_str(),
+                &detail_hash,
+            ])
+        )),
+        kind: ProofKind::RepositoryProfile,
+        repository_revision: profile.repository_revision.clone(),
+        node_ids: Vec::new(),
+        related_proof_ids: Vec::new(),
+        related_evidence_ids: Vec::new(),
+        detail_hash,
+    }
+}
+
 pub(crate) fn discovery_impact_map_proof_hash(evidence_id: &EvidenceId) -> String {
     stable_sha256(&[
         "execution-protocol-v1:discovery-impact-map-proof",
@@ -3017,6 +3092,14 @@ pub(crate) fn reduce(
     Ok(next)
 }
 
+pub(crate) fn reduce_strict_v1(
+    state: &ExecutionState,
+    event: ProtocolEventEnvelope,
+) -> Result<ExecutionState, ProtocolViolation> {
+    state.validate_strict_bootstrap_contract()?;
+    reduce(state, event)
+}
+
 pub(crate) fn validate_state(state: &ExecutionState) -> Result<(), ProtocolViolation> {
     state.require_trusted_bootstrap()?;
     state.validate_invariants()?;
@@ -3252,6 +3335,7 @@ impl ExecutionState {
                 field: "execution_attempt",
             });
         }
+        event.validate_context_against(self)?;
         if event.repository_revision != self.repository_revision {
             return Err(ProtocolViolation::EnvelopeMismatch {
                 field: "repository_revision",
@@ -5184,6 +5268,13 @@ impl ExecutionState {
         if self.discovery.is_some() {
             return Err(ProtocolViolation::DiscoveryContract {
                 code: "discovery_goal_already_recorded",
+            });
+        }
+        if self.protocol_mode == ExecutionProtocolModeV1::StrictV1
+            && self.requested_discovery_goal.as_ref() != Some(&goal)
+        {
+            return Err(ProtocolViolation::DiscoveryContract {
+                code: "strict_v1_discovery_goal_mismatch",
             });
         }
         let discovery = DiscoveryState::new(
@@ -8795,6 +8886,14 @@ impl ExecutionState {
         match proof.kind {
             ProofKind::RepositoryProfile => {
                 self.require_stage_for_proof(proof, ProtocolStage::Profiling)?;
+                if self.protocol_mode == ExecutionProtocolModeV1::StrictV1
+                    && self.repository_profile.is_none()
+                {
+                    return Err(ProtocolViolation::InvalidProof {
+                        proof_id: proof.id.clone(),
+                        code: "strict_v1_repository_profile_proof_requires_profile",
+                    });
+                }
                 if let Some(profile) = &self.repository_profile
                     && (proof.detail_hash != repository_profile_proof_hash(&profile.profile_id)
                         || !proof.node_ids.is_empty()
@@ -8803,6 +8902,17 @@ impl ExecutionState {
                     return Err(ProtocolViolation::InvalidProof {
                         proof_id: proof.id.clone(),
                         code: "repository_profile_proof_binding_mismatch",
+                    });
+                }
+                if self.protocol_mode == ExecutionProtocolModeV1::StrictV1
+                    && self
+                        .repository_profile
+                        .as_ref()
+                        .is_some_and(|profile| proof != &strict_repository_profile_proof(profile))
+                {
+                    return Err(ProtocolViolation::InvalidProof {
+                        proof_id: proof.id.clone(),
+                        code: "strict_v1_repository_profile_proof_mismatch",
                     });
                 }
             }
@@ -12142,6 +12252,9 @@ impl ExecutionState {
                 found: self.protocol_version,
             });
         }
+        if self.protocol_mode == ExecutionProtocolModeV1::StrictV1 {
+            self.validate_strict_bootstrap_contract()?;
+        }
         if self.execution_id.is_empty() {
             return Err(ProtocolViolation::InvalidIdentity {
                 field: "execution_id",
@@ -12904,6 +13017,20 @@ impl ExecutionState {
             }
             return Ok(());
         }
+        if self.stage() == ProtocolStage::Terminal && self.review.is_none() {
+            if self.publication.is_some()
+                || !review_events.is_empty()
+                || !publication_events.is_empty()
+            {
+                return Err(ProtocolViolation::ReviewContract {
+                    code: "phase7_state_without_review",
+                });
+            }
+            // Discovery, planning, implementation, validation, and repair may
+            // terminate before Review exists. Their exact source-stage result
+            // authority is replayed and checked by terminal invariants.
+            return Ok(());
+        }
         let plan = self
             .planning
             .as_ref()
@@ -13077,6 +13204,8 @@ impl ExecutionState {
         }
         let mut recorded_proofs = BTreeMap::new();
         let mut recorded_model_calls = BTreeMap::new();
+        let mut recorded_event_ids = BTreeSet::new();
+        let mut correlation_id = None;
         let mut derived_repository_revision = self.initial_repository_revision.clone();
         for (index, stored) in self.event_log.iter().enumerate() {
             let expected_sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
@@ -13109,6 +13238,30 @@ impl ExecutionState {
                     ),
                 });
             }
+            if (index == 0) != stored.envelope.causation_id.is_none()
+                || stored
+                    .envelope
+                    .causation_id
+                    .as_ref()
+                    .is_some_and(|cause| !recorded_event_ids.contains(cause))
+                || correlation_id
+                    .as_ref()
+                    .is_some_and(|expected| expected != &stored.envelope.correlation_id)
+                || stored
+                    .envelope
+                    .node_id
+                    .as_ref()
+                    .is_some_and(|node_id| !self.nodes.contains_key(node_id))
+            {
+                return Err(ProtocolViolation::Invariant {
+                    code: "stored_event_context_invalid",
+                    detail: format!(
+                        "event `{}` has invalid causation, correlation, or node ownership",
+                        stored.envelope.event_id
+                    ),
+                });
+            }
+            correlation_id.get_or_insert_with(|| stored.envelope.correlation_id.clone());
             let hash = stored.envelope.canonical_hash()?;
             if stored.payload_hash != hash
                 || self.event_payload_hashes.get(&stored.envelope.event_id) != Some(&hash)
@@ -13221,6 +13374,7 @@ impl ExecutionState {
                 }
                 _ => {}
             }
+            recorded_event_ids.insert(stored.envelope.event_id.clone());
             derived_repository_revision = repository_revision_after_event(
                 &stored.envelope.payload,
                 &derived_repository_revision,

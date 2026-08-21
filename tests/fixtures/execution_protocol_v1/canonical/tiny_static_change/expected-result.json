@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "outcome": "succeeded",
+  "process_health": "healthy",
+  "reason_code": "publication_succeeded",
+  "remaining_work": [],
+  "semantic_fields": {
+    "publication_mode": "normal",
+    "published": true
+  },
+  "semantic_hash": "21792f9135f0aa66e6a888f4277aade629b62d27b34c100f89f95559d94cfa77"
+}

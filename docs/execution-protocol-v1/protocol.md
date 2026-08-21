@@ -22,6 +22,67 @@ an expected aggregate revision, applies the event to a clone, validates all
 invariants, and commits the new snapshot atomically. Direct phase or node
 mutation is not part of the API.
 
+## Root modes and strict initialization
+
+The aggregate root records one explicit mode:
+
+```rust
+enum ExecutionProtocolModeV1 {
+    CompatibilityScaffold,
+    StrictV1,
+}
+```
+
+`CompatibilityScaffold` preserves pre-freeze private tests while their
+builders are migrated. It is not eligible for strict decisions, reductions,
+the transaction runner, or external effects. `StrictV1` is the only
+production-eligible shape. Its revision-zero root binds the requested
+`DiscoveryGoal`, the validation policy, and the finalization/publication
+policy in addition to execution identity, initial repository revision, graph
+budgets, and mission budgets. Missing policies, invalid policy authority, or a
+publication base revision different from the initial repository revision are
+bootstrap errors rather than facts an adapter may repair later.
+
+Repository profiling remains a separately trusted, deterministic adapter
+precondition in this foundation slice. Initialization then proceeds through
+normal event authority:
+
+1. an authority-fenced, revision-zero compare-and-swap records the exact
+   `RepositoryProfileRecorded` event after checking its revision and validation
+   policy binding;
+2. strict `decide` emits `GoalRecorded` for exactly the root's requested goal;
+3. strict `decide` derives and emits the repository-profile proof; and
+4. the reducer-owned proof authorizes `Profiling -> Discovery`.
+
+The adapter cannot inject a different goal, synthesize the proof, or advance
+the position. A pristine strict aggregate without a profile reports the typed
+profile-initialization precondition and performs no ordinary protocol effect.
+
+## Authority-fenced transaction runner
+
+The private runner contract atomically loads the aggregate event stream, the
+execution-attempt authority fence, and any unresolved effect intent. The fence
+binds the execution and attempt plus lease epoch/status and cancellation
+revision/status. Every event, intent, and effect-observation write is an
+expected-revision compare-and-swap carrying that same authority. Confirmed
+lease loss suppresses writes; cancellation remains fail closed until an
+explicit reducer-owned cancellation transition exists.
+
+For `Perform`, the runner persists a request identity and its trigger,
+aggregate revision, repository revision, and authority fence before invoking
+the adapter. A definitive observation may resolve the intent and append its
+validated reducer event atomically. An indeterminate observation leaves the
+same intent unresolved and requires reconciliation; it cannot allocate or
+dispatch a replacement request. Persisted intent identity contains bounded
+hashes and typed request metadata, not raw provider bodies or credentials.
+
+For `Finish`, the runner does not report completion directly. It first uses an
+authority-fenced CAS to append `CanonicalResultRecorded`. Only after a reload
+finds that exact terminal result committed may the runner return `Finished`.
+The interfaces and deterministic in-memory tests establish this ordering; a
+real durable store, control-plane authority source, effect adapters, and
+production route remain deferred.
+
 ## Protocol position
 
 ```rust
@@ -406,9 +467,54 @@ attempt ID or reason variant alone cannot authorize publication terminal state.
 | Allowed actions | Idempotent result reporting and cleanup that cannot change the canonical outcome. |
 | Forbidden actions | Model/repository/validation/publication work; replacing an existing canonical result; mapping callback failure to mission failure. |
 | Exit | None. A continuation creates a new execution attempt/epoch through an explicit resume event. |
-| Failure | Callback/journal transport after canonical persistence is outside this private checkpoint and must never replace the canonical result. Hosted lease loss must suppress stale writes rather than being modeled as review/publication convergence. |
+| Failure | Callback/journal transport after canonical persistence is represented only in the separate delivery projection and must never replace the canonical result. Hosted lease loss suppresses stale writes rather than becoming review/publication convergence. |
 | Idempotency | Canonical result identity hashes execution attempt and domain proof. Same result replay is a no-op; different result is rejected. |
 | Persistence | Canonical result is persisted before callbacks. Callback attempt/acknowledgement is a separate transport record. |
+
+### Post-terminal delivery projection
+
+Callback delivery is not a domain event in `ExecutionState`. A distinct,
+strictly serialized projection is created only from a replay-validated strict
+terminal aggregate supplied by the runner/store boundary and binds the
+execution attempt, terminal event ID and hash, canonical-result hash, callback
+payload hash, and idempotency key. The pure projection cannot independently
+prove physical durability; that remains an obligation of the deferred durable
+store implementation. It persists an attempt intent before send. Acknowledgement
+settles delivery; a definite failure may allocate only a bounded next attempt;
+an indeterminate result reconciles the same attempt before anything else. The
+reconciliation ceiling counts observations made by reconciliation after the
+initial send observation, so a ceiling of one authorizes exactly one reconcile
+call.
+
+Delivery acknowledgement, retry exhaustion, reconciliation exhaustion, and
+transport failure are operational states only. They cannot reduce the mission
+aggregate, rewrite the canonical outcome or process health, or manufacture a
+second terminal event. This private projection does not implement a callback
+transport, durable outbox store, or backend route.
+
+## Event-envelope authority
+
+Private domain-event envelope schema v2 makes causal context mandatory and
+identity-bearing. The first stored event is the aggregate's single causal
+root and has `causation_id = null`. Every subsequent event names an event ID
+already present in that aggregate. `correlation_id` is non-empty and constant
+for the execution attempt. `node_id` is exactly the owner derived from the
+payload and current aggregate, including explicit `null` for aggregate-level
+events; an unknown or mismatched owner is rejected. Causation, correlation,
+and node ownership participate in semantic event identity and replay checks.
+
+Effect-result events also carry an optional typed observation binding containing
+the exact durable effect-intent ID and safe canonical request digest. The
+binding, causation, execution attempt, aggregate/repository revisions, and
+payload are checked by the atomic outbox commit and retained in event identity;
+ordinary reducer events carry explicit `null`. No display or semantic-key
+parsing supplies this authority.
+
+The pre-freeze private schema-v1 envelope omitted this authority, and the
+pre-freeze snapshot omitted the required protocol mode. Both old wire shapes
+are deliberately rejected. There is no serde default, inferred context, or
+silent migration on strict restore; affected private fixtures must be
+regenerated or passed through a separately reviewed explicit importer.
 
 ## Canonical outcomes
 

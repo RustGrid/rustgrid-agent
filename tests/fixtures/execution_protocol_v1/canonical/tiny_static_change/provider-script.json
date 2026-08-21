@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "steps": [
+    {
+      "ordinal": 0,
+      "action_class": "discovery",
+      "tool_name": "search_repository",
+      "response": {
+        "candidate_paths": ["index.txt"],
+        "query": "status old"
+      }
+    },
+    {
+      "ordinal": 1,
+      "action_class": "planning",
+      "tool_name": "record_plan",
+      "response": {
+        "operation": "modify_existing",
+        "path": "index.txt"
+      }
+    },
+    {
+      "ordinal": 2,
+      "action_class": "mutation",
+      "tool_name": "apply_patch",
+      "response": {
+        "replacement": "status=ready\n",
+        "target": "index.txt"
+      }
+    },
+    {
+      "ordinal": 3,
+      "action_class": "review",
+      "tool_name": "record_diff_review",
+      "response": {
+        "findings": [],
+        "status": "complete"
+      }
+    },
+    {
+      "ordinal": 4,
+      "action_class": "completion",
+      "tool_name": "record_completion_evaluation",
+      "response": {
+        "criteria_complete": true,
+        "status": "complete"
+      }
+    }
+  ],
+  "semantic_hash": "f71366caf67f84d8f1ee030ebdf5a9be330059c7da3fff5f489b6407c12788ab"
+}

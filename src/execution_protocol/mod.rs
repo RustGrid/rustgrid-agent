@@ -9,6 +9,8 @@
 mod discovery;
 mod error;
 mod event;
+#[cfg(test)]
+mod fixtures;
 mod identity;
 mod implementation;
 mod model;
@@ -18,7 +20,9 @@ mod profile;
 mod publication;
 mod reducer;
 mod review;
+mod runner;
 mod store;
+mod terminal_delivery;
 mod validation;
 mod validation_process;
 
@@ -34,11 +38,16 @@ pub(crate) use profile::*;
 pub(crate) use publication::*;
 #[allow(unused_imports)]
 pub(crate) use reducer::{
-    build_prepared_discovery_action, build_prepared_planning_action, decide, reduce, validate_state,
+    build_prepared_discovery_action, build_prepared_planning_action, decide, decide_strict_v1,
+    reduce, reduce_strict_v1, validate_state,
 };
 pub(crate) use review::*;
 #[allow(unused_imports)]
+pub(crate) use runner::*;
+#[allow(unused_imports)]
 pub(crate) use store::InMemoryEventStore;
+#[allow(unused_imports)]
+pub(crate) use terminal_delivery::*;
 pub(crate) use validation::*;
 #[allow(unused_imports)]
 pub(crate) use validation_process::*;

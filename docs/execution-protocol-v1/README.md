@@ -1,8 +1,10 @@
 # Execution Protocol v1 architecture package
 
 Status: architecture proposed; Phase 1 through the private Phase 7 review,
-publication, and terminal-mapping checkpoint are implemented side by side and
-kept private from production routing. Positive no-op authority and every real
+publication, and terminal-mapping checkpoint plus the post-Phase-7 foundation
+freeze are implemented side by side and kept private from production routing.
+The first Phase 8 artifact is only a schema-foundation fixture, not a complete
+reducer trace or conformance fixture. Positive no-op authority and every real
 hosted/publication side-effect boundary remain deliberately deferred.
 
 Execution Protocol v1 redesigns RustGrid Agent as a deterministic workflow
@@ -202,15 +204,57 @@ alone is not publication terminal ancestry. Confirmed normal publication maps
 to `Succeeded`; confirmed draft publication with only the signed external-
 review criteria remaining maps to `PartialReviewable`.
 
+The foundation freeze separates `CompatibilityScaffold` from `StrictV1`.
+Compatibility mode exists only so the pre-freeze private fixture suite can be
+retained while it is migrated. Strict decision, reduction, and runner entry
+points accept only a strict aggregate root, which binds the requested
+`DiscoveryGoal`, validation policy, and finalization/publication policy at
+revision zero. After a separately trusted profile has been acquired, strict
+initialization uses an authority-fenced CAS to append
+`RepositoryProfileRecorded`; the reducer then records the exact requested
+goal, derives and records the profile proof, and alone advances `Profiling` to
+`Discovery`.
+
+Stored domain events now use private event-envelope schema v2. Exactly the
+first event is a root with no cause; every later event names an existing prior
+event as its cause. One correlation ID is stable for the execution attempt,
+and each payload carries exactly its reducer-derived node owner or no owner.
+These fields participate in semantic identity. Pre-freeze private event schema
+v1 and snapshots without the required protocol mode are rejected deliberately;
+there is no defaulting or silent in-place migration.
+
+The private transaction-runner boundary loads the event stream, attempt
+authority, and unresolved effect intent together. It requires an
+authority-fenced compare-and-swap for every write, persists an exact effect
+intent before dispatch, and reconciles an indeterminate observation against
+that same intent before another effect is possible. The committed observation
+envelope retains a typed effect-intent ID and canonical safe request digest;
+the atomic outbox commit verifies those coordinates, and replay never recovers
+them by parsing a semantic key. A reducer `Finish`
+decision first persists `CanonicalResultRecorded`; only a later step may
+return `Finished`. Post-terminal callback delivery is a separate replayable
+projection bound to the exact terminal event and canonical-result hashes. Its
+delivery status, retries, or failure cannot mutate mission truth.
+
+The checked-in `tiny_static_change` artifact begins Phase 8 only as
+`fixture_scope = "schema_foundation"` with
+`trace_kind = "checkpoint_summary"`. Its loader proves bounded paths, hashes,
+strict schema, and tamper rejection. The summary is not reduced as a canonical
+event trace, does not prove the stated terminal result, and does not count as
+completion of fixture 1 or of the 20-fixture matrix.
+
 The Phase 5 through Phase 7 implementations remain internal protocol slices.
 They do not route hosted, backend, CLI, or existing provider traffic; emit
 backend events; replace production behavior; or perform a live commit, push,
 or pull request. The real diff and mutation artifact-store resolution ports,
 hosted Git/GitHub adapters, control-plane lease/cancellation authority,
-callback/outbox delivery, production routing, live publication, durable Phase
-4 loader-failure convergence, and positive no-op proof remain deferred. The
-validation subprocess adapter is real and locally contract-tested, but is not
-connected to production routing.
+durable event/outbox/CAS store, callback transport and persistence adapter,
+production routing, live publication, durable Phase 4 loader-failure
+convergence, and positive no-op proof remain deferred. The private runner and
+terminal-delivery implementations establish in-memory contracts around
+injected ports; they do not supply those production systems. The validation
+subprocess adapter is real and locally contract-tested, but is not connected
+to production routing.
 
 These private slices are exercised only by checked-in protocol fixtures and
 conformance tests. The module is compiled but is not called by hosted or local

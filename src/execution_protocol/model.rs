@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ActionEnvelope, ActionId, ContextManifest, DiscoveryState, EffectId, EventId, EvidenceId,
-    ExecutionId, FailureRevisionId, FinalizationPolicyV1, ImplementationState, ModelCallId,
-    MutationLedger, NodeId, PlanGraphBudgetContract, PlanningState, PreparedPlanningAction,
-    ProofId, PublicationStateV1, RepositoryProfile, RepositoryRevisionId, ReviewStateV1,
-    ValidationPolicyV1, ValidationState,
+    ActionEnvelope, ActionId, ContextManifest, DiscoveryGoal, DiscoveryState, EffectId, EventId,
+    EvidenceId, ExecutionId, FailureRevisionId, FinalizationPolicyV1, ImplementationState,
+    ModelCallId, MutationLedger, NodeId, PlanGraphBudgetContract, PlanningState,
+    PreparedPlanningAction, ProofId, ProtocolViolation, PublicationStateV1, RepositoryProfile,
+    RepositoryRevisionId, ReviewStateV1, ValidationPolicyV1, ValidationState,
 };
 
 pub(crate) const EXECUTION_PROTOCOL_VERSION: u16 = 1;
@@ -556,6 +556,16 @@ pub(crate) struct StoredProtocolEvent {
     pub(crate) payload_hash: String,
 }
 
+/// Selects whether the aggregate is a compatibility scaffold used by the
+/// side-by-side conformance work or a fully policy-bound Protocol v1 attempt.
+/// Production runners must accept only `StrictV1`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionProtocolModeV1 {
+    CompatibilityScaffold,
+    StrictV1,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionState {
@@ -565,6 +575,7 @@ pub(crate) struct ExecutionState {
     #[serde(skip)]
     pub(super) trusted_bootstrap: bool,
     pub(crate) protocol_version: u16,
+    pub(crate) protocol_mode: ExecutionProtocolModeV1,
     pub(crate) aggregate_revision: u64,
     pub(crate) execution_id: ExecutionId,
     pub(crate) execution_attempt: u32,
@@ -574,6 +585,9 @@ pub(crate) struct ExecutionState {
     pub(crate) latest_transition_proof: Option<ProofId>,
     pub(crate) mission_budget: MissionBudgetContract,
     pub(crate) plan_graph_budget: PlanGraphBudgetContract,
+    /// Exact trusted mission/search authority. Compatibility scaffolds retain
+    /// `None`; strict execution requires and revalidates `Some`.
+    pub(crate) requested_discovery_goal: Option<DiscoveryGoal>,
     pub(crate) validation_policy: Option<ValidationPolicyV1>,
     pub(crate) finalization_policy: Option<FinalizationPolicyV1>,
     pub(crate) nodes: BTreeMap<NodeId, ExecutionNode>,
@@ -637,6 +651,80 @@ impl ExecutionState {
         validation_policy: Option<ValidationPolicyV1>,
         finalization_policy: Option<FinalizationPolicyV1>,
     ) -> Self {
+        Self::bootstrap_with_mode(
+            execution_id,
+            execution_attempt,
+            repository_revision,
+            mission_budget,
+            discovery_budget,
+            planning_budget,
+            plan_graph_budget,
+            None,
+            validation_policy,
+            finalization_policy,
+            ExecutionProtocolModeV1::CompatibilityScaffold,
+        )
+    }
+
+    /// Creates a production-eligible Protocol v1 aggregate.
+    ///
+    /// Unlike the compatibility constructors, this rejects missing or
+    /// structurally invalid validation/finalization authority at revision zero.
+    /// Repository-specific validation-policy membership is revalidated after
+    /// the canonical repository profile is recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bootstrap_strict_v1(
+        execution_id: ExecutionId,
+        execution_attempt: u32,
+        repository_revision: RepositoryRevisionId,
+        mission_budget: MissionBudgetContract,
+        discovery_budget: NodeBudgetContract,
+        planning_budget: NodeBudgetContract,
+        plan_graph_budget: PlanGraphBudgetContract,
+        requested_discovery_goal: DiscoveryGoal,
+        validation_policy: ValidationPolicyV1,
+        finalization_policy: FinalizationPolicyV1,
+    ) -> Result<Self, ProtocolViolation> {
+        requested_discovery_goal.validate()?;
+        validation_policy.validate_structure()?;
+        finalization_policy.validate()?;
+        if finalization_policy.publication.base_repository_revision != repository_revision {
+            return Err(ProtocolViolation::ReviewContract {
+                code: "strict_v1_publication_base_revision_mismatch",
+            });
+        }
+        let state = Self::bootstrap_with_mode(
+            execution_id,
+            execution_attempt,
+            repository_revision,
+            mission_budget,
+            discovery_budget,
+            planning_budget,
+            plan_graph_budget,
+            Some(requested_discovery_goal),
+            Some(validation_policy),
+            Some(finalization_policy),
+            ExecutionProtocolModeV1::StrictV1,
+        );
+        state.validate_strict_bootstrap_contract()?;
+        state.validate_invariants()?;
+        Ok(state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bootstrap_with_mode(
+        execution_id: ExecutionId,
+        execution_attempt: u32,
+        repository_revision: RepositoryRevisionId,
+        mission_budget: MissionBudgetContract,
+        discovery_budget: NodeBudgetContract,
+        planning_budget: NodeBudgetContract,
+        plan_graph_budget: PlanGraphBudgetContract,
+        requested_discovery_goal: Option<DiscoveryGoal>,
+        validation_policy: Option<ValidationPolicyV1>,
+        finalization_policy: Option<FinalizationPolicyV1>,
+        protocol_mode: ExecutionProtocolModeV1,
+    ) -> Self {
         let discovery_id = NodeId::new("protocol-v1:discovery");
         let planning_id = NodeId::new("protocol-v1:planning");
         let bootstrap_nodes = [
@@ -663,6 +751,7 @@ impl ExecutionState {
         Self {
             trusted_bootstrap: true,
             protocol_version: EXECUTION_PROTOCOL_VERSION,
+            protocol_mode,
             aggregate_revision: 0,
             execution_id,
             execution_attempt,
@@ -672,6 +761,7 @@ impl ExecutionState {
             latest_transition_proof: None,
             mission_budget,
             plan_graph_budget,
+            requested_discovery_goal,
             validation_policy,
             finalization_policy,
             nodes,
@@ -692,6 +782,57 @@ impl ExecutionState {
             event_log: Vec::new(),
             event_payload_hashes: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn validate_strict_bootstrap_contract(&self) -> Result<(), ProtocolViolation> {
+        if self.protocol_mode != ExecutionProtocolModeV1::StrictV1 {
+            return Err(ProtocolViolation::Invariant {
+                code: "strict_v1_bootstrap_required",
+                detail: "production execution requires strict Protocol v1 bootstrap authority"
+                    .into(),
+            });
+        }
+        let requested_goal =
+            self.requested_discovery_goal
+                .as_ref()
+                .ok_or(ProtocolViolation::DiscoveryContract {
+                    code: "strict_v1_discovery_goal_missing",
+                })?;
+        requested_goal.validate()?;
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| &discovery.goal != requested_goal)
+        {
+            return Err(ProtocolViolation::DiscoveryContract {
+                code: "strict_v1_discovery_goal_mismatch",
+            });
+        }
+        let validation_policy =
+            self.validation_policy
+                .as_ref()
+                .ok_or(ProtocolViolation::ValidationContract {
+                    code: "strict_v1_validation_policy_missing",
+                })?;
+        validation_policy.validate_structure()?;
+        if let Some(profile) = self.repository_profile.as_ref() {
+            validation_policy.validate(profile)?;
+        }
+        let finalization_policy =
+            self.finalization_policy
+                .as_ref()
+                .ok_or(ProtocolViolation::ReviewContract {
+                    code: "strict_v1_finalization_policy_missing",
+                })?;
+        finalization_policy.validate()?;
+        if finalization_policy.publication.base_repository_revision
+            != self.initial_repository_revision
+        {
+            return Err(ProtocolViolation::ReviewContract {
+                code: "strict_v1_publication_base_revision_mismatch",
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn stage(&self) -> ProtocolStage {

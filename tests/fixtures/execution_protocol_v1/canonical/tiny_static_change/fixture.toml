@@ -1,0 +1,16 @@
+schema_version = 1
+fixture_id = "tiny_static_change"
+fixture_scope = "schema_foundation"
+description = "A schema-foundation checkpoint summary for a generic one-line static text change."
+mission = "Change the status value in index.txt from old to ready."
+repository_path = "repository"
+expected_ecosystem = "unknown"
+expected_generated_path_count = 0
+max_model_calls = 5
+max_input_tokens_per_call = 8192
+max_output_tokens_per_call = 4096
+provider_script_path = "provider-script.json"
+expected_events_path = "expected-events.json"
+expected_result_path = "expected-result.json"
+repository_tree_hash = "c4120590b88f429a8192273aa5a0723c0b67c42247af4f524ea0df75b8d1e6da"
+semantic_hash = "0b6c4a07ba2d1996a4cdc974d3eb57896399d53c3576d32bed87d07778bfe89d"

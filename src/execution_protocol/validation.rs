@@ -202,9 +202,38 @@ impl ValidationPolicyV1 {
         &self,
         profile: &RepositoryProfile,
     ) -> Result<(), ValidationContractError> {
+        self.validate_structure()?;
+        if self.repository_profile_id != profile.profile_id
+            || self.authorizations.iter().any(|authorization| {
+                profile
+                    .validation_candidates
+                    .iter()
+                    .all(|candidate| candidate.candidate_id != authorization.candidate_id)
+            })
+            || self.required_broad_candidates.iter().any(|candidate_id| {
+                profile
+                    .validation_candidates
+                    .iter()
+                    .all(|candidate| &candidate.candidate_id != candidate_id)
+            })
+        {
+            return Err(ValidationContractError::Invalid {
+                code: "validation_policy_invalid",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the signed policy independently from repository materialization.
+    ///
+    /// A strict Protocol v1 bootstrap must reject a malformed policy before any
+    /// repository effect is allowed. Candidate/profile membership is checked
+    /// later by [`Self::validate`] once the exact repository profile has been
+    /// recorded.
+    pub(crate) fn validate_structure(&self) -> Result<(), ValidationContractError> {
         if self.schema_version != VALIDATION_SCHEMA_VERSION
             || self.signed_policy_evidence_id.is_empty()
-            || self.repository_profile_id != profile.profile_id
+            || self.repository_profile_id.is_empty()
             || self.authorizations.is_empty()
             || self.authorizations.len() > MAX_AUTHORIZATIONS
             || self.required_broad_candidates.len() > MAX_AUTHORIZATIONS
@@ -217,22 +246,15 @@ impl ValidationPolicyV1 {
                 .test_repair_authorizations
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1])
-            || self.authorizations.iter().any(|authorization| {
-                authorization.validate().is_err()
-                    || profile
-                        .validation_candidates
-                        .iter()
-                        .all(|candidate| candidate.candidate_id != authorization.candidate_id)
-            })
+            || self
+                .authorizations
+                .iter()
+                .any(|authorization| authorization.validate().is_err())
             || self.required_broad_candidates.iter().any(|candidate_id| {
                 self.authorization(candidate_id)
                     .is_none_or(|authorization| {
                         authorization.gate_class == ValidationGateClass::Focused
                     })
-                    || profile
-                        .validation_candidates
-                        .iter()
-                        .all(|candidate| &candidate.candidate_id != candidate_id)
             })
             || self
                 .test_repair_authorizations

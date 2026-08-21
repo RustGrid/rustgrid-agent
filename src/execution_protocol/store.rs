@@ -99,17 +99,48 @@ fn bootstrap_from(state: &ExecutionState) -> Result<ExecutionState, ProtocolViol
         })?
         .budget
         .clone();
-    Ok(ExecutionState::bootstrap_with_finalization_policy(
-        state.execution_id.clone(),
-        state.execution_attempt,
-        state.initial_repository_revision.clone(),
-        state.mission_budget.clone(),
-        discovery_budget,
-        planning_budget,
-        state.plan_graph_budget.clone(),
-        state.validation_policy.clone(),
-        state.finalization_policy.clone(),
-    ))
+    match state.protocol_mode {
+        super::ExecutionProtocolModeV1::CompatibilityScaffold => {
+            Ok(ExecutionState::bootstrap_with_finalization_policy(
+                state.execution_id.clone(),
+                state.execution_attempt,
+                state.initial_repository_revision.clone(),
+                state.mission_budget.clone(),
+                discovery_budget,
+                planning_budget,
+                state.plan_graph_budget.clone(),
+                state.validation_policy.clone(),
+                state.finalization_policy.clone(),
+            ))
+        }
+        super::ExecutionProtocolModeV1::StrictV1 => ExecutionState::bootstrap_strict_v1(
+            state.execution_id.clone(),
+            state.execution_attempt,
+            state.initial_repository_revision.clone(),
+            state.mission_budget.clone(),
+            discovery_budget,
+            planning_budget,
+            state.plan_graph_budget.clone(),
+            state
+                .requested_discovery_goal
+                .clone()
+                .ok_or(ProtocolViolation::DiscoveryContract {
+                    code: "strict_v1_discovery_goal_missing",
+                })?,
+            state
+                .validation_policy
+                .clone()
+                .ok_or(ProtocolViolation::ValidationContract {
+                    code: "strict_v1_validation_policy_missing",
+                })?,
+            state
+                .finalization_policy
+                .clone()
+                .ok_or(ProtocolViolation::ReviewContract {
+                    code: "strict_v1_finalization_policy_missing",
+                })?,
+        ),
+    }
 }
 
 fn replay_and_validate(

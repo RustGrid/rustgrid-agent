@@ -310,6 +310,7 @@ impl FinalizationPolicyV1 {
     pub(crate) fn validate(&self) -> Result<(), ReviewContractError> {
         self.publication.validate()?;
         if self.schema_version != REVIEW_SCHEMA_VERSION
+            || self.policy_evidence_id.is_empty()
             || self.max_changed_paths == 0
             || usize::try_from(self.max_changed_paths).unwrap_or(usize::MAX) > MAX_CHANGED_PATHS
             || self.max_diff_pages == 0

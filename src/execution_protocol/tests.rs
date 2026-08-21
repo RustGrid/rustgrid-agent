@@ -11,6 +11,7 @@ mod phase4_implementation_context;
 mod phase5_mutation;
 mod phase6_validation;
 mod phase7_review_publication;
+mod phase8_contract_freeze;
 
 const EXECUTION_ID: &str = "execution-protocol-v1:test-execution";
 const REPOSITORY_REVISION: &str = "repository-revision:test-0";
@@ -75,7 +76,7 @@ fn envelope(
     semantic_key: &str,
     payload: impl Into<DomainEvent>,
 ) -> ProtocolEventEnvelope {
-    ProtocolEventEnvelope::new(
+    ProtocolEventEnvelope::new_legacy_test_compatible(
         state,
         semantic_key,
         state.next_sequence().saturating_mul(10),
