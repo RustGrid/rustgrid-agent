@@ -31,30 +31,6 @@ reason; documentation-only changes may record why automated focused validation
 is not applicable. Gates, publication, lease renewal, audit persistence, and
 cleanup are never skipped or interrupted by a Codex budget.
 
-The ephemeral GitHub Actions executor uses a separate hard phase controller.
-Its signed hosted coding budget is divided into discovery, planning,
-implementation/repair, diff-review, and completion-evaluation allocations.
-For the 40-call default these are `8/4/20/4/4`; earlier phases cannot consume
-later reservations, while unused discovery/planning calls roll forward only to
-implementation and repair. Validation and publication remain worker-owned
-phases. A versioned notebook, structured impact map and plan, search guard,
-write-progress thresholds, complete paged diff review, and fresh completion
-evaluator prevent technical gates from disguising incomplete functional work.
-Manifest v4 carries one canonical `model_call_budget` plus requested, resolved,
-source, and clamp audit fields. The worker compares that value with both the
-persisted execution limit and the gateway limit before the first model call;
-any difference is `execution_budget_mismatch`, never a silent lower runtime
-budget.
-
-Impact-map semantics are independent from event persistence. A valid map stays
-available in memory and in the versioned notebook even when a phase or tool
-event cannot be written. Event writes use stable idempotency identities and
-revision/hash checkpoint metadata; a failed write is retried without a model
-call. Strict recovery can reuse tool arguments, assistant JSON, and previously
-recorded discovery progress. Only a still-invalid artifact enters the
-supplemental one-call `artifact_repair` phase, where repository reads, searches,
-and mutations are forbidden.
-
 ## Components
 
 - **Coordinator:** connects to a pre-announced worker identity, consumes the durable assignment queue, reconciles runs assigned by RustGrid, and drains on shutdown.
@@ -66,50 +42,28 @@ and mutations are forbidden.
 
 ## Ports and adapters
 
-Domain reconciliation remains data-in/data-out. `hosted_orchestrator` consumes an
-`ExecutionSnapshot` and returns one `ExecutionDecision`; it does not read the
-environment, call HTTP, run Git or subprocesses, touch the filesystem, or read a
-wall clock. `hosted_simulation` drives that same reducer from in-memory scripted
-effects for deterministic end-to-end tests.
-
 Side effects are reached through narrow, consumer-owned ports:
 
 | Consumer | Port | Production adapter | Responsibility |
 | --- | --- | --- | --- |
 | Persistent run supervision | `LeaseControlPlane` | `RustGridLeaseControlPlane` over `RustGridClient` | Worker heartbeat and run-lease renewal only |
 | Supervisor loop | `ExecutionEnvironment` | `SystemExecutionEnvironment` | Monotonic time, shutdown observation, and bounded sleeping |
-| Hosted lease supervision | `HostedLeaseControlPlane` | `HostedApiClient` | Hosted execution heartbeat and typed lease invalidation |
-| Hosted model session | `ModelProvider` | `HostedApiClient` AI-response adapter | One registered, deadline-bound model invocation |
-| Pull-request reconciliation | `GitHubPublisher` | `GitHubClient` | Find, create, update, and confirm draft state |
-| Branch publication | `RepositoryPublisher` | `GitRepositoryPublisher` over `Repo` | Reconcile and push one authorized branch/commit |
 | Recovery journal | `EventStore` | `FilesystemEventStore` | Load and atomically replace the versioned journal |
-| Hosted retry and credential policy | `HostedClock` | `SystemHostedClock` | System/monotonic time and retry sleeping |
 
-The traits live with the policy that consumes them. Read and mutation
-capabilities remain separate: for example, publication cannot use arbitrary
-GitHub endpoints, and lease supervision cannot mutate execution state beyond a
-renewal. Errors retain typed lease-loss and remote-branch-movement identities so
-reconciliation never depends on transport strings.
+The traits live with the policy that consumes them. Lease supervision cannot
+mutate execution state beyond a renewal, and errors retain typed lease-loss and
+remote-branch-movement identities so reconciliation never depends on transport
+strings.
 
-The CLI is the composition root. Hosted execution explicitly loads the GitHub
-Actions environment, constructs the hardened HTTP client, exchanges OIDC,
-builds `HostedApiClient` with `SystemHostedClock`, and passes the concrete Git,
-GitHub, process-containment, and filesystem adapters into the application flow.
-The persistent worker similarly constructs `RustGridClient`; `RunSupervisor`
-wraps it in its lease-only adapter. There is no service locator or mutable
-dependency registry. Dynamic dispatch is limited to the clock stored by cloned
-hosted API adapters and the store retained by the non-generic public
-`RunJournal`; making either container generic would spread adapter types across
-the API and reporting layers. Orchestration, lease supervision, model
-invocation, and publication use static dispatch.
+The CLI is the composition root. The worker constructs `RustGridClient`;
+`RunSupervisor` wraps it in its lease-only adapter. There is no service locator
+or mutable dependency registry. Dynamic dispatch is limited to the store
+retained by the non-generic public `RunJournal`.
 
-Adapter contract tests continue to exercise real HTTP request shapes, Git
-force-with-lease behavior, atomic journal replacement, and GitHub publication
-fallbacks. In-memory fakes cover lease loss, transient and permanent failures,
-remote movement, duplicate publication, model-budget exhaustion, clock
-advancement, and journal write retry. The token-refresh contract test combines
-the manual clock with a loopback HTTP adapter fixture. Full in-memory replay
-uses no sockets, Git, subprocesses, or wall-clock waiting.
+Adapter contract tests exercise real HTTP request shapes, Git
+force-with-lease behavior, atomic journal replacement, and GitHub publication.
+In-memory fakes cover lease loss, transient and permanent failures, and journal
+write retry.
 
 ## Run sequence
 
@@ -152,6 +106,19 @@ failed jobs and steps, and bounded job-log tails. Each CI repair is locally
 validated and pushed as a new commit to the existing pull request. Three
 unsuccessful repair iterations produce a blocked handoff and retain the isolated
 execution state.
+
+## Architecture boundaries
+
+When the run manifest carries a project architecture contract, the worker
+validates it with the manifest and adds it to the Codex prompt together with
+the ticket's declared boundaries and any open escalations. Codex checks its
+plan against the contract before editing and can request an escalation instead
+of crossing a boundary. After every successful Codex session the worker
+independently matches the changed paths against the boundary globs. Either
+check that fails raises a run-scoped architecture escalation (or reuses a
+matching open one) and ends the run as a blocked handoff, retaining the
+workspace like any other human-intervention block. See the
+[worker API contract](worker-api-contract.md#architecture-contract-and-escalations).
 
 ## Trust boundaries
 

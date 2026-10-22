@@ -515,6 +515,7 @@ mod tests {
             required_permissions: json!({}),
             execution_policy: json!({}),
             execution_policy_sha256: String::new(),
+            architecture: None,
         }
     }
 

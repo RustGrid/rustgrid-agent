@@ -531,6 +531,48 @@
         ],
         "type": "object"
       },
+      "AgentArchitectureContext": {
+        "description": "Architecture context delivered to agents in the run manifest.",
+        "properties": {
+          "document": {
+            "$ref": "#/components/schemas/ArchitectureDocumentBody"
+          },
+          "escalation_path": {
+            "description": "Endpoint for raising an escalation from this run.",
+            "example": "/api/v1/agent-runs/{run_id}/architecture-escalations",
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "open_escalations": {
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+            },
+            "type": "array"
+          },
+          "ticket_boundary_ids": {
+            "description": "Boundaries the ticket declared. Empty means none were declared.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "document",
+          "ticket_boundary_ids",
+          "open_escalations",
+          "escalation_path",
+          "instructions"
+        ],
+        "type": "object"
+      },
       "AgentCodexPolicyResponse": {
         "properties": {
           "command": {
@@ -554,6 +596,17 @@
       },
       "AgentExecutionManifestResponse": {
         "properties": {
+          "architecture": {
+            "description": "The project's architecture contract, or null when none is defined. Agents read it before planning and escalate instead of crossing a boundary.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AgentArchitectureContext"
+              }
+            ]
+          },
           "attachments": {
             "items": {
               "$ref": "#/components/schemas/AttachmentResponse"
@@ -1858,6 +1911,92 @@
         ],
         "type": "object"
       },
+      "AiGenerationRequest": {
+        "properties": {
+          "prompt": {
+            "description": "The instruction for the model.",
+            "example": "Design a quest for this goal: ...",
+            "type": "string"
+          },
+          "schema": {
+            "description": "JSON Schema the result must match. Becomes the forced tool's\n`input_schema`, so the model cannot answer in any other shape."
+          },
+          "source": {
+            "description": "Free-form label for attributing spend, e.g. the feature calling this.",
+            "example": "quest-generation",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "strict": {
+            "description": "Enforce `schema` rather than merely suggesting it.\n\nOff by default, because it is not free: the provider compiles the\nschema into a sampling grammar and only part of JSON Schema compiles.\n`minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`,\n`maxItems` and `multipleOf` are rejected, and `minItems` is accepted\nonly as 0 or 1 — so a schema that works today would start returning\n400 if this were turned on for everyone.\n\nOpt in once `schema` is within that subset. Without it the schema is\nadvisory and a model may answer in a different shape, which is a real\nfailure mode: one caller received its whole result nested under an\nextra key.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "system": {
+            "description": "Optional system prompt.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_name": {
+            "description": "Name for the forced tool. Shows up in the model's reasoning, so a\ndescriptive verb helps.",
+            "example": "emit_quest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt",
+          "schema"
+        ],
+        "type": "object"
+      },
+      "AiGenerationResponse": {
+        "properties": {
+          "data": {
+            "description": "The model's answer, matching the schema that was supplied.",
+            "type": "object"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "model": {
+            "description": "Model that produced it, so callers can tell when the platform changes it.",
+            "type": "string"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "remaining": {
+            "description": "Remaining allowance, or `null` when the plan does not cap generations.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "used": {
+            "description": "Generations used this billing period, including this one.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "data",
+          "model",
+          "input_tokens",
+          "output_tokens",
+          "used"
+        ],
+        "type": "object"
+      },
       "ApiKeyResponse": {
         "properties": {
           "created_at": {
@@ -1870,96 +2009,61 @@
           },
           "expires_at": {
             "format": "date-time",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "format": "uuid",
             "type": "string"
           },
           "key_prefix": {
-            "description": "Stable lookup prefix. The full API key is shown only once at creation time.",
+            "description": "Stable lookup prefix. The full API key is shown only once at creation.",
             "type": "string"
           },
           "last_used_at": {
             "format": "date-time",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
           },
           "project_id": {
             "format": "uuid",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "revoked_at": {
             "format": "date-time",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "revoked_by": {
             "format": "uuid",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scope_version": {
-            "description": "Monotonic version incremented whenever server-side scopes are replaced.",
             "format": "int32",
             "type": "integer"
           },
           "scopes": {
-            "description": "Editable server-side API key scopes. The key secret never encodes scopes.",
             "items": {
-              "enum": [
-                "tickets:read",
-                "tickets:write",
-                "tickets:delete",
-                "projects:read",
-                "projects:write",
-                "webhooks:read",
-                "webhooks:write",
-                "api_keys:read",
-                "api_keys:write",
-                "api_keys:create",
-                "api_keys:update",
-                "api_keys:revoke",
-                "audit:read",
-                "agents:read",
-                "agents:write",
-                "agents:workers:register",
-                "agents:workers:heartbeat",
-                "agents:workers:maintain",
-                "agents:workers:credentials",
-                "agents:runs:read",
-                "agents:runs:create",
-                "agents:runs:claim",
-                "agents:runs:update",
-                "agents:steps:read",
-                "agents:steps:create",
-                "agents:steps:update",
-                "agents:steps:delete",
-                "agents:links:read",
-                "agents:links:create",
-                "agents:links:update",
-                "agents:links:delete",
-                "agents:quality_gates:read",
-                "agents:quality_gates:create",
-                "agents:quality_gates:update",
-                "agents:quality_gates:delete"
-              ],
               "type": "string"
             },
             "type": "array"
           },
           "status": {
-            "description": "Server-side API key status.",
-            "enum": [
-              "active",
-              "disabled",
-              "revoked"
-            ],
             "type": "string"
           },
           "tenant_id": {
@@ -1976,11 +2080,11 @@
           "tenant_id",
           "name",
           "key_prefix",
+          "status",
+          "scope_version",
           "scopes",
           "created_by_user_id",
           "created_at",
-          "status",
-          "scope_version",
           "updated_at"
         ],
         "type": "object"
@@ -2050,6 +2154,452 @@
           "tenant_id",
           "credential_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "ArchitectureBoundary": {
+        "additionalProperties": false,
+        "description": "A module boundary agents must respect.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Stable identifier referenced by tickets, rules, and escalations.",
+            "example": "security-authz",
+            "pattern": "^[A-Za-z0-9._-]{1,64}$",
+            "type": "string"
+          },
+          "may_depend_on": {
+            "description": "Boundary ids this boundary may depend on. Anything else is a violation.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "example": "Authorization",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Path globs that belong to this boundary.",
+            "example": [
+              "crates/ticket-service/src/security/**"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ArchitectureDecision": {
+        "additionalProperties": false,
+        "description": "An architecture decision record.",
+        "properties": {
+          "consequences": {
+            "type": "string"
+          },
+          "context": {
+            "type": "string"
+          },
+          "decision": {
+            "type": "string"
+          },
+          "id": {
+            "example": "ADR-001",
+            "type": "string"
+          },
+          "question": {
+            "description": "The bootstrap wizard question this decision answers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rationale": {
+            "description": "Why this option won over the alternatives. At least 20 characters.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ArchitectureDecisionStatus"
+          },
+          "superseded_by": {
+            "description": "Required when status is superseded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "context",
+          "decision",
+          "consequences",
+          "rationale"
+        ],
+        "type": "object"
+      },
+      "ArchitectureDecisionStatus": {
+        "enum": [
+          "proposed",
+          "accepted",
+          "superseded",
+          "deprecated"
+        ],
+        "type": "string"
+      },
+      "ArchitectureDocumentBody": {
+        "additionalProperties": false,
+        "description": "The machine-readable architecture contract.",
+        "properties": {
+          "boundaries": {
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureBoundary"
+            },
+            "type": "array"
+          },
+          "decisions": {
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureDecision"
+            },
+            "type": "array"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ArchitectureProfile"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureRule"
+            },
+            "type": "array"
+          },
+          "schema_version": {
+            "example": "rustgrid.architecture.v1",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version"
+        ],
+        "type": "object"
+      },
+      "ArchitectureEnforcement": {
+        "enum": [
+          "agent_check",
+          "ci",
+          "review"
+        ],
+        "type": "string"
+      },
+      "ArchitectureEscalationDecision": {
+        "enum": [
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ArchitectureEscalationResponse": {
+        "description": "A request to cross an architecture boundary, decided by an architect.",
+        "properties": {
+          "agent_run_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "architecture_version": {
+            "description": "The architecture version the escalation was checked against.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "boundary_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "proposed_change": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "raised_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ArchitectureEscalationSource"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ArchitectureEscalationStatus"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "ticket_id",
+          "architecture_version",
+          "boundary_ids",
+          "reason",
+          "source",
+          "status",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ArchitectureEscalationSource": {
+        "enum": [
+          "user",
+          "agent"
+        ],
+        "type": "string"
+      },
+      "ArchitectureEscalationStatus": {
+        "enum": [
+          "open",
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ArchitectureEscalationsResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first, at most 200.",
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ArchitectureProfile": {
+        "additionalProperties": false,
+        "description": "Answers from the architecture bootstrap wizard.",
+        "properties": {
+          "auth": {
+            "description": "Authentication and authorization approach.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "communication": {
+            "description": "Communication style, for example `sync`, `async`, or `event_driven`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consistency": {
+            "description": "Consistency model, for example `strong` or `eventual`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "style": {
+            "description": "Deployment style, for example `monolith`, `modular_monolith`, or `services`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tenancy": {
+            "description": "Tenancy model, for example `single_tenant` or `multi_tenant_shared_schema`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ArchitectureRule": {
+        "additionalProperties": false,
+        "description": "A constraint that applies within or across boundaries.",
+        "properties": {
+          "applies_to": {
+            "description": "Boundary ids the rule applies to. Empty means every boundary.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "enforcement": {
+            "$ref": "#/components/schemas/ArchitectureEnforcement"
+          },
+          "id": {
+            "example": "authz-location",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ArchitectureRuleKind"
+          },
+          "statement": {
+            "example": "Authorization checks live in security::authz.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "statement",
+          "enforcement"
+        ],
+        "type": "object"
+      },
+      "ArchitectureRuleKind": {
+        "enum": [
+          "cross_cutting",
+          "dependency",
+          "convention",
+          "technology",
+          "non_functional"
+        ],
+        "type": "string"
+      },
+      "ArchitectureVersionResponse": {
+        "description": "One immutable version of a project's architecture.",
+        "properties": {
+          "change_summary": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "document": {
+            "$ref": "#/components/schemas/ArchitectureDocumentBody"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "version",
+          "document",
+          "change_summary",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ArchitectureVersionSummaryResponse": {
+        "properties": {
+          "change_summary": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "change_summary",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ArchitectureVersionsResponse": {
+        "properties": {
+          "items": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureVersionSummaryResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -2830,6 +3380,15 @@
       },
       "CompleteExecutionRequest": {
         "properties": {
+          "canonical_terminal_result": {},
+          "canonical_terminal_result_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completion_evaluation": {},
           "failure_code": {
             "type": [
               "string",
@@ -2840,6 +3399,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "final_callback": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FinalExecutionCallbackRequest"
+              }
             ]
           },
           "head_branch": {
@@ -2854,7 +3423,19 @@
               "null"
             ]
           },
+          "mission_outcome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "output_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "process_health": {
             "type": [
               "string",
               "null"
@@ -2875,6 +3456,20 @@
           },
           "status": {
             "type": "string"
+          },
+          "terminal_authority": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "terminal_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3122,8 +3717,10 @@
         "properties": {
           "expires_at": {
             "format": "date-time",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "maxLength": 120,
@@ -3132,54 +3729,21 @@
           },
           "project_id": {
             "format": "uuid",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scopes": {
-            "description": "Server-side scopes to grant to the API key.",
+            "description": "Server-side scopes to grant. Any permission string the platform defines is accepted (see `perms::ALL`) as long as the caller already holds it; this is not a closed set, so it is typed as free-form strings rather than an enum that would go stale.",
+            "example": [
+              "tickets:read",
+              "ai:generate"
+            ],
             "items": {
-              "enum": [
-                "tickets:read",
-                "tickets:write",
-                "tickets:delete",
-                "projects:read",
-                "projects:write",
-                "webhooks:read",
-                "webhooks:write",
-                "api_keys:read",
-                "api_keys:write",
-                "api_keys:create",
-                "api_keys:update",
-                "api_keys:revoke",
-                "audit:read",
-                "agents:read",
-                "agents:write",
-                "agents:workers:register",
-                "agents:workers:heartbeat",
-                "agents:workers:maintain",
-                "agents:workers:credentials",
-                "agents:runs:read",
-                "agents:runs:create",
-                "agents:runs:claim",
-                "agents:runs:update",
-                "agents:steps:read",
-                "agents:steps:create",
-                "agents:steps:update",
-                "agents:steps:delete",
-                "agents:links:read",
-                "agents:links:create",
-                "agents:links:update",
-                "agents:links:delete",
-                "agents:quality_gates:read",
-                "agents:quality_gates:create",
-                "agents:quality_gates:update",
-                "agents:quality_gates:delete"
-              ],
               "type": "string"
             },
-            "minItems": 1,
-            "type": "array",
-            "uniqueItems": true
+            "type": "array"
           }
         },
         "required": [
@@ -3525,6 +4089,17 @@
               "null"
             ]
           },
+          "custom_fields": {
+            "additionalProperties": {},
+            "description": "Initial custom field values, keyed by field key. Values are canonical by\nfield type (see `CustomFieldType`).",
+            "example": {
+              "impact": "high"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "description": {
             "description": "Optional markdown/plaintext description",
             "example": "Optional markdown description",
@@ -3537,7 +4112,10 @@
             "description": "Due date in ISO \"YYYY-MM-DD\" (kept as `NaiveDate` internally)",
             "example": "2025-12-31",
             "format": "date",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "parent_id": {
             "example": "a9dbb3b1-3cf1-45b8-9b61-9f3d8c9b3a22",
@@ -3594,7 +4172,10 @@
           "story_points": {
             "description": "Decimal encoded as string (e.g., \"3.5\"); kept as `Decimal` internally",
             "example": "3.5",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "title": {
             "description": "Human-readable title",
@@ -3997,7 +4578,80 @@
           "single_select",
           "multi_select"
         ],
+        "example": "text",
         "type": "string"
+      },
+      "CustomFieldValue": {
+        "description": "Canonical custom field value: text, number, date and single_select are strings; boolean is a JSON boolean; multi_select is a sorted string array.",
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
+      "CustomFieldValueResponse": {
+        "description": "A single resolved custom field value attached to a ticket.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "field_definition_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "field_key": {
+            "type": "string"
+          },
+          "field_type": {
+            "$ref": "#/components/schemas/CustomFieldType"
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "row_version": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/CustomFieldValue"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "project_id",
+          "ticket_id",
+          "field_definition_id",
+          "field_key",
+          "field_type",
+          "value",
+          "row_version",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
       },
       "DeactivateAccountRequest": {
         "properties": {
@@ -4124,6 +4778,14 @@
             "description": "Machine-friendly code (snake_case)",
             "example": "validation_failed",
             "type": "string"
+          },
+          "details": {
+            "additionalProperties": true,
+            "description": "Optional bounded machine-readable diagnostics. Only explicitly safe fields are exposed.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "message": {
             "description": "Human-friendly message",
@@ -4559,11 +5221,33 @@
               "null"
             ]
           },
+          "credential_source": {
+            "example": "rustgrid_included",
+            "type": "string"
+          },
           "fingerprint": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "included_executions_limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "included_executions_remaining": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "included_executions_used": {
+            "format": "int64",
+            "type": "integer"
           },
           "last_validated_at": {
             "format": "date-time",
@@ -4583,12 +5267,18 @@
           },
           "status": {
             "type": "string"
+          },
+          "tenant_credential_configured": {
+            "type": "boolean"
           }
         },
         "required": [
           "provider",
           "status",
-          "models"
+          "models",
+          "credential_source",
+          "included_executions_used",
+          "tenant_credential_configured"
         ],
         "type": "object"
       },
@@ -4839,6 +5529,10 @@
       },
       "ExecutionResponse": {
         "properties": {
+          "ai_credential_source": {
+            "example": "rustgrid_included",
+            "type": "string"
+          },
           "ai_provider": {
             "type": [
               "string",
@@ -4866,6 +5560,15 @@
               }
             ]
           },
+          "canonical_terminal_result": {},
+          "canonical_terminal_result_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completion_evaluation": {},
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -4940,6 +5643,12 @@
               "null"
             ]
           },
+          "mission_outcome": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "model": {
             "type": [
               "string",
@@ -4947,6 +5656,12 @@
             ]
           },
           "output_summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "process_health": {
             "type": [
               "string",
               "null"
@@ -4974,6 +5689,26 @@
           },
           "status": {
             "$ref": "#/components/schemas/ExecutionState"
+          },
+          "terminal_authority": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "terminal_finalized_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "terminal_revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "ticket_id": {
             "format": "uuid",
@@ -5011,6 +5746,7 @@
           "ticket_id",
           "project_id",
           "provider",
+          "ai_credential_source",
           "status",
           "attempt_number",
           "created_at",
@@ -5082,6 +5818,9 @@
           "validating",
           "creating_pull_request",
           "completed",
+          "awaiting_external_review",
+          "needs_continuation",
+          "blocked",
           "failed",
           "cancel_requested",
           "cancelling",
@@ -5625,6 +6364,76 @@
         ],
         "type": "object"
       },
+      "ExternalReviewDecisionRequest": {
+        "properties": {
+          "item_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_index",
+          "status"
+        ],
+        "type": "object"
+      },
+      "FinalExecutionCallbackRequest": {
+        "properties": {
+          "canonical_terminal_result_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "execution_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "final_notebook_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "process_exit_code": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sent_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "terminal_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workflow_run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "canonical_terminal_result_id",
+          "terminal_revision",
+          "final_notebook_revision",
+          "process_exit_code",
+          "workflow_run_id",
+          "sent_at",
+          "idempotency_key"
+        ],
+        "type": "object"
+      },
       "ForgotPasswordRequest": {
         "properties": {
           "email": {
@@ -5712,6 +6521,44 @@
         "properties": {
           "authenticated_at": {
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "callback_acknowledged_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "callback_attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "callback_idempotency_key": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "callback_last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "callback_observed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "callback_outbox": {},
+          "callback_status": {
             "type": [
               "string",
               "null"
@@ -5859,6 +6706,7 @@
           "repository_name",
           "workflow_id",
           "workflow_ref",
+          "callback_attempts",
           "cancellation_delivery"
         ],
         "type": "object"
@@ -7348,7 +8196,7 @@
         "type": "object"
       },
       "Page": {
-        "description": "Paged list response.",
+        "description": "Paged list of sprints. (Historically named `Page`; the sprint list is its only user.)",
         "properties": {
           "items": {
             "items": {
@@ -8074,6 +8922,42 @@
         ],
         "type": "object"
       },
+      "RaiseArchitectureEscalationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_run_id": {
+            "description": "The run that hit the boundary, when a person escalates on its behalf.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "boundary_ids": {
+            "description": "Boundaries the work needs to cross. At least one.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "proposed_change": {
+            "description": "What the change would look like if approved.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why the plan cannot stay inside the declared boundaries.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "boundary_ids",
+          "reason"
+        ],
+        "type": "object"
+      },
       "RefreshExecutionTokenRequest": {
         "properties": {
           "ttl_seconds": {
@@ -8083,6 +8967,25 @@
         },
         "required": [
           "ttl_seconds"
+        ],
+        "type": "object"
+      },
+      "RefreshTokenResponse": {
+        "description": "A replacement token for the same sign-in, from `/auth/refresh`.",
+        "properties": {
+          "expires_in_secs": {
+            "description": "Lifetime of `token`. Shorter than the usual token lifetime when the\nsign-in is close to its session max age.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "token": {
+            "description": "New bearer token. Same user, tenant and role as the one presented.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_in_secs"
         ],
         "type": "object"
       },
@@ -8175,6 +9078,63 @@
         ],
         "type": "object"
       },
+      "ReserveAiGenerationRequest": {
+        "properties": {
+          "count": {
+            "description": "How many generations to reserve. Defaults to 1.\n\n`0` reports token usage without consuming allowance, so a caller can\nreport what a call actually cost without being charged twice for it.",
+            "example": 1,
+            "format": "int64",
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "Free-form label for attributing spend, e.g. the feature making the call.",
+            "example": "quest-generation",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens": {
+            "description": "Model tokens consumed by the caller's *previous* generation, recorded\nfor cost visibility. Not enforced.",
+            "example": 4096,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ReserveAiGenerationResponse": {
+        "properties": {
+          "remaining": {
+            "description": "Remaining allowance, or `null` when the plan does not cap generations.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reserved": {
+            "description": "Generations reserved by this call.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "used": {
+            "description": "Total generations used this billing period, including this reservation.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "reserved",
+          "used"
+        ],
+        "type": "object"
+      },
       "ResetPasswordRequest": {
         "properties": {
           "new_password": {
@@ -8261,9 +9221,36 @@
         ],
         "type": "object"
       },
+      "ResolveArchitectureEscalationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ArchitectureEscalationDecision"
+          },
+          "resolution": {
+            "description": "Guidance for the agent or person who raised it. When approving, say\nwhich ADR or rule change makes the crossing legitimate.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision",
+          "resolution"
+        ],
+        "type": "object"
+      },
       "RetryExecutionRequest": {
         "description": "Optional retry overrides. An empty object reuses the previous execution policy.",
         "properties": {
+          "agent_candidate_sha": {
+            "description": "Optional immutable candidate commit. Restricted to platform superadmins.",
+            "maxLength": 40,
+            "minLength": 40,
+            "pattern": "^[0-9a-fA-F]{40}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "maximum_cost_usd": {
             "oneOf": [
               {
@@ -8296,6 +9283,28 @@
         ],
         "type": "object"
       },
+      "RewardProfileResponse": {
+        "description": "The stored document, as both endpoints return it.",
+        "properties": {
+          "payload": {
+            "description": "Null until the profile has been written once.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "revision": {
+            "description": "Increments on every successful write; pass it back as\n`expected_revision` to detect a concurrent change.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "payload"
+        ],
+        "type": "object"
+      },
       "RoleResponse": {
         "properties": {
           "description": {
@@ -8313,6 +9322,13 @@
             },
             "type": "array",
             "uniqueItems": true
+          },
+          "role_group": {
+            "description": "Role catalog group. ADD workspace responsibility roles use add; legacy and administrative roles are ungrouped.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role_id": {
             "format": "uuid",
@@ -8338,6 +9354,52 @@
           "system"
         ],
         "type": "string"
+      },
+      "SaveArchitectureVersionRequest": {
+        "additionalProperties": false,
+        "description": "Append a new architecture version.",
+        "properties": {
+          "base_version": {
+            "description": "The version the edit started from. Omit only for the first version.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "change_summary": {
+            "description": "What changed and why, shown in the version history.",
+            "example": "Bootstrap from the architecture wizard",
+            "type": "string"
+          },
+          "document": {
+            "$ref": "#/components/schemas/ArchitectureDocumentBody"
+          }
+        },
+        "required": [
+          "change_summary",
+          "document"
+        ],
+        "type": "object"
+      },
+      "SaveRewardProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "description": "Revision the caller last read. The write is rejected if it has moved.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "payload": {
+            "description": "Opaque application preferences, at most 32 KB once serialised.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "payload"
+        ],
+        "type": "object"
       },
       "SendAdvisorMessageRequest": {
         "properties": {
@@ -8367,6 +9429,22 @@
         },
         "required": [
           "content"
+        ],
+        "type": "object"
+      },
+      "SetTicketArchitectureRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "boundary_ids": {
+            "description": "Boundaries this ticket is expected to touch. Empty clears the link.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "boundary_ids"
         ],
         "type": "object"
       },
@@ -8562,6 +9640,16 @@
       },
       "StartExecutionRequest": {
         "properties": {
+          "agent_candidate_sha": {
+            "description": "Optional immutable candidate commit. Restricted to platform superadmins.",
+            "maxLength": 40,
+            "minLength": 40,
+            "pattern": "^[0-9a-fA-F]{40}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ai_provider": {
             "type": "string"
           },
@@ -9266,6 +10354,75 @@
         ],
         "type": "object"
       },
+      "TicketArchitectureResponse": {
+        "description": "The architecture a ticket is planned against.",
+        "properties": {
+          "boundaries": {
+            "description": "Linked boundaries resolved against the current version.",
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureBoundary"
+            },
+            "type": "array"
+          },
+          "boundary_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "current_version": {
+            "description": "Latest architecture version, or null when the project has none.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "escalations": {
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+            },
+            "type": "array"
+          },
+          "linked_version": {
+            "description": "The version the boundaries were linked against.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "rules": {
+            "description": "Rules that apply to the linked boundaries, plus global rules.",
+            "items": {
+              "$ref": "#/components/schemas/ArchitectureRule"
+            },
+            "type": "array"
+          },
+          "stale": {
+            "description": "True when the architecture changed after the boundaries were linked.",
+            "type": "boolean"
+          },
+          "ticket_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket_id",
+          "project_id",
+          "stale",
+          "boundary_ids",
+          "boundaries",
+          "rules",
+          "escalations"
+        ],
+        "type": "object"
+      },
       "TicketExternalLinkPageResponse": {
         "properties": {
           "items": {
@@ -9397,7 +10554,14 @@
           },
           "created_at": {
             "example": "2025-10-17T10:02:00Z",
+            "format": "date-time",
             "type": "string"
+          },
+          "custom_fields": {
+            "items": {
+              "$ref": "#/components/schemas/CustomFieldValueResponse"
+            },
+            "type": "array"
           },
           "id": {
             "format": "uuid",
@@ -9417,11 +10581,6 @@
               "null"
             ]
           },
-          "row_version": {
-            "description": "Optimistic-concurrency version. Clients may derive a strong ticket ETag when an intermediary does not expose the response header.",
-            "format": "int64",
-            "type": "integer"
-          },
           "status": {
             "$ref": "#/components/schemas/TicketStatus"
           },
@@ -9435,9 +10594,9 @@
           "title",
           "status",
           "priority",
-          "row_version",
           "reporter_id",
           "assignee_id",
+          "custom_fields",
           "created_at"
         ],
         "type": "object"
@@ -9447,6 +10606,36 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/TicketListItemResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "size": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "TicketRelationPageResponse": {
+        "description": "Paged list of ticket relations.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TicketRelationResponse"
             },
             "type": "array"
           },
@@ -9538,7 +10727,14 @@
           "created_at": {
             "description": "RFC3339 UTC timestamp, e.g. \"2025-10-17T10:02:00Z\"",
             "example": "2025-10-17T10:02:00Z",
+            "format": "date-time",
             "type": "string"
+          },
+          "custom_fields": {
+            "items": {
+              "$ref": "#/components/schemas/CustomFieldValueResponse"
+            },
+            "type": "array"
           },
           "description": {
             "type": [
@@ -9564,6 +10760,11 @@
               "null"
             ]
           },
+          "row_version": {
+            "description": "Optimistic-concurrency version. Clients may derive `\"tickets:<id>:<row_version>\"`\nwhen an intermediary does not expose the response ETag header.",
+            "format": "int64",
+            "type": "integer"
+          },
           "status": {
             "$ref": "#/components/schemas/TicketStatus"
           },
@@ -9583,6 +10784,8 @@
           "priority",
           "reporter_id",
           "assignee_id",
+          "row_version",
+          "custom_fields",
           "created_at"
         ],
         "type": "object"
@@ -10801,64 +12004,35 @@
         "properties": {
           "expires_at": {
             "format": "date-time",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "maxLength": 120,
             "minLength": 1,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "project_id": {
             "format": "uuid",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scopes": {
-            "description": "Server-side scopes to replace on the API key.",
+            "description": "Server-side scopes to grant. Any permission string the platform defines is accepted (see `perms::ALL`) as long as the caller already holds it; this is not a closed set, so it is typed as free-form strings rather than an enum that would go stale.",
             "items": {
-              "enum": [
-                "tickets:read",
-                "tickets:write",
-                "tickets:delete",
-                "projects:read",
-                "projects:write",
-                "webhooks:read",
-                "webhooks:write",
-                "api_keys:read",
-                "api_keys:write",
-                "api_keys:create",
-                "api_keys:update",
-                "api_keys:revoke",
-                "audit:read",
-                "agents:read",
-                "agents:write",
-                "agents:workers:register",
-                "agents:workers:heartbeat",
-                "agents:workers:maintain",
-                "agents:workers:credentials",
-                "agents:runs:read",
-                "agents:runs:create",
-                "agents:runs:claim",
-                "agents:runs:update",
-                "agents:steps:read",
-                "agents:steps:create",
-                "agents:steps:update",
-                "agents:steps:delete",
-                "agents:links:read",
-                "agents:links:create",
-                "agents:links:update",
-                "agents:links:delete",
-                "agents:quality_gates:read",
-                "agents:quality_gates:create",
-                "agents:quality_gates:update",
-                "agents:quality_gates:delete"
-              ],
               "type": "string"
             },
-            "minItems": 1,
-            "type": "array",
-            "uniqueItems": true
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -11134,6 +12308,20 @@
             "format": "uuid",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "custom_fields": {
+            "additionalProperties": {},
+            "description": "Change custom field values, keyed by field key. A `null` value clears that\nfield; omitted keys are left unchanged. Values are canonical by field type\n(see `CustomFieldType`).",
+            "example": {
+              "impact": "high"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -13403,7 +14591,7 @@
     "/api/v1/account/users": {
       "get": {
         "description": "\nAuthorization:\n- Caller must have at least one of:\n  - `tenants:members:read`\n  - `users:read:self`\n- If the caller has `tenants:members:read` or `users:read:all`, they see the full roster.\n- Otherwise, they only see themselves.\n",
-        "operationId": "listUsers",
+        "operationId": "listAccountUsers",
         "parameters": [
           {
             "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
@@ -15400,6 +16588,61 @@
         "summary": "Create a mission-scoped Advisor conversation",
         "tags": [
           "advisor"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/architecture-escalations": {
+      "post": {
+        "description": "Agents call this instead of making a change that would cross a boundary.\nA worker credential may only escalate for a run it holds the lease on.",
+        "operationId": "raise_for_run",
+        "parameters": [
+          {
+            "description": "Agent run id",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RaiseArchitectureEscalationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+                }
+              }
+            },
+            "description": "Escalation raised for an architect"
+          },
+          "400": {
+            "description": "Unknown boundary or invalid text"
+          },
+          "409": {
+            "description": "No architecture, or the worker lease is not active"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Escalate a boundary crossing from an agent run",
+        "tags": [
+          "architecture"
         ]
       }
     },
@@ -21022,6 +22265,61 @@
         ]
       }
     },
+    "/api/v1/ai/generations": {
+      "post": {
+        "description": "Checks the tenant's `ai.generations.monthly` entitlement, then performs one\nforced tool call against the supplied JSON Schema using the platform's\nprovider credentials. Returns `403` with `PLAN_LIMIT_EXCEEDED` when the\nallowance is exhausted, and `500` when the deployment has no provider key.",
+        "operationId": "generate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AiGenerationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiGenerationResponse"
+                }
+              }
+            },
+            "description": "Generation completed"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or invalid credentials"
+          },
+          "403": {
+            "description": "PLAN_LIMIT_EXCEEDED, or missing ai:generate"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Internal error, or AI generation not configured"
+          },
+          "502": {
+            "description": "Upstream provider failed"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Generate structured output",
+        "tags": [
+          "ai-generations"
+        ]
+      }
+    },
     "/api/v1/api-keys": {
       "get": {
         "description": "Lists API-key metadata for the current tenant. Full keys and key hashes are never returned.",
@@ -23594,6 +24892,39 @@
         },
         "security": [],
         "summary": "Start OAuth authorization",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "description": "Exchanges a valid, unexpired JWT for a new one with a fresh expiry. The\noriginal sign-in time is kept, so a session cannot be refreshed past the\ndeployment's session max age (30 days by default); after that the response\nis `401` and the user must sign in again. API keys cannot be refreshed.",
+        "operationId": "handler",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshTokenResponse"
+                }
+              }
+            },
+            "description": "Token refreshed"
+          },
+          "401": {
+            "description": "Missing, invalid or expired token, inactive account, or session past its max age"
+          },
+          "403": {
+            "description": "No longer a member of the token's tenant"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Refresh a session token",
         "tags": [
           "auth"
         ]
@@ -27131,13 +28462,52 @@
             }
           },
           {
-            "description": "Required UUID model-call key",
+            "description": "Transport request UUID for this registration attempt",
             "in": "header",
             "name": "Idempotency-Key",
             "required": true,
             "schema": {
               "format": "uuid",
               "type": "string"
+            }
+          },
+          {
+            "description": "Stable semantic call UUID across safe registration retries",
+            "in": "header",
+            "name": "X-RustGrid-Semantic-Call-Id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Zero-based semantic call index within the execution attempt",
+            "in": "header",
+            "name": "X-RustGrid-Call-Index",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Hosted execution phase owning the semantic call",
+            "in": "header",
+            "name": "X-RustGrid-Call-Phase",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Zero-based transport registration attempt",
+            "in": "header",
+            "name": "X-RustGrid-Registration-Attempt",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           },
           {
@@ -28237,6 +29607,182 @@
           }
         ],
         "summary": "Stream mission execution events",
+        "tags": [
+          "executions"
+        ]
+      }
+    },
+    "/api/v1/executions/{execution_id}/external-reviews": {
+      "post": {
+        "description": "Updates one pending human-review checklist item without rerunning implementation. Completing every item promotes the mission outcome to complete.",
+        "operationId": "record_external_review",
+        "parameters": [
+          {
+            "description": "Mission execution ID",
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExternalReviewDecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionResponse"
+                }
+              }
+            },
+            "description": "Updated execution",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid checklist item or decision",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing execution-update permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Execution not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Execution is not awaiting external review",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Record an external review checklist decision",
         "tags": [
           "executions"
         ]
@@ -34100,6 +35646,303 @@
         "summary": "Update project Advisor settings",
         "tags": [
           "advisor"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/architecture": {
+      "get": {
+        "operationId": "get_current",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureVersionResponse"
+                }
+              }
+            },
+            "description": "Latest architecture version"
+          },
+          "404": {
+            "description": "The project has no architecture yet, or is not visible"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the current project architecture",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/architecture/escalations": {
+      "get": {
+        "operationId": "list_escalations",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by status: `open`, `approved`, or `rejected`.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureEscalationsResponse"
+                }
+              }
+            },
+            "description": "Escalations, newest first"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List architecture escalations for a project",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/architecture/escalations/{escalation_id}/resolve": {
+      "post": {
+        "operationId": "resolve_escalation",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Escalation id",
+            "in": "path",
+            "name": "escalation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveArchitectureEscalationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+                }
+              }
+            },
+            "description": "Resolved"
+          },
+          "403": {
+            "description": "Requires architecture:manage"
+          },
+          "409": {
+            "description": "Already resolved"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resolve an architecture escalation",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/architecture/versions": {
+      "get": {
+        "operationId": "list_versions",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureVersionsResponse"
+                }
+              }
+            },
+            "description": "Version history, newest first"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List architecture versions",
+        "tags": [
+          "architecture"
+        ]
+      },
+      "post": {
+        "description": "Versions are append-only. `base_version` must equal the latest version, so\na concurrent edit is rejected instead of silently overwritten.",
+        "operationId": "save_version",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveArchitectureVersionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureVersionResponse"
+                }
+              }
+            },
+            "description": "Saved as the new latest version"
+          },
+          "400": {
+            "description": "The document is invalid; the message lists every problem"
+          },
+          "403": {
+            "description": "Requires architecture:manage"
+          },
+          "412": {
+            "description": "base_version is not the latest version"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Save a new architecture version",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/architecture/versions/{version}": {
+      "get": {
+        "operationId": "get_version",
+        "parameters": [
+          {
+            "description": "Project id",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Version number",
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureVersionResponse"
+                }
+              }
+            },
+            "description": "The requested version"
+          },
+          "404": {
+            "description": "Unknown version"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read one architecture version",
+        "tags": [
+          "architecture"
         ]
       }
     },
@@ -43285,6 +45128,16 @@
               "minLength": 1,
               "type": "string"
             }
+          },
+          {
+            "description": "Filter by role group. Use add for invitation choices; omit for the full administrative catalog.",
+            "example": "add",
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -44136,9 +45989,9 @@
         "parameters": [
           {
             "description": "1-based page number. Defaults to 1 if <1.",
-            "in": "path",
+            "in": "query",
             "name": "page",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -44146,9 +45999,9 @@
           },
           {
             "description": "Page size (max will be clamped server-side, e.g. 200).",
-            "in": "path",
+            "in": "query",
             "name": "size",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -44156,18 +46009,18 @@
           },
           {
             "description": "Free-text query. We'll rank by similarity / ts_rank.",
-            "in": "path",
+            "in": "query",
             "name": "q",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
           },
           {
             "description": "Optional project filter.",
-            "in": "path",
+            "in": "query",
             "name": "project_id",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "uuid",
               "type": [
@@ -44178,9 +46031,9 @@
           },
           {
             "description": "Optional assignee filter.",
-            "in": "path",
+            "in": "query",
             "name": "assignee_id",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "uuid",
               "type": [
@@ -44191,9 +46044,9 @@
           },
           {
             "description": "Optional reporter filter.",
-            "in": "path",
+            "in": "query",
             "name": "reporter_id",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "uuid",
               "type": [
@@ -44204,9 +46057,9 @@
           },
           {
             "description": "Comma-separated label ids; ticket must have ALL listed labels.",
-            "in": "path",
+            "in": "query",
             "name": "label_ids",
-            "required": true,
+            "required": false,
             "schema": {
               "type": [
                 "string",
@@ -44215,9 +46068,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "status",
-            "required": true,
+            "required": false,
             "schema": {
               "oneOf": [
                 {
@@ -44230,9 +46083,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "type",
-            "required": true,
+            "required": false,
             "schema": {
               "oneOf": [
                 {
@@ -44245,9 +46098,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "priority",
-            "required": true,
+            "required": false,
             "schema": {
               "oneOf": [
                 {
@@ -44260,9 +46113,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "sprint_id",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "uuid",
               "type": [
@@ -44272,9 +46125,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "created_from",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
               "type": [
@@ -44284,9 +46137,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "created_to",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
               "type": [
@@ -44296,9 +46149,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "updated_from",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
               "type": [
@@ -44308,9 +46161,9 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "updated_to",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "date-time",
               "type": [
@@ -44333,9 +46186,9 @@
           },
           {
             "description": "Sort mode: relevance|updated_at_desc|created_at_desc|priority_desc|due_date_asc",
-            "in": "path",
+            "in": "query",
             "name": "sort",
-            "required": true,
+            "required": false,
             "schema": {
               "type": [
                 "string",
@@ -44345,9 +46198,9 @@
           },
           {
             "description": "Include total count (set false to skip count query).",
-            "in": "path",
+            "in": "query",
             "name": "include_total",
-            "required": true,
+            "required": false,
             "schema": {
               "type": [
                 "boolean",
@@ -45113,7 +46966,7 @@
           {
             "description": "Ticket id",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -45866,6 +47719,151 @@
         ]
       }
     },
+    "/api/v1/tickets/{id}/architecture": {
+      "get": {
+        "operationId": "get_ticket",
+        "parameters": [
+          {
+            "description": "Ticket id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketArchitectureResponse"
+                }
+              }
+            },
+            "description": "Linked boundaries, applicable rules, and escalations"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a ticket's architecture context",
+        "tags": [
+          "architecture"
+        ]
+      },
+      "put": {
+        "description": "Replaces the full list. Boundaries must exist in the current architecture\nversion, which is recorded so later changes can be detected.",
+        "operationId": "set_ticket",
+        "parameters": [
+          {
+            "description": "Ticket id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetTicketArchitectureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketArchitectureResponse"
+                }
+              }
+            },
+            "description": "Updated ticket architecture"
+          },
+          "400": {
+            "description": "Unknown boundary"
+          },
+          "409": {
+            "description": "The project has no architecture yet"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set the boundaries a ticket touches",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
+    "/api/v1/tickets/{id}/architecture/escalations": {
+      "post": {
+        "operationId": "raise_for_ticket",
+        "parameters": [
+          {
+            "description": "Ticket id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RaiseArchitectureEscalationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArchitectureEscalationResponse"
+                }
+              }
+            },
+            "description": "Escalation raised for an architect"
+          },
+          "400": {
+            "description": "Unknown boundary or invalid text"
+          },
+          "409": {
+            "description": "The project has no architecture yet"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Escalate a boundary crossing for a ticket",
+        "tags": [
+          "architecture"
+        ]
+      }
+    },
     "/api/v1/tickets/{id}/assign": {
       "post": {
         "description": "\nAssign or unassign a ticket's assignee.\n\nAuthorization:\n- Requires a valid Bearer JWT (`Authorization: Bearer <token>`).\n- Requires RBAC permission `tickets:ASSIGN`.\n- Caller must belong to the same tenant as the target ticket.\n\nMulti-tenancy:\n- Tenant context is derived from the Bearer JWT.\n- Tickets from other tenants are masked as `404 Not Found`.\n\nOptimistic concurrency:\n- Requires `If-Match: \"tickets:<uuid>:<row_version>\"`.\n- Returns `428` when missing and `412` when the ETag targets another resource or the row version is stale.\n\nRequest body:\n- The request body is `AssignPayload`.\n- Typical shape:\n  - `assignee_id`: UUID of the new assignee.\n  - Or `null`/absence to unassign.\n- Input is validated at the HTTP edge (`ValidatedJson`), so malformed input is surfaced as `400 Bad Request`, not `500`.\n\nBehavior:\n- Updates the assignee for the given ticket.\n- May also record audit information (who reassigned, from what to what).\n- Returns the updated ticket.\n\nResponse:\n- Returns `200 OK` with the updated ticket as `TicketResponse`.\n- Includes a strong ETag of the form `\"tickets:<uuid>:<row_version>\"`.\n- Includes `x-request-id` for correlation / audit tracing.\n\nRate limiting:\n- This route is subject to per-route concurrency and rate limits.\n- When limits are exceeded, responds `429 Too Many Requests` with\n  `retry-after` and `x-ratelimit-*` headers.\n",
@@ -46547,7 +48545,7 @@
           {
             "description": "Ticket identifier (UUID) whose comments should be listed",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -46737,7 +48735,7 @@
           {
             "description": "Ticket identifier (UUID)",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -49224,7 +51222,7 @@
           {
             "description": "Ticket id",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -49266,7 +51264,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page"
+                  "$ref": "#/components/schemas/TicketRelationPageResponse"
                 }
               }
             },
@@ -49417,7 +51415,7 @@
           {
             "description": "Source ticket id",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -49671,7 +51669,7 @@
           {
             "description": "Ticket id",
             "in": "path",
-            "name": "ticket_id",
+            "name": "id",
             "required": true,
             "schema": {
               "format": "uuid",
@@ -52577,9 +54575,9 @@
         "parameters": [
           {
             "description": "Optional text filter on email/name (ILIKE)",
-            "in": "path",
+            "in": "query",
             "name": "q",
-            "required": true,
+            "required": false,
             "schema": {
               "type": [
                 "string",
@@ -52589,9 +54587,9 @@
           },
           {
             "description": "Optional filter on active status",
-            "in": "path",
+            "in": "query",
             "name": "is_active",
-            "required": true,
+            "required": false,
             "schema": {
               "type": [
                 "boolean",
@@ -52600,18 +54598,18 @@
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "page",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "size",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -53254,6 +55252,92 @@
         ]
       }
     },
+    "/api/v1/users/me/reward-profile": {
+      "get": {
+        "description": "Self-only: the user comes from the credential, never from the request.",
+        "operationId": "get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RewardProfileResponse"
+                }
+              }
+            },
+            "description": "The caller's profile"
+          },
+          "401": {
+            "description": "Missing or invalid credentials"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the caller's reward profile",
+        "tags": [
+          "users"
+        ]
+      },
+      "put": {
+        "description": "Concurrency is the `expected_revision` in the body rather than an ETag,\nwhich is why this route is exempt from the If-Match middleware.",
+        "operationId": "put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRewardProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RewardProfileResponse"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "description": "Payload is not an object, too large, or the revision is invalid"
+          },
+          "401": {
+            "description": "Missing or invalid credentials"
+          },
+          "412": {
+            "description": "The profile changed since expected_revision"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace the caller's reward profile",
+        "tags": [
+          "users"
+        ]
+      }
+    },
     "/api/v1/users/search": {
       "get": {
         "description": "\nPerforms **fuzzy full-text search** over user **email** and **name** fields using PostgreSQL trigram similarity.\n\n### Authorization\n- Requires Bearer JWT.\n- Requires RBAC permission `users:read:all`.\n\n### Search semantics\n- `q` must be non-empty after trimming.\n- Results are ranked by trigram similarity (`rank` 0.0–1.0).\n- Pagination uses `page` (1-based) and `size` (server-clamped).\n\n### Response\n- `200 OK` with [`UserPage`](#schema-UserPage):\n  - `items[]` include `id`, `email`, `name`, `is_active`,\n    `created_at`, `updated_at`, and `rank` (similarity score).\n- Includes `x-request-id` header for correlation.\n\n### Rate limiting\n- Per-route concurrency/rate limits may apply (`429` on excess).\n",
@@ -53261,26 +55345,26 @@
         "parameters": [
           {
             "description": "REQUIRED free text for similarity search (email/name)",
-            "in": "path",
+            "in": "query",
             "name": "q",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "page",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "size",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int64",
               "type": "integer"
@@ -56141,6 +58225,10 @@
     {
       "description": "Bounded OpenAI Responses gateway for an authenticated mission execution.",
       "name": "ai-gateway"
+    },
+    {
+      "description": "ADD architecture contract: boundaries, rules, ADRs, and escalations",
+      "name": "architecture"
     }
   ],
   "x-tagGroups": [
@@ -56168,7 +58256,8 @@
         "labels",
         "custom-fields",
         "sprints",
-        "tickets"
+        "tickets",
+        "architecture"
       ]
     },
     {

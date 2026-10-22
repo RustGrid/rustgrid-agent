@@ -1,4 +1,5 @@
 pub mod api;
+pub mod architecture;
 pub mod attachments;
 pub mod auth;
 pub mod command;
@@ -7,7 +8,6 @@ pub mod coordinator;
 pub mod credentials;
 pub mod error;
 mod execution;
-pub mod execution_graph;
 // Protocol v1 is intentionally compiled but not routed to production while its
 // conformance suite and backend contract are built phase by phase.
 #[allow(dead_code)]
@@ -17,9 +17,6 @@ mod finalization;
 pub mod git;
 pub mod github;
 pub mod health;
-pub mod hosted;
-pub mod hosted_orchestrator;
-pub mod hosted_simulation;
 pub mod journal;
 pub mod lifecycle;
 pub mod manifest;

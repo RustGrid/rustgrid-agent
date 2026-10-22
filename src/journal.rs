@@ -10,8 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    execution_graph::ExecutionSnapshot, lifecycle::RunPhase, optimization::DependencyState,
-    token_consumption::TokenConsumption,
+    lifecycle::RunPhase, optimization::DependencyState, token_consumption::TokenConsumption,
 };
 
 pub type JournalResult<T> = std::result::Result<T, JournalError>;
@@ -172,11 +171,6 @@ pub struct RunJournal {
     pub token_consumption: TokenConsumption,
     #[serde(default)]
     pub dependency_state: Option<DependencyState>,
-    /// Optional graph-backed hosted checkpoint. Older journals deserialize
-    /// without it and hosted GitHub Actions runs may persist the same payload in
-    /// their remote worker notebook instead.
-    #[serde(default)]
-    pub hosted_execution: Option<ExecutionSnapshot>,
     #[serde(skip)]
     path: PathBuf,
     #[serde(skip, default = "filesystem_event_store")]
@@ -254,7 +248,6 @@ impl RunJournal {
             recovery_source_run_id: None,
             token_consumption: TokenConsumption::default(),
             dependency_state: None,
-            hosted_execution: None,
             path,
             store,
         };
@@ -265,18 +258,6 @@ impl RunJournal {
     pub fn checkpoint(&mut self, phase: RunPhase, sequence: u64) -> JournalResult<()> {
         self.phase = phase;
         self.last_sequence = sequence;
-        self.persist().map_err(Into::into)
-    }
-
-    pub fn checkpoint_hosted_execution(
-        &mut self,
-        snapshot: ExecutionSnapshot,
-    ) -> JournalResult<()> {
-        snapshot
-            .validate_invariants()
-            .context("cannot persist an invalid hosted execution snapshot")
-            .map_err(|error| JournalError::from_anyhow(JournalOperation::Validate, error))?;
-        self.hosted_execution = Some(snapshot);
         self.persist().map_err(Into::into)
     }
 

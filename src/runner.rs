@@ -438,7 +438,10 @@ fn execute_claimed(
             mission_profile.class,
         )?;
         let prompt_composition = generated_prompt.composition;
-        let generated_prompt = generated_prompt.text;
+        let mut generated_prompt = generated_prompt.text;
+        if let Some(architecture) = manifest.architecture.as_ref() {
+            generated_prompt.push_str(&architecture.prompt_section()?);
+        }
         let estimated_prompt_tokens = generated_prompt.len().div_ceil(4) as u64;
         reporter.step(
             "context_composed",
@@ -725,6 +728,7 @@ fn validate_reconciled_commit(
     );
     let codex = CodexContext {
         app: context.app,
+        api: context.api,
         reporter: context.reporter,
         repo: context.repo,
         running: context.running,
@@ -1123,6 +1127,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 MissionProfile::classify_after_checkout(ticket, manifest, &repo.root);
             let codex = CodexContext {
                 app: context,
+                api,
                 reporter,
                 repo: &repo,
                 running,

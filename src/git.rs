@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use reqwest::Url;
 
 use crate::command;
 
@@ -112,59 +111,6 @@ impl Repo {
         Ok(())
     }
 
-    pub fn verify_hosted_origin(&self, owner: &str, name: &str, web_base_url: &str) -> Result<()> {
-        let remote = command::checked("git", ["remote", "get-url", "origin"], &self.root)
-            .context("repository does not have an origin remote")?;
-        let remote_url =
-            Url::parse(&remote).context("hosted repository origin must be an HTTPS URL")?;
-        let web_url =
-            Url::parse(web_base_url).context("hosted repository web base must be an HTTPS URL")?;
-        let remote_path = remote_url
-            .path()
-            .trim_end_matches('/')
-            .trim_end_matches(".git");
-        let expected_path = format!("/{owner}/{name}");
-        if remote_url.scheme() != "https"
-            || web_url.scheme() != "https"
-            || remote_url.origin() != web_url.origin()
-            || !remote_url.username().is_empty()
-            || remote_url.password().is_some()
-            || remote_url.query().is_some()
-            || remote_url.fragment().is_some()
-            || !remote_path.eq_ignore_ascii_case(&expected_path)
-        {
-            bail!("hosted repository origin is not the credential-free manifest repository URL");
-        }
-        Ok(())
-    }
-
-    pub fn hosted_local_config(&self) -> Result<Vec<u8>> {
-        let git_dir = self.root.join(".git");
-        let git_metadata = std::fs::symlink_metadata(&git_dir)
-            .context("hosted checkout has no inspectable .git directory")?;
-        if !git_metadata.is_dir() || git_metadata.file_type().is_symlink() {
-            bail!("hosted checkout .git path must be a real directory");
-        }
-        let config = git_dir.join("config");
-        let metadata = std::fs::symlink_metadata(&config)
-            .context("hosted checkout has no inspectable local Git config")?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024
-        {
-            bail!("hosted checkout local Git config is not a bounded regular file");
-        }
-        std::fs::read(config).context("could not snapshot hosted checkout Git config")
-    }
-
-    pub fn configure_hosted_author(&self, name: &str, email: &str) -> Result<()> {
-        command::checked("git", ["config", "--local", "user.name", name], &self.root)?;
-        command::checked(
-            "git",
-            ["config", "--local", "user.email", email],
-            &self.root,
-        )?;
-        Ok(())
-    }
-
     pub fn create_branch(&self, branch: &str, base: &str) -> Result<()> {
         if command::capture(
             "git",
@@ -211,92 +157,6 @@ impl Repo {
             return Ok(true);
         }
         self.create_branch(branch, base)?;
-        Ok(false)
-    }
-
-    /// Reuses an existing hosted-execution branch without force-pushing, or creates it
-    /// from the requested base when this is the first execution process to publish it.
-    pub fn checkout_or_create_hosted_branch(
-        &self,
-        branch: &str,
-        base_sha: &str,
-        github_token: &str,
-        web_base_url: &str,
-    ) -> Result<bool> {
-        validate_branch_name(branch)?;
-        validate_commit_sha(base_sha)?;
-        if !self.has_commit(base_sha)? {
-            bail!("immutable hosted checkout commit {base_sha} is not present locally");
-        }
-        let local_ref = format!("refs/heads/{branch}");
-        let local_branch_exists = command::capture(
-            "git",
-            ["show-ref", "--verify", "--quiet", &local_ref],
-            &self.root,
-        )?
-        .status
-        .success();
-
-        let environment = github_environment(github_token, web_base_url);
-        if self
-            .remote_branch_commit(branch, environment.clone())?
-            .is_some()
-        {
-            let remote_ref = format!("refs/rustgrid-agent/remotes/{branch}");
-            let fetch_spec = format!("+refs/heads/{branch}:{remote_ref}");
-            let fetch = command::capture_with_env(
-                "git",
-                ["fetch", "--no-tags", "origin", &fetch_spec],
-                &self.root,
-                environment,
-            )?;
-            if !fetch.status.success() {
-                bail!(
-                    "git fetch for hosted branch exited with {}: {}",
-                    fetch.status,
-                    fetch.stderr
-                );
-            }
-            let create_mode = if local_branch_exists {
-                "-C"
-            } else {
-                "--create"
-            };
-            command::checked(
-                "git",
-                [
-                    "-c",
-                    hooks_disabled(),
-                    "switch",
-                    create_mode,
-                    branch,
-                    &remote_ref,
-                ],
-                &self.root,
-            )?;
-            return Ok(true);
-        }
-
-        if local_branch_exists {
-            command::checked(
-                "git",
-                ["-c", hooks_disabled(), "switch", "-C", branch, base_sha],
-                &self.root,
-            )?;
-        } else {
-            command::checked(
-                "git",
-                [
-                    "-c",
-                    hooks_disabled(),
-                    "switch",
-                    "--create",
-                    branch,
-                    base_sha,
-                ],
-                &self.root,
-            )?;
-        }
         Ok(false)
     }
 
@@ -692,34 +552,6 @@ fn hooks_disabled() -> &'static str {
     }
 }
 
-fn validate_branch_name(branch: &str) -> Result<()> {
-    if branch.is_empty()
-        || branch.len() > 255
-        || branch.starts_with('-')
-        || branch.starts_with('/')
-        || branch.ends_with('/')
-        || branch.ends_with('.')
-        || branch.contains("..")
-        || branch.contains("@{")
-        || branch.contains("//")
-        || branch.bytes().any(|byte| {
-            byte.is_ascii_control()
-                || byte.is_ascii_whitespace()
-                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
-        })
-    {
-        bail!("unsafe Git branch name in execution manifest");
-    }
-    Ok(())
-}
-
-fn validate_commit_sha(commit: &str) -> Result<()> {
-    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("unsafe immutable Git commit SHA in execution manifest");
-    }
-    Ok(())
-}
-
 fn parse_porcelain_z(bytes: &[u8]) -> BTreeSet<String> {
     let entries = bytes
         .split(|b| *b == 0)
@@ -870,45 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn hosted_origin_requires_the_exact_credential_free_https_repository() {
-        let directory = tempfile::tempdir().unwrap();
-        command::checked("git", ["init", "--initial-branch=main"], directory.path()).unwrap();
-        command::checked(
-            "git",
-            [
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/RustGrid/example.git",
-            ],
-            directory.path(),
-        )
-        .unwrap();
-        let repo = Repo {
-            root: directory.path().into(),
-        };
-        repo.verify_hosted_origin("rustgrid", "EXAMPLE", "https://github.com")
-            .unwrap();
-        assert!(!repo.hosted_local_config().unwrap().is_empty());
-
-        command::checked(
-            "git",
-            [
-                "remote",
-                "set-url",
-                "origin",
-                "ext::sh -c 'echo stolen' https://github.com/RustGrid/example.git",
-            ],
-            directory.path(),
-        )
-        .unwrap();
-        assert!(
-            repo.verify_hosted_origin("RustGrid", "example", "https://github.com")
-                .is_err()
-        );
-    }
-
-    #[test]
     fn commit_paths_excludes_preexisting_dirty_work() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1007,150 +800,6 @@ mod tests {
                 .push("main", &commit, "token", "https://github.com")
                 .unwrap()
         );
-    }
-
-    #[test]
-    fn hosted_branch_checkout_reuses_remote_attempt_without_force_push() {
-        let directory = tempfile::tempdir().unwrap();
-        let remote = directory.path().join("remote.git");
-        let seed = directory.path().join("seed");
-        let worker = directory.path().join("worker");
-        command::checked(
-            "git",
-            ["init", "--bare", remote.to_str().unwrap()],
-            directory.path(),
-        )
-        .unwrap();
-        command::checked(
-            "git",
-            ["init", "--initial-branch=main", seed.to_str().unwrap()],
-            directory.path(),
-        )
-        .unwrap();
-        command::checked("git", ["config", "user.email", "agent@example.com"], &seed).unwrap();
-        command::checked("git", ["config", "user.name", "Agent Test"], &seed).unwrap();
-        std::fs::write(seed.join("README.md"), "base\n").unwrap();
-        command::checked("git", ["add", "README.md"], &seed).unwrap();
-        command::checked("git", ["commit", "-m", "base"], &seed).unwrap();
-        command::checked(
-            "git",
-            ["remote", "add", "origin", remote.to_str().unwrap()],
-            &seed,
-        )
-        .unwrap();
-        command::checked("git", ["push", "-u", "origin", "main"], &seed).unwrap();
-        let base_sha = command::checked("git", ["rev-parse", "main"], &seed).unwrap();
-        command::checked(
-            "git",
-            ["switch", "-c", "rustgrid/rg-1-11111111", "main"],
-            &seed,
-        )
-        .unwrap();
-        std::fs::write(seed.join("attempt.txt"), "attempt\n").unwrap();
-        command::checked("git", ["add", "attempt.txt"], &seed).unwrap();
-        command::checked("git", ["commit", "-m", "attempt"], &seed).unwrap();
-        let expected = command::checked("git", ["rev-parse", "HEAD"], &seed).unwrap();
-        command::checked(
-            "git",
-            ["push", "-u", "origin", "rustgrid/rg-1-11111111"],
-            &seed,
-        )
-        .unwrap();
-        command::checked(
-            "git",
-            [
-                "clone",
-                "--branch",
-                "main",
-                remote.to_str().unwrap(),
-                worker.to_str().unwrap(),
-            ],
-            directory.path(),
-        )
-        .unwrap();
-
-        let repo = Repo { root: worker };
-        command::checked(
-            "git",
-            ["config", "user.email", "attacker@example.com"],
-            &repo.root,
-        )
-        .unwrap();
-        command::checked("git", ["config", "user.name", "Untrusted Step"], &repo.root).unwrap();
-        command::checked(
-            "git",
-            ["switch", "-c", "rustgrid/rg-1-11111111"],
-            &repo.root,
-        )
-        .unwrap();
-        std::fs::write(repo.root.join("untrusted-local.txt"), "not authoritative\n").unwrap();
-        command::checked("git", ["add", "untrusted-local.txt"], &repo.root).unwrap();
-        command::checked(
-            "git",
-            ["commit", "-m", "untrusted local branch"],
-            &repo.root,
-        )
-        .unwrap();
-        command::checked("git", ["switch", "main"], &repo.root).unwrap();
-        assert!(
-            repo.checkout_or_create_hosted_branch(
-                "rustgrid/rg-1-11111111",
-                &base_sha,
-                "short-lived-token",
-                "https://github.com",
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
-            expected
-        );
-        assert!(!repo.root.join("untrusted-local.txt").exists());
-        assert_eq!(
-            command::checked("git", ["branch", "--show-current"], &repo.root).unwrap(),
-            "rustgrid/rg-1-11111111"
-        );
-        repo.configure_hosted_author("octocat", "583231+octocat@users.noreply.github.com")
-            .unwrap();
-        assert_eq!(
-            command::checked("git", ["config", "--local", "user.name"], &repo.root).unwrap(),
-            "octocat"
-        );
-        assert_eq!(
-            command::checked("git", ["config", "--local", "user.email"], &repo.root).unwrap(),
-            "583231+octocat@users.noreply.github.com"
-        );
-    }
-
-    #[test]
-    fn hosted_fresh_branch_uses_the_immutable_local_checkout_sha() {
-        let directory = tempfile::tempdir().unwrap();
-        let (seed, remote) = initialized_repository(directory.path());
-        let worker = directory.path().join("worker");
-        clone_branch(&remote, &worker);
-        let base_sha = command::checked("git", ["rev-parse", "HEAD"], &worker).unwrap();
-
-        std::fs::write(seed.root.join("advanced.txt"), "remote moved\n").unwrap();
-        let advanced = commit_all(&seed.root, "advance mutable main");
-        command::checked("git", ["push", "origin", "main"], &seed.root).unwrap();
-        assert_ne!(base_sha, advanced);
-
-        let repo = Repo { root: worker };
-        assert!(
-            !repo
-                .checkout_or_create_hosted_branch(
-                    "rustgrid/rg-1-22222222",
-                    &base_sha,
-                    "short-lived-token",
-                    "https://github.com",
-                )
-                .unwrap()
-        );
-        assert_eq!(
-            command::checked("git", ["rev-parse", "HEAD"], &repo.root).unwrap(),
-            base_sha
-        );
-        assert!(!repo.root.join("advanced.txt").exists());
     }
 
     #[test]

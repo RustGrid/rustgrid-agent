@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::architecture::{ArchitectureEscalation, EscalationRequest};
 use crate::config::AppContext;
 use crate::{
     lifecycle::{AgentRunStatus, LifecycleEvent, StepStatus, TicketStatus, WorkerStatus},
@@ -318,6 +319,34 @@ impl RustGridClient {
             &[],
             None,
         )
+    }
+
+    /// Raises an architecture escalation instead of crossing a boundary. Requires
+    /// an active lease on the run.
+    pub fn raise_architecture_escalation(
+        &self,
+        run_id: &str,
+        request: &EscalationRequest,
+    ) -> Result<ArchitectureEscalation> {
+        let body = serde_json::to_value(request)?;
+        let fingerprint = payload_fingerprint(&body);
+        let escalation: ArchitectureEscalation = self.send_json(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/architecture-escalations"),
+            Some(body),
+            Some(&format!("architecture-escalation-{run_id}-{fingerprint}")),
+            &[],
+            None,
+        )?;
+        if escalation.id.trim().is_empty()
+            || escalation
+                .agent_run_id
+                .as_deref()
+                .is_some_and(|id| id != run_id)
+        {
+            bail!("RustGrid returned an invalid architecture escalation response");
+        }
+        Ok(escalation)
     }
 
     pub fn download_attachment(&self, attachment_id: &str, max_bytes: u64) -> Result<Vec<u8>> {
@@ -1008,6 +1037,7 @@ pub fn is_lease_lost(error: &anyhow::Error) -> bool {
                 && (failure.path.ends_with("/lease")
                     || ((failure.path.ends_with("/events")
                         || failure.path.ends_with("/manifest")
+                        || failure.path.ends_with("/architecture-escalations")
                         || failure.path.ends_with("/github-token"))
                         && matches!(
                             failure.error_code.as_deref(),

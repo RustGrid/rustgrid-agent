@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     api::{AgentRun, RustGridClient, Ticket},
+    architecture::{PlanVerdict, escalation_from_feedback},
     command,
     config::AppContext,
     executor::{ExecutionHandle, Executor, RunCommand},
@@ -63,6 +64,7 @@ pub(crate) struct QualityGateContext<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct CodexContext<'a> {
     pub app: &'a AppContext,
+    pub api: &'a RustGridClient,
     pub reporter: &'a Reporter<'a>,
     pub repo: &'a Repo,
     pub running: &'a AtomicBool,
@@ -138,6 +140,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
     )?;
     let codex_context = CodexContext {
         app: context,
+        api,
         reporter,
         repo,
         running,
@@ -402,6 +405,7 @@ pub(crate) fn run_codex_prompt(
         })),
     )?;
     let blocked_action = RefCell::new(None);
+    let escalation_signal = RefCell::new(None);
     let codex_args = policy.codex_args(externally_isolated, image_paths);
     let mut agent_sessions = 0u32;
     let mut idle_retries = 0u32;
@@ -554,6 +558,9 @@ pub(crate) fn run_codex_prompt(
                     if let Some(action) = blocked_action_from_feedback(&message) {
                         blocked_action.replace(Some(action));
                     }
+                    if let Some(signal) = escalation_from_feedback(&message) {
+                        escalation_signal.replace(Some(signal));
+                    }
                     if should_publish_feedback(&message, published_feedback.get()) {
                         context.reporter.feedback(&message)?;
                         published_feedback.set(published_feedback.get().saturating_add(1));
@@ -660,6 +667,7 @@ pub(crate) fn run_codex_prompt(
         context.reporter.flush_telemetry();
         match result {
             Ok(status) if status.success() && completion_ready.get() => break true,
+            Ok(status) if status.success() && escalation_signal.borrow().is_some() => break true,
             Ok(status) if status.success() && completion_restarts < 1 => {
                 completion_restarts = completion_restarts.saturating_add(1);
                 session_prompt = compact_handoff_prompt(
@@ -737,6 +745,15 @@ pub(crate) fn run_codex_prompt(
             }
         }
     };
+    if let Some(signal) = escalation_signal.into_inner() {
+        let verdict = match context.manifest.architecture.as_ref() {
+            Some(architecture) => architecture.agent_escalation(signal)?,
+            None => bail!(
+                "Codex requested an architecture escalation but the project has no architecture contract"
+            ),
+        };
+        enforce_architecture(context, step_id, "Codex plan check", verdict)?;
+    }
     if let Some(action) = blocked_action.into_inner() {
         if is_validation_only_blocker(&action)
             && policy.quality_gates.iter().any(|gate| gate.required)
@@ -754,6 +771,21 @@ pub(crate) fn run_codex_prompt(
     if !codex_succeeded {
         bail!("Codex exited unsuccessfully");
     }
+    if let Some(architecture) = context.manifest.architecture.as_ref() {
+        let paths = context.repo.new_agent_paths(context.baseline)?;
+        let verdict = architecture.check_paths(paths.iter().map(String::as_str));
+        enforce_architecture(context, step_id, "worker diff check", verdict)?;
+        context.reporter.step(
+            &format!("{step_id}_architecture_check"),
+            StepStatus::Completed,
+            "Changed paths stay inside the ticket's architecture boundaries",
+            Some(json!({
+                "architecture_version": architecture.version,
+                "ticket_boundary_ids": architecture.ticket_boundary_ids,
+                "changed_paths": paths.len()
+            })),
+        )?;
+    }
     context.reporter.step(
         step_id,
         StepStatus::Completed,
@@ -767,6 +799,44 @@ pub(crate) fn run_codex_prompt(
         })),
     )?;
     Ok(())
+}
+
+/// Raises (or reuses) an architecture escalation and blocks the run until an
+/// architect resolves it. Returns `Ok` only when the plan stays in bounds.
+fn enforce_architecture(
+    context: &CodexContext<'_>,
+    step_id: &str,
+    source: &str,
+    verdict: PlanVerdict,
+) -> Result<()> {
+    let escalation_id = match verdict {
+        PlanVerdict::WithinBoundaries => return Ok(()),
+        PlanVerdict::AwaitingEscalation(id) => id,
+        PlanVerdict::Escalate(request) => {
+            context.reporter.step(
+                &format!("{step_id}_architecture_escalation"),
+                StepStatus::Running,
+                "Raising an architecture escalation instead of crossing a boundary",
+                Some(json!({"source": source, "request": request})),
+            )?;
+            context
+                .api
+                .raise_architecture_escalation(&context.manifest.run.id, &request)?
+                .id
+        }
+    };
+    context.reporter.step(
+        &format!("{step_id}_architecture_escalation"),
+        StepStatus::Completed,
+        &format!("Architecture escalation {escalation_id} awaits an architect"),
+        Some(json!({"source": source, "escalation_id": escalation_id})),
+    )?;
+    Err(RunFailure::HumanIntervention {
+        action: format!(
+            "An architect must resolve architecture escalation {escalation_id} before this ticket can cross the requested boundaries"
+        ),
+    }
+    .into())
 }
 
 fn constrained_prompt(finalization: bool) -> String {

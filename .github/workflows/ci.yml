@@ -90,9 +90,6 @@ jobs:
       - name: Use Rust toolchain
         run: rustup default 1.94
 
-      - name: Verify impact-map generated contract
-        run: node scripts/check-impact-map-contract.mjs --check
-
       - name: Check formatting
         run: cargo fmt --check
 
@@ -126,6 +123,7 @@ jobs:
             '/api/v1/agent-runs/{run_id}/github-token' \
             '/api/v1/agent-runs/{run_id}/lease' \
             '/api/v1/agent-runs/{run_id}/manifest' \
+            '/api/v1/agent-runs/{run_id}/architecture-escalations' \
             '/api/v1/agent-workers/{id}/heartbeat' \
             '/api/v1/agent-workers/{id}/queue' \
             '/api/v1/agent-workers/{id}/queue/stream' \

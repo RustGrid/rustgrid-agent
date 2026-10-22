@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-use crate::{config::RepoConfig, error::ManifestError};
+use crate::{architecture::ArchitectureContext, config::RepoConfig, error::ManifestError};
 
 pub type ManifestResult<T> = std::result::Result<T, ManifestValidationError>;
 
@@ -77,6 +77,9 @@ pub struct ExecutionManifest {
     pub required_permissions: serde_json::Value,
     pub execution_policy: serde_json::Value,
     pub execution_policy_sha256: String,
+    /// The project's architecture contract; `None` when the project defines none.
+    #[serde(default)]
+    pub architecture: Option<ArchitectureContext>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -297,6 +300,11 @@ impl ExecutionManifest {
             bail!("execution policy hash does not match the manifest payload");
         }
         self.policy()?.validate()?;
+        if let Some(architecture) = &self.architecture {
+            architecture
+                .validate(run_id)
+                .context("execution manifest contains an invalid architecture contract")?;
+        }
         self.repo_config()?;
         self.normalized_required_workflows()?;
         Ok(())
@@ -559,6 +567,7 @@ mod tests {
                 "sandbox": {"mode":"workspace_write","network_access":true,"writable_roots":["."],"approval_policy":"never"}
             }),
             execution_policy_sha256: String::new(),
+            architecture: None,
         }
     }
 

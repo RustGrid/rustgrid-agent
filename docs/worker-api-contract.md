@@ -4,161 +4,6 @@
 ticket has been atomically claimed. The configured RustGrid API URL already
 contains `/api/v1`.
 
-## Ephemeral GitHub Actions contract (manifest v3)
-
-The GitHub Actions provider does not use any persistent worker endpoint or
-credential. Its sequence is:
-
-1. request a GitHub OIDC JWT using the workflow's
-   `ACTIONS_ID_TOKEN_REQUEST_URL` and request token;
-2. `POST /execution-auth/github-actions/exchange` with the execution UUID,
-   one-time dispatch nonce, and JWT;
-3. use the returned `rge_` bearer token for
-   `/executions/{execution_id}/claim`, `/manifest`, `/heartbeat`,
-   `/token/refresh`, `/worker-events`, `/telemetry/batch`, `/state`,
-   `/github-token`, `/ai/responses`, and `/complete`.
-
-The exchange response identifies the tenant, project, execution, attempt,
-ephemeral worker/session, immutable repository, and GitHub workflow run. The
-agent validates those identities, requires the workflow's `GITHUB_SHA` to
-exactly match the manifest `base_sha`, and keeps `access_token` only in process
-memory. It refreshes before expiry while renewing the execution lease.
-
-Manifest version 3 contains:
-
-- the execution/run/ticket/project identity and terminal budgets;
-- immutable GitHub repository and installation IDs, clone/web origins,
-  `base_sha`, PR target `base_ref`, deterministic branch, and repository-token
-  endpoint;
-- the resolved model, AI gateway endpoint, input/output/model-call/cost limits;
-- the hashed execution policy and mission-scoped lifecycle endpoint paths.
-
-Every endpoint path is validated against the configured RustGrid API origin and
-execution UUID before use. The policy hash is computed from the typed v3 policy
-wire representation. The agent rejects a mismatched workflow repository ID,
-model or budget mismatch, unsafe Git ref, alternate gateway origin, sensitive
-child-environment variable, or unsupported sandbox policy.
-
-A fresh deterministic branch is created from the locally present immutable
-`base_sha`; the agent does not fetch mutable `refs/heads/{base_ref}` to seed the
-mission. A retry may fetch only its deterministic remote execution branch.
-
-`POST /executions/{execution_id}/ai/responses` accepts only the constrained
-Responses subset and requires a UUID `Idempotency-Key`. The agent uses an
-internal function-tool adapter so the execution bearer never enters Codex,
-`OPENAI_API_KEY`, `CODEX_API_KEY`, a config file, or a repository subprocess.
-The idempotency identity is derived from execution ID, execution attempt,
-ephemeral worker session, and zero-based semantic call index. It deliberately
-does not include the request payload: an identical replay can return the
-existing registration or result, while a different payload under the same
-semantic identity must be rejected by the gateway.
-
-When RustGrid reports `failure_stage=request_registration`,
-`provider_contacted=false`, and `call_budget_consumed=false`, the worker restores
-the phase ledger and retains the current notebook and phase. It retries only
-when the gateway also marks the failure retryable, with bounded exponential
-backoff. Failure diagnostics keep `rustgrid_gateway_status` separate from
-`upstream_provider_status` and include reservation reconciliation state.
-Historical `409 ai_provider_request_failed` failed-row replays are reported as
-`ai_request_idempotency_conflict`; they are not blindly retried.
-
-RustGrid is authoritative for model-call usage and cost. Hosted coding missions
-must carry a signed budget of at least 10 calls. The control-plane default is 40
-calls, allocated by the worker as eight discovery calls, four planning calls,
-at least 20 implementation/repair calls, four diff-review calls, and four
-completion-evaluation calls. Discovery and planning are hard maxima and cannot
-borrow later reservations. If either phase finishes early, its unused calls
-roll forward only into implementation/repair. Non-default totals use
-deterministic `20/10/50/10/10` proportional allocation with implementation and
-repair receiving at least half.
-
-Manifest v4 adds the canonical top-level `model_call_budget` field and requires
-`requested_model_call_budget`, `resolved_model_call_budget`, `budget_source`,
-`clamped`, and `clamp_reason`. The worker-derived
-`worker_received_model_call_budget` is the exact limit delivered to the AI
-gateway. Requested, resolved, canonical, persisted-execution, and received
-values must match, `clamped` must be false, and `clamp_reason` must be null or
-the worker fails before its first model request with
-`execution_budget_mismatch`. Manifest v3 remains supported only as a legacy
-signed contract and never supplies a worker-side default.
-
-Every AI request identifies one of `discovery`, `artifact_repair`, `planning`,
-`implementation`, `repair`, `diff_review`, or `completion_evaluation`;
-worker-owned actions use `validation` and `publication`. `artifact_repair` is a
-single supplemental infrastructure-recovery call, admits only
-`record_impact_map`, and does not consume configured coding capacity. The
-RustGrid gateway must validate this
-internal phase metadata, omit it from the upstream provider request, persist it
-on the authoritative model-call usage row, and enforce both the total and
-phase allocation. The worker emits durable phase-transition, phase-budget
-warning, search-loop guardrail, tool-usage, and notebook-checkpoint events.
-
-Discovery must produce a structured implementation impact map. Planning must
-produce a structured implementation plan before mutation tools are admitted.
-The default progress deadlines are the impact map by call 8, plan by call 12,
-first write attempt by call 16, successful write by call 20, and diff review
-starting at call 33. Search duplicates and a fourth consecutive search are
-rejected. After discovery, broad root or `src` searches are rejected and
-targeted reads must map to a planned edit, acceptance criterion, or failed
-write.
-
-Impact-map artifact state records `semantic_status` independently from
-`persistence_status`. A produced map may advance to planning when its event
-write fails because the strict artifact remains in memory and the notebook.
-The worker retries event persistence without a model call and emits
-`worker.artifact_persistence_failed` with a safe error, revision, expected
-previous revision, artifact hash, model-call index, and phase. A strict fallback
-may reconstruct the map from tool arguments, assistant JSON, and already
-recorded discovery progress; it never invents missing semantic content.
-
-The compact versioned worker notebook is included in durable worker events and
-in every subsequent model request. A continuation manifest may return it under
-`run.metadata.worker_notebook`; the worker reuses it only when the base SHA,
-deterministic branch, and repository-diff fingerprint still match. The control
-plane must checkpoint the newest notebook revision and copy it into a
-continuation execution. It must not store source excerpts, edit contents,
-credentials, or raw command output in that notebook.
-
-The implementation model must page through the complete immutable diff,
-declare changed paths and criterion evidence, and leave no unrecovered write
-failure. A fresh reserved evaluator then receives the ticket, impact map,
-implementation plan, notebook, declaration, validation outcomes, changed
-paths, failures, and complete diff. It retains the gathered turn history until
-the signed input ceiling requires trimming the oldest turns. The signed overall
-model-call, cost, token, and duration limits remain authoritative. The worker
-reports implementation completeness separately from technical validation.
-Each required quality gate emits deterministic `phase.started` and
-`phase.completed` telemetry with a `quality_gate:*` phase name so successful
-completion has durable validation evidence.
-
-This repository does not own the execution-policy default, gateway reservation
-rows, continuation checkpoint storage, generated OpenAPI clients, or AgentOps
-forms. Deploy the matching RustGrid backend contract first: default and
-validation changes, signed phase policy, gateway phase enforcement, notebook
-checkpointing, structured completion diagnostics, and resumable
-`partial_result`. Regenerate AgentOps from that OpenAPI contract and deploy its
-40-call selector and phase/continuation UI before pinning canonical workflows
-to this worker. The canonical workflow must continue accepting only
-`execution_id` and `dispatch_nonce`; model-call budgets remain authenticated
-manifest policy rather than unsigned workflow inputs.
-
-Successful completion requires implementation completeness to be `complete`
-as well as passing required gates. Partial, incomplete, or uncertain work is
-preserved on the deterministic branch and a clearly marked draft pull request
-for continuation; passing regression gates alone cannot make it successful.
-The completion endpoint must accept `partial_result` as a distinct resumable
-terminal result with branch, commit, and draft-pull-request metadata. It must
-leave the ticket out of review-ready state and expose a continuation that
-increments the execution attempt while retaining the deterministic branch.
-Deploy that control-plane contract before deploying a worker that can emit
-`partial_result`; older endpoints accept only `completed`, `failed`, and
-`cancelled` and will reject the resumable result.
-Successful completion also requires the deterministic branch, 40-character
-head SHA, pull-request number and URL. The completion idempotency key is derived
-from the complete request. Failures use stable machine-readable codes and never
-include provider response bodies. Cancellation or token revocation stops
-repository commands and suppresses unsafe publication.
-
 ## Token consumption
 
 At terminal finalization, the worker writes the aggregate consumption from every completed Codex turn in the run to `PUT /agent-runs/{run_id}/token-consumption`. The payload contains `provider`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `total_tokens`; retries replace the same per-run resource idempotently. This report is sent before the successful terminal status update, and unsuccessful runs attempt the same report before failure, cancellation, or timeout handling.
@@ -201,7 +46,8 @@ At terminal finalization, the worker writes the aggregate consumption from every
       "writable_roots": ["."], "approval_policy": "never"
     }
   },
-  "execution_policy_sha256": "64-lowercase-hex-characters"
+  "execution_policy_sha256": "64-lowercase-hex-characters",
+  "architecture": null
 }
 ```
 
@@ -222,6 +68,86 @@ boundaries. Approval policy remains `never` in both cases.
 The optional user-selected model is not read directly from client metadata by
 the worker. RustGrid validates the requested identifier against its configured
 catalog and places `--model <id>` in the snapshotted, hashed command above.
+
+## Architecture contract and escalations
+
+`architecture` is optional and is `null` when the project defines no
+architecture. When present it is an `AgentArchitectureContext`:
+
+```json
+{
+  "version": 3,
+  "document": {
+    "schema_version": "rustgrid.architecture.v1",
+    "boundaries": [
+      {
+        "id": "security-authz",
+        "name": "Authorization",
+        "paths": ["crates/ticket-service/src/security/**"],
+        "may_depend_on": []
+      }
+    ],
+    "rules": [],
+    "decisions": [],
+    "profile": {}
+  },
+  "ticket_boundary_ids": ["api"],
+  "open_escalations": [],
+  "escalation_path": "/api/v1/agent-runs/{run_id}/architecture-escalations",
+  "instructions": "Escalate instead of crossing a boundary."
+}
+```
+
+The worker rejects the manifest when the schema version is not
+`rustgrid.architecture.v1`, a boundary ID is invalid or duplicated, a path glob
+is absolute or contains `..`, any `may_depend_on`, `applies_to`,
+`ticket_boundary_ids`, or open-escalation entry names an unknown boundary,
+`escalation_path` does not name the claimed run, or the context exceeds
+256 KiB. The worker always calls its own run-scoped path and never follows a
+URL taken from the manifest.
+
+Boundary `paths` are repository-relative globs: `*` and `?` match within one
+path segment, `**` matches any number of segments, and a trailing `/` matches
+everything below a directory.
+
+The plan is checked twice:
+
+1. The Codex prompt carries the contract, the ticket's declared boundaries, and
+   any open escalations. Codex must list the files it will change and their
+   owning boundaries before editing. If no compliant plan exists, it ends with
+   `RUSTGRID_AGENT_STATUS: ESCALATE`, `RUSTGRID_ESCALATION_BOUNDARIES`,
+   `RUSTGRID_ESCALATION_REASON`, and `RUSTGRID_PROPOSED_CHANGE` lines.
+2. After every successful Codex session (initial, gate repair, and CI repair)
+   the worker matches each agent-changed path against the boundaries. A path is
+   in scope when it belongs to no boundary or to at least one declared
+   boundary. When `ticket_boundary_ids` is empty no path scope is enforced.
+   `may_depend_on`, rules, and decisions are enforced through the prompt, CI,
+   and review, not by the worker's diff check.
+
+Either check that fails raises an escalation:
+
+`POST /agent-runs/{run_id}/architecture-escalations`
+
+```json
+{
+  "boundary_ids": ["security-authz"],
+  "reason": "Why the plan cannot stay inside the declared boundaries.",
+  "proposed_change": "What the change would look like if approved."
+}
+```
+
+The request carries an `Idempotency-Key` derived from the run and payload, so a
+retry returns the original escalation. RustGrid answers `201` with an
+`ArchitectureEscalationResponse`, `400` for an unknown boundary or invalid text,
+and `409` when the project has no architecture or the worker lease is not
+active; a `409` with a lease-lost error code is handled as lease loss. When an
+open escalation in the manifest already covers the requested boundaries, the
+worker reuses it instead of raising another.
+
+After escalating, the run ends as a human-intervention block: the ticket moves
+to `blocked`, the workspace and sandbox are retained, and the blocking reason
+names the escalation ID. Approval is expected to be reflected in a later run's
+`ticket_boundary_ids`; the manifest only lists open escalations.
 
 ## Queue and capacity
 

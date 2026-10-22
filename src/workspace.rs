@@ -339,6 +339,7 @@ mod tests {
             required_permissions: json!({}),
             execution_policy: json!({}),
             execution_policy_sha256: String::new(),
+            architecture: None,
         };
         let root = directory.path().join("workspaces");
         let first = RunWorkspace::prepare(&root, "run-1", &manifest, "token").unwrap();

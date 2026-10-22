@@ -2,10 +2,6 @@ use crate::error::{
     CancellationError, ExecutionFailure, ExecutionFailureKind, ExecutionResult, TerminalOutcome,
 };
 
-/// Canonical hosted-domain outcome. The general local-run `RunOutcome` below
-/// remains responsible for process and supervisor failures.
-pub use crate::execution_graph::MissionOutcome as HostedMissionOutcome;
-
 #[derive(Debug)]
 pub struct RunSummary {
     pub ticket_key: String,

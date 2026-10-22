@@ -5,6 +5,26 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- Read the optional `architecture` contract from the run manifest, validate
+  it, and include it in the Codex prompt with a plan check against the
+  ticket's declared boundaries.
+- Check agent-changed paths against the declared boundaries after every Codex
+  session, and raise an escalation through
+  `POST /agent-runs/{run_id}/architecture-escalations` instead of crossing a
+  boundary. The run then blocks until an architect resolves the escalation.
+
+### Removed
+
+- The GitHub Actions execution provider: the `execute` and
+  `report-emergency-failure` commands, the hosted orchestrator, execution
+  graph, and simulation, the cgroup-v2 command containment used on
+  GitHub-hosted runners, the impact-map contract and its generator, the
+  canonical `rustgrid-agent.yml` workflow, and the `Candidate` prerelease
+  workflow. Use the persistent `serve` worker. Journals that still contain a
+  `hosted_execution` checkpoint load without it.
+
 ## 1.4.55 - 2026-08-18
 
 ### Fixed

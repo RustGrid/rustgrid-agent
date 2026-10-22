@@ -16,11 +16,6 @@ use anyhow::{Context, Result, bail};
 
 use crate::shutdown;
 
-#[cfg(target_os = "linux")]
-use std::{fs, path::PathBuf, process::Child};
-
-const CONTAINED_CHILD_MARKER: &str = "__rustgrid-contained-child";
-
 #[derive(Debug)]
 pub struct CommandOutput {
     pub status: ExitStatus,
@@ -64,21 +59,6 @@ pub enum CommandFailure {
     OutputLimit { detail: String },
 }
 
-/// Linux cgroup-v2 boundary for repository-controlled hosted commands.
-///
-/// The cgroup is created by the trusted coordinator as a root-owned child of
-/// its own cgroup. The coordinator uses a bounded privileged write to move the
-/// blocked child into the leaf, while only `cgroup.kill` is delegated to the
-/// unprivileged runner user. A command cannot migrate to the parent, and
-/// `PR_SET_NO_NEW_PRIVS` prevents it from using the runner's passwordless sudo
-/// installation to escape the boundary.
-pub struct HostedProcessContainment {
-    #[cfg(target_os = "linux")]
-    cgroup_path: PathBuf,
-    #[cfg(target_os = "linux")]
-    expected_cgroup: String,
-}
-
 impl std::fmt::Display for CommandFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -98,264 +78,6 @@ impl std::fmt::Display for CommandFailure {
 }
 
 impl std::error::Error for CommandFailure {}
-
-impl HostedProcessContainment {
-    #[cfg(target_os = "linux")]
-    pub fn new() -> Result<Self> {
-        let effective_uid = unsafe { libc::geteuid() };
-        let effective_gid = unsafe { libc::getegid() };
-        if effective_uid == 0 {
-            bail!(
-                "hosted repository containment refuses to run commands as root; use the unprivileged GitHub runner account"
-            );
-        }
-        if linux_effective_capabilities()? != 0 {
-            bail!(
-                "hosted repository containment requires an unprivileged process with no effective Linux capabilities"
-            );
-        }
-
-        let root = Path::new("/sys/fs/cgroup");
-        if !root.join("cgroup.controllers").is_file() {
-            bail!("GitHub Actions hosted execution requires a cgroup-v2 unified hierarchy");
-        }
-        let current = linux_current_cgroup()?;
-        let parent = root.join(current.trim_start_matches('/'));
-        let parent = fs::canonicalize(&parent)
-            .context("could not resolve the coordinator cgroup-v2 directory")?;
-        let canonical_root =
-            fs::canonicalize(root).context("could not resolve the cgroup-v2 mount")?;
-        if !parent.starts_with(&canonical_root) || !parent.join("cgroup.procs").is_file() {
-            bail!("coordinator cgroup-v2 membership is outside the unified hierarchy");
-        }
-        match fs::OpenOptions::new()
-            .write(true)
-            .open(parent.join("cgroup.procs"))
-        {
-            Ok(_) => {
-                bail!(
-                    "coordinator parent cgroup is writable by repository commands; refusing an escapable hosted boundary"
-                )
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EPERM) => {}
-            Err(error) => {
-                return Err(error)
-                    .context("could not verify that the coordinator parent cgroup is protected");
-            }
-        }
-
-        let name = format!(
-            "rustgrid-agent-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let cgroup_path = parent.join(&name);
-        run_privileged_cgroup_command("/usr/bin/mkdir", &["--", path_text(&cgroup_path)?])
-            .context("could not create the hosted command cgroup")?;
-
-        let configured = (|| {
-            let procs = cgroup_path.join("cgroup.procs");
-            let kill = cgroup_path.join("cgroup.kill");
-            if !procs.is_file() || !kill.is_file() {
-                bail!("hosted command cgroup lacks cgroup.kill; Linux 5.14 or newer is required");
-            }
-            let owner = format!("{effective_uid}:{effective_gid}");
-            run_privileged_cgroup_command("/usr/bin/chown", &["--", &owner, path_text(&kill)?])
-                .context("could not delegate the hosted command kill control")?;
-            Ok::<(), anyhow::Error>(())
-        })();
-        if let Err(error) = configured {
-            let _ =
-                run_privileged_cgroup_command("/usr/bin/rmdir", &["--", path_text(&cgroup_path)?]);
-            return Err(error);
-        }
-
-        let expected_cgroup = if current == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{}", current.trim_end_matches('/'), name)
-        };
-        let containment = Self {
-            cgroup_path,
-            expected_cgroup,
-        };
-        containment.drain()?;
-        Ok(containment)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn new() -> Result<Self> {
-        bail!("GitHub Actions hosted repository commands require Linux cgroup-v2 containment")
-    }
-
-    /// Kill and reap every process in the hosted command cgroup.
-    ///
-    /// This is deliberately called after each repository-controlled command
-    /// and immediately before every credentialed publication operation.
-    #[cfg(target_os = "linux")]
-    pub fn drain(&self) -> Result<()> {
-        fs::write(self.cgroup_path.join("cgroup.kill"), b"1\n")
-            .context("could not kill all hosted repository command descendants")?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let events = fs::read_to_string(self.cgroup_path.join("cgroup.events"))
-                .context("could not inspect hosted command cgroup state")?;
-            let populated = events
-                .lines()
-                .find_map(|line| line.strip_prefix("populated "))
-                .context("hosted command cgroup has no populated state")?;
-            if populated == "0" {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                bail!("hosted repository command descendants did not terminate");
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn drain(&self) -> Result<()> {
-        bail!("GitHub Actions hosted repository commands require Linux cgroup-v2 containment")
-    }
-
-    #[cfg(target_os = "linux")]
-    fn attach(&self, pid: u32) -> Result<()> {
-        // Moving a process out of the protected coordinator cgroup requires
-        // privilege at the common ancestor. The child is still blocked on the
-        // trusted pre-exec gate here, so use a bounded sudo write and verify
-        // membership before releasing it.
-        run_privileged_cgroup_write(&self.cgroup_path.join("cgroup.procs"), &format!("{pid}\n"))
-            .context("could not attach the hosted repository command to its cgroup")?;
-        let actual = linux_process_cgroup(pid)?;
-        if actual != self.expected_cgroup {
-            bail!(
-                "hosted repository command entered cgroup {actual}, expected {}",
-                self.expected_cgroup
-            );
-        }
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for HostedProcessContainment {
-    fn drop(&mut self) {
-        let _ = self.drain();
-        if let Ok(path) = path_text(&self.cgroup_path) {
-            let _ = run_privileged_cgroup_command("/usr/bin/rmdir", &["--", path]);
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl Drop for HostedProcessContainment {
-    fn drop(&mut self) {}
-}
-
-#[cfg(target_os = "linux")]
-fn linux_effective_capabilities() -> Result<u64> {
-    let status =
-        fs::read_to_string("/proc/self/status").context("could not inspect Linux capabilities")?;
-    let encoded = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:\t"))
-        .context("Linux process status has no effective-capability field")?;
-    u64::from_str_radix(encoded.trim(), 16).context("Linux effective capabilities are malformed")
-}
-
-#[cfg(target_os = "linux")]
-fn linux_current_cgroup() -> Result<String> {
-    let memberships =
-        fs::read_to_string("/proc/self/cgroup").context("could not inspect cgroup membership")?;
-    let current = memberships
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .context("process is not attached to a cgroup-v2 unified hierarchy")?;
-    if !current.starts_with('/')
-        || current.split('/').any(|part| part == "." || part == "..")
-        || current.contains('\0')
-    {
-        bail!("process has an unsafe cgroup-v2 membership path");
-    }
-    Ok(current.to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_cgroup(pid: u32) -> Result<String> {
-    let memberships = fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .context("could not verify hosted command cgroup membership")?;
-    memberships
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .map(str::to_owned)
-        .context("hosted command is not attached to cgroup v2")
-}
-
-#[cfg(target_os = "linux")]
-fn path_text(path: &Path) -> Result<&str> {
-    path.to_str().context("cgroup-v2 path is not valid UTF-8")
-}
-
-#[cfg(target_os = "linux")]
-fn run_privileged_cgroup_command(program: &str, args: &[&str]) -> Result<()> {
-    if !Path::new("/usr/bin/sudo").is_file() {
-        bail!("GitHub runner is missing /usr/bin/sudo required for cgroup setup");
-    }
-    let output = Command::new("/usr/bin/sudo")
-        .args(["-n", "--", program])
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("could not run trusted cgroup helper {program}"))?;
-    if !output.status.success() {
-        bail!(
-            "trusted cgroup helper {program} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn run_privileged_cgroup_write(path: &Path, value: &str) -> Result<()> {
-    if !Path::new("/usr/bin/sudo").is_file() || !Path::new("/usr/bin/tee").is_file() {
-        bail!("GitHub runner is missing the trusted cgroup write helpers");
-    }
-    let mut child = Command::new("/usr/bin/sudo")
-        .args(["-n", "--", "/usr/bin/tee", "--", path_text(path)?])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("could not start the trusted cgroup write helper")?;
-    child
-        .stdin
-        .take()
-        .context("trusted cgroup write helper has no stdin")?
-        .write_all(value.as_bytes())
-        .context("could not provide the cgroup membership to the trusted helper")?;
-    let output = child
-        .wait_with_output()
-        .context("could not wait for the trusted cgroup write helper")?;
-    if !output.status.success() {
-        bail!(
-            "trusted cgroup write helper exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
 
 pub fn is_timeout(error: &anyhow::Error) -> bool {
     error
@@ -427,7 +149,7 @@ pub fn capture_cancellable_with_environment(
     environment_allowlist: Option<&[String]>,
     limits: Option<ChildLimits>,
 ) -> Result<CommandOutput> {
-    capture_cancellable_with_containment(
+    capture_cancellable_observed(
         command,
         cwd,
         running,
@@ -436,13 +158,12 @@ pub fn capture_cancellable_with_environment(
         environment_allowlist,
         limits,
         None,
-        None,
         &mut |_| {},
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn capture_hosted_cancellable_with_environment(
+fn capture_cancellable_observed(
     command: &str,
     cwd: &Path,
     running: &AtomicBool,
@@ -450,69 +171,14 @@ pub fn capture_hosted_cancellable_with_environment(
     max_output_bytes: usize,
     environment_allowlist: Option<&[String]>,
     limits: Option<ChildLimits>,
-    containment: &HostedProcessContainment,
-) -> Result<CommandOutput> {
-    capture_cancellable_with_containment(
-        command,
-        cwd,
-        running,
-        timeout,
-        max_output_bytes,
-        environment_allowlist,
-        limits,
-        Some(containment),
-        None,
-        &mut |_| {},
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn capture_hosted_cancellable_observed_with_environment(
-    command: &str,
-    cwd: &Path,
-    running: &AtomicBool,
-    absolute_timeout: Duration,
-    inactivity_timeout: Option<Duration>,
-    max_output_bytes: usize,
-    environment_allowlist: Option<&[String]>,
-    limits: Option<ChildLimits>,
-    containment: &HostedProcessContainment,
-    on_activity: &mut dyn FnMut(CommandActivity),
-) -> Result<CommandOutput> {
-    capture_cancellable_with_containment(
-        command,
-        cwd,
-        running,
-        absolute_timeout,
-        max_output_bytes,
-        environment_allowlist,
-        limits,
-        Some(containment),
-        inactivity_timeout,
-        on_activity,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn capture_cancellable_with_containment(
-    command: &str,
-    cwd: &Path,
-    running: &AtomicBool,
-    timeout: Duration,
-    max_output_bytes: usize,
-    environment_allowlist: Option<&[String]>,
-    limits: Option<ChildLimits>,
-    containment: Option<&HostedProcessContainment>,
     inactivity_timeout: Option<Duration>,
     on_activity: &mut dyn FnMut(CommandActivity),
 ) -> Result<CommandOutput> {
-    if containment.is_some() && environment_allowlist.is_none() {
-        bail!("hosted repository commands require an explicit environment allowlist");
-    }
     let parts = parse(command)?;
     println!("  $ {}", display_command(&parts));
-    let (mut command, start_gate) = command_for_parts(&parts, containment)?;
+    let mut command = Command::new(&parts[0]);
     command
+        .args(&parts[1..])
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -524,13 +190,6 @@ fn capture_cancellable_with_containment(
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", parts[0]))?;
-    if let Some(start_gate) = start_gate
-        && let Err(error) = start_gate.release(&child, containment.expect("paired containment"))
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
     let mut stdout = child
         .stdout
         .take()
@@ -567,14 +226,14 @@ fn capture_cancellable_with_containment(
     let mut last_activity_report = None::<std::time::Instant>;
     let status = loop {
         if !running.load(Ordering::SeqCst) || shutdown::requested() {
-            terminate_command(&mut child, containment)?;
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(CommandFailure::Cancelled.into());
         }
         if started.elapsed() >= timeout {
-            terminate_command(&mut child, containment)?;
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -598,7 +257,7 @@ fn capture_cancellable_with_containment(
         if inactivity_timeout
             .is_some_and(|limit| started.elapsed() >= limit && last_output_age >= limit)
         {
-            terminate_command(&mut child, containment)?;
+            terminate_process_tree(&mut child);
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -621,11 +280,10 @@ fn capture_cancellable_with_containment(
         }
         thread::sleep(Duration::from_millis(250));
     };
-    // A repository command can fork, create a new session, and let its direct
-    // child exit. Drain the cgroup before joining output readers so even a
-    // double-forked helper cannot survive to observe later credentialed
-    // publication operations.
-    terminate_command(&mut child, containment)?;
+    // A repository command can leave background descendants in its process
+    // group. Kill the group before joining output readers so they cannot hold
+    // the pipes open.
+    terminate_process_tree(&mut child);
     let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
@@ -1024,179 +682,6 @@ fn spawn_bounded_line_reader<R: Read + Send + 'static>(
     })
 }
 
-fn command_for_parts(
-    parts: &[String],
-    containment: Option<&HostedProcessContainment>,
-) -> Result<(Command, Option<ChildStartGate>)> {
-    if containment.is_none() {
-        let mut command = Command::new(&parts[0]);
-        command.args(&parts[1..]);
-        return Ok((command, None));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let gate = ChildStartGate::new()?;
-        // /proc/self/exe names the currently executing, already-open agent
-        // image. It cannot be replaced by repository writes between commands.
-        let mut command = Command::new("/proc/self/exe");
-        command
-            .arg(CONTAINED_CHILD_MARKER)
-            .arg(gate.child_fd().to_string())
-            .args(parts);
-        Ok((command, Some(gate)))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = parts;
-        bail!("hosted repository commands require Linux cgroup-v2 containment")
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct ChildStartGate {
-    read_fd: libc::c_int,
-    write_fd: libc::c_int,
-}
-
-#[cfg(target_os = "linux")]
-impl ChildStartGate {
-    fn new() -> Result<Self> {
-        let mut descriptors = [-1; 2];
-        // SAFETY: descriptors points to two writable integers. O_CLOEXEC keeps
-        // both ends private unless the read end is explicitly delegated below.
-        if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("could not create the hosted command start gate");
-        }
-        // The trusted /proc/self/exe wrapper must inherit the read side across
-        // exec. The write side remains CLOEXEC, so only the coordinator can
-        // release the command after cgroup membership is verified.
-        if unsafe { libc::fcntl(descriptors[0], libc::F_SETFD, 0) } == -1 {
-            let error = std::io::Error::last_os_error();
-            unsafe {
-                libc::close(descriptors[0]);
-                libc::close(descriptors[1]);
-            }
-            return Err(error).context("could not delegate the hosted command start gate");
-        }
-        Ok(Self {
-            read_fd: descriptors[0],
-            write_fd: descriptors[1],
-        })
-    }
-
-    fn child_fd(&self) -> libc::c_int {
-        self.read_fd
-    }
-
-    fn release(mut self, child: &Child, containment: &HostedProcessContainment) -> Result<()> {
-        unsafe {
-            libc::close(self.read_fd);
-        }
-        self.read_fd = -1;
-        containment.attach(child.id())?;
-        let byte = [0xa5_u8];
-        // SAFETY: write_fd is the live coordinator end of the one-byte gate.
-        let written = unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), byte.len()) };
-        if written != 1 {
-            return Err(std::io::Error::last_os_error())
-                .context("could not release the contained hosted command");
-        }
-        unsafe {
-            libc::close(self.write_fd);
-        }
-        self.write_fd = -1;
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ChildStartGate {
-    fn drop(&mut self) {
-        if self.read_fd >= 0 {
-            unsafe {
-                libc::close(self.read_fd);
-            }
-        }
-        if self.write_fd >= 0 {
-            unsafe {
-                libc::close(self.write_fd);
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-struct ChildStartGate;
-
-#[cfg(not(target_os = "linux"))]
-impl ChildStartGate {
-    fn release(
-        self,
-        _child: &std::process::Child,
-        _containment: &HostedProcessContainment,
-    ) -> Result<()> {
-        bail!("hosted repository commands require Linux cgroup-v2 containment")
-    }
-}
-
-/// Returns true only for the private, pre-cgroup command wrapper invocation.
-pub fn contained_child_requested() -> bool {
-    std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument == OsStr::new(CONTAINED_CHILD_MARKER))
-}
-
-/// Blocks the private command wrapper until its parent has attached it to the
-/// cgroup boundary, then replaces it with the requested repository command.
-pub fn exec_contained_child() -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-
-        let mut arguments = std::env::args_os();
-        let _executable = arguments.next();
-        if arguments.next().as_deref() != Some(OsStr::new(CONTAINED_CHILD_MARKER)) {
-            bail!("invalid contained child invocation");
-        }
-        let gate = arguments
-            .next()
-            .context("contained child invocation has no start gate")?;
-        let gate = gate
-            .to_str()
-            .context("contained child start gate is not UTF-8")?
-            .parse::<libc::c_int>()
-            .context("contained child start gate is invalid")?;
-        let program = arguments
-            .next()
-            .context("contained child invocation has no program")?;
-
-        // SAFETY: PR_SET_NO_NEW_PRIVS takes one integer flag. Once set it is
-        // inherited across fork/exec and cannot be cleared, preventing the
-        // repository command from using sudo/setuid to move out of its cgroup.
-        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("could not disable hosted command privilege escalation");
-        }
-        let mut byte = [0_u8; 1];
-        // SAFETY: gate is the inherited read end created by ChildStartGate.
-        let read = unsafe { libc::read(gate, byte.as_mut_ptr().cast(), byte.len()) };
-        unsafe {
-            libc::close(gate);
-        }
-        if read != 1 || byte[0] != 0xa5 {
-            bail!("hosted command start gate closed before cgroup attachment");
-        }
-
-        let error = Command::new(&program).args(arguments).exec();
-        Err(error).with_context(|| format!("failed to exec {}", program.to_string_lossy()))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        bail!("contained hosted commands require Linux")
-    }
-}
-
 #[cfg(unix)]
 fn configure_child(command: &mut Command, limits: Option<ChildLimits>) {
     use std::os::unix::process::CommandExt;
@@ -1261,22 +746,6 @@ fn terminate_process_tree(child: &mut std::process::Child) {
     unsafe {
         libc::kill(process_group, libc::SIGKILL);
     }
-}
-
-fn terminate_command(
-    child: &mut std::process::Child,
-    containment: Option<&HostedProcessContainment>,
-) -> Result<()> {
-    if let Some(containment) = containment {
-        if let Err(error) = containment.drain() {
-            terminate_process_tree(child);
-            let _ = child.kill();
-            return Err(error);
-        }
-    } else {
-        terminate_process_tree(child);
-    }
-    Ok(())
 }
 
 fn sanitize_child_environment(command: &mut Command) {
@@ -1483,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_identity_and_provider_credentials_are_protected_child_environment() {
+    fn provider_credentials_are_protected_child_environment() {
         for name in [
             "RUSTGRID_EXECUTION_TOKEN",
             "RUSTGRID_OIDC_REQUEST_TOKEN",
@@ -1521,80 +990,6 @@ mod tests {
         .unwrap();
         assert!(output.status.success());
         assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cgroup_boundary_kills_a_setsid_double_fork_before_publication() {
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("escape.py");
-        let release = directory.path().join("release");
-        let escaped_pid = directory.path().join("escaped.pid");
-        fs::write(
-            &script,
-            r#"import os
-import sys
-import time
-
-release, pid_file = sys.argv[1], sys.argv[2]
-while not os.path.exists(release):
-    time.sleep(0.01)
-first = os.fork()
-if first == 0:
-    os.setsid()
-    second = os.fork()
-    if second == 0:
-        with open(pid_file, "w", encoding="ascii") as handle:
-            handle.write(str(os.getpid()))
-            handle.flush()
-            os.fsync(handle.fileno())
-        while True:
-            time.sleep(1)
-    os._exit(0)
-os.waitpid(first, 0)
-while not os.path.exists(pid_file):
-    time.sleep(0.01)
-"#,
-        )
-        .unwrap();
-
-        let containment = HostedProcessContainment::new().unwrap();
-        let mut child = Command::new("/usr/bin/python3")
-            .args([
-                script.as_os_str(),
-                release.as_os_str(),
-                escaped_pid.as_os_str(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        containment.attach(child.id()).unwrap();
-        fs::write(&release, b"release\n").unwrap();
-        assert!(child.wait().unwrap().success());
-        let pid = fs::read_to_string(&escaped_pid)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
-
-        // This is the publication barrier: after it returns, even a process
-        // that escaped the original session and process group must be gone.
-        containment.drain().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            // SAFETY: signal 0 only probes the parsed test child PID.
-            let result = unsafe { libc::kill(pid, 0) };
-            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "escaped descendant {pid} survived the publication barrier"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
     }
 
     #[test]
@@ -1666,13 +1061,12 @@ while not os.path.exists(pid_file):
         let running = AtomicBool::new(true);
         let directory = tempfile::tempdir().unwrap();
         let mut activity = Vec::new();
-        let output = capture_cancellable_with_containment(
+        let output = capture_cancellable_observed(
             "sh -c 'printf \"first\\n\"; sleep 0.1; printf \"second\\n\" >&2; sleep 0.1; printf \"third\\n\"'",
             directory.path(),
             &running,
             Duration::from_secs(2),
             64 * 1024,
-            None,
             None,
             None,
             None,
