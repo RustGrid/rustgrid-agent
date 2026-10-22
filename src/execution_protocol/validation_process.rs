@@ -1606,6 +1606,8 @@ fn safe_environment_name(name: &str) -> bool {
         && !normalized.starts_with("OPENAI_")
         && !normalized.starts_with("CODEX_")
         && !normalized.starts_with("CHATGPT_")
+        && !normalized.starts_with("ANTHROPIC_")
+        && !normalized.starts_with("CLAUDE_CODE_")
         && !normalized.starts_with("LD_")
         && !normalized.starts_with("DYLD_")
         && !normalized.starts_with("GIT_CONFIG")

@@ -122,13 +122,22 @@ workspace like any other human-intervention block. See the
 
 ## Trust boundaries
 
-RustGrid and GitHub are trusted external control planes. Ticket content, repository content, Codex output, child processes, and network responses are untrusted. Docker Sandbox provides the production microVM boundary. Only the disposable run clone is mounted; control-plane credentials and publication stay in the parent coordinator. Unix limits remain defense in depth for the local executor.
+RustGrid and GitHub are trusted external control planes. Ticket content, repository content, agent output (Codex or Claude Code), child processes, and network responses are untrusted. Docker Sandbox provides the production microVM boundary. Only the disposable run clone is mounted; control-plane credentials and publication stay in the parent coordinator. Unix limits remain defense in depth for the local executor.
 
-Inside the production microVM, Codex runs with its inner sandbox disabled so
-repository toolchains can execute downloaded binaries and subprocesses such as
-esbuild. This does not grant host access: the Docker Sandbox remains the outer
+Inside the production microVM, Codex runs with its inner sandbox disabled and
+Claude Code runs with `--permission-mode bypassPermissions`, so repository
+toolchains can execute downloaded binaries and subprocesses such as esbuild.
+This does not grant host access: the Docker Sandbox remains the outer
 filesystem, process, network-policy, and resource boundary. Local execution
-continues to use Codex `workspace-write` mode.
+continues to use Codex `workspace-write` mode or Claude Code's OS sandbox with
+writes confined to the workspace.
+
+The signed execution policy selects the agent (`codex` in policy version 1,
+`agent.provider` in version 2). The worker translates Claude Code's
+`stream-json` output into the same agent event stream it reads from Codex, so
+one implementation of worker-owned command interception, validation evidence,
+completion checks, and telemetry covers both agents. See
+[Claude Code runs](claude-code.md).
 
 The worker API key remains in the parent process. Child environments are rebuilt from an allowlist, while GitHub installation tokens are issued for the active run, validated against the manifest, held in memory, and refreshed before expiry.
 

@@ -177,7 +177,7 @@ impl Repo {
 
     pub fn commit_paths(&self, paths: &[String], message: &str) -> Result<String> {
         if paths.is_empty() {
-            bail!("Codex produced no committable changes");
+            bail!("the coding agent produced no committable changes");
         }
         let mut add_args = vec!["add".to_owned(), "--".to_owned()];
         add_args.extend(paths.iter().cloned());
@@ -189,7 +189,7 @@ impl Repo {
             &self.root,
         )?;
         if staged.status.success() {
-            bail!("Codex produced no committable changes");
+            bail!("the coding agent produced no committable changes");
         }
         command::checked(
             "git",

@@ -5,7 +5,9 @@
 Production uses the standalone Docker Sandboxes CLI. Install `sbx` using
 Docker's current instructions for a supported macOS or Ubuntu Linux host,
 authenticate Codex through Docker's credential proxy, and configure
-`executor.kind` as `docker_sandbox`.
+`executor.kind` as `docker_sandbox`. To accept Claude Code runs, also store an
+Anthropic credential with `sbx secret set -g anthropic` and pin
+`claude_template` and `claude_version`; see [Claude Code runs](claude-code.md).
 
 Run one `serve` process per worker identity and authenticate it with
 `rustgrid-agent login`. GitHub credentials are issued per active run. Use a
@@ -24,7 +26,9 @@ release. Use `sbx` 0.34.0 or newer.
 Sandbox admission requires the Codex CLI already embedded in the immutable
 template to match `codex_version` exactly. The worker never installs or upgrades
 Codex while starting a ticket. A mismatch fails quickly with an actionable
-configuration error; update the version and template digest together.
+configuration error; update the version and template digest together. Claude
+Code runs follow the same rule with `claude_template` and `claude_version`; a
+worker without them stops Claude runs for human intervention.
 JavaScript workspaces always receive registry admission, including when signed
 gates invoke npm indirectly.
 Before Codex starts, a detected npm, pnpm, Yarn, or Bun lockfile is hydrated
@@ -86,10 +90,12 @@ as defense against races and writes outside the polling interval.
 The worker also applies Unix child limits for address space, individual file
 size, open files, CPU time, wall time, and captured output. These limits are
 defense in depth for local development and do not replace host quotas.
-Codex additionally has an output-inactivity watchdog. The signed execution
-policy may set `codex.idle_timeout_seconds`; when omitted, the worker uses the
-smaller of 300 seconds and the total run timeout. Crossing that deadline kills
-the command process tree and restarts a fresh ephemeral Codex process against
+The coding agent additionally has an output-inactivity watchdog. The signed
+execution policy may set `codex.idle_timeout_seconds` (version 1) or
+`agent.idle_timeout_seconds` (version 2); when omitted, the worker uses the
+smaller of 300 seconds and the total run timeout. Reasoning or thinking-only
+output does not count as activity. Crossing that deadline kills the command
+process tree and restarts a fresh ephemeral agent process against
 the same retained workspace, up to three attempts. Exhaustion reports a
 timed-out run and leaves the sandbox recoverable by a later run attempt.
 

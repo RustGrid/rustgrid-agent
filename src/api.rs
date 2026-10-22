@@ -748,13 +748,14 @@ impl RustGridClient {
     pub fn report_token_consumption(
         &self,
         run_id: &str,
+        provider: &str,
         consumption: TokenConsumption,
     ) -> Result<()> {
         self.send_empty(
             Method::PUT,
             &format!("{RUNS}/{run_id}/token-consumption"),
             Some(json!({
-                "provider": "codex",
+                "provider": provider,
                 "input_tokens": consumption.input_tokens,
                 "cached_input_tokens": consumption.cached_input_tokens,
                 "output_tokens": consumption.output_tokens,

@@ -217,7 +217,7 @@ impl ArchitectureContext {
             .collect::<Vec<_>>();
         if signal.boundary_ids.is_empty() || !unknown.is_empty() {
             bail!(
-                "Codex requested an architecture escalation without valid boundary IDs (unknown: {})",
+                "The coding agent requested an architecture escalation without valid boundary IDs (unknown: {})",
                 if unknown.is_empty() {
                     "none given".to_owned()
                 } else {
@@ -306,7 +306,7 @@ The worker raises the escalation for an architect and independently checks the f
     }
 }
 
-/// Escalation fields Codex reported in its final update.
+/// Escalation fields the coding agent reported in its final update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentEscalationSignal {
     pub boundary_ids: Vec<String>,
@@ -345,7 +345,7 @@ pub fn escalation_from_feedback(message: &str) -> Option<AgentEscalationSignal> 
             .collect(),
         reason: reason
             .filter(|reason| !reason.is_empty())
-            .unwrap_or("Codex reported that the plan cannot stay inside the declared boundaries")
+            .unwrap_or("The coding agent reported that the plan cannot stay inside the declared boundaries")
             .to_owned(),
         proposed_change: proposed
             .filter(|change| !change.is_empty())

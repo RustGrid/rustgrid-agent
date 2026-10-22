@@ -10,7 +10,7 @@ Choose and review an explicit Codex version:
 docker build --build-arg CODEX_VERSION=X.Y.Z -t rustgrid-agent:local .
 ```
 
-The image runs as UID/GID `65532`, contains Git, CA certificates, Tini, the RustGrid worker, and the pinned Codex package. The image does not contain credentials or Codex authentication state.
+The image runs as UID/GID `65532`, contains Git, CA certificates, Tini, the RustGrid worker, and the pinned Codex and Claude Code packages (`CLAUDE_CODE_VERSION`, default `2.1.246`). The image does not contain credentials or agent authentication state. These examples are verified for Codex authentication state only; run Claude Code through the Docker Sandbox executor described in [Claude Code runs](../docs/claude-code.md).
 
 Release builds additionally require `RUST_BUILDER_IMAGE` and
 `NODE_RUNTIME_IMAGE` to be immutable `name@sha256:digest` references configured

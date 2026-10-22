@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-use crate::{architecture::ArchitectureContext, config::RepoConfig, error::ManifestError};
+use crate::{
+    agent::AgentProvider, architecture::ArchitectureContext, config::RepoConfig,
+    error::ManifestError,
+};
 
 pub type ManifestResult<T> = std::result::Result<T, ManifestValidationError>;
 
@@ -123,21 +126,103 @@ fn default_attempt() -> u32 {
     1
 }
 
+/// The signed run policy. Version 1 names its agent block `codex`; version 2
+/// carries a provider-tagged `agent` block. Both normalize to [`AgentPolicy`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "WireExecutionPolicy", into = "WireExecutionPolicy")]
 pub struct ExecutionPolicy {
     pub policy_version: u32,
-    pub codex: CodexPolicy,
+    pub agent: AgentPolicy,
     pub quality_gates: Vec<QualityGatePolicy>,
     pub timeout_seconds: u64,
     pub sandbox: SandboxPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CodexPolicy {
+pub struct AgentPolicy {
+    pub provider: AgentProvider,
     pub command: Vec<String>,
     pub environment_allowlist: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexPolicy {
+    command: Vec<String>,
+    environment_allowlist: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idle_timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct WireExecutionPolicy {
+    policy_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex: Option<CodexPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentPolicy>,
+    quality_gates: Vec<QualityGatePolicy>,
+    timeout_seconds: u64,
+    sandbox: SandboxPolicy,
+}
+
+impl TryFrom<WireExecutionPolicy> for ExecutionPolicy {
+    type Error = String;
+
+    fn try_from(wire: WireExecutionPolicy) -> std::result::Result<Self, Self::Error> {
+        let agent = match (wire.policy_version, wire.codex, wire.agent) {
+            (1, Some(codex), None) => AgentPolicy {
+                provider: AgentProvider::Codex,
+                command: codex.command,
+                environment_allowlist: codex.environment_allowlist,
+                idle_timeout_seconds: codex.idle_timeout_seconds,
+            },
+            (2, None, Some(agent)) => agent,
+            (1 | 2, _, _) => {
+                return Err(
+                    "execution policy v1 requires a codex block and v2 requires an agent block"
+                        .into(),
+                );
+            }
+            (version, _, _) => {
+                return Err(format!("unsupported execution policy version {version}"));
+            }
+        };
+        Ok(Self {
+            policy_version: wire.policy_version,
+            agent,
+            quality_gates: wire.quality_gates,
+            timeout_seconds: wire.timeout_seconds,
+            sandbox: wire.sandbox,
+        })
+    }
+}
+
+impl From<ExecutionPolicy> for WireExecutionPolicy {
+    fn from(policy: ExecutionPolicy) -> Self {
+        let (codex, agent) = if policy.policy_version == 1 {
+            let agent = policy.agent;
+            (
+                Some(CodexPolicy {
+                    command: agent.command,
+                    environment_allowlist: agent.environment_allowlist,
+                    idle_timeout_seconds: agent.idle_timeout_seconds,
+                }),
+                None,
+            )
+        } else {
+            (None, Some(policy.agent))
+        };
+        Self {
+            policy_version: policy.policy_version,
+            codex,
+            agent,
+            quality_gates: policy.quality_gates,
+            timeout_seconds: policy.timeout_seconds,
+            sandbox: policy.sandbox,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -157,9 +242,9 @@ pub struct SandboxPolicy {
 }
 
 impl ExecutionPolicy {
-    pub fn codex_idle_timeout(&self) -> std::time::Duration {
+    pub fn agent_idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
-            self.codex
+            self.agent
                 .idle_timeout_seconds
                 .unwrap_or(self.timeout_seconds.min(300)),
         )
@@ -392,34 +477,19 @@ impl ExecutionPolicy {
     }
 
     fn validate_impl(&self) -> Result<()> {
-        if self.policy_version != 1
+        let agent = &self.agent;
+        if !matches!(self.policy_version, 1 | 2)
+            || (self.policy_version == 1 && agent.provider != AgentProvider::Codex)
             || !(1..=86_400).contains(&self.timeout_seconds)
-            || self.codex.command.is_empty()
-            || self.codex.command.len() > 256
+            || agent.command.is_empty()
+            || agent.command.len() > 256
             || self.quality_gates.len() > 100
-            || self.codex.environment_allowlist.len() > 128
+            || agent.environment_allowlist.len() > 128
         {
             bail!("unsupported or incomplete execution policy");
         }
-        if self
-            .codex
-            .command
-            .iter()
-            .any(|value| value.trim().is_empty())
-            || self.codex.command.iter().any(|value| {
-                let lower = value.to_ascii_lowercase();
-                matches!(
-                    lower.as_str(),
-                    "--sandbox"
-                        | "-s"
-                        | "--dangerously-bypass-approvals-and-sandbox"
-                        | "--dangerously-bypass-hook-trust"
-                ) || lower.starts_with("--sandbox=")
-                    || lower.contains("approval_policy")
-                    || lower.contains("sandbox_mode")
-            })
-            || self
-                .codex
+        if agent.command.iter().any(|value| value.trim().is_empty())
+            || agent
                 .idle_timeout_seconds
                 .is_some_and(|seconds| seconds == 0 || seconds > self.timeout_seconds)
             || self.quality_gates.iter().any(|gate| {
@@ -430,8 +500,11 @@ impl ExecutionPolicy {
         {
             bail!("execution policy contains an empty command, gate id, or timeout");
         }
-        if self
-            .codex
+        match agent.provider {
+            AgentProvider::Codex => validate_codex_command(&agent.command)?,
+            AgentProvider::Claude => validate_claude_command(&agent.command)?,
+        }
+        if agent
             .environment_allowlist
             .iter()
             .any(|name| is_sensitive_environment_name(name))
@@ -448,12 +521,25 @@ impl ExecutionPolicy {
         Ok(())
     }
 
-    pub fn codex_args(
+    /// The hardened agent command line. The worker, not the signed policy, owns
+    /// the sandbox, approval, and session-persistence flags for every provider.
+    pub fn agent_args(
         &self,
         externally_isolated: bool,
         image_paths: &[std::path::PathBuf],
     ) -> Vec<String> {
-        let mut command = self.codex.command.clone();
+        match self.agent.provider {
+            AgentProvider::Codex => self.codex_args(externally_isolated, image_paths),
+            AgentProvider::Claude => self.claude_args(externally_isolated),
+        }
+    }
+
+    fn codex_args(
+        &self,
+        externally_isolated: bool,
+        image_paths: &[std::path::PathBuf],
+    ) -> Vec<String> {
+        let mut command = self.agent.command.clone();
         let insertion = command
             .iter()
             .position(|part| part == "-")
@@ -517,6 +603,134 @@ impl ExecutionPolicy {
         }
         command
     }
+
+    /// Claude Code reads the prompt from stdin in print mode and streams
+    /// `stream-json` events. Docker Sandboxes are the isolation boundary, so
+    /// Claude bypasses its own permission prompts there, mirroring Codex's
+    /// `danger-full-access`. Local development keeps Claude Code's OS sandbox
+    /// with writes confined to the workspace, mirroring Codex `workspace-write`,
+    /// and auto-approves sandboxed shell commands because nobody can answer a
+    /// permission prompt.
+    fn claude_args(&self, externally_isolated: bool) -> Vec<String> {
+        let mut command = self.agent.command.clone();
+        if !command.iter().any(|part| part == "-p" || part == "--print") {
+            command.insert(1.min(command.len()), "--print".into());
+        }
+        if !command
+            .iter()
+            .any(|part| part == "--output-format" || part.starts_with("--output-format="))
+        {
+            command.extend(["--output-format".into(), "stream-json".into()]);
+        }
+        for flag in ["--verbose", "--no-session-persistence"] {
+            if !command.iter().any(|part| part == flag) {
+                command.push(flag.into());
+            }
+        }
+        if externally_isolated {
+            command.extend(["--permission-mode".into(), "bypassPermissions".into()]);
+        } else {
+            command.extend([
+                "--permission-mode".into(),
+                "acceptEdits".into(),
+                "--settings".into(),
+                CLAUDE_LOCAL_SANDBOX_SETTINGS.into(),
+            ]);
+        }
+        command
+    }
+}
+
+/// Claude Code settings for local (not externally isolated) execution: shell
+/// commands run inside the OS sandbox with writes confined to the workspace and
+/// no unsandboxed escape hatch.
+const CLAUDE_LOCAL_SANDBOX_SETTINGS: &str = r#"{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}"#;
+
+fn validate_codex_command(command: &[String]) -> Result<()> {
+    if command.iter().any(|value| {
+        let lower = value.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "--sandbox"
+                | "-s"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--dangerously-bypass-hook-trust"
+        ) || lower.starts_with("--sandbox=")
+            || lower.contains("approval_policy")
+            || lower.contains("sandbox_mode")
+    }) {
+        bail!("execution policy contains an empty command, gate id, or timeout");
+    }
+    Ok(())
+}
+
+/// Rejects Claude Code flags that would widen permissions, load host or
+/// caller-controlled configuration, resume another session, or change the
+/// stream format the worker parses.
+fn validate_claude_command(command: &[String]) -> Result<()> {
+    let executable = std::path::Path::new(&command[0])
+        .file_name()
+        .and_then(|name| name.to_str());
+    if executable != Some(AgentProvider::Claude.executable()) {
+        bail!("Claude execution policy must invoke the claude executable");
+    }
+    let mut arguments = command[1..].iter().peekable();
+    while let Some(argument) = arguments.next() {
+        let lower = argument.to_ascii_lowercase();
+        let (flag, inline_value) = match lower.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (lower.as_str(), None),
+        };
+        let forbidden = matches!(
+            flag,
+            "--dangerously-skip-permissions"
+                | "--allow-dangerously-skip-permissions"
+                | "--permission-mode"
+                | "--permission-prompt-tool"
+                | "--settings"
+                | "--setting-sources"
+                | "--allowedtools"
+                | "--allowed-tools"
+                | "--add-dir"
+                | "--mcp-config"
+                | "--plugin-dir"
+                | "--plugin-url"
+                | "--agent"
+                | "--agents"
+                | "--resume"
+                | "-r"
+                | "--continue"
+                | "-c"
+                | "--fork-session"
+                | "--session-id"
+                | "--from-pr"
+                | "--teleport"
+                | "--remote-control"
+                | "--cloud"
+                | "--environment"
+                | "--bg"
+                | "--background"
+                | "--worktree"
+                | "-w"
+                | "--tmux"
+                | "--ide"
+                | "--chrome"
+                | "--input-format"
+                | "--fallback-model"
+        );
+        if forbidden {
+            bail!("Claude execution policy contains a worker-owned or unsafe flag: {flag}");
+        }
+        if flag == "--output-format" {
+            let value = inline_value
+                .map(str::to_owned)
+                .or_else(|| arguments.next().map(|value| value.to_ascii_lowercase()));
+            if value.as_deref() != Some("stream-json") {
+                bail!("Claude execution policy must use --output-format stream-json");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_sensitive_environment_name(name: &str) -> bool {
@@ -631,29 +845,29 @@ mod tests {
     }
 
     #[test]
-    fn codex_idle_timeout_is_bounded_by_the_signed_run_policy() {
+    fn agent_idle_timeout_is_bounded_by_the_signed_run_policy() {
         let policy = manifest().policy().unwrap();
         assert_eq!(
-            policy.codex_idle_timeout(),
+            policy.agent_idle_timeout(),
             std::time::Duration::from_secs(300)
         );
 
         let mut configured = manifest().policy().unwrap();
-        configured.codex.idle_timeout_seconds = Some(120);
+        configured.agent.idle_timeout_seconds = Some(120);
         assert_eq!(
-            configured.codex_idle_timeout(),
+            configured.agent_idle_timeout(),
             std::time::Duration::from_secs(120)
         );
         assert!(configured.validate().is_ok());
 
-        configured.codex.idle_timeout_seconds = Some(configured.timeout_seconds + 1);
+        configured.agent.idle_timeout_seconds = Some(configured.timeout_seconds + 1);
         assert!(configured.validate().is_err());
     }
 
     #[test]
     fn hardens_the_codex_command() {
         let policy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
-        let args = policy.codex_args(false, &[]);
+        let args = policy.agent_args(false, &[]);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--sandbox", "workspace-write"])
@@ -666,7 +880,7 @@ mod tests {
                 || arg.starts_with("model_auto_compact_token_limit=")
                 || arg.starts_with("project_doc_max_bytes=")
         }));
-        let image_args = policy.codex_args(
+        let image_args = policy.agent_args(
             false,
             &[std::path::PathBuf::from(
                 ".git/rustgrid-agent/context/attachments/screenshot.png",
@@ -680,11 +894,11 @@ mod tests {
         }));
         assert!(
             policy
-                .codex_args(true, &[])
+                .agent_args(true, &[])
                 .windows(2)
                 .any(|pair| pair == ["--sandbox", "danger-full-access"])
         );
-        let docker_args = policy.codex_args(true, &[]);
+        let docker_args = policy.agent_args(true, &[]);
         assert!(
             docker_args
                 .iter()
@@ -781,5 +995,154 @@ mod tests {
                 "accepted sensitive variable {name}"
             );
         }
+    }
+
+    fn claude_policy() -> serde_json::Value {
+        serde_json::json!({
+            "policy_version": 2,
+            "agent": {
+                "provider": "claude",
+                "command": ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-opus-5-5"],
+                "environment_allowlist": ["PATH", "HOME"]
+            },
+            "quality_gates": [{"id":"gate-1","command":"cargo test","timeout_seconds":900,"required":true}],
+            "timeout_seconds": 3600,
+            "sandbox": {"mode":"workspace_write","network_access":true,"writable_roots":["."],"approval_policy":"never"}
+        })
+    }
+
+    #[test]
+    fn version_one_policies_round_trip_byte_for_byte() {
+        let value = manifest().execution_policy;
+        let policy: ExecutionPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(policy.agent.provider, AgentProvider::Codex);
+        assert_eq!(serde_json::to_value(&policy).unwrap(), value);
+    }
+
+    #[test]
+    fn accepts_provider_tagged_version_two_policies() {
+        let value = claude_policy();
+        let policy: ExecutionPolicy = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(policy.agent.provider, AgentProvider::Claude);
+        assert!(policy.validate().is_ok());
+        assert_eq!(serde_json::to_value(&policy).unwrap(), value);
+
+        let mut codex = claude_policy();
+        codex["agent"] = serde_json::json!({
+            "provider": "codex",
+            "command": ["codex", "exec", "--json"],
+            "environment_allowlist": ["PATH"]
+        });
+        let policy: ExecutionPolicy = serde_json::from_value(codex).unwrap();
+        assert_eq!(policy.agent.provider, AgentProvider::Codex);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatched_or_unknown_policy_shapes() {
+        let mut v1_with_agent = manifest().execution_policy;
+        v1_with_agent["agent"] = claude_policy()["agent"].clone();
+        assert!(serde_json::from_value::<ExecutionPolicy>(v1_with_agent).is_err());
+
+        let mut v2_with_codex = claude_policy();
+        v2_with_codex["codex"] = manifest().execution_policy["codex"].clone();
+        assert!(serde_json::from_value::<ExecutionPolicy>(v2_with_codex).is_err());
+
+        let mut future = claude_policy();
+        future["policy_version"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<ExecutionPolicy>(future).is_err());
+
+        let mut unknown_provider = claude_policy();
+        unknown_provider["agent"]["provider"] = serde_json::json!("gemini");
+        assert!(serde_json::from_value::<ExecutionPolicy>(unknown_provider).is_err());
+    }
+
+    #[test]
+    fn hardens_the_claude_command() {
+        let policy: ExecutionPolicy = serde_json::from_value(claude_policy()).unwrap();
+        let local = policy.agent_args(false, &[]);
+        assert_eq!(local[0], "claude");
+        assert!(
+            local
+                .windows(2)
+                .any(|pair| pair == ["--model", "claude-opus-5-5"])
+        );
+        assert!(local.iter().any(|arg| arg == "--no-session-persistence"));
+        assert!(
+            local
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
+        );
+        let settings = local
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .map(|pair| serde_json::from_str::<serde_json::Value>(&pair[1]).unwrap())
+            .expect("local Claude runs carry sandbox settings");
+        assert_eq!(settings["sandbox"]["enabled"], true);
+        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
+
+        let isolated = policy.agent_args(true, &[std::path::PathBuf::from("shot.png")]);
+        assert!(
+            isolated
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+        );
+        assert!(
+            !isolated
+                .iter()
+                .any(|arg| arg == "--settings" || arg == "--image")
+        );
+
+        let mut minimal = claude_policy();
+        minimal["agent"]["command"] = serde_json::json!(["claude"]);
+        let minimal: ExecutionPolicy = serde_json::from_value(minimal).unwrap();
+        let args = minimal.agent_args(true, &[]);
+        assert_eq!(args[1], "--print");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--output-format", "stream-json"])
+        );
+        assert!(args.iter().any(|arg| arg == "--verbose"));
+    }
+
+    #[test]
+    fn rejects_caller_supplied_claude_permission_and_session_overrides() {
+        for command in [
+            vec!["claude", "-p", "--dangerously-skip-permissions"],
+            vec!["claude", "-p", "--permission-mode", "bypassPermissions"],
+            vec!["claude", "-p", "--permission-mode=plan"],
+            vec!["claude", "-p", "--settings", "{}"],
+            vec!["claude", "-p", "--setting-sources", "user"],
+            vec!["claude", "-p", "--allowedTools", "Bash"],
+            vec!["claude", "-p", "--add-dir", "/"],
+            vec!["claude", "-p", "--mcp-config", "servers.json"],
+            vec!["claude", "-p", "--resume", "session"],
+            vec!["claude", "-p", "-c"],
+            vec!["claude", "-p", "--output-format", "text"],
+            vec!["claude", "-p", "--output-format=json"],
+            vec!["claude", "-p", "--output-format"],
+            vec!["claude", "-p", "--input-format", "stream-json"],
+            vec!["claude", "-p", "--fallback-model", "claude-haiku-5-5"],
+            vec!["codex", "exec"],
+            vec!["/usr/bin/env", "claude", "-p"],
+        ] {
+            let mut value = claude_policy();
+            value["agent"]["command"] = serde_json::json!(command);
+            let policy: ExecutionPolicy = serde_json::from_value(value).unwrap();
+            assert!(policy.validate().is_err(), "accepted command: {command:?}");
+        }
+        let mut absolute = claude_policy();
+        absolute["agent"]["command"] = serde_json::json!(["/usr/local/bin/claude", "-p"]);
+        let policy: ExecutionPolicy = serde_json::from_value(absolute).unwrap();
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn version_one_policies_cannot_select_claude() {
+        let mut policy: ExecutionPolicy =
+            serde_json::from_value(manifest().execution_policy).unwrap();
+        policy.agent.provider = AgentProvider::Claude;
+        policy.agent.command = vec!["claude".into(), "-p".into()];
+        assert!(policy.validate().is_err());
     }
 }

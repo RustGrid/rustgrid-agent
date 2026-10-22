@@ -4,8 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `rustgrid-agent` is the worker that turns RustGrid tickets into ready-to-review
-GitHub pull requests. RustGrid assigns a run, the worker executes Codex inside an
-isolated Docker Sandbox, validates the result with repository-specific quality
+GitHub pull requests. RustGrid assigns a run, the worker executes the coding
+agent RustGrid selected for it (Codex or Claude Code) inside an isolated Docker
+Sandbox, validates the result with repository-specific quality
 gates, publishes the branch and pull request, and reports progress and token
 consumption back to RustGrid.
 
@@ -30,13 +31,13 @@ For each run, the worker:
    manifest and policy hash.
 3. Obtains a short-lived, repository-scoped GitHub App token and creates an
    isolated clone under the configured workspace root.
-4. Stages clean ticket attachments and builds a Codex prompt from the ticket,
+4. Stages clean ticket attachments and builds an agent prompt from the ticket,
    comments, custom fields, prior gate failures, and repository instructions.
    When the project defines an architecture contract, the prompt includes it
-   and asks Codex to check its plan against the ticket's declared boundaries.
-5. Runs the exact Codex command and model selected by RustGrid inside a dedicated
-   Docker Sandbox microVM.
-6. Publishes concise Codex updates, ordered lifecycle events, run steps, and
+   and asks the agent to check its plan against the ticket's declared boundaries.
+5. Runs the exact agent command and model selected by RustGrid (Codex or Claude
+   Code) inside a dedicated Docker Sandbox microVM.
+6. Publishes concise agent updates, ordered lifecycle events, run steps, and
    aggregate token consumption to RustGrid.
    If the plan or the resulting diff would cross an architecture boundary, the
    worker raises an architecture escalation instead and blocks the ticket until
@@ -71,7 +72,9 @@ before provisioning a host.
   GitHub App.
 - For production: Docker Sandboxes (`sbx`) 0.34.0 or newer, a working microVM
   runtime, an effective network policy, and Codex authentication stored through
-  the Docker credential proxy.
+  the Docker credential proxy. Claude Code runs additionally need an Anthropic
+  credential in the same proxy and a pinned Claude sandbox template; see
+  [Claude Code runs](docs/claude-code.md).
 - Rust 1.94 or newer when building from source. Release binaries and Homebrew
   installations do not require Rust at runtime.
 
@@ -145,6 +148,14 @@ Review the effective network rules before admitting production work. Docker's
 [Codex authentication guide](https://docs.docker.com/ai/sandboxes/agents/codex/)
 explains the host-side credential proxy; the OpenAI credential is not copied
 into the sandbox.
+
+To also accept Claude Code runs, store an Anthropic credential the same way and
+configure `executor.claude_template` and `executor.claude_version`, as described
+in [Claude Code runs](docs/claude-code.md):
+
+```sh
+printf '%s' "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
+```
 
 ### 2. Configure and log in to RustGrid
 
@@ -225,16 +236,21 @@ For a service manager, start with the example
 The model is not selected from `.rustgrid-agent.json`:
 
 1. A user selects an allowed model in AgentOps.
-2. RustGrid validates that model against its server-side catalog.
+2. RustGrid validates that model against its server-side catalog, which also
+   decides the coding agent: Codex models produce a version 1 policy and Claude
+   Code models a version 2 policy with `agent.provider: "claude"`.
 3. RustGrid snapshots `--model <id>` into the run's signed execution policy.
-4. The worker verifies the policy hash and executes that exact command.
+4. The worker verifies the policy hash and executes that exact command with the
+   matching agent.
 
 The `executor.codex_version` setting pins the **Codex CLI version**, not the
 model. The selected immutable Docker Sandbox template must already contain that
 exact version; the worker verifies `codex --version` before starting the run and
 never installs or upgrades Codex while a ticket is starting. Local `codex_command`,
 `quality_gate_command`, and timeout fields are retained only for configuration
-compatibility and cannot override a claimed run.
+compatibility and cannot override a claimed run. `executor.claude_version` and
+`executor.claude_template` pin Claude Code the same way and are verified with
+`claude --version`.
 
 RustGrid also owns the quality gates, timeouts, environment allowlist, required
 GitHub workflows, repository binding, and sandbox policy in each manifest. See
@@ -276,6 +292,7 @@ development-only local executor unless `executor` is set.
 | `executor.command` | `sbx` | Docker Sandboxes executable. |
 | `executor.template` | Digest-pinned default | Production rejects mutable tags and requires a 64-character `@sha256:` digest. |
 | `executor.codex_version` | `0.142.4` | Exact numeric Codex CLI version, for example `0.142.4`. Must match the pinned template. |
+| `executor.claude_template`, `executor.claude_version` | Unset | Optional pair that enables Claude Code runs: a digest-pinned template that embeds Claude Code and its exact CLI version, for example `2.1.246`. Set both or neither. Without them, Claude runs stop for human intervention. |
 | `executor.cpus`, `executor.memory` | `4`, `8g` | CPU and memory allocated to each run sandbox. |
 | `executor.capacity_cpus`, `executor.capacity_memory` | `4`, `8g` | Host capacity reserved for all concurrent worker sandboxes. Startup rejects overcommit. |
 | `lease_seconds` | `900`; range `30..=86400` | Requested run lease. Must exceed three heartbeat intervals. |
@@ -405,8 +422,8 @@ child process groups and exits safely.
 
 ## Run lifecycle, recovery, and telemetry
 
-Manifest version `2` owns the repository, input prompt, selected model, Codex
-command, quality gates, timeouts, environment allowlist, sandbox policy, GitHub
+Manifest version `2` owns the repository, input prompt, selected model, agent
+provider and command, quality gates, timeouts, environment allowlist, sandbox policy, GitHub
 permissions, and required workflows. The worker rejects identity mismatches,
 unknown versions, invalid policy hashes, unpinned execution settings, and
 repository origins that do not match the manifest.
@@ -431,8 +448,9 @@ RustGrid can explicitly adopt that state in a later attempt with
 manifest with `metadata.fresh_start: true` always uses a new run-specific branch
 and cannot include recovery lineage.
 
-Codex JSONL `turn.completed` usage is accumulated across every Codex and repair
-turn. At terminal finalization the worker idempotently writes `input_tokens`,
+Agent `turn.completed` usage is accumulated across every agent and repair turn.
+Claude Code `stream-json` output is translated into the same event stream, with
+cache writes and reads folded into input tokens. At terminal finalization the worker idempotently writes `input_tokens`,
 `cached_input_tokens`, `output_tokens`, and `total_tokens` to
 `PUT /agent-runs/{run_id}/token-consumption`. Cached input is a subset of input,
 and total consumption is input plus output. Successful runs require this report;
@@ -467,8 +485,10 @@ and central OTLP export remain external deployment integrations described in
 
 - Production runs execute in separate Docker Sandbox microVMs. Only the
   disposable run clone crosses the filesystem boundary.
-- Codex uses `danger-full-access` only inside that disposable microVM. Local
-  development retains Codex `workspace-write`.
+- Codex uses `danger-full-access` and Claude Code uses
+  `--permission-mode bypassPermissions` only inside that disposable microVM.
+  Local development retains Codex `workspace-write` and Claude Code's OS sandbox
+  with writes confined to the workspace.
 - RustGrid API calls, GitHub token acquisition, commits, pushes, and pull-request
   publication stay in the trusted coordinator.
 - The execution policy can allow only explicitly named environment variables.
@@ -537,6 +557,10 @@ run and login boundaries used by the client.
   confirm the configured Codex version matches the pinned template.
 - **Codex cannot authenticate:** run `sbx secret set -g openai --oauth` as the
   same OS account that runs the worker. Sandboxes do not inherit `~/.codex`.
+- **Claude Code runs block with "not configured for Claude Code runs":** set
+  `executor.claude_template` and `executor.claude_version` together, store the
+  Anthropic credential with `sbx secret set -g anthropic`, and restart the
+  worker. See [Claude Code runs](docs/claude-code.md).
 - **Token consumption remains zero:** verify the manifest invokes Codex, inspect
   JSON lifecycle logs for valid `turn.completed` usage, and verify RustGrid
   accepts `PUT /agent-runs/{run_id}/token-consumption`.

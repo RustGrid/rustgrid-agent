@@ -55,7 +55,7 @@ impl std::fmt::Display for RunFailure {
                 diagnostics,
             } => write!(
                 formatter,
-                "validation is still failing after {attempts} Codex attempt(s):\n{diagnostics}"
+                "validation is still failing after {attempts} coding agent attempt(s):\n{diagnostics}"
             ),
             Self::InfrastructureTransient { detail } => {
                 write!(

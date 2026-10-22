@@ -13,12 +13,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    agent::{AgentProvider, claude_vendor_and_model},
     api::{RustGridClient, is_lease_lost},
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{AgentRunStatus, LifecycleEvent, RunPhase, StepStatus, TicketStatus},
     mission::MissionClass,
     telemetry::{
-        CodexInvocation, CodexTelemetrySession, TelemetryEmitter, codex_provider_and_model,
+        AgentInvocation, AgentTelemetrySession, TelemetryEmitter, codex_provider_and_model,
     },
     token_consumption::TokenConsumption,
 };
@@ -66,6 +67,7 @@ pub(crate) struct Reporter<'a> {
     phase_started: RefCell<std::time::Instant>,
     token_consumption: Cell<TokenConsumption>,
     telemetry: Option<TelemetryEmitter>,
+    agent_provider: AgentProvider,
 }
 
 impl<'a> Reporter<'a> {
@@ -107,12 +109,20 @@ impl<'a> Reporter<'a> {
             phase_started: RefCell::new(std::time::Instant::now()),
             token_consumption: Cell::new(token_consumption),
             telemetry,
+            agent_provider: AgentProvider::default(),
         }
     }
 
+    /// Attributes reported token consumption to the run's coding agent.
+    pub(crate) fn with_agent_provider(mut self, provider: AgentProvider) -> Self {
+        self.agent_provider = provider;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn start_codex_telemetry(
+    pub(crate) fn start_agent_telemetry(
         &self,
+        provider: AgentProvider,
         args: &[String],
         prompt: &str,
         mission_class: MissionClass,
@@ -120,8 +130,11 @@ impl<'a> Reporter<'a> {
         phase_name: &str,
         attempt_number: u32,
         retry_of_call_id: Option<uuid::Uuid>,
-    ) -> CodexTelemetrySession {
-        let (provider, model) = codex_provider_and_model(args);
+    ) -> AgentTelemetrySession {
+        let (vendor, model) = match provider {
+            AgentProvider::Codex => codex_provider_and_model(args),
+            AgentProvider::Claude => claude_vendor_and_model(args),
+        };
         let context_estimates = serde_json::Map::from_iter([
             (
                 "ctx_known_est_tokens".into(),
@@ -143,12 +156,13 @@ impl<'a> Reporter<'a> {
             ("mission_class".into(), json!(mission_class.as_str())),
             ("ctx_ambient_config_loaded".into(), json!(false)),
         ]);
-        CodexTelemetrySession::start(
-            CodexInvocation {
+        AgentTelemetrySession::start(
+            AgentInvocation {
                 run_id: self.run_id.to_owned(),
+                agent_name: provider.display_name().to_owned(),
                 execution_sequence: self.sequence.get(),
                 phase_name: phase_name.to_owned(),
-                provider,
+                provider: vendor,
                 model,
                 attempt_number,
                 retry_of_call_id,
@@ -307,7 +321,11 @@ impl<'a> Reporter<'a> {
 
     pub(crate) fn report_token_consumption(&self) -> Result<()> {
         self.api
-            .report_token_consumption(self.run_id, self.token_consumption.get())
+            .report_token_consumption(
+                self.run_id,
+                self.agent_provider.as_str(),
+                self.token_consumption.get(),
+            )
             .context("could not report final token consumption to RustGrid")
     }
 

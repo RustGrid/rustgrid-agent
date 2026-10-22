@@ -10,7 +10,7 @@
 ## Trust boundaries
 
 RustGrid owns manifests, leases, policy, and token issuance. GitHub owns
-repository and check-run state. Ticket text, repository contents, Codex output,
+repository and check-run state. Ticket text, repository contents, agent output,
 quality-gate processes, and network responses are untrusted. Docker Sandbox
 owns each run's filesystem, process, resource, and network isolation.
 
@@ -23,10 +23,17 @@ owns each run's filesystem, process, resource, and network isolation.
   mounted into that VM.
 - **Command escape:** commands are argument-parsed without a shell, Git hooks
   are disabled, and quality gates receive only the allowlisted environment.
-  Local execution keeps the Codex workspace sandbox. Production Codex disables
-  its redundant inner OS sandbox so repository binaries can spawn, but only
+  Local execution keeps the Codex workspace sandbox or Claude Code's OS
+  sandbox with workspace-only writes and no unsandboxed fallback. Production
+  Codex disables its redundant inner OS sandbox, and production Claude Code
+  bypasses its permission prompts, so repository binaries can spawn, but only
   inside the per-run Docker Sandbox microVM that owns filesystem, process,
   resource, and network isolation.
+- **Policy downgrade or agent substitution:** the agent is part of the hashed
+  execution policy. Claude policies use version 2, which older workers reject
+  rather than running Codex, and caller-supplied Claude permission, settings,
+  session, tool, MCP, plugin, and format flags are rejected by both RustGrid and
+  the worker.
 - **Resource exhaustion:** wall/CPU/address-space/file/open-file/output limits,
   symlink-safe accounting, and deployment quotas bound untrusted children.
 - **Replay or duplicate side effects:** leases, ETags, ordered events, semantic
@@ -43,8 +50,10 @@ GitHub repository rules unavailable on the current plan, or protect against a
 compromised RustGrid control plane. Credentialed staging and periodic isolation
 escape tests remain mandatory.
 
-Codex authentication state is a high-value deployment secret. Production
-sandboxes must use a dedicated least-privilege Codex identity, make its state
+Codex and Anthropic authentication state are high-value deployment secrets.
+The worker strips `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*`, and `CLAUDE_CODE_*`
+variables from every child process. Production sandboxes must use a dedicated
+least-privilege identity for each provider, make its state
 read-only where supported, avoid reusing developer credentials, and rotate it
 after suspected workspace escape. Staging certification must explicitly test
 that repository commands cannot read or publish that state.

@@ -89,6 +89,13 @@ pub enum ExecutorConfig {
         template: String,
         #[serde(default = "default_codex_version")]
         codex_version: String,
+        /// Digest-pinned template whose image embeds Claude Code. Claude runs are
+        /// refused until this and `claude_version` are configured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_template: Option<String>,
+        /// Exact Claude Code CLI version embedded in `claude_template`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_version: Option<String>,
         #[serde(default = "default_sandbox_cpus")]
         cpus: u16,
         #[serde(default = "default_sandbox_memory")]
@@ -106,6 +113,8 @@ impl ExecutorConfig {
             command: default_sbx_command(),
             template: default_sandbox_template(),
             codex_version: default_codex_version(),
+            claude_template: None,
+            claude_version: None,
             cpus: default_sandbox_cpus(),
             memory: default_sandbox_memory(),
             capacity_cpus: default_sandbox_capacity_cpus(),
@@ -123,6 +132,8 @@ impl ExecutorConfig {
             command: default_sbx_command(),
             template: default_sandbox_template(),
             codex_version: default_codex_version(),
+            claude_template: None,
+            claude_version: None,
             cpus,
             memory,
             capacity_cpus,
@@ -145,6 +156,8 @@ impl ExecutorConfig {
         let Self::DockerSandbox {
             template,
             codex_version,
+            claude_template,
+            claude_version,
             cpus,
             memory,
             capacity_cpus,
@@ -154,13 +167,19 @@ impl ExecutorConfig {
         else {
             bail!("executor.kind=docker_sandbox is required for production");
         };
-        let digest = template.split_once("@sha256:").map(|(_, value)| value);
-        if !digest
-            .is_some_and(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
-        {
+        if !is_digest_pinned(template) {
             bail!("production sandbox template must be pinned by a 64-character sha256 digest");
         }
         validate_codex_version(codex_version)?;
+        validate_claude_sandbox(claude_template.as_deref(), claude_version.as_deref())?;
+        if claude_template
+            .as_deref()
+            .is_some_and(|template| !is_digest_pinned(template))
+        {
+            bail!(
+                "production Claude sandbox template must be pinned by a 64-character sha256 digest"
+            );
+        }
         let required_cpus = usize::from(*cpus).saturating_mul(max_concurrency);
         if required_cpus > usize::from(*capacity_cpus) {
             bail!("sandbox CPU allocation exceeds configured host capacity");
@@ -256,13 +275,39 @@ fn parse_binary_size(value: &str) -> Result<u64> {
         .context("memory size overflow")
 }
 
-fn validate_codex_version(value: &str) -> Result<()> {
+fn is_digest_pinned(template: &str) -> bool {
+    template
+        .split_once("@sha256:")
+        .map(|(_, value)| value)
+        .is_some_and(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn is_exact_version(value: &str) -> bool {
     let components = value.split('.').collect::<Vec<_>>();
-    if components.len() != 3
-        || components
+    components.len() == 3
+        && components
             .iter()
-            .any(|component| component.is_empty() || !component.chars().all(|c| c.is_ascii_digit()))
-    {
+            .all(|component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Claude support is opt-in per worker: both settings or neither.
+fn validate_claude_sandbox(template: Option<&str>, version: Option<&str>) -> Result<()> {
+    match (template, version) {
+        (None, None) => Ok(()),
+        (Some(template), Some(version)) if !template.trim().is_empty() => {
+            if !is_exact_version(version) {
+                bail!(
+                    "docker sandbox claude_version must be an exact numeric version such as 2.1.246"
+                );
+            }
+            Ok(())
+        }
+        _ => bail!("docker sandbox claude_template and claude_version must be configured together"),
+    }
+}
+
+fn validate_codex_version(value: &str) -> Result<()> {
+    if !is_exact_version(value) {
         bail!("docker sandbox codex_version must be an exact numeric version such as 0.144.4");
     }
     Ok(())
@@ -714,6 +759,8 @@ impl Config {
                 command,
                 template,
                 codex_version,
+                claude_template,
+                claude_version,
                 cpus,
                 memory,
                 capacity_cpus,
@@ -728,6 +775,7 @@ impl Config {
                     bail!("docker sandbox command, template, and memory cannot be empty");
                 }
                 validate_codex_version(codex_version)?;
+                validate_claude_sandbox(claude_template.as_deref(), claude_version.as_deref())?;
                 if !(1..=64).contains(cpus) {
                     bail!("docker sandbox cpus must be between 1 and 64");
                 }
@@ -838,6 +886,8 @@ mod tests {
             command: "sbx".into(),
             template: "test".into(),
             codex_version: "0.144.4".into(),
+            claude_template: None,
+            claude_version: None,
             cpus: 1,
             memory: "1g".into(),
             capacity_cpus: 2,
@@ -852,6 +902,8 @@ mod tests {
             command: "sbx".into(),
             template: "example:latest".into(),
             codex_version: "0.144.4".into(),
+            claude_template: None,
+            claude_version: None,
             cpus: 4,
             memory: "8g".into(),
             capacity_cpus: 8,
@@ -862,6 +914,8 @@ mod tests {
             command: "sbx".into(),
             template: format!("example@sha256:{}", "a".repeat(64)),
             codex_version: "0.144.4".into(),
+            claude_template: None,
+            claude_version: None,
             cpus: 4,
             memory: "8g".into(),
             capacity_cpus: 8,
@@ -869,6 +923,53 @@ mod tests {
         };
         pinned.validate_production(2).unwrap();
         assert!(pinned.validate_production(3).is_err());
+    }
+
+    #[test]
+    fn claude_sandbox_support_is_opt_in_and_pinned() {
+        let claude =
+            |template: Option<String>, version: Option<&str>| ExecutorConfig::DockerSandbox {
+                command: "sbx".into(),
+                template: format!("example@sha256:{}", "a".repeat(64)),
+                codex_version: "0.144.4".into(),
+                claude_template: template,
+                claude_version: version.map(str::to_owned),
+                cpus: 4,
+                memory: "8g".into(),
+                capacity_cpus: 8,
+                capacity_memory: "16g".into(),
+            };
+        let pinned = format!("claude@sha256:{}", "b".repeat(64));
+        claude(None, None).validate_production(1).unwrap();
+        claude(Some(pinned.clone()), Some("2.1.246"))
+            .validate_production(1)
+            .unwrap();
+        assert!(
+            claude(Some("claude:latest".into()), Some("2.1.246"))
+                .validate_production(1)
+                .is_err()
+        );
+        assert!(
+            claude(Some(pinned.clone()), None)
+                .validate_production(1)
+                .is_err()
+        );
+        assert!(
+            claude(None, Some("2.1.246"))
+                .validate_production(1)
+                .is_err()
+        );
+        assert!(
+            claude(Some(pinned), Some("latest"))
+                .validate_production(1)
+                .is_err()
+        );
+
+        let defaults: ExecutorConfig = serde_json::from_str(
+            r#"{"kind":"docker_sandbox","template":"example","cpus":1,"memory":"1g","capacity_cpus":1,"capacity_memory":"1g"}"#,
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&defaults).unwrap().contains("claude"));
     }
 
     #[test]

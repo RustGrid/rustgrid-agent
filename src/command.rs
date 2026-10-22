@@ -763,6 +763,8 @@ fn protected_child_environment_name(name: &str) -> bool {
         || name.starts_with("OPENAI_")
         || name.starts_with("CODEX_")
         || name.starts_with("CHATGPT_")
+        || name.starts_with("ANTHROPIC_")
+        || name.starts_with("CLAUDE_CODE_")
         || name.starts_with("GIT_CONFIG_")
         || matches!(
             name.as_str(),
@@ -961,6 +963,9 @@ mod tests {
             "OPENAI_API_KEY",
             "CODEX_API_KEY",
             "CHATGPT_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
             "GITHUB_TOKEN",
             "GH_TOKEN",
             "SSH_AUTH_SOCK",

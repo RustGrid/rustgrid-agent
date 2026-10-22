@@ -12,6 +12,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    agent::AgentStream,
     api::{AgentRun, RustGridClient, Ticket},
     architecture::{PlanVerdict, escalation_from_feedback},
     command,
@@ -27,7 +28,7 @@ use crate::{
     telemetry::SessionOutcome,
 };
 
-const CODEX_IDLE_ATTEMPTS: u32 = 3;
+const AGENT_IDLE_ATTEMPTS: u32 = 3;
 const DEPENDENCY_INSTALL_ATTEMPTS: u32 = 3;
 pub(crate) const VALIDATION_REPAIR_ATTEMPTS: u32 = 3;
 
@@ -62,7 +63,7 @@ pub(crate) struct QualityGateContext<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CodexContext<'a> {
+pub(crate) struct AgentContext<'a> {
     pub app: &'a AppContext,
     pub api: &'a RustGridClient,
     pub reporter: &'a Reporter<'a>,
@@ -132,13 +133,14 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor_handle,
     } = implementation;
     let mission_profile = MissionProfile::classify_after_checkout(ticket, manifest, &repo.root);
+    let agent_name = manifest.policy()?.agent.provider.display_name();
     reporter.step(
         "prompt_built",
         StepStatus::Completed,
-        "Built Codex prompt from ticket and repository context",
+        &format!("Built {agent_name} prompt from ticket and repository context"),
         Some(json!({"characters": generated_prompt.len()})),
     )?;
-    let codex_context = CodexContext {
+    let codex_context = AgentContext {
         app: context,
         api,
         reporter,
@@ -152,12 +154,12 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         baseline,
         ticket,
     };
-    run_codex_prompt(
+    run_agent_prompt(
         &codex_context,
         generated_prompt,
         image_paths,
         "codex",
-        "Running Codex",
+        &format!("Running {agent_name}"),
     )?;
     run_gates_with_repairs(
         &codex_context,
@@ -179,7 +181,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
     reporter.set_phase(RunPhase::Publishing);
     let paths = repo.new_agent_paths(baseline)?;
     if paths.is_empty() {
-        bail!("Codex produced no committable changes");
+        bail!("{agent_name} produced no committable changes");
     }
     reporter.step(
         "changes_detected",
@@ -238,7 +240,7 @@ pub(crate) fn bootstrap_dependencies(
     reporter.step(
         "dependency_bootstrap",
         StepStatus::Running,
-        &format!("Installing locked {manager} dependencies before Codex execution"),
+        &format!("Installing locked {manager} dependencies before agent execution"),
         Some(json!({"manager": manager, "command": command_text})),
     )?;
     let bootstrap_started = Instant::now();
@@ -256,7 +258,7 @@ pub(crate) fn bootstrap_dependencies(
                 idle_timeout: None,
                 output_is_activity: None,
                 max_output_bytes: app.config.max_command_output_bytes as usize,
-                environment_allowlist: &policy.codex.environment_allowlist,
+                environment_allowlist: &policy.agent.environment_allowlist,
                 limits: Some(child_limits(
                     app,
                     Duration::from_secs(policy.timeout_seconds.min(1_800)),
@@ -298,7 +300,7 @@ pub(crate) fn bootstrap_dependencies(
             reporter.step(
                 "dependency_bootstrap",
                 StepStatus::Failed,
-                "Dependency bootstrap failed for a repository-specific reason; Codex will inspect and repair it",
+                "Dependency bootstrap failed for a repository-specific reason; the coding agent will inspect and repair it",
                 Some(json!({
                     "manager": manager,
                     "attempt": attempt,
@@ -362,30 +364,32 @@ fn dependency_bootstrap_command(root: &std::path::Path) -> Option<(&'static str,
 }
 
 #[derive(Clone, Debug)]
-enum CodexControl {
+enum AgentControl {
     WorkerOwnedCommand(String),
 }
 
-impl std::fmt::Display for CodexControl {
+impl std::fmt::Display for AgentControl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WorkerOwnedCommand(command) => {
-                write!(formatter, "Codex attempted worker-owned command: {command}")
+                write!(formatter, "agent attempted worker-owned command: {command}")
             }
         }
     }
 }
 
-impl std::error::Error for CodexControl {}
+impl std::error::Error for AgentControl {}
 
-pub(crate) fn run_codex_prompt(
-    context: &CodexContext<'_>,
+pub(crate) fn run_agent_prompt(
+    context: &AgentContext<'_>,
     prompt: &str,
     image_paths: &[PathBuf],
     step_id: &str,
     message: &str,
 ) -> Result<()> {
     let policy = context.manifest.policy()?;
+    let provider = policy.agent.provider;
+    let agent_name = provider.display_name();
     let externally_isolated = context.executor.externally_isolated();
     let codex_sandbox_mode = if externally_isolated {
         "danger-full-access"
@@ -398,15 +402,16 @@ pub(crate) fn run_codex_prompt(
         StepStatus::Running,
         message,
         Some(json!({
-            "idle_timeout_seconds": policy.codex_idle_timeout().as_secs(),
-            "max_idle_attempts": CODEX_IDLE_ATTEMPTS,
+            "idle_timeout_seconds": policy.agent_idle_timeout().as_secs(),
+            "max_idle_attempts": AGENT_IDLE_ATTEMPTS,
+            "agent_provider": provider.as_str(),
             "codex_sandbox_mode": codex_sandbox_mode,
             "external_isolation": externally_isolated
         })),
     )?;
     let blocked_action = RefCell::new(None);
     let escalation_signal = RefCell::new(None);
-    let codex_args = policy.codex_args(externally_isolated, image_paths);
+    let agent_args = policy.agent_args(externally_isolated, image_paths);
     let mut agent_sessions = 0u32;
     let mut idle_retries = 0u32;
     let mut completion_restarts = 0u32;
@@ -435,7 +440,7 @@ pub(crate) fn run_codex_prompt(
             context.reporter.step(
                 &format!("{step_id}_initial_prompt_constrained"),
                 StepStatus::Running,
-                "Initial prompt reached 70% of its advisory budget; asking Codex to stay focused",
+                &format!("Initial prompt reached 70% of its advisory budget; asking {agent_name} to stay focused"),
                 Some(json!({"threshold_percent": 70, "usage": accumulated_usage, "action": "advise_initial_session"})),
             )?;
         }
@@ -446,7 +451,7 @@ pub(crate) fn run_codex_prompt(
             context.reporter.step(
                 &format!("{step_id}_initial_prompt_finalization"),
                 StepStatus::Running,
-                "Initial prompt reached 90% of its advisory budget; asking Codex to minimize additional discovery",
+                &format!("Initial prompt reached 90% of its advisory budget; asking {agent_name} to minimize additional discovery"),
                 Some(json!({"threshold_percent": 90, "usage": accumulated_usage, "action": "advise_initial_session"})),
             )?;
         }
@@ -462,38 +467,42 @@ pub(crate) fn run_codex_prompt(
             )?;
         }
     }
-    let codex_succeeded = loop {
+    let agent_succeeded = loop {
         agent_sessions = agent_sessions.saturating_add(1);
-        let codex_attempt = agent_sessions;
+        let agent_attempt = agent_sessions;
+        let mut stream = AgentStream::new(provider);
         let session_started = Instant::now();
-        let telemetry = RefCell::new(context.reporter.start_codex_telemetry(
-            &codex_args,
+        let telemetry = RefCell::new(context.reporter.start_agent_telemetry(
+            provider,
+            &agent_args,
             &session_prompt,
             context.mission_class,
             context.budget,
             step_id,
-            codex_attempt,
+            agent_attempt,
             retry_of_call_id,
         ));
         let result = context.executor.streaming(
             context.executor_handle,
             RunCommand {
-                args: &codex_args,
+                args: &agent_args,
                 cwd: &context.repo.root,
                 stdin_text: Some(&session_prompt),
                 running: context.running,
                 timeout: Duration::from_secs(policy.timeout_seconds),
-                idle_timeout: Some(policy.codex_idle_timeout()),
-                output_is_activity: Some(codex_output_is_meaningful_activity),
+                idle_timeout: Some(policy.agent_idle_timeout()),
+                output_is_activity: Some(provider.output_is_activity()),
                 max_output_bytes: context.app.config.max_command_output_bytes as usize,
-                environment_allowlist: &policy.codex.environment_allowlist,
+                environment_allowlist: &policy.agent.environment_allowlist,
                 limits: Some(child_limits(
                     context.app,
                     Duration::from_secs(policy.timeout_seconds),
                 )),
                 max_workspace_bytes: context.app.config.max_workspace_bytes,
             },
-            |line| {
+            |raw_line| {
+                for line in stream.translate(raw_line) {
+                let line = line.as_str();
                 telemetry.borrow_mut().observe_line(line);
                 if let Some(command) = attempted_worker_owned_command(line, &policy.quality_gates) {
                     if let Some(reason) = ownership_override_reason.borrow_mut().take()
@@ -508,11 +517,11 @@ pub(crate) fn run_codex_prompt(
                         context.reporter.step(
                             &format!("{step_id}_ownership_exception"),
                             StepStatus::Running,
-                            "Codex used an explicitly justified exceptional validation override",
+                            &format!("{agent_name} used an explicitly justified exceptional validation override"),
                             Some(json!({"command": command, "reason": reason, "override_allowed": true})),
                         )?;
                     } else {
-                        return Err(CodexControl::WorkerOwnedCommand(command).into());
+                        return Err(AgentControl::WorkerOwnedCommand(command).into());
                     }
                 }
                 if let Some((progress_id, progress_message)) = derived_progress_from_line(line)
@@ -583,7 +592,7 @@ pub(crate) fn run_codex_prompt(
                                 context.reporter.step(
                                     &format!("{step_id}_completion_ready"),
                                     StepStatus::Completed,
-                                    "Codex supplied complete delivery and validation evidence",
+                                    &format!("{agent_name} supplied complete delivery and validation evidence"),
                                     Some(json!({
                                         "validation_mode": readiness.validation_mode,
                                         "changed_paths": changed_paths,
@@ -595,7 +604,7 @@ pub(crate) fn run_codex_prompt(
                                 context.reporter.step(
                                     &format!("{step_id}_completion_not_ready"),
                                     StepStatus::Running,
-                                    "Codex requested completion without the required implementation and validation evidence",
+                                    &format!("{agent_name} requested completion without the required implementation and validation evidence"),
                                     Some(json!({
                                         "missing": readiness.missing,
                                         "changed_paths": changed_paths,
@@ -611,7 +620,7 @@ pub(crate) fn run_codex_prompt(
                 // accepted, keep draining the stream instead of interrupting it for a budget
                 // transition and losing the provider-reported token counts.
                 if completion_ready.get() {
-                    return Ok(());
+                    continue;
                 }
                 let current = accumulated_usage.combined_with(
                     telemetry.borrow().budget_usage(
@@ -631,13 +640,14 @@ pub(crate) fn run_codex_prompt(
                     context.reporter.step(
                         &format!("{step_id}_budget_{stage_name}"),
                         StepStatus::Running,
-                        message,
+                        &format!("{agent_name} {message}"),
                         Some(json!({
                             "threshold_percent": threshold_percent,
                             "usage": current,
                             "action": "continue_active_session"
                         })),
                     )?;
+                }
                 }
                 Ok(())
             },
@@ -686,20 +696,20 @@ pub(crate) fn run_codex_prompt(
             }
             Ok(status) => break status.success() && completion_ready.get(),
             Err(error) => {
-                if let Some(control) = error.downcast_ref::<CodexControl>().cloned() {
+                if let Some(control) = error.downcast_ref::<AgentControl>().cloned() {
                     match control {
-                        CodexControl::WorkerOwnedCommand(command) => {
+                        AgentControl::WorkerOwnedCommand(command) => {
                             let attempts = ownership_interrupts.get().saturating_add(1);
                             ownership_interrupts.set(attempts);
                             context.reporter.step(
                             &format!("{step_id}_ownership_override_{attempts}"),
                             StepStatus::Running,
-                            "Stopped a Codex attempt before a worker-owned full command could duplicate deterministic validation",
+                            &format!("Stopped a {agent_name} attempt before a worker-owned full command could duplicate deterministic validation"),
                             Some(json!({"command": command, "override_allowed": false, "action": "compact_restart"})),
                         )?;
                             if attempts >= 2 {
                                 bail!(
-                                    "Codex repeatedly attempted worker-owned full validation command `{command}`"
+                                    "{agent_name} repeatedly attempted worker-owned full validation command `{command}`"
                                 );
                             }
                             session_prompt = compact_handoff_prompt(
@@ -714,22 +724,22 @@ pub(crate) fn run_codex_prompt(
                     }
                     continue;
                 }
-                if command::is_idle_timeout(&error) && idle_retries + 1 < CODEX_IDLE_ATTEMPTS {
+                if command::is_idle_timeout(&error) && idle_retries + 1 < AGENT_IDLE_ATTEMPTS {
                     idle_retries = idle_retries.saturating_add(1);
                     let delay = Duration::from_secs(u64::from(idle_retries) * 2);
                     context.reporter.step(
                         &format!("{step_id}_idle_retry"),
                         StepStatus::Running,
                         &format!(
-                            "Codex stopped producing output; restarting ephemeral attempt {} of {} in {}s",
+                            "{agent_name} stopped producing output; restarting ephemeral attempt {} of {} in {}s",
                             agent_sessions + 1,
-                            CODEX_IDLE_ATTEMPTS,
+                            AGENT_IDLE_ATTEMPTS,
                             delay.as_secs()
                         ),
                         Some(json!({
                             "attempt": agent_sessions + 1,
-                            "max_attempts": CODEX_IDLE_ATTEMPTS,
-                            "idle_timeout_seconds": policy.codex_idle_timeout().as_secs()
+                            "max_attempts": AGENT_IDLE_ATTEMPTS,
+                            "idle_timeout_seconds": policy.agent_idle_timeout().as_secs()
                         })),
                     )?;
                     thread::sleep(delay);
@@ -749,10 +759,15 @@ pub(crate) fn run_codex_prompt(
         let verdict = match context.manifest.architecture.as_ref() {
             Some(architecture) => architecture.agent_escalation(signal)?,
             None => bail!(
-                "Codex requested an architecture escalation but the project has no architecture contract"
+                "{agent_name} requested an architecture escalation but the project has no architecture contract"
             ),
         };
-        enforce_architecture(context, step_id, "Codex plan check", verdict)?;
+        enforce_architecture(
+            context,
+            step_id,
+            &format!("{agent_name} plan check"),
+            verdict,
+        )?;
     }
     if let Some(action) = blocked_action.into_inner() {
         if is_validation_only_blocker(&action)
@@ -761,15 +776,15 @@ pub(crate) fn run_codex_prompt(
             context.reporter.step(
                 &format!("{step_id}_validation_handoff"),
                 StepStatus::Completed,
-                "Codex could not complete local validation; continuing with runner-owned quality gates",
+                &format!("{agent_name} could not complete local validation; continuing with runner-owned quality gates"),
                 Some(json!({"reported_action": action})),
             )?;
         } else {
             return Err(RunFailure::HumanIntervention { action }.into());
         }
     }
-    if !codex_succeeded {
-        bail!("Codex exited unsuccessfully");
+    if !agent_succeeded {
+        bail!("{agent_name} exited unsuccessfully");
     }
     if let Some(architecture) = context.manifest.architecture.as_ref() {
         let paths = context.repo.new_agent_paths(context.baseline)?;
@@ -789,7 +804,7 @@ pub(crate) fn run_codex_prompt(
     context.reporter.step(
         step_id,
         StepStatus::Completed,
-        "Codex iteration finished successfully",
+        &format!("{agent_name} iteration finished successfully"),
         Some(json!({
             "usage": accumulated_usage,
             "budget": context.budget,
@@ -804,7 +819,7 @@ pub(crate) fn run_codex_prompt(
 /// Raises (or reuses) an architecture escalation and blocks the run until an
 /// architect resolves it. Returns `Ok` only when the plan stays in bounds.
 fn enforce_architecture(
-    context: &CodexContext<'_>,
+    context: &AgentContext<'_>,
     step_id: &str,
     source: &str,
     verdict: PlanVerdict,
@@ -853,17 +868,17 @@ fn budget_advisory(stage: BudgetStage) -> Option<(&'static str, u8, &'static str
         BudgetStage::Constrained => Some((
             "constrained",
             70,
-            "Codex reached 70% of an advisory execution budget; continuing the active session",
+            "reached 70% of an advisory execution budget; continuing the active session",
         )),
         BudgetStage::FinalizationRequired => Some((
             "finalization",
             90,
-            "Codex reached 90% of an advisory execution budget; continuing toward a validated result",
+            "reached 90% of an advisory execution budget; continuing toward a validated result",
         )),
         BudgetStage::HardLimit => Some((
             "exceeded",
             100,
-            "Codex exceeded an advisory execution budget; continuing because task completion takes priority",
+            "exceeded an advisory execution budget; continuing because task completion takes priority",
         )),
     }
 }
@@ -965,7 +980,7 @@ fn completion_readiness(
 }
 
 fn compact_handoff_prompt(
-    context: &CodexContext<'_>,
+    context: &AgentContext<'_>,
     directive: &str,
     focused_validation: &[FocusedValidationEvidence],
     usage: BudgetUsage,
@@ -1092,7 +1107,7 @@ fn is_validation_command(command: &str) -> bool {
 }
 
 pub(crate) fn run_gates_with_repairs(
-    codex: &CodexContext<'_>,
+    codex: &AgentContext<'_>,
     gates: QualityGateContext<'_>,
     source: &str,
 ) -> Result<()> {
@@ -1129,11 +1144,12 @@ pub(crate) fn run_gates_with_repairs(
             .into());
         }
         let repair_attempt = attempt + 1;
+        let agent_name = codex.manifest.policy()?.agent.provider.display_name();
         codex.reporter.step(
             &format!("validation_repair_{repair_attempt}"),
             StepStatus::Running,
             &format!(
-                "{source} failed; asking Codex to repair attempt {repair_attempt} of {VALIDATION_REPAIR_ATTEMPTS}"
+                "{source} failed; asking {agent_name} to repair attempt {repair_attempt} of {VALIDATION_REPAIR_ATTEMPTS}"
             ),
             Some(json!({"attempt": repair_attempt, "source": source})),
         )?;
@@ -1159,12 +1175,12 @@ pub(crate) fn run_gates_with_repairs(
             truncate_text(&diagnostics, 20_000),
             truncate_text(&diff, 20_000),
         );
-        run_codex_prompt(
+        run_agent_prompt(
             codex,
             &prompt,
             &[],
             &format!("validation_repair_{repair_attempt}_codex"),
-            "Running Codex validation repair",
+            &format!("Running {agent_name} validation repair"),
         )?;
     }
     unreachable!("bounded validation repair loop always returns")
@@ -1249,7 +1265,7 @@ fn run_quality_gates(
                     idle_timeout: None,
                     output_is_activity: None,
                     max_output_bytes: app.config.max_command_output_bytes as usize,
-                    environment_allowlist: &policy.codex.environment_allowlist,
+                    environment_allowlist: &policy.agent.environment_allowlist,
                     limits: Some(child_limits(
                         app,
                         Duration::from_secs(gate_policy.timeout_seconds),
@@ -1477,26 +1493,6 @@ fn combine_output(stdout: &str, stderr: &str) -> String {
     }
 }
 
-fn codex_output_is_meaningful_activity(line: &str) -> bool {
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-        return true;
-    };
-    match event.get("type").and_then(serde_json::Value::as_str) {
-        Some("item.started" | "item.updated" | "item.completed") => {
-            event
-                .get("item")
-                .and_then(|item| item.get("type"))
-                .and_then(serde_json::Value::as_str)
-                != Some("reasoning")
-        }
-        Some("thread.started" | "turn.started" | "turn.completed" | "turn.failed" | "error") => {
-            true
-        }
-        Some(_) => false,
-        None => true,
-    }
-}
-
 fn print_output(stdout: &str, stderr: &str) {
     if !stdout.is_empty() {
         println!("{stdout}");
@@ -1607,6 +1603,15 @@ fn derived_progress_from_line(line: &str) -> Option<(String, &'static str)> {
                 ))
             }
         }
+        // Claude Code searches and reads through dedicated tools instead of a shell.
+        "mcp_tool_call" => match item.get("tool").and_then(serde_json::Value::as_str)? {
+            "Grep" | "Glob" => Some(("searching_source".into(), "Searching relevant source files")),
+            "Read" | "LS" => Some((
+                "inspecting_repository".into(),
+                "Inspecting relevant repository state",
+            )),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1644,7 +1649,7 @@ fn feedback_from_output_line(line: &str) -> Option<String> {
         Some("error") => event
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .map(|message| format!("Codex error: {message}")),
+            .map(|message| format!("Agent error: {message}")),
         _ => None,
     }
 }
@@ -1666,7 +1671,9 @@ fn blocked_action_from_feedback(message: &str) -> Option<String> {
                 .then(|| value.trim().to_owned())
         })
         .filter(|value| !value.is_empty())
-        .or_else(|| Some("Codex reported that human intervention is required".to_owned()))
+        .or_else(|| {
+            Some("The coding agent reported that human intervention is required".to_owned())
+        })
 }
 
 fn is_validation_only_blocker(action: &str) -> bool {
@@ -1746,25 +1753,71 @@ mod tests {
     }
 
     #[test]
-    fn all_non_reasoning_codex_output_preserves_a_working_session() {
-        assert!(!codex_output_is_meaningful_activity(
-            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#
-        ));
-        assert!(codex_output_is_meaningful_activity(
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"working"}}"#
-        ));
-        assert!(codex_output_is_meaningful_activity(
-            r#"{"type":"error","message":"Reconnecting... 4/5"}"#
-        ));
-        assert!(codex_output_is_meaningful_activity(
-            r#"{"type":"item.started","item":{"type":"command_execution","command":"npm test"}}"#
-        ));
-        assert!(codex_output_is_meaningful_activity(
-            r#"{"type":"item.completed","item":{"type":"file_change","changes":[]}}"#
-        ));
-        assert!(!codex_output_is_meaningful_activity(
-            r#"{"type":"response.keepalive"}"#
-        ));
+    fn worker_guards_apply_to_translated_claude_events() {
+        use crate::agent::{AgentProvider, AgentStream};
+
+        let gates = vec![crate::manifest::QualityGatePolicy {
+            id: "gate-1".into(),
+            command: "cargo test --all-features".into(),
+            timeout_seconds: 900,
+            required: true,
+        }];
+        let mut stream = AgentStream::new(AgentProvider::Claude);
+        let translate = |stream: &mut AgentStream, line: &str| stream.translate(line);
+
+        let full_gate = translate(
+            &mut stream,
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --all-features"}}]}}"#,
+        );
+        assert_eq!(
+            attempted_worker_owned_command(&full_gate[0], &gates).as_deref(),
+            Some("cargo test --all-features")
+        );
+
+        translate(
+            &mut stream,
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cargo test parser::"}}]}}"#,
+        );
+        let focused = translate(
+            &mut stream,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok","is_error":false}]}}"#,
+        );
+        assert_eq!(
+            successful_focused_validation_command(&focused[0], &gates).as_deref(),
+            Some("cargo test parser::")
+        );
+
+        translate(
+            &mut stream,
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cargo test lexer::"}}]}}"#,
+        );
+        let failing = translate(
+            &mut stream,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":"Exit code 101\ntest failed","is_error":true}]}}"#,
+        );
+        assert_eq!(
+            successful_focused_validation_command(&failing[0], &gates),
+            None
+        );
+
+        let search = translate(
+            &mut stream,
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t4","name":"Grep","input":{"pattern":"fn parse"}}]}}"#,
+        );
+        assert_eq!(
+            derived_progress_from_line(&search[0]).map(|progress| progress.0),
+            Some("searching_source".into())
+        );
+
+        let message = translate(
+            &mut stream,
+            r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"Blocked.\nRUSTGRID_AGENT_STATUS: BLOCKED\nHUMAN_ACTION_REQUIRED: Provide the signing key."}]}}"#,
+        );
+        let feedback = feedback_from_output_line(&message[0]).unwrap();
+        assert_eq!(
+            blocked_action_from_feedback(&feedback).as_deref(),
+            Some("Provide the signing key.")
+        );
     }
 
     #[test]

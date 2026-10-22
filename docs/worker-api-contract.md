@@ -6,7 +6,7 @@ contains `/api/v1`.
 
 ## Token consumption
 
-At terminal finalization, the worker writes the aggregate consumption from every completed Codex turn in the run to `PUT /agent-runs/{run_id}/token-consumption`. The payload contains `provider`, `input_tokens`, `cached_input_tokens`, `output_tokens`, and `total_tokens`; retries replace the same per-run resource idempotently. This report is sent before the successful terminal status update, and unsuccessful runs attempt the same report before failure, cancellation, or timeout handling.
+At terminal finalization, the worker writes the aggregate consumption from every completed agent turn in the run to `PUT /agent-runs/{run_id}/token-consumption`. The payload contains `provider` (`codex` or `claude`, from the run's execution policy), `input_tokens`, `cached_input_tokens`, `output_tokens`, and `total_tokens`; retries replace the same per-run resource idempotently. This report is sent before the successful terminal status update, and unsuccessful runs attempt the same report before failure, cancellation, or timeout handling.
 
 ## Execution manifest
 
@@ -56,7 +56,7 @@ and GitHub App installation. The worker rejects unsupported schema versions,
 identity mismatches, missing values, zero installation IDs, and a local origin
 that does not match `owner/name`.
 
-The worker verifies the policy SHA-256, executes only the server-owned Codex
+The worker verifies the policy SHA-256, executes only the server-owned agent
 command and gates, applies their timeouts and environment allowlist, and refuses
 a sandbox policy it cannot enforce. The manifest's `workspace_write` mode
 describes the effective repository scope. The local executor enforces it with
@@ -68,6 +68,51 @@ boundaries. Approval policy remains `never` in both cases.
 The optional user-selected model is not read directly from client metadata by
 the worker. RustGrid validates the requested identifier against its configured
 catalog and places `--model <id>` in the snapshotted, hashed command above.
+
+### Agent providers and policy versions
+
+Policy version `1` always runs Codex and carries the `codex` block shown above.
+Policy version `2` replaces it with a provider-tagged `agent` block. RustGrid
+emits version `2` for models in its Claude Code catalog:
+
+```json
+"execution_policy": {
+  "policy_version": 2,
+  "agent": {
+    "provider": "claude",
+    "command": ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", "claude-opus-5-5"],
+    "environment_allowlist": ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"]
+  },
+  "quality_gates": [],
+  "timeout_seconds": 3600,
+  "sandbox": {"mode": "workspace_write", "network_access": true, "writable_roots": ["."], "approval_policy": "never"}
+}
+```
+
+`agent.provider` is `codex` or `claude`, and `agent.idle_timeout_seconds` is
+optional as it is for `codex`. A version `1` policy with an `agent` block, a
+version `2` policy with a `codex` block, an unknown provider, or an unknown
+version is rejected before any work starts. Workers released before version `2`
+reject Claude policies instead of running Codex in their place.
+
+A Claude command must invoke the `claude` executable. The worker owns print
+mode, `stream-json` output, `--verbose`, `--no-session-persistence`, and the
+permission mode, and rejects policies that set permissions, settings or
+setting sources, tool allowlists, extra directories, MCP or plugin
+configuration, custom agents, session resume or continuation, remote, cloud,
+background, or worktree sessions, a different input or output format, or a
+fallback model. Inside a Docker Sandbox microVM the worker adds
+`--permission-mode bypassPermissions`, the Claude Code equivalent of Codex
+`danger-full-access`. The local executor adds `--permission-mode acceptEdits`
+with Claude Code's OS sandbox enabled, writes confined to the workspace, and no
+unsandboxed fallback, the equivalent of Codex `workspace-write`.
+
+The worker translates Claude Code's `stream-json` messages into the same agent
+event stream it reads from Codex, so worker-owned command interception,
+focused-validation evidence, completion readiness, idle detection, budgets, and
+telemetry behave identically for both providers. Claude usage is normalized
+before it is reported: `input_tokens` is uncached input plus cache writes plus
+cache reads, and `cached_input_tokens` is the cache-read share.
 
 ## Architecture contract and escalations
 

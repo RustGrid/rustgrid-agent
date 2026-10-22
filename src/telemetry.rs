@@ -252,8 +252,9 @@ pub enum SessionOutcome {
 }
 
 #[derive(Clone, Debug)]
-pub struct CodexInvocation {
+pub struct AgentInvocation {
     pub run_id: String,
+    pub agent_name: String,
     pub execution_sequence: u64,
     pub phase_name: String,
     pub provider: String,
@@ -619,8 +620,8 @@ struct ActiveTool {
     related_model_call_id: Option<Uuid>,
 }
 
-pub struct CodexTelemetrySession {
-    invocation: CodexInvocation,
+pub struct AgentTelemetrySession {
+    invocation: AgentInvocation,
     emitter: Option<TelemetryEmitter>,
     execution_id: Uuid,
     phase_id: Uuid,
@@ -636,8 +637,8 @@ pub struct CodexTelemetrySession {
     finished: bool,
 }
 
-impl CodexTelemetrySession {
-    pub fn start(invocation: CodexInvocation, emitter: Option<TelemetryEmitter>) -> Self {
+impl AgentTelemetrySession {
+    pub fn start(invocation: AgentInvocation, emitter: Option<TelemetryEmitter>) -> Self {
         let execution_id = stable_uuid(&format!(
             "run:{}:execution:{}",
             invocation.run_id, invocation.execution_sequence
@@ -1072,7 +1073,7 @@ impl CodexTelemetrySession {
             id,
             execution_id: self.execution_id,
             agent_id: self.agent_id,
-            agent_name: Some("Codex".into()),
+            agent_name: Some(self.invocation.agent_name.clone()),
             phase_id: Some(self.phase_id),
             phase_name: Some(self.invocation.phase_name.clone()),
             turn_index,
@@ -1124,7 +1125,7 @@ impl CodexTelemetrySession {
             id: tool.id,
             execution_id: self.execution_id,
             agent_id: self.agent_id,
-            agent_name: Some("Codex".into()),
+            agent_name: Some(self.invocation.agent_name.clone()),
             phase_id: Some(self.phase_id),
             phase_name: Some(self.invocation.phase_name.clone()),
             turn_index: tool.turn_index,
@@ -1148,7 +1149,7 @@ impl CodexTelemetrySession {
         ExecutionSnapshot {
             id: self.execution_id,
             agent_id: self.agent_id,
-            agent_name: Some("Codex".into()),
+            agent_name: Some(self.invocation.agent_name.clone()),
             role: Some(invocation_role(&self.invocation.phase_name).into()),
             started_at: self.started_at.clone(),
             completed_at,
@@ -1420,8 +1421,9 @@ mod tests {
             sender,
             dropped_events: Arc::new(AtomicU64::new(0)),
         };
-        let mut session = CodexTelemetrySession::start(
-            CodexInvocation {
+        let mut session = AgentTelemetrySession::start(
+            AgentInvocation {
+                agent_name: "Codex".into(),
                 run_id: "run-1".into(),
                 execution_sequence: 7,
                 phase_name: "validation_repair_2_codex".into(),
@@ -1497,8 +1499,9 @@ mod tests {
 
     #[test]
     fn one_agent_session_reports_multiple_inference_turns_and_distinct_context() {
-        let mut session = CodexTelemetrySession::start(
-            CodexInvocation {
+        let mut session = AgentTelemetrySession::start(
+            AgentInvocation {
+                agent_name: "Codex".into(),
                 run_id: "run-turns".into(),
                 execution_sequence: 1,
                 phase_name: "implementation".into(),

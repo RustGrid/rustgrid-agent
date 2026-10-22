@@ -113,11 +113,11 @@ pub fn prompt_section(attachments: &[StagedAttachment]) -> Option<String> {
             attachment.filename,
             attachment.mime.as_deref().unwrap_or("unknown type"),
             attachment.relative_path.display(),
-            if attachment.image_path.is_some() {
-                " (also attached to the initial Codex prompt as an image)"
-            } else {
-                ""
-            }
+            attachment
+                .image_path
+                .as_ref()
+                .map(|path| format!(" (image preview at `{}`)", path.display()))
+                .unwrap_or_default()
         ));
     }
     Some(section)

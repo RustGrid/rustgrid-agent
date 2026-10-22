@@ -594,6 +594,36 @@
         ],
         "type": "object"
       },
+      "AgentCommandPolicyResponse": {
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "environment_allowlist": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "description": "Coding agent that executes the command.",
+            "enum": [
+              "codex",
+              "claude"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "command",
+          "environment_allowlist"
+        ],
+        "type": "object"
+      },
       "AgentExecutionManifestResponse": {
         "properties": {
           "architecture": {
@@ -706,7 +736,11 @@
         "type": "object"
       },
       "AgentExecutionPolicyResponse": {
+        "description": "Signed run policy. Version 1 carries a `codex` block; version 2 carries a provider-tagged `agent` block instead (used for Claude Code runs). Exactly one of the two is present.",
         "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/AgentCommandPolicyResponse"
+          },
           "codex": {
             "$ref": "#/components/schemas/AgentCodexPolicyResponse"
           },
@@ -730,7 +764,6 @@
         },
         "required": [
           "policy_version",
-          "codex",
           "quality_gates",
           "timeout_seconds",
           "sandbox"
@@ -764,6 +797,25 @@
         ],
         "type": "object"
       },
+      "AgentModelOptionResponse": {
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "codex",
+              "claude"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "provider"
+        ],
+        "type": "object"
+      },
       "AgentModelOptionsResponse": {
         "properties": {
           "default_model": {
@@ -777,11 +829,19 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "options": {
+            "description": "The coding agent that runs each model in `models`.",
+            "items": {
+              "$ref": "#/components/schemas/AgentModelOptionResponse"
+            },
+            "type": "array"
           }
         },
         "required": [
           "default_model",
-          "models"
+          "models",
+          "options"
         ],
         "type": "object"
       },
@@ -16019,7 +16079,7 @@
     },
     "/api/v1/agent-runs/models": {
       "get": {
-        "description": "Lists the server-configured Codex models that can be selected when creating or claiming an agent run.",
+        "description": "Lists the server-configured Codex and Claude Code models that can be selected when creating or claiming an agent run, with the coding agent that runs each model.",
         "operationId": "listAgentModels",
         "parameters": [
           {

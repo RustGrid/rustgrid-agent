@@ -20,8 +20,10 @@ The RustGrid control plane and deployment platform should alert on:
 
 ## Execution-efficiency semantics
 
-An agent session is one `codex exec` process. A model inference turn is one
-provider `turn.started`/`turn.completed` pair inside that process. Tool calls are
+An agent session is one `codex exec` or `claude --print` process. A model
+inference turn is one `turn.started`/`turn.completed` pair inside that process;
+Claude Code reports one such pair per session, closed by its final `result`
+message. Tool calls are
 captured from provider item events. These counts are separate: a single agent
 session may contain many inference turns and tool calls. Historical runs that
 only contain an aggregate model call must not be reinterpreted as turn-level
@@ -43,7 +45,9 @@ Step records receive the measurement payload directly; the separate progress
 event retains the full lifecycle envelope. Model identity is resolved from
 Codex model flags and safe `model`/`model_provider` config overrides, allowing
 the control plane to distinguish API-priced calls from the ChatGPT subscription
-transport without inspecting credentials.
+transport without inspecting credentials. Claude Code calls report provider
+`anthropic`, agent name `Claude Code`, and the `--model` value from the signed
+command.
 
 Worker command output has three model-facing modes: `summary`,
 `failure_excerpt`, and explicit `full_requested`. Successful output is reduced

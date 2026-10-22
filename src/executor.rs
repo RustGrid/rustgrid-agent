@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    agent::AgentProvider,
     command::{self, CommandOutput, StreamingCommand},
     config::ExecutorConfig,
     reporting::console_event,
@@ -48,6 +49,8 @@ pub(crate) enum Executor {
         command: String,
         template: String,
         codex_version: String,
+        claude_template: Option<String>,
+        claude_version: Option<String>,
         cpus: u16,
         memory: String,
     },
@@ -83,6 +86,8 @@ impl Executor {
                 command,
                 template,
                 codex_version,
+                claude_template,
+                claude_version,
                 cpus,
                 memory,
                 ..
@@ -90,6 +95,8 @@ impl Executor {
                 command: command.clone(),
                 template: template.clone(),
                 codex_version: codex_version.clone(),
+                claude_template: claude_template.clone(),
+                claude_version: claude_version.clone(),
                 cpus: *cpus,
                 memory: memory.clone(),
             },
@@ -198,6 +205,7 @@ impl Executor {
 
     pub(crate) fn prepare(
         &self,
+        provider: AgentProvider,
         run_id: &str,
         workspace: &Path,
         probe_npm_registry: bool,
@@ -210,9 +218,24 @@ impl Executor {
                 command,
                 template,
                 codex_version,
+                claude_template,
+                claude_version,
                 cpus,
                 memory,
             } => {
+                let (template, agent_version) = match provider {
+                    AgentProvider::Codex => (template.as_str(), codex_version.as_str()),
+                    AgentProvider::Claude => match (claude_template, claude_version) {
+                        (Some(template), Some(version)) => (template.as_str(), version.as_str()),
+                        _ => {
+                            return Err(RunFailure::HumanIntervention {
+                                action: "This worker is not configured for Claude Code runs; set executor.claude_template to a digest-pinned Docker Sandboxes template that embeds Claude Code and executor.claude_version to its exact CLI version, then retry".into(),
+                            }
+                            .into());
+                        }
+                    },
+                };
+                let agent_name = provider.display_name();
                 let name = retained_sandbox_name
                     .map(validate_managed_sandbox_name)
                     .transpose()?
@@ -223,16 +246,17 @@ impl Executor {
                         &format!("Reusing retained Docker Sandbox {name}"),
                         "36",
                     );
-                    if let Err(error) = verify_sandbox_codex_version(
+                    if let Err(error) = verify_sandbox_agent_version(
                         command,
                         &name,
                         workspace,
-                        codex_version,
+                        provider,
+                        agent_version,
                         running,
                     ) {
                         return Err(RunFailure::InfrastructureTransient {
                             detail: format!(
-                                "retained Docker Sandbox Codex version mismatch; sandbox preserved: {error:#}"
+                                "retained Docker Sandbox {agent_name} version mismatch; sandbox preserved: {error:#}"
                             ),
                         }
                         .into());
@@ -279,12 +303,12 @@ impl Executor {
                     "--name".into(),
                     name.clone(),
                     "--template".into(),
-                    template.clone(),
+                    template.to_owned(),
                     "--cpus".into(),
                     cpus.to_string(),
                     "--memory".into(),
                     memory.clone(),
-                    "codex".into(),
+                    provider.sandbox_agent().into(),
                     workspace.display().to_string(),
                 ];
                 let mut last_failure = String::new();
@@ -322,11 +346,12 @@ impl Executor {
                             &format!("created {name} in {}ms", started.elapsed().as_millis()),
                             "36",
                         );
-                        match verify_sandbox_codex_version(
+                        match verify_sandbox_agent_version(
                             command,
                             &name,
                             workspace,
-                            codex_version,
+                            provider,
+                            agent_version,
                             running,
                         ) {
                             Ok(()) if !probe_npm_registry => {
@@ -352,7 +377,7 @@ impl Executor {
                                 );
                                 return Err(RunFailure::InfrastructureTransient {
                                     detail: format!(
-                                        "Docker Sandbox Codex verification exceeded the {SANDBOX_PREPARE_TIMEOUT_SECONDS}s timeout"
+                                        "Docker Sandbox {agent_name} verification exceeded the {SANDBOX_PREPARE_TIMEOUT_SECONDS}s timeout"
                                     ),
                                 }
                                 .into());
@@ -383,7 +408,7 @@ impl Executor {
                 }
                 Err(RunFailure::InfrastructureTransient {
                     detail: format!(
-                        "Docker Sandbox Codex/network admission failed after {SANDBOX_NETWORK_ATTEMPTS} attempts: {last_failure}"
+                        "Docker Sandbox {agent_name}/network admission failed after {SANDBOX_NETWORK_ATTEMPTS} attempts: {last_failure}"
                     ),
                 }
                 .into())
@@ -621,39 +646,53 @@ fn sandbox_exists(command: &str, name: &str, cwd: &Path) -> Result<bool> {
         .any(|candidate| candidate == name))
 }
 
-fn verify_sandbox_codex_version(
+fn verify_sandbox_agent_version(
     command: &str,
     name: &str,
     workspace: &Path,
+    provider: AgentProvider,
     expected: &str,
     running: &AtomicBool,
 ) -> Result<()> {
+    let agent_name = provider.display_name();
     let args = [
         "exec".to_owned(),
         name.to_owned(),
-        "codex".to_owned(),
+        provider.executable().to_owned(),
         "--version".to_owned(),
     ];
     let output = capture_sandbox_prepare_command(command, &args, workspace, running)?;
     if !output.status.success() {
         bail!(
-            "could not verify Codex in Docker Sandbox {name}: {}",
+            "could not verify {agent_name} in Docker Sandbox {name}: {}",
             output.stderr.trim()
         );
     }
     let actual = output.stdout.trim();
-    let required = format!("codex-cli {expected}");
+    let required = required_agent_version(provider, expected);
     if actual != required {
+        let setting = match provider {
+            AgentProvider::Codex => "codex_version",
+            AgentProvider::Claude => "claude_version",
+        };
         bail!(
-            "Docker Sandbox {name} has {actual}, required {required}; configure codex_version to match the pinned template or select a template digest that already contains {required}"
+            "Docker Sandbox {name} has {actual}, required {required}; configure {setting} to match the pinned template or select a template digest that already contains {required}"
         );
     }
     console_event(
         "completed",
-        &format!("Verified Docker Sandbox Codex {expected}"),
+        &format!("Verified Docker Sandbox {agent_name} {expected}"),
         "32",
     );
     Ok(())
+}
+
+/// The exact `--version` output each pinned agent CLI prints.
+fn required_agent_version(provider: AgentProvider, version: &str) -> String {
+    match provider {
+        AgentProvider::Codex => format!("codex-cli {version}"),
+        AgentProvider::Claude => format!("{version} (Claude Code)"),
+    }
 }
 
 fn stop_sandbox(command: &str, name: &str, cwd: &Path) -> Result<()> {
@@ -938,10 +977,52 @@ mod tests {
                 command: "sbx".into(),
                 template: "default".into(),
                 codex_version: "0.144.4".into(),
+                claude_template: None,
+                claude_version: None,
                 cpus: 1,
                 memory: "1g".into(),
             }
             .externally_isolated()
+        );
+    }
+
+    #[test]
+    fn verifies_each_agent_cli_by_its_exact_version_banner() {
+        assert_eq!(
+            required_agent_version(AgentProvider::Codex, "0.144.4"),
+            "codex-cli 0.144.4"
+        );
+        assert_eq!(
+            required_agent_version(AgentProvider::Claude, "2.1.246"),
+            "2.1.246 (Claude Code)"
+        );
+    }
+
+    #[test]
+    fn refuses_claude_runs_on_workers_without_a_claude_sandbox() {
+        let executor = Executor::DockerSandbox {
+            command: "sbx-not-installed".into(),
+            template: "unused".into(),
+            codex_version: "0.144.4".into(),
+            claude_template: None,
+            claude_version: None,
+            cpus: 1,
+            memory: "1g".into(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let error = executor
+            .prepare(
+                AgentProvider::Claude,
+                "run-1",
+                directory.path(),
+                false,
+                None,
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+        let failure = error.downcast_ref::<RunFailure>().unwrap();
+        assert!(
+            matches!(failure, RunFailure::HumanIntervention { action } if action.contains("executor.claude_template"))
         );
     }
 
@@ -979,6 +1060,8 @@ mod tests {
             command: "sbx".into(),
             template: "unused".into(),
             codex_version: "0.144.4".into(),
+            claude_template: None,
+            claude_version: None,
             cpus: 1,
             memory: "1g".into(),
         };

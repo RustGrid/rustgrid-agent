@@ -55,6 +55,28 @@ fn openapi_snapshot_contains_the_architecture_escalation_contract() {
     }
 }
 
+#[test]
+fn openapi_snapshot_documents_provider_tagged_agent_policies() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../openapi.current.json")).expect("valid OpenAPI JSON");
+    let schemas = &spec["components"]["schemas"];
+    let policy = &schemas["AgentExecutionPolicyResponse"];
+    assert!(policy["properties"]["codex"].is_object());
+    assert!(policy["properties"]["agent"].is_object());
+    assert!(
+        !policy["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "codex"),
+        "version 2 policies omit the codex block"
+    );
+    assert_eq!(
+        schemas["AgentCommandPolicyResponse"]["properties"]["provider"]["enum"],
+        json!(["codex", "claude"])
+    );
+}
+
 fn context(base_url: String) -> AppContext {
     AppContext {
         config: Config {
@@ -254,6 +276,54 @@ fn retrieves_the_run_manifest_contract() {
 }
 
 #[test]
+fn accepts_a_signed_claude_code_manifest() {
+    use sha2::{Digest, Sha256};
+
+    let policy = json!({
+      "policy_version": 2,
+      "agent": {
+        "provider": "claude",
+        "command": ["claude","-p","--output-format","stream-json","--verbose","--model","claude-opus-5-5"],
+        "environment_allowlist": ["PATH","HOME"]
+      },
+      "quality_gates": [{"id":"gate-1","command":"cargo test","timeout_seconds":900,"required":true}],
+      "timeout_seconds": 3600,
+      "sandbox":{"mode":"workspace_write","network_access":true,"writable_roots":["."],"approval_policy":"never"}
+    });
+    let policy_sha256 = hex::encode(Sha256::digest(policy.to_string().as_bytes()));
+    let Some((url, _request)) = server(json!({
+        "manifest_version": 2,
+        "run": {"id": "run-1", "ticket_id": "ticket-1", "attempt": 1, "input_prompt": "Fix the parser.", "metadata": {"codex_model": "claude-opus-5-5"}},
+        "attachments": [],
+        "project_id": "project-1", "project_key": "RG", "project_name": "RustGrid",
+        "ticket_id": "ticket-1", "ticket_key": "RG-1", "ticket_title": "Task",
+        "repository_id": 7, "repository": "RustGrid/example",
+        "clone_url": "https://github.com/RustGrid/example.git", "web_base_url": "https://github.com",
+        "installation_id": 42, "default_branch": "main",
+        "required_workflows": [], "required_permissions": {},
+        "execution_policy": policy,
+        "execution_policy_sha256": policy_sha256
+    })) else {
+        return;
+    };
+    let manifest = RustGridClient::new(&context(url))
+        .unwrap()
+        .execution_manifest("run-1")
+        .unwrap();
+    manifest.validate("run-1", "ticket-1").unwrap();
+    let policy = manifest.policy().unwrap();
+    assert_eq!(
+        policy.agent.provider,
+        rustgrid_agent::agent::AgentProvider::Claude
+    );
+    let args = policy.agent_args(true, &[]);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "claude-opus-5-5"])
+    );
+}
+
+#[test]
 fn heartbeat_advertises_configured_capacity() {
     let Some((url, request)) = server(json!({})) else {
         return;
@@ -276,6 +346,7 @@ fn reports_final_run_token_consumption() {
         .unwrap()
         .report_token_consumption(
             "run-1",
+            "codex",
             TokenConsumption {
                 input_tokens: 100,
                 cached_input_tokens: 40,

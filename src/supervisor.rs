@@ -405,6 +405,8 @@ mod tests {
                     command: "sbx".into(),
                     template: "test".into(),
                     codex_version: "0.144.4".into(),
+                    claude_template: None,
+                    claude_version: None,
                     cpus: 1,
                     memory: "1g".into(),
                     capacity_cpus: 2,

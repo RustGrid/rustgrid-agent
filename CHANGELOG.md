@@ -7,6 +7,19 @@ Semantic Versioning.
 
 ### Added
 
+- Run Claude Code as the coding agent when RustGrid signs a version 2
+  execution policy with `agent.provider: "claude"`. Claude Code's
+  `stream-json` output is translated into the worker's agent event stream, so
+  worker-owned gate interception, focused-validation evidence, completion
+  checks, idle detection, budgets, telemetry, and token accounting apply
+  unchanged. Version 1 Codex policies are read exactly as before. See
+  [Claude Code runs](docs/claude-code.md).
+- `executor.claude_template` and `executor.claude_version` pin the Docker
+  Sandboxes template and Claude Code CLI version for Claude runs. Without them a
+  worker stops Claude runs for human intervention and keeps running Codex.
+- The container image installs the pinned Claude Code CLI
+  (`CLAUDE_CODE_VERSION`, default `2.1.246`).
+
 - Read the optional `architecture` contract from the run manifest, validate
   it, and include it in the Codex prompt with a plan check against the
   ticket's declared boundaries.
@@ -14,6 +27,14 @@ Semantic Versioning.
   session, and raise an escalation through
   `POST /agent-runs/{run_id}/architecture-escalations` instead of crossing a
   boundary. The run then blocks until an architect resolves the escalation.
+
+### Changed
+
+- Token-consumption reports name the run's agent (`codex` or `claude`) instead
+  of always `codex`, and telemetry model calls name the agent and vendor.
+- Child processes no longer inherit `ANTHROPIC_*` or `CLAUDE_CODE_*`
+  variables.
+- Image attachments are listed in the prompt with their preview path.
 
 ### Removed
 

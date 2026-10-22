@@ -22,8 +22,8 @@ use crate::{
     config::AppContext,
     coordinator::CoordinatorHealth,
     execution::{
-        CodexContext, ImplementationContext, QualityGateContext, bootstrap_dependencies,
-        implement_and_commit, run_codex_prompt, run_gates_with_repairs, short_sha,
+        AgentContext, ImplementationContext, QualityGateContext, bootstrap_dependencies,
+        implement_and_commit, run_agent_prompt, run_gates_with_repairs, short_sha,
     },
     executor::{ExecutionHandle, Executor, SANDBOX_PREPARE_TIMEOUT_SECONDS},
     finalization::finalize,
@@ -266,7 +266,8 @@ fn execute_claimed(
         ticket.row_version,
         journal,
         &context.workspace_root,
-    );
+    )
+    .with_agent_provider(execution_policy.agent.provider);
 
     let supervisor = RunSupervisor::start(
         api.clone(),
@@ -368,6 +369,7 @@ fn execute_claimed(
             Some(json!({"timeout_seconds": SANDBOX_PREPARE_TIMEOUT_SECONDS})),
         )?;
         let handle = executor.prepare(
+            execution_policy.agent.provider,
             &run.id,
             &repo.root,
             execution_policy.requires_npm_registry() || repo.root.join("package.json").is_file(),
@@ -470,7 +472,7 @@ fn execute_claimed(
                 "attachments_staged",
                 StepStatus::Completed,
                 &format!(
-                    "Staged {} clean ticket attachment(s) for Codex context",
+                    "Staged {} clean ticket attachment(s) for agent context",
                     staged_attachments.len()
                 ),
                 Some(json!({
@@ -596,7 +598,7 @@ fn execute_direct_operation(
     reporter.step(
         "direct_operation",
         StepStatus::Running,
-        "Executing validated RustGrid operation without Codex or repository checkout",
+        "Executing validated RustGrid operation without a coding agent or repository checkout",
         Some(json!({
             "mission_class": "metadata",
             "model_calls": 0,
@@ -726,7 +728,7 @@ fn validate_reconciled_commit(
         context.manifest,
         &context.repo.root,
     );
-    let codex = CodexContext {
+    let codex = AgentContext {
         app: context.app,
         api: context.api,
         reporter: context.reporter,
@@ -1119,13 +1121,13 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 &format!("ci_repair_{repair_attempt}"),
                 StepStatus::Running,
                 &format!(
-                    "Required CI failed; asking Codex to repair attempt {repair_attempt} of {CI_REPAIR_ATTEMPTS}"
+                    "Required CI failed; asking the coding agent to repair attempt {repair_attempt} of {CI_REPAIR_ATTEMPTS}"
                 ),
                 Some(json!({"attempt": repair_attempt, "commit": commit})),
             )?;
             let mission_profile =
                 MissionProfile::classify_after_checkout(ticket, manifest, &repo.root);
-            let codex = CodexContext {
+            let codex = AgentContext {
                 app: context,
                 api,
                 reporter,
@@ -1154,12 +1156,12 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 bounded_text(&failure, 20_000),
                 bounded_text(&diff, 20_000),
             );
-            run_codex_prompt(
+            run_agent_prompt(
                 &codex,
                 &repair_prompt,
                 &[],
                 &format!("ci_repair_{repair_attempt}_codex"),
-                "Running Codex CI repair",
+                "Running coding agent CI repair",
             )?;
             run_gates_with_repairs(
                 &codex,
@@ -1182,7 +1184,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 reporter.step(
                     &format!("ci_repair_{repair_attempt}"),
                     StepStatus::Failed,
-                    "Codex CI repair produced no committable changes; another repair attempt is required",
+                    "Coding agent CI repair produced no committable changes; another repair attempt is required",
                     Some(json!({"attempt": repair_attempt})),
                 )?;
                 continue;

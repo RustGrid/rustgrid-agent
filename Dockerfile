@@ -10,12 +10,14 @@ RUN cargo build --locked --release
 
 FROM ${NODE_RUNTIME_IMAGE} AS runtime
 ARG CODEX_VERSION=0.144.4
+ARG CLAUDE_CODE_VERSION=2.1.246
 ARG NPM_VERSION=12.0.1
 ARG NPM_BRACE_EXPANSION_VERSION=5.0.9
 ARG NPM_IP_ADDRESS_VERSION=10.3.1
 ARG NPM_TAR_VERSION=7.5.22
 ARG NPM_UNDICI_VERSION=6.28.0
 RUN test -n "${CODEX_VERSION}" \
+    && test -n "${CLAUDE_CODE_VERSION}" \
     && test -n "${NPM_VERSION}" \
     && test -n "${NPM_BRACE_EXPANSION_VERSION}" \
     && test -n "${NPM_IP_ADDRESS_VERSION}" \
@@ -26,6 +28,7 @@ RUN test -n "${CODEX_VERSION}" \
     && apt-get install --no-install-recommends -y ca-certificates git tini \
     && npm install --global "npm@${NPM_VERSION}" \
     && npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm install --prefix /tmp/npm-security-patches --ignore-scripts --no-audit --no-fund \
       "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}" \
       "ip-address@${NPM_IP_ADDRESS_VERSION}" \
