@@ -133,7 +133,8 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         executor_handle,
     } = implementation;
     let mission_profile = MissionProfile::classify_after_checkout(ticket, manifest, &repo.root);
-    let agent_name = manifest.policy()?.agent.provider.display_name();
+    let provider = manifest.policy()?.agent.provider;
+    let agent_name = provider.display_name();
     reporter.step(
         "prompt_built",
         StepStatus::Completed,
@@ -158,7 +159,7 @@ pub(crate) fn implement_and_commit(implementation: ImplementationContext<'_>) ->
         &codex_context,
         generated_prompt,
         image_paths,
-        "codex",
+        provider.as_str(),
         &format!("Running {agent_name}"),
     )?;
     run_gates_with_repairs(
@@ -1144,7 +1145,8 @@ pub(crate) fn run_gates_with_repairs(
             .into());
         }
         let repair_attempt = attempt + 1;
-        let agent_name = codex.manifest.policy()?.agent.provider.display_name();
+        let provider = codex.manifest.policy()?.agent.provider;
+        let agent_name = provider.display_name();
         codex.reporter.step(
             &format!("validation_repair_{repair_attempt}"),
             StepStatus::Running,
@@ -1179,7 +1181,7 @@ pub(crate) fn run_gates_with_repairs(
             codex,
             &prompt,
             &[],
-            &format!("validation_repair_{repair_attempt}_codex"),
+            &format!("validation_repair_{repair_attempt}_{}", provider.as_str()),
             &format!("Running {agent_name} validation repair"),
         )?;
     }

@@ -1160,7 +1160,10 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
                 &codex,
                 &repair_prompt,
                 &[],
-                &format!("ci_repair_{repair_attempt}_codex"),
+                &format!(
+                    "ci_repair_{repair_attempt}_{}",
+                    codex.manifest.policy()?.agent.provider.as_str()
+                ),
                 "Running coding agent CI repair",
             )?;
             run_gates_with_repairs(

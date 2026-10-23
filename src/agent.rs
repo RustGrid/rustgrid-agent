@@ -383,7 +383,10 @@ fn reported_exit_code(output: &str) -> Option<i64> {
 /// Converts Anthropic usage into the canonical `turn.completed` usage shape.
 /// Anthropic reports uncached, cache-write, and cache-read input separately;
 /// the canonical `input_tokens` is their sum and `cached_input_tokens` is the
-/// cache-read share, matching how Codex reports cached input.
+/// cache-read share, matching how Codex reports cached input. Cache writes
+/// stay visible as `cache_creation_input_tokens`, with the 1-hour TTL share in
+/// `cache_creation_1h_input_tokens`, because Anthropic bills 1-hour writes at
+/// a higher rate than 5-minute writes.
 fn canonical_usage(usage: &Value) -> Option<Value> {
     let count = |field: &str| usage.get(field).and_then(Value::as_u64);
     let output_tokens = count("output_tokens")?;
@@ -398,6 +401,13 @@ fn canonical_usage(usage: &Value) -> Option<Value> {
         "total_tokens": input_tokens.checked_add(output_tokens)?,
         "cache_creation_input_tokens": cache_write
     });
+    if let Some(one_hour) = usage
+        .get("cache_creation")
+        .and_then(|breakdown| breakdown.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+    {
+        canonical["cache_creation_1h_input_tokens"] = json!(one_hour.min(cache_write));
+    }
     if let Some(thinking) = usage
         .get("output_tokens_details")
         .and_then(|details| details.get("thinking_tokens"))
@@ -532,6 +542,31 @@ mod tests {
         assert_eq!(consumption.input_tokens, 66_025);
         assert_eq!(consumption.cached_input_tokens, 1_200);
         assert_eq!(consumption.output_tokens, 419);
+    }
+
+    #[test]
+    fn canonical_usage_keeps_the_one_hour_cache_write_share() {
+        let usage = canonical_usage(&json!({
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 5_000,
+            "cache_read_input_tokens": 300,
+            "output_tokens": 20,
+            "cache_creation": {"ephemeral_5m_input_tokens": 3_000, "ephemeral_1h_input_tokens": 2_000}
+        }))
+        .unwrap();
+        assert_eq!(usage["input_tokens"], 10 + 5_000 + 300);
+        assert_eq!(usage["cache_creation_input_tokens"], 5_000);
+        assert_eq!(usage["cache_creation_1h_input_tokens"], 2_000);
+
+        let without_breakdown = canonical_usage(&json!({
+            "input_tokens": 10, "cache_creation_input_tokens": 5_000, "output_tokens": 20
+        }))
+        .unwrap();
+        assert!(
+            without_breakdown
+                .get("cache_creation_1h_input_tokens")
+                .is_none()
+        );
     }
 
     #[test]
