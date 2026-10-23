@@ -21,14 +21,11 @@ The policy schema is in [the worker run contract](worker-api-contract.md#agent-p
 ## Enable Claude Code on a worker
 
 Claude Code needs its own sandbox template, because Docker Sandboxes builds a
-separate image and credential proxy for each agent.
+separate image for each agent.
 
-1. Store an Anthropic API key in the Docker credential proxy, as the OS
-   account that runs the worker. The key never enters the sandbox:
-
-   ```sh
-   printf '%s' "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
-   ```
+1. Connect the tenant's Anthropic API key in RustGrid (AgentOps → AI provider
+   connections). The worker does not need, and never receives, the key; see
+   [Model gateway](#model-gateway).
 
 2. Choose a Docker Sandboxes Claude Code template release and pin it by digest,
    for example a `docker.io/docker/sandbox-templates:claude-code-docker-<release>`
@@ -83,6 +80,34 @@ rate-limit notices do not reset the idle watchdog.
 
 The worker removes `ANTHROPIC_*` and `CLAUDE_CODE_*` variables from every child
 process, as it removes `OPENAI_*` and `CODEX_*`.
+
+## Model gateway
+
+The tenant's Anthropic key stays in RustGrid. Before each Claude Code session
+the worker calls `POST /agent-runs/{run_id}/model-gateway-token` with its device
+credential. RustGrid issues a short-lived `rgmg_` token only while the worker
+holds the run's lease, and binds it to the run, the worker, the tenant's
+Anthropic connection, and the run's signed model. The worker passes it to the
+Claude Code process only:
+
+| Variable | Value |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` | `<RustGrid API URL>/agent-gateway/anthropic` |
+| `ANTHROPIC_AUTH_TOKEN` | The run-scoped token |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` | The run's model, because the gateway rejects any other model |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` |
+
+RustGrid checks the lease on every request, attaches the key server-side, and
+streams Anthropic's response back unchanged. A token stops working as soon as
+the run ends or its lease moves to another worker. Quality gates and other
+child processes never receive these variables.
+
+In Docker Sandboxes the worker adds a network allow rule for the RustGrid API
+host, scoped to the run's sandbox, so the gateway is reachable under a
+default-deny policy. The rule is removed with the sandbox.
+
+If the tenant has no valid Anthropic connection, the run stops for human
+intervention with "Connect a valid Anthropic API key in RustGrid".
 
 ## Limitations
 

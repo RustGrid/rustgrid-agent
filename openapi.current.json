@@ -797,6 +797,42 @@
         ],
         "type": "object"
       },
+      "AgentModelGatewayTokenResponse": {
+        "properties": {
+          "base_path": {
+            "description": "Gateway base path relative to the API root; use it as ANTHROPIC_BASE_URL.",
+            "example": "/agent-gateway/anthropic",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "model": {
+            "description": "The run's signed model; the gateway rejects any other model.",
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "anthropic"
+            ],
+            "type": "string"
+          },
+          "token": {
+            "description": "Secret returned once. RustGrid stores only its SHA-256.",
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "provider",
+          "model",
+          "base_path"
+        ],
+        "type": "object"
+      },
       "AgentModelOptionResponse": {
         "properties": {
           "model": {
@@ -9126,11 +9162,15 @@
       "ReorderRequest": {
         "properties": {
           "ticket_ids": {
+            "description": "Ticket ids in their new order, top first. Backlog tickets left out keep their previous relative order after these.",
             "items": {
               "format": "uuid",
               "type": "string"
             },
-            "type": "array"
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
           }
         },
         "required": [
@@ -10882,6 +10922,19 @@
       },
       "TicketUsageSummaryResponse": {
         "properties": {
+          "agent_duration_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Wall-clock duration of coding-agent sessions, whichever agent ran them."
+          },
           "agent_sessions": {
             "format": "int64",
             "minimum": 0,
@@ -10941,6 +10994,19 @@
               }
             ]
           },
+          "cache_write_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Prompt-cache tokens written. Included in input_tokens."
+          },
           "cached_input_tokens": {
             "anyOf": [
               {
@@ -10963,7 +11029,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "deprecated": true
           },
           "compression_ratio_percent": {
             "anyOf": [
@@ -11008,6 +11075,18 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "estimated_cache_write_cost_micros": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated cost of prompt-cache writes, billed above the base input rate by Anthropic."
           },
           "estimated_cached_input_cost_micros": {
             "anyOf": [
@@ -11079,7 +11158,14 @@
             "minimum": 0,
             "type": "integer"
           },
+          "full_gate_commands_attempted_by_agent": {
+            "description": "Worker-owned full gates the coding agent tried to run itself.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "full_gate_commands_attempted_by_codex": {
+            "deprecated": true,
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -11207,6 +11293,13 @@
                 "type": "null"
               }
             ]
+          },
+          "models": {
+            "description": "Usage per coding agent, provider, and model.",
+            "items": {
+              "$ref": "#/components/schemas/UsageModelResponse"
+            },
+            "type": "array"
           },
           "output_tokens": {
             "anyOf": [
@@ -11483,7 +11576,12 @@
           "model_narration_characters",
           "model_narration_estimated_tokens",
           "model_narration_output_percent",
-          "latest_telemetry_at"
+          "latest_telemetry_at",
+          "agent_duration_ms",
+          "full_gate_commands_attempted_by_agent",
+          "cache_write_input_tokens",
+          "estimated_cache_write_cost_micros",
+          "models"
         ],
         "type": "object"
       },
@@ -12601,6 +12699,18 @@
       },
       "UsageBreakdownItemResponse": {
         "properties": {
+          "cache_write_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cached_input_tokens": {
             "anyOf": [
               {
@@ -12674,6 +12784,13 @@
                 "type": "null"
               }
             ]
+          },
+          "models": {
+            "description": "provider/model pairs this group used.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "name": {
             "type": "string"
@@ -12766,7 +12883,9 @@
           "estimated_cost_micros",
           "cost_currency",
           "cost_status",
-          "pricing_missing_models"
+          "pricing_missing_models",
+          "cache_write_input_tokens",
+          "models"
         ],
         "type": "object"
       },
@@ -12917,6 +13036,130 @@
         "required": [
           "items",
           "generated_at"
+        ],
+        "type": "object"
+      },
+      "UsageModelResponse": {
+        "description": "Usage and cost for one coding agent, provider, and model on a ticket.",
+        "properties": {
+          "agent_name": {
+            "description": "Coding agent that made the calls, for example Codex or Claude Code.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cache_write_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cached_input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cost_currency": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cost_status": {
+            "enum": [
+              "available",
+              "not_applicable",
+              "unavailable"
+            ],
+            "type": "string"
+          },
+          "estimated_cost_micros": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "model_calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider": {
+            "description": "Model vendor, for example openai or anthropic.",
+            "type": "string"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "agent_name",
+          "provider",
+          "model",
+          "model_calls",
+          "input_tokens",
+          "cached_input_tokens",
+          "cache_write_input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "estimated_cost_micros",
+          "cost_currency",
+          "cost_status"
         ],
         "type": "object"
       },
@@ -13934,6 +14177,12 @@
       "executionToken": {
         "bearerFormat": "rge_ execution token",
         "description": "Short-lived, mission-scoped RustGrid credential issued only after a verified GitHub OIDC exchange.",
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "modelGatewayToken": {
+        "bearerFormat": "rgmg_ run-scoped token",
+        "description": "Short-lived token from POST /agent-runs/{run_id}/model-gateway-token.",
         "scheme": "bearer",
         "type": "http"
       }
@@ -15667,6 +15916,134 @@
         "summary": "Dismiss a pending Advisor proposal",
         "tags": [
           "advisor"
+        ]
+      }
+    },
+    "/api/v1/agent-gateway/anthropic/v1/messages": {
+      "post": {
+        "description": "Anthropic Messages API gateway for Claude Code runs. Authenticated with a run-scoped model gateway token (`Authorization: Bearer rgmg_...`); RustGrid attaches the tenant's Anthropic key server-side and streams the response back.",
+        "operationId": "forwardAgentAnthropicMessages",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          },
+          "description": "Anthropic Messages API request body. `model` must equal the run's signed model.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Anthropic's response, passed through unchanged (JSON or text/event-stream)."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body or model mismatch"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, or expired gateway token, or the run lease ended"
+          }
+        },
+        "security": [
+          {
+            "modelGatewayToken": []
+          }
+        ],
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-gateway/anthropic/v1/messages/count_tokens": {
+      "post": {
+        "description": "Anthropic token-counting gateway for Claude Code runs, authenticated like the Messages gateway.",
+        "operationId": "forwardAgentAnthropicCountTokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          },
+          "description": "Anthropic Messages API request body. `model` must equal the run's signed model.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Anthropic's response, passed through unchanged (JSON or text/event-stream)."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid body or model mismatch"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, or expired gateway token, or the run lease ended"
+          }
+        },
+        "security": [
+          {
+            "modelGatewayToken": []
+          }
+        ],
+        "tags": [
+          "agents"
         ]
       }
     },
@@ -18011,6 +18388,198 @@
           }
         ],
         "summary": "Get an agent execution manifest",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/api/v1/agent-runs/{run_id}/model-gateway-token": {
+      "post": {
+        "description": "Issue a short-lived bearer token for RustGrid's model gateway, bound to the claimed Claude Code run, its worker, the tenant's Anthropic connection, and the run's signed model. The provider key never leaves RustGrid. Requires the bound worker credential and an active lease.",
+        "operationId": "issueAgentModelGatewayToken",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional retry key for supported mutating routes. Reusing a key with the same semantic fingerprint replays the saved result; a different fingerprint returns conflict.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentModelGatewayTokenResponse"
+                }
+              }
+            },
+            "description": "Short-lived model gateway token",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "example": "no-store",
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not a bound worker credential",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Run lease is not active, the run does not use Claude Code, or no valid Anthropic connection is configured",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "retry-after": {
+                "description": "Seconds until retry is recommended.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-limit": {
+                "description": "Configured request limit for the bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-remaining": {
+                "description": "Remaining requests in the current bucket.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-ratelimit-reset": {
+                "description": "Unix timestamp or relative reset value emitted by the rate limiter.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "GitHub token issuance failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Issue a model gateway token",
         "tags": [
           "agents"
         ]
@@ -21560,6 +22129,594 @@
         "summary": "Recover active runs assigned to a worker",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/api/v1/ai-provider-connections/anthropic": {
+      "delete": {
+        "description": "Removes the encrypted Anthropic credential material.",
+        "operationId": "delete_anthropic_connection",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Connection revoked",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing ai-providers manage permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Connection not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Persistence or audit failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke the Anthropic connection",
+        "tags": [
+          "ai-providers"
+        ]
+      },
+      "get": {
+        "description": "Returns safe connection status and fingerprint metadata for the Anthropic API key used by Claude Code runs. The key is never returned.",
+        "operationId": "get_anthropic_connection",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiConnectionResponse"
+                }
+              }
+            },
+            "description": "Connection metadata or an explicit not-configured response",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing ai-providers read permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get Anthropic connection metadata",
+        "tags": [
+          "ai-providers"
+        ]
+      },
+      "put": {
+        "description": "Validates the credential against Anthropic's model listing, envelope-encrypts it before persistence, and returns only safe metadata. Replacing a key revokes the previous connection. Responses use Cache-Control: no-store.",
+        "operationId": "put_anthropic_connection",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutOpenAiConnectionRequest"
+              }
+            }
+          },
+          "description": "One-way Anthropic credential submission",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiConnectionResponse"
+                }
+              }
+            },
+            "description": "Connection created or replaced",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Malformed credential, or Anthropic rejected it",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing ai-providers manage permission, or the key lacks permissions",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Encryption or persistence failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic validation failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Connect or replace an Anthropic API key",
+        "tags": [
+          "ai-providers"
+        ]
+      }
+    },
+    "/api/v1/ai-provider-connections/anthropic/validation": {
+      "post": {
+        "description": "Decrypts and validates the stored credential inside the RustGrid trust boundary, then returns safe metadata.",
+        "operationId": "validate_anthropic_connection",
+        "parameters": [
+          {
+            "description": "Optional client-supplied correlation id. If omitted, RustGrid creates one and returns it in the response.",
+            "in": "header",
+            "name": "x-request-id",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiConnectionResponse"
+                }
+              }
+            },
+            "description": "Updated validation metadata",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic rejected the credential",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unauthorized",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing ai-providers manage permission",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Connection not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too many requests",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Decryption or persistence failure",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Anthropic validation failed",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revalidate the Anthropic connection",
+        "tags": [
+          "ai-providers"
         ]
       }
     },
@@ -36008,7 +37165,7 @@
     },
     "/api/v1/projects/{project_id}/backlog": {
       "get": {
-        "description": "\nList backlog tickets for a project in a grouped board view.\n\nAuthorization:\n- Bearer JWT.\n- RBAC `projects:sprints:view`.\n- Tenant guard: project must belong to caller tenant; others are masked as 404.\n\nBehavior:\n- Default grouping is by ticket status.\n- `group=assignee` groups tickets under each assignee bucket.\n- Tickets are ordered by backlog ordering maintained by the backlog reorder API.\n\nResponse:\n- `200 OK` with `[SprintBoardColumnResponse]` containing grouped tickets.\n- `404 Not Found` when the project is missing or outside tenant scope.\n- Always emits `x-request-id`.\n\nRate limiting:\n- Standard per-route limits with `429` carrying `x-ratelimit-*`.\n    ",
+        "description": "\nList backlog tickets for a project in a grouped board view.\n\nAuthorization:\n- Bearer JWT.\n- RBAC `projects:sprints:view`.\n- Tenant guard: project must belong to caller tenant; others are masked as 404.\n\nBehavior:\n- Default grouping is by ticket status.\n- `group=assignee` groups tickets under each assignee bucket.\n- `group=none` returns a single `all` column, so the order across statuses is visible.\n- Within each column, tickets follow the order saved by the backlog reorder API; tickets never reordered follow, most recently updated first.\n\nResponse:\n- `200 OK` with `[SprintBoardColumnResponse]` containing grouped tickets.\n- `404 Not Found` when the project is missing or outside tenant scope.\n- Always emits `x-request-id`.\n\nRate limiting:\n- Standard per-route limits with `429` carrying `x-ratelimit-*`.\n    ",
         "operationId": "projectBacklog",
         "parameters": [
           {
@@ -36022,11 +37179,15 @@
             }
           },
           {
-            "description": "`assignee` to group by assignee, otherwise by status",
+            "description": "`assignee` groups by assignee, `none` returns one `all` column in saved order; otherwise grouped by status",
             "in": "query",
             "name": "group",
             "required": false,
             "schema": {
+              "enum": [
+                "assignee",
+                "none"
+              ],
               "type": "string"
             }
           },
@@ -36386,7 +37547,7 @@
     },
     "/api/v1/projects/{project_id}/backlog/reorder": {
       "post": {
-        "description": "\nPersist a new ordering for backlog tickets in a project.\n\nAuthorization:\n- Bearer JWT.\n- RBAC `projects:backlog:manage`.\n- Tenant guard: project must belong to caller tenant; otherwise masked as 404.\n\nBehavior:\n- Accepts the full ordered list of ticket ids; overwrites existing backlog ordering.\n- Idempotent when the same ordering is provided.\n- Tickets not present in the list remain in their previous relative order after the provided items.\n\nResponse:\n- `204 No Content` on success.\n- `404` when project/tickets are not in tenant scope.\n- Emits `x-request-id` for tracing.\n\nRate limiting:\n- Standard per-route limits; `429` returns rate-limit headers.\n    ",
+        "description": "\nPersist a new ordering for backlog tickets in a project.\n\nAuthorization:\n- Bearer JWT.\n- RBAC `projects:backlog:manage`.\n- Tenant guard: project must belong to caller tenant; otherwise masked as 404.\n\nBehavior:\n- Accepts up to 1000 ticket ids, top first; overwrites existing backlog ordering.\n- Idempotent when the same ordering is provided.\n- Tickets not present in the list remain in their previous relative order after the provided items.\n\nResponse:\n- `204 No Content` on success.\n- `400` when `ticket_ids` is empty, longer than 1000, or contains duplicates.\n- `404` when the project, or any listed ticket, is not in this project and tenant (`backlog_ticket_not_found`).\n- `409` when a listed ticket is in a sprint (`ticket_not_in_backlog`).\n- Emits `x-request-id` for tracing.\n\nRate limiting:\n- Standard per-route limits; `429` returns rate-limit headers.\n    ",
         "operationId": "reorderBacklog",
         "parameters": [
           {
@@ -36444,6 +37605,24 @@
               }
             }
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid ticket_ids",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "401": {
             "content": {
               "application/json": {
@@ -36488,7 +37667,25 @@
                 }
               }
             },
-            "description": "Project not found",
+            "description": "Project or ticket not found",
+            "headers": {
+              "x-request-id": {
+                "description": "Request correlation id for audit and support.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Ticket is not in the backlog",
             "headers": {
               "x-request-id": {
                 "description": "Request correlation id for audit and support.",
@@ -41579,11 +42776,15 @@
             }
           },
           {
-            "description": "`assignee` to group by assignee, otherwise by status",
+            "description": "`assignee` groups by assignee, `none` returns one `all` column in saved order; otherwise grouped by status",
             "in": "query",
             "name": "group",
             "required": false,
             "schema": {
+              "enum": [
+                "assignee",
+                "none"
+              ],
               "type": "string"
             }
           },

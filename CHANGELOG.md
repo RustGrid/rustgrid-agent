@@ -5,6 +5,16 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Claude Code reaches Anthropic through RustGrid's model gateway. Before each
+  Claude session the worker requests a run-scoped token from
+  `POST /agent-runs/{run_id}/model-gateway-token` and passes it to Claude Code
+  only; the tenant's Anthropic key stays in RustGrid and no Anthropic secret is
+  needed in Docker Sandboxes. Claude sandboxes get a sandbox-scoped network
+  allow rule for the RustGrid API host. A tenant without a valid Anthropic
+  connection stops the run for human intervention.
+
 ### Added
 
 - Run Claude Code as the coding agent when RustGrid signs a version 2

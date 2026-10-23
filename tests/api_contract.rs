@@ -324,6 +324,52 @@ fn accepts_a_signed_claude_code_manifest() {
 }
 
 #[test]
+fn issues_a_run_scoped_model_gateway_token() {
+    let Some((url, request)) = server(json!({
+        "token": "rgmg_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+        "expires_at": "2026-10-23T12:00:00Z",
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "base_path": "/agent-gateway/anthropic"
+    })) else {
+        return;
+    };
+    let client = RustGridClient::new(&context(url.clone())).unwrap();
+    let token = client.issue_model_gateway_token("run-1").unwrap();
+    assert_eq!(token.model, "claude-opus-5-5");
+    assert_eq!(
+        client.model_gateway_base_url(&token),
+        format!("{}/agent-gateway/anthropic", url.trim_end_matches('/'))
+    );
+    assert!(!format!("{token:?}").contains("rgmg_"));
+    let request = request.recv().unwrap();
+    assert!(request.starts_with("POST /agent-runs/run-1/model-gateway-token HTTP/1.1"));
+    assert!(
+        header_value(&request, "idempotency-key")
+            .is_some_and(|key| key.starts_with("model-gateway-token-run-1-"))
+    );
+}
+
+#[test]
+fn rejects_gateway_tokens_with_unsafe_base_paths() {
+    let Some((url, _request)) = server(json!({
+        "token": "rgmg_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+        "expires_at": "2026-10-23T12:00:00Z",
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "base_path": "@evil.example/anthropic"
+    })) else {
+        return;
+    };
+    assert!(
+        RustGridClient::new(&context(url))
+            .unwrap()
+            .issue_model_gateway_token("run-1")
+            .is_err()
+    );
+}
+
+#[test]
 fn heartbeat_advertises_configured_capacity() {
     let Some((url, request)) = server(json!({})) else {
         return;

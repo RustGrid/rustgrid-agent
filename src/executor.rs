@@ -66,6 +66,8 @@ pub(crate) struct RunCommand<'a> {
     pub output_is_activity: Option<fn(&str) -> bool>,
     pub max_output_bytes: usize,
     pub environment_allowlist: &'a [String],
+    /// Explicit values for this command only, such as a gateway token.
+    pub extra_environment: &'a [(String, String)],
     pub limits: Option<command::ChildLimits>,
     pub max_workspace_bytes: u64,
 }
@@ -203,9 +205,14 @@ impl Executor {
         Ok(removed)
     }
 
+    /// `allowed_hosts` are added to the sandbox's own network policy, for
+    /// example the RustGrid model gateway for Claude Code runs. The rules are
+    /// scoped to this sandbox and disappear with it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         &self,
         provider: AgentProvider,
+        allowed_hosts: &[String],
         run_id: &str,
         workspace: &Path,
         probe_npm_registry: bool,
@@ -246,6 +253,16 @@ impl Executor {
                         &format!("Reusing retained Docker Sandbox {name}"),
                         "36",
                     );
+                    if let Err(error) =
+                        allow_sandbox_hosts(command, &name, allowed_hosts, workspace, running)
+                    {
+                        return Err(RunFailure::InfrastructureTransient {
+                            detail: format!(
+                                "retained Docker Sandbox network policy update failed; sandbox preserved: {error:#}"
+                            ),
+                        }
+                        .into());
+                    }
                     if let Err(error) = verify_sandbox_agent_version(
                         command,
                         &name,
@@ -346,14 +363,19 @@ impl Executor {
                             &format!("created {name} in {}ms", started.elapsed().as_millis()),
                             "36",
                         );
-                        match verify_sandbox_agent_version(
-                            command,
-                            &name,
-                            workspace,
-                            provider,
-                            agent_version,
-                            running,
-                        ) {
+                        let verified =
+                            allow_sandbox_hosts(command, &name, allowed_hosts, workspace, running)
+                                .and_then(|()| {
+                                    verify_sandbox_agent_version(
+                                        command,
+                                        &name,
+                                        workspace,
+                                        provider,
+                                        agent_version,
+                                        running,
+                                    )
+                                });
+                        match verified {
                             Ok(()) if !probe_npm_registry => {
                                 return Ok(ExecutionHandle::DockerSandbox { name });
                             }
@@ -432,6 +454,7 @@ impl Executor {
             request.cwd,
             &args,
             request.environment_allowlist,
+            request.extra_environment,
             request.stdin_text.is_some(),
         )?;
         let monitor = WorkspaceMonitor::start(
@@ -452,6 +475,12 @@ impl Executor {
                 max_output_bytes: request.max_output_bytes,
                 environment_allowlist: matches!(self, Self::Local)
                     .then_some(request.environment_allowlist),
+                // Docker Sandboxes receive these through the protected env file.
+                extra_environment: if matches!(self, Self::Local) {
+                    request.extra_environment
+                } else {
+                    &[]
+                },
                 limits: matches!(self, Self::Local)
                     .then_some(request.limits)
                     .flatten(),
@@ -483,6 +512,7 @@ impl Executor {
             request.cwd,
             &args,
             request.environment_allowlist,
+            request.extra_environment,
             false,
         )?;
         let monitor = WorkspaceMonitor::start(
@@ -573,6 +603,7 @@ impl Executor {
         cwd: &Path,
         args: &[String],
         allowlist: &[String],
+        extra_environment: &[(String, String)],
         interactive: bool,
     ) -> Result<PreparedCommand> {
         match (self, handle) {
@@ -587,7 +618,7 @@ impl Executor {
                 }
                 wrapped.extend(["-w".into(), cwd.display().to_string()]);
                 wrapped.push(name.clone());
-                let env_file = TemporaryEnvFile::create(cwd, allowlist)?;
+                let env_file = TemporaryEnvFile::create(cwd, allowlist, extra_environment)?;
                 if let Some(file) = &env_file {
                     wrapped.extend([
                         "sh".into(),
@@ -687,6 +718,41 @@ fn verify_sandbox_agent_version(
     Ok(())
 }
 
+/// Adds sandbox-scoped allow rules. Re-adding an existing rule is a no-op.
+fn allow_sandbox_hosts(
+    command: &str,
+    name: &str,
+    hosts: &[String],
+    workspace: &Path,
+    running: &AtomicBool,
+) -> Result<()> {
+    if hosts.is_empty() {
+        return Ok(());
+    }
+    let args = [
+        "policy".to_owned(),
+        "allow".to_owned(),
+        "network".to_owned(),
+        "--sandbox".to_owned(),
+        name.to_owned(),
+        hosts.join(","),
+    ];
+    let output = capture_sandbox_prepare_command(command, &args, workspace, running)?;
+    if !output.status.success() {
+        bail!(
+            "could not allow {} for Docker Sandbox {name}: {}",
+            hosts.join(", "),
+            output.stderr.trim()
+        );
+    }
+    console_event(
+        "completed",
+        &format!("Allowed {} for Docker Sandbox {name}", hosts.join(", ")),
+        "32",
+    );
+    Ok(())
+}
+
 /// The exact `--version` output each pinned agent CLI prints.
 fn required_agent_version(provider: AgentProvider, version: &str) -> String {
     match provider {
@@ -755,11 +821,21 @@ struct TemporaryEnvFile {
 }
 
 impl TemporaryEnvFile {
-    fn create(cwd: &Path, allowlist: &[String]) -> Result<Option<Self>> {
+    fn create(
+        cwd: &Path,
+        allowlist: &[String],
+        extra_environment: &[(String, String)],
+    ) -> Result<Option<Self>> {
         let values = allowlist
             .iter()
             .filter(|key| !is_sandbox_environment_control(key))
-            .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value)))
+            .chain(
+                extra_environment
+                    .iter()
+                    .filter(|(key, _)| !is_sandbox_environment_control(key))
+                    .cloned(),
+            )
             .collect::<Vec<_>>();
         if values.is_empty() {
             return Ok(None);
@@ -1013,6 +1089,7 @@ mod tests {
         let error = executor
             .prepare(
                 AgentProvider::Claude,
+                &[],
                 "run-1",
                 directory.path(),
                 false,
@@ -1077,6 +1154,7 @@ mod tests {
                 &workspace,
                 &["cargo".into(), "test".into()],
                 &[],
+                &[],
                 false,
             )
             .unwrap();
@@ -1093,6 +1171,7 @@ mod tests {
                 },
                 &workspace,
                 &["codex".into()],
+                &[],
                 &[],
                 true,
             )
@@ -1141,7 +1220,7 @@ mod tests {
         let key = format!("RUSTGRID_TEST_SECRET_{}", uuid::Uuid::new_v4().simple());
         // SAFETY: the unique name is not read by other tests or production code.
         unsafe { std::env::set_var(&key, "top-secret") };
-        let temporary = TemporaryEnvFile::create(&workspace, std::slice::from_ref(&key))
+        let temporary = TemporaryEnvFile::create(&workspace, std::slice::from_ref(&key), &[])
             .unwrap()
             .unwrap();
         let path = temporary.path.clone();

@@ -72,8 +72,8 @@ before provisioning a host.
   GitHub App.
 - For production: Docker Sandboxes (`sbx`) 0.34.0 or newer, a working microVM
   runtime, an effective network policy, and Codex authentication stored through
-  the Docker credential proxy. Claude Code runs additionally need an Anthropic
-  credential in the same proxy and a pinned Claude sandbox template; see
+  the Docker credential proxy. Claude Code runs additionally need the tenant's
+  Anthropic key connected in RustGrid and a pinned Claude sandbox template; see
   [Claude Code runs](docs/claude-code.md).
 - Rust 1.94 or newer when building from source. Release binaries and Homebrew
   installations do not require Rust at runtime.
@@ -149,13 +149,11 @@ Review the effective network rules before admitting production work. Docker's
 explains the host-side credential proxy; the OpenAI credential is not copied
 into the sandbox.
 
-To also accept Claude Code runs, store an Anthropic credential the same way and
-configure `executor.claude_template` and `executor.claude_version`, as described
-in [Claude Code runs](docs/claude-code.md):
-
-```sh
-printf '%s' "$ANTHROPIC_API_KEY" | sbx secret set -g anthropic
-```
+To also accept Claude Code runs, connect the tenant's Anthropic key in RustGrid
+and configure `executor.claude_template` and `executor.claude_version`, as
+described in [Claude Code runs](docs/claude-code.md). Claude Code reaches
+Anthropic through RustGrid's model gateway with a run-scoped token, so no
+Anthropic key is stored on the worker host or in Docker Sandboxes.
 
 ### 2. Configure and log in to RustGrid
 
@@ -558,9 +556,11 @@ run and login boundaries used by the client.
 - **Codex cannot authenticate:** run `sbx secret set -g openai --oauth` as the
   same OS account that runs the worker. Sandboxes do not inherit `~/.codex`.
 - **Claude Code runs block with "not configured for Claude Code runs":** set
-  `executor.claude_template` and `executor.claude_version` together, store the
-  Anthropic credential with `sbx secret set -g anthropic`, and restart the
-  worker. See [Claude Code runs](docs/claude-code.md).
+  `executor.claude_template` and `executor.claude_version` together and restart
+  the worker. See [Claude Code runs](docs/claude-code.md).
+- **Claude Code runs block with "Connect a valid Anthropic API key in
+  RustGrid":** add or revalidate the tenant's Anthropic connection in AgentOps,
+  then retry the run.
 - **Token consumption remains zero:** verify the manifest invokes Codex, inspect
   JSON lifecycle logs for valid `turn.completed` usage, and verify RustGrid
   accepts `PUT /agent-runs/{run_id}/token-consumption`.

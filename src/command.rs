@@ -48,6 +48,9 @@ pub struct StreamingCommand<'a> {
     pub output_is_activity: Option<fn(&str) -> bool>,
     pub max_output_bytes: usize,
     pub environment_allowlist: Option<&'a [String]>,
+    /// Values the worker sets explicitly, such as a run-scoped gateway token.
+    /// They are applied after the allowlist and never read from the host.
+    pub extra_environment: &'a [(String, String)],
     pub limits: Option<ChildLimits>,
 }
 
@@ -438,6 +441,7 @@ where
             output_is_activity: None,
             max_output_bytes,
             environment_allowlist: None,
+            extra_environment: &[],
             limits: None,
         },
         on_line,
@@ -458,6 +462,7 @@ where
         output_is_activity,
         max_output_bytes,
         environment_allowlist,
+        extra_environment,
         limits,
     } = execution;
     if args.is_empty() {
@@ -481,6 +486,7 @@ where
     if let Some(allowlist) = environment_allowlist {
         apply_environment_allowlist(&mut command, allowlist);
     }
+    command.envs(extra_environment.iter().map(|(name, value)| (name, value)));
     configure_child(&mut command, limits);
     let mut child = command
         .spawn()
@@ -1017,6 +1023,7 @@ mod tests {
                 output_is_activity: None,
                 max_output_bytes: 1024 * 1024,
                 environment_allowlist: None,
+                extra_environment: &[],
                 limits: None,
             },
             |_| Ok(()),

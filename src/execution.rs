@@ -12,8 +12,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    agent::AgentStream,
-    api::{AgentRun, RustGridClient, Ticket},
+    agent::{AgentProvider, AgentStream},
+    api::{self, AgentRun, ModelGatewayToken, RustGridClient, Ticket},
     architecture::{PlanVerdict, escalation_from_feedback},
     command,
     config::AppContext,
@@ -260,6 +260,7 @@ pub(crate) fn bootstrap_dependencies(
                 output_is_activity: None,
                 max_output_bytes: app.config.max_command_output_bytes as usize,
                 environment_allowlist: &policy.agent.environment_allowlist,
+                extra_environment: &[],
                 limits: Some(child_limits(
                     app,
                     Duration::from_secs(policy.timeout_seconds.min(1_800)),
@@ -472,6 +473,11 @@ pub(crate) fn run_agent_prompt(
         agent_sessions = agent_sessions.saturating_add(1);
         let agent_attempt = agent_sessions;
         let mut stream = AgentStream::new(provider);
+        // Each session gets a fresh run-scoped token; the tenant key stays in RustGrid.
+        let gateway_environment = match provider {
+            AgentProvider::Claude => claude_gateway_environment(context, step_id, agent_attempt)?,
+            AgentProvider::Codex => Vec::new(),
+        };
         let session_started = Instant::now();
         let telemetry = RefCell::new(context.reporter.start_agent_telemetry(
             provider,
@@ -495,6 +501,7 @@ pub(crate) fn run_agent_prompt(
                 output_is_activity: Some(provider.output_is_activity()),
                 max_output_bytes: context.app.config.max_command_output_bytes as usize,
                 environment_allowlist: &policy.agent.environment_allowlist,
+                extra_environment: &gateway_environment,
                 limits: Some(child_limits(
                     context.app,
                     Duration::from_secs(policy.timeout_seconds),
@@ -815,6 +822,68 @@ pub(crate) fn run_agent_prompt(
         })),
     )?;
     Ok(())
+}
+
+/// Obtains a run-scoped RustGrid model gateway token for one Claude Code
+/// session. RustGrid holds the tenant's Anthropic key and attaches it
+/// server-side, so the worker and sandbox only ever see the short-lived token.
+fn claude_gateway_environment(
+    context: &AgentContext<'_>,
+    step_id: &str,
+    agent_attempt: u32,
+) -> Result<Vec<(String, String)>> {
+    let token = match context
+        .api
+        .issue_model_gateway_token(&context.manifest.run.id)
+    {
+        Ok(token) => token,
+        Err(error) if api::is_missing_provider_connection(&error) => {
+            return Err(RunFailure::HumanIntervention {
+                action: "Connect a valid Anthropic API key in RustGrid (AI provider connections) before running Claude Code, then retry".into(),
+            }
+            .into());
+        }
+        Err(error) => return Err(error.context("could not obtain a RustGrid model gateway token")),
+    };
+    if agent_attempt == 1 {
+        context.reporter.step(
+            &format!("{step_id}_model_gateway"),
+            StepStatus::Completed,
+            "Claude Code reaches Anthropic through the RustGrid model gateway",
+            Some(json!({
+                "provider": token.provider,
+                "model": token.model,
+                "expires_at": token.expires_at
+            })),
+        )?;
+    }
+    Ok(gateway_environment(
+        &context.api.model_gateway_base_url(&token),
+        &token,
+    ))
+}
+
+/// Claude Code environment for the gateway. Every model alias resolves to the
+/// run's signed model, because the gateway rejects any other model.
+fn gateway_environment(base_url: &str, token: &ModelGatewayToken) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("ANTHROPIC_BASE_URL".to_owned(), base_url.to_owned()),
+        ("ANTHROPIC_AUTH_TOKEN".to_owned(), token.token.clone()),
+        (
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_owned(),
+            "1".to_owned(),
+        ),
+    ];
+    for alias in [
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+    ] {
+        environment.push((alias.to_owned(), token.model.clone()));
+    }
+    environment
 }
 
 /// Raises (or reuses) an architecture escalation and blocks the run until an
@@ -1268,6 +1337,7 @@ fn run_quality_gates(
                     output_is_activity: None,
                     max_output_bytes: app.config.max_command_output_bytes as usize,
                     environment_allowlist: &policy.agent.environment_allowlist,
+                    extra_environment: &[],
                     limits: Some(child_limits(
                         app,
                         Duration::from_secs(gate_policy.timeout_seconds),
@@ -1820,6 +1890,44 @@ mod tests {
             blocked_action_from_feedback(&feedback).as_deref(),
             Some("Provide the signing key.")
         );
+    }
+
+    #[test]
+    fn claude_gateway_environment_pins_every_model_alias_to_the_run_model() {
+        let token: ModelGatewayToken = serde_json::from_value(json!({
+            "token": "rgmg_secret",
+            "expires_at": "2026-10-23T12:00:00Z",
+            "provider": "anthropic",
+            "model": "claude-opus-5-5",
+            "base_path": "/agent-gateway/anthropic"
+        }))
+        .unwrap();
+        let environment = gateway_environment(
+            "https://app.rustgrid.com/api/v1/agent-gateway/anthropic",
+            &token,
+        );
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("ANTHROPIC_BASE_URL"),
+            Some("https://app.rustgrid.com/api/v1/agent-gateway/anthropic")
+        );
+        assert_eq!(value("ANTHROPIC_AUTH_TOKEN"), Some("rgmg_secret"));
+        assert_eq!(value("ANTHROPIC_API_KEY"), None);
+        for alias in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert_eq!(value(alias), Some("claude-opus-5-5"), "{alias}");
+        }
+        assert!(!format!("{token:?}").contains("rgmg_secret"));
     }
 
     #[test]

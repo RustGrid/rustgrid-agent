@@ -50,9 +50,12 @@ GitHub repository rules unavailable on the current plan, or protect against a
 compromised RustGrid control plane. Credentialed staging and periodic isolation
 escape tests remain mandatory.
 
-Codex and Anthropic authentication state are high-value deployment secrets.
-The worker strips `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*`, and `CLAUDE_CODE_*`
-variables from every child process. Production sandboxes must use a dedicated
+Codex authentication state is a high-value deployment secret. The tenant's
+Anthropic key never reaches the worker: Claude Code receives only a run-scoped
+RustGrid model gateway token that is valid while the worker holds the run's
+lease, is pinned to the run's signed model, and is passed only to the Claude
+Code process. The worker strips host `OPENAI_*`, `CODEX_*`, `ANTHROPIC_*`, and
+`CLAUDE_CODE_*` variables from every child process. Production sandboxes must use a dedicated
 least-privilege identity for each provider, make its state
 read-only where supported, avoid reusing developer credentials, and rotate it
 after suspected workspace escape. Staging certification must explicitly test

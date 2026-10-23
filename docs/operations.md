@@ -5,9 +5,10 @@
 Production uses the standalone Docker Sandboxes CLI. Install `sbx` using
 Docker's current instructions for a supported macOS or Ubuntu Linux host,
 authenticate Codex through Docker's credential proxy, and configure
-`executor.kind` as `docker_sandbox`. To accept Claude Code runs, also store an
-Anthropic credential with `sbx secret set -g anthropic` and pin
-`claude_template` and `claude_version`; see [Claude Code runs](claude-code.md).
+`executor.kind` as `docker_sandbox`. To accept Claude Code runs, pin
+`claude_template` and `claude_version` and connect the tenant's Anthropic key in
+RustGrid; Claude Code uses RustGrid's model gateway, so the worker needs no
+Anthropic credential. See [Claude Code runs](claude-code.md).
 
 Run one `serve` process per worker identity and authenticate it with
 `rustgrid-agent login`. GitHub credentials are issued per active run. Use a

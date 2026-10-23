@@ -173,6 +173,31 @@ pub struct GitHubAccessToken {
     pub permissions: Value,
 }
 
+/// Run-scoped credential for RustGrid's model gateway. RustGrid attaches the
+/// tenant's provider key server-side; the key itself never reaches the worker.
+#[derive(Clone, Deserialize)]
+pub struct ModelGatewayToken {
+    pub token: String,
+    pub expires_at: String,
+    pub provider: String,
+    pub model: String,
+    /// Gateway path relative to the API root, for example `/agent-gateway/anthropic`.
+    pub base_path: String,
+}
+
+impl std::fmt::Debug for ModelGatewayToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelGatewayToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_path", &self.base_path)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AgentRunEvent {
     pub sequence: u64,
@@ -474,6 +499,41 @@ impl RustGridClient {
             anyhow::bail!("RustGrid issued an invalid GitHub token response");
         }
         Ok(token)
+    }
+
+    pub fn issue_model_gateway_token(&self, run_id: &str) -> Result<ModelGatewayToken> {
+        let path = format!("{RUNS}/{run_id}/model-gateway-token");
+        let idempotency_key = format!("model-gateway-token-{run_id}-{}", Uuid::new_v4());
+        let token: ModelGatewayToken = deserialize_envelope(
+            self.send_value_with_policy(
+                Method::POST,
+                &path,
+                None,
+                Some(&idempotency_key),
+                None,
+                GITHUB_TOKEN_RETRY_POLICY,
+            )?,
+            &[],
+        )?;
+        let base_path_is_safe = token.base_path.starts_with('/')
+            && !token.base_path.contains("..")
+            && token
+                .base_path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'));
+        if !token.token.starts_with("rgmg_")
+            || token.expires_at.trim().is_empty()
+            || token.model.trim().is_empty()
+            || !base_path_is_safe
+        {
+            anyhow::bail!("RustGrid issued an invalid model gateway token response");
+        }
+        Ok(token)
+    }
+
+    /// The gateway base URL for a token, under the configured API origin.
+    pub fn model_gateway_base_url(&self, token: &ModelGatewayToken) -> String {
+        format!("{}{}", self.base_url, token.base_path)
     }
 
     pub fn publish_run_event(
@@ -1039,7 +1099,8 @@ pub fn is_lease_lost(error: &anyhow::Error) -> bool {
                     || ((failure.path.ends_with("/events")
                         || failure.path.ends_with("/manifest")
                         || failure.path.ends_with("/architecture-escalations")
-                        || failure.path.ends_with("/github-token"))
+                        || failure.path.ends_with("/github-token")
+                        || failure.path.ends_with("/model-gateway-token"))
                         && matches!(
                             failure.error_code.as_deref(),
                             Some(
@@ -1051,6 +1112,14 @@ pub fn is_lease_lost(error: &anyhow::Error) -> bool {
                                     | "assigned_worker_mismatch"
                             )
                         ))))
+    })
+}
+
+/// RustGrid has no valid tenant Anthropic connection for a Claude run.
+pub(crate) fn is_missing_provider_connection(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
+        failure.path.ends_with("/model-gateway-token")
+            && failure.error_code.as_deref() == Some("ai_provider_not_configured")
     })
 }
 

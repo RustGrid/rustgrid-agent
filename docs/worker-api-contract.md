@@ -107,6 +107,27 @@ fallback model. Inside a Docker Sandbox microVM the worker adds
 with Claude Code's OS sandbox enabled, writes confined to the workspace, and no
 unsandboxed fallback, the equivalent of Codex `workspace-write`.
 
+Claude Code never receives the tenant's Anthropic key. Before each Claude
+session the worker calls `POST /agent-runs/{run_id}/model-gateway-token`:
+
+```json
+{
+  "token": "rgmg_...",
+  "expires_at": "2026-10-23T12:00:00Z",
+  "provider": "anthropic",
+  "model": "claude-opus-5-5",
+  "base_path": "/agent-gateway/anthropic"
+}
+```
+
+The token is issued only to the bound worker while it holds an active lease on
+a run whose signed policy uses Claude Code and whose tenant has a valid
+Anthropic connection; a missing connection is `409` with code
+`ai_provider_not_configured`. Claude Code sends Anthropic Messages requests to
+`<API URL><base_path>/v1/messages` with `Authorization: Bearer <token>`.
+RustGrid rechecks the lease on every request, rejects any model other than the
+run's, attaches the key, and streams the response back.
+
 The worker translates Claude Code's `stream-json` messages into the same agent
 event stream it reads from Codex, so worker-owned command interception,
 focused-validation evidence, completion readiness, idle detection, budgets, and
