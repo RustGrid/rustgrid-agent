@@ -1329,13 +1329,14 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
         );
     }
     sweep_workspaces(context, &active_run_ids)?;
+    // Each task is keyed by its ticket so a ticket never has two attempts in flight,
+    // while a retry RustGrid assigns after the previous attempt finished still starts.
     let mut tasks: Vec<(String, thread::JoinHandle<()>)> = Vec::new();
     let mut started_run_ids = HashSet::new();
-    let mut attempted_ticket_ids = HashSet::new();
     for run in select_unstarted_assignments(
         active_runs,
         &started_run_ids,
-        &attempted_ticket_ids,
+        &HashSet::new(),
         context.config.max_concurrency,
     ) {
         let ticket = match api.fetch_ticket(&run.ticket_id) {
@@ -1355,11 +1356,9 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
         let task_context = context.clone();
         let task_api = api.clone();
         let task_worker = worker.clone();
-        let run_id = run.id.clone();
-        started_run_ids.insert(run_id.clone());
-        attempted_ticket_ids.insert(run.ticket_id.clone());
+        started_run_ids.insert(run.id.clone());
         tasks.push((
-            run_id,
+            run.ticket_id.clone(),
             thread::spawn(move || {
                 if let Err(error) = execute_claimed(
                     &task_context,
@@ -1416,10 +1415,14 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
         };
         let mut assigned = 0usize;
         let assigned_runs = api.active_runs(&worker.id)?;
+        let in_flight_ticket_ids = tasks
+            .iter()
+            .map(|(ticket_id, _)| ticket_id.clone())
+            .collect::<HashSet<_>>();
         for run in select_unstarted_assignments(
             assigned_runs,
             &started_run_ids,
-            &attempted_ticket_ids,
+            &in_flight_ticket_ids,
             available_slots,
         ) {
             let ticket = match api.fetch_ticket(&run.ticket_id) {
@@ -1437,15 +1440,14 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
                 &format!("RustGrid assigned {}", ticket.key),
                 "32",
             );
-            let run_id = run.id.clone();
-            started_run_ids.insert(run_id.clone());
-            attempted_ticket_ids.insert(run.ticket_id.clone());
+            started_run_ids.insert(run.id.clone());
+            let task_ticket_id = run.ticket_id.clone();
             let task_context = context.clone();
             let task_api = api.clone();
             let task_worker = worker.clone();
             let task_running = Arc::new(AtomicBool::new(true));
             tasks.push((
-                run_id,
+                task_ticket_id,
                 thread::spawn(move || {
                     if let Err(error) = execute_claimed(
                         &task_context,
@@ -1501,10 +1503,10 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
 fn select_unstarted_assignments(
     assigned_runs: Vec<AgentRun>,
     started_run_ids: &HashSet<String>,
-    attempted_ticket_ids: &HashSet<String>,
+    in_flight_ticket_ids: &HashSet<String>,
     available_slots: usize,
 ) -> Vec<AgentRun> {
-    let mut selected_ticket_ids = attempted_ticket_ids.clone();
+    let mut selected_ticket_ids = in_flight_ticket_ids.clone();
     assigned_runs
         .into_iter()
         .filter(|run| !started_run_ids.contains(&run.id))
@@ -1640,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn assigned_run_selection_does_not_retry_a_ticket_in_one_worker_session() {
+    fn assigned_run_selection_waits_for_the_in_flight_attempt_of_a_ticket() {
         let selected = select_unstarted_assignments(
             vec![run("run-2")],
             &HashSet::new(),
@@ -1649,6 +1651,19 @@ mod tests {
         );
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn assigned_run_selection_starts_a_retry_once_the_previous_attempt_finished() {
+        let started = HashSet::from(["run-1".to_owned()]);
+        let mut retry = run("run-2");
+        retry.ticket_id = "ticket-run-1".into();
+
+        let selected =
+            select_unstarted_assignments(vec![run("run-1"), retry], &started, &HashSet::new(), 1);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "run-2");
     }
 
     #[cfg(unix)]

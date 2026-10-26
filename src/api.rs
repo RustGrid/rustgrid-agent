@@ -1159,10 +1159,14 @@ pub(crate) fn typed_control_plane_error(
 }
 
 fn is_idle_stream_timeout(error: &std::io::Error) -> bool {
+    // The blocking body reader surfaces its own timeout as a wrapped reqwest error.
     matches!(
         error.kind(),
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    )
+    ) || error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout)
 }
 
 #[derive(Debug)]
