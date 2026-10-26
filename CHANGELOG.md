@@ -5,6 +5,18 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Fixed
+
+- A worker no longer stops taking runs after an attempt fails: it holds back a
+  ticket only while an attempt for it is in flight, so a RustGrid retry of a
+  failed ticket starts instead of occupying the worker's capacity forever.
+- Required GitHub workflows that never appear on the pushed commit (not defined,
+  or not triggered for the branch) are skipped after a five-minute discovery
+  window instead of holding the run until its timeout. The skipped names are
+  reported in the `required_workflows` step.
+- An idle queue stream read timeout is treated as an idle poll instead of being
+  logged as an unavailable stream.
+
 ### Changed
 
 - Claude Code reaches Anthropic through RustGrid's model gateway. Before each

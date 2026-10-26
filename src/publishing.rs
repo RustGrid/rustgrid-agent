@@ -18,6 +18,11 @@ use crate::{
     token::GitHubTokenManager,
 };
 
+/// GitHub registers workflow and check runs within seconds of a push. A required name
+/// with nothing on the commit after this window does not exist or is not triggered for
+/// the branch, so waiting longer would only hold the run until its timeout.
+const WORKFLOW_DISCOVERY_GRACE: Duration = Duration::from_secs(300);
+
 pub(crate) struct WorkflowRequirements<'a> {
     pub repo: &'a RepoConfig,
     pub web_base_url: &'a str,
@@ -64,7 +69,9 @@ pub(crate) fn wait_for_required_workflows(
         } else {
             Vec::new()
         };
+        let discovery_closed = started.elapsed() >= WORKFLOW_DISCOVERY_GRACE;
         let mut all_passed = true;
+        let mut absent = Vec::new();
         for name in requirements.required {
             let workflow = latest_workflow_run(&workflows, name);
             let check = latest_check_run(&checks, name);
@@ -95,16 +102,26 @@ pub(crate) fn wait_for_required_workflows(
                     }
                     .into());
                 }
+                None if discovery_closed => absent.push(name.as_str()),
                 _ => all_passed = false,
             }
         }
         if all_passed {
+            let message = if absent.is_empty() {
+                "Required GitHub workflows passed".to_owned()
+            } else {
+                format!(
+                    "Required GitHub workflows passed; skipped {} that never ran on this commit",
+                    absent.join(", ")
+                )
+            };
             reporter.step(
                 "required_workflows",
                 StepStatus::Completed,
-                "Required GitHub workflows passed",
+                &message,
                 Some(json!({
                     "required": requirements.required,
+                    "absent": absent,
                     "duration_ms": started.elapsed().as_millis()
                 })),
             )?;
