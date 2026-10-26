@@ -14,6 +14,10 @@ Semantic Versioning.
   or not triggered for the branch) are skipped after a five-minute discovery
   window instead of holding the run until its timeout. The skipped names are
   reported in the `required_workflows` step.
+- JavaScript quality gates (`npm`, `npx`, `pnpm`, `yarn`, `bun`) that run in
+  the repository root are skipped when the repository has no `package.json`
+  instead of failing every validation attempt. Gates that change directory
+  still run.
 - An idle queue stream read timeout is treated as an idle poll instead of being
   logged as an unavailable stream.
 

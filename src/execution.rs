@@ -1277,6 +1277,19 @@ fn run_quality_gates(
     reporter.set_phase(RunPhase::Verifying);
     let mut outcome = QualityGateOutcome::default();
     for gate_policy in &policy.quality_gates {
+        if !gate_policy.applies_to(&repo.root) {
+            reporter.step(
+                &gate_policy.id,
+                StepStatus::Completed,
+                "Skipped a JavaScript quality gate because the repository has no package.json",
+                Some(json!({
+                    "gate_id": gate_policy.id,
+                    "command": gate_policy.command,
+                    "applicable": false
+                })),
+            )?;
+            continue;
+        }
         let source_tree_hash = source_tree_hash(&repo.root)?;
         if executed.contains(&(gate_policy.command.clone(), source_tree_hash.clone())) {
             reporter.step(

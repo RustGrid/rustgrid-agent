@@ -251,20 +251,41 @@ impl ExecutionPolicy {
     }
 
     pub fn requires_npm_registry(&self) -> bool {
-        self.quality_gates.iter().any(|gate| {
-            gate.command.split_whitespace().any(|token| {
-                let executable = token
-                    .trim_matches(|character: char| {
-                        !character.is_ascii_alphanumeric()
-                            && character != '-'
-                            && character != '_'
-                            && character != '/'
-                    })
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or_default();
-                matches!(executable, "npm" | "npx" | "pnpm" | "yarn" | "bun")
-            })
+        self.quality_gates
+            .iter()
+            .any(QualityGatePolicy::uses_js_package_manager)
+    }
+}
+
+impl QualityGatePolicy {
+    pub fn uses_js_package_manager(&self) -> bool {
+        self.command.split_whitespace().any(|token| {
+            let executable = token
+                .trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric()
+                        && character != '-'
+                        && character != '_'
+                        && character != '/'
+                })
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            matches!(executable, "npm" | "npx" | "pnpm" | "yarn" | "bun")
+        })
+    }
+
+    /// A JS package-manager gate that runs in the repository root cannot apply to a
+    /// repository without a root `package.json`; no coding change can make it pass.
+    /// Gates that change directory may target a nested project and always apply.
+    pub fn applies_to(&self, repo_root: &std::path::Path) -> bool {
+        if !self.uses_js_package_manager() || repo_root.join("package.json").is_file() {
+            return true;
+        }
+        self.command.split_whitespace().any(|token| {
+            matches!(token, "cd" | "-C" | "--prefix" | "--dir" | "--cwd")
+                || token.starts_with("--prefix=")
+                || token.starts_with("--dir=")
+                || token.starts_with("--cwd=")
         })
     }
 }
@@ -747,6 +768,30 @@ fn is_sensitive_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate(command: &str) -> QualityGatePolicy {
+        QualityGatePolicy {
+            id: "gate-1".into(),
+            command: command.into(),
+            timeout_seconds: 60,
+            required: true,
+        }
+    }
+
+    #[test]
+    fn js_gates_do_not_apply_to_a_repository_without_package_json() {
+        let repo = tempfile::tempdir().unwrap();
+
+        for command in ["npm ci --maxsockets=1", "npm test", "npx tsc", "yarn build"] {
+            assert!(!gate(command).applies_to(repo.path()), "{command}");
+        }
+        assert!(gate("cargo test").applies_to(repo.path()));
+        assert!(gate("cd web && npm ci").applies_to(repo.path()));
+        assert!(gate("npm --prefix web test").applies_to(repo.path()));
+
+        std::fs::write(repo.path().join("package.json"), "{}").unwrap();
+        assert!(gate("npm test").applies_to(repo.path()));
+    }
 
     fn manifest() -> ExecutionManifest {
         ExecutionManifest {

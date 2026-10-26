@@ -285,6 +285,7 @@ impl ValidationPlan {
         }
         let worker_gates = gates
             .iter()
+            .filter(|gate| gate.applies_to(root))
             .map(|gate| gate.command.clone())
             .collect::<Vec<_>>();
         let codex_instructions = format!(
