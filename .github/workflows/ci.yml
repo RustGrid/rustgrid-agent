@@ -30,7 +30,7 @@ jobs:
           CLAUDE_CODE_VERSION: 2.1.246
           NPM_VERSION: 12.0.1
           RUST_BUILDER_IMAGE: rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
-          NODE_RUNTIME_IMAGE: node:24.18.1-trixie-slim@sha256:ac39e4b5fcb2b1b34b20364fd58b2e898f3bb80731ee6f62a7536f9df3d6aadc
+          NODE_RUNTIME_IMAGE: node:24.22.1-trixie-slim@sha256:89c5244bc22a9bc3287d89ebc7e49b9cb5bb84cd40e6175ac3421d5a9f68b95a
         run: |
           docker build \
             --build-arg "CODEX_VERSION=${CODEX_VERSION}" \
