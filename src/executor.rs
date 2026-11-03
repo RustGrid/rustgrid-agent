@@ -667,6 +667,7 @@ fn run_as_user(
         .filter(|name| std::env::var_os(name.as_str()).is_some())
         .cloned()
         .chain(extra_environment.iter().map(|(name, _)| name.clone()))
+        .filter(|name| !is_run_user_identity(name))
         .collect::<Vec<_>>();
     preserved.sort();
     preserved.dedup();
@@ -689,6 +690,17 @@ fn run_as_user(
     ]);
     wrapped.extend_from_slice(args);
     wrapped
+}
+
+/// Variables that describe the worker's own account. `sudo -H` gives the run
+/// user its own; carrying the worker's across would point npm, git and the
+/// coding agent at the worker's private home, which the run user cannot read.
+fn is_run_user_identity(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_uppercase();
+    matches!(
+        normalized.as_str(),
+        "HOME" | "USER" | "LOGNAME" | "SHELL" | "MAIL" | "TMPDIR"
+    ) || normalized.starts_with("XDG_")
 }
 
 fn capture_sandbox_prepare_command(
@@ -1290,6 +1302,22 @@ mod tests {
             ]
         );
         assert!(!prepared.args.iter().any(|arg| arg.contains("rgmg_secret")));
+    }
+
+    #[test]
+    fn disposable_vm_gives_the_run_user_its_own_home() {
+        assert!(std::env::var_os("HOME").is_some());
+        let args = run_as_user(
+            "rustgrid-run",
+            &["npm".into(), "ci".into()],
+            &["PATH".into(), "HOME".into()],
+            &[(
+                "XDG_CACHE_HOME".into(),
+                "/var/lib/rustgrid-agent/.cache".into(),
+            )],
+        );
+        assert!(args.contains(&"--preserve-env=PATH".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg.contains("HOME")), "{args:?}");
     }
 
     #[test]
