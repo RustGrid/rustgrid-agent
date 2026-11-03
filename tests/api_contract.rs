@@ -109,6 +109,7 @@ fn context(base_url: String) -> AppContext {
             max_child_memory_bytes: 8 * 1024 * 1024 * 1024,
             max_child_file_bytes: 1024 * 1024 * 1024,
             max_child_open_files: 1024,
+            hosted_run_id: None,
         },
         config_path: PathBuf::from("test.json"),
         instance_url: base_url.clone(),

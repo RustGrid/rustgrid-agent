@@ -1274,10 +1274,20 @@ pub fn watch(
     interval: Duration,
     once: bool,
 ) -> crate::error::ExecutionResult<()> {
-    watch_impl(context, interval, once).map_err(crate::error::ExecutionFailure::from_anyhow)
+    watch_impl(context, interval, once, false).map_err(crate::error::ExecutionFailure::from_anyhow)
 }
 
-fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()> {
+/// How long a hosted VM waits for its assigned run before giving up. RustGrid
+/// claims the run before creating the VM, so it is normally there at once.
+const HOSTED_ASSIGNMENT_WAIT: Duration = Duration::from_secs(5 * 60);
+
+fn watch_impl(
+    context: &AppContext,
+    interval: Duration,
+    once: bool,
+    exit_after_run: bool,
+) -> Result<()> {
+    let started_at = std::time::Instant::now();
     let _process_lock = WorkerProcessLock::acquire(context)?;
     if once && context.config.max_concurrency != 1 {
         bail!(
@@ -1389,6 +1399,15 @@ fn watch_impl(context: &AppContext, interval: Duration, once: bool) -> Result<()
         if shutdown::drain_requested() && tasks.is_empty() {
             console_event("drained", "All active runs finished", "33");
             break;
+        }
+        if exit_after_run && tasks.is_empty() {
+            if !started_run_ids.is_empty() {
+                console_event("finished", "The hosted run finished", "33");
+                break;
+            }
+            if started_at.elapsed() >= HOSTED_ASSIGNMENT_WAIT {
+                bail!("no run was assigned to this hosted worker");
+            }
         }
         if shutdown::drain_requested() {
             coordinator.start_draining();
@@ -1526,17 +1545,22 @@ fn bounded_text(value: &str, max: usize) -> String {
     format!("{}\n...[truncated]", &value[..end])
 }
 
-pub fn serve(context: &AppContext, interval: Duration) -> crate::error::ExecutionResult<()> {
-    serve_impl(context, interval).map_err(crate::error::ExecutionFailure::from_anyhow)
+pub fn serve(
+    context: &AppContext,
+    interval: Duration,
+    exit_after_run: bool,
+) -> crate::error::ExecutionResult<()> {
+    serve_impl(context, interval, exit_after_run)
+        .map_err(crate::error::ExecutionFailure::from_anyhow)
 }
 
-fn serve_impl(context: &AppContext, interval: Duration) -> Result<()> {
+fn serve_impl(context: &AppContext, interval: Duration, exit_after_run: bool) -> Result<()> {
     context
         .config
         .executor
         .validate_production(context.config.max_concurrency)?;
     Executor::from_config(&context.config.executor).preflight(&context.workspace_root)?;
-    watch_impl(context, interval, false)
+    watch_impl(context, interval, false, exit_after_run)
 }
 
 fn sweep_workspaces(context: &AppContext, protected_run_ids: &HashSet<String>) -> Result<()> {

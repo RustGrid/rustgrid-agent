@@ -52,6 +52,25 @@ enum Commands {
         /// Seconds between empty queue polls.
         #[arg(long, default_value_t = 15)]
         interval: u64,
+        /// Exit once the run assigned to this worker has finished. Used on
+        /// RustGrid-hosted VMs, which run exactly one task.
+        #[arg(long)]
+        exit_after_run: bool,
+    },
+    /// Set up a RustGrid-hosted VM from its one-time bootstrap token.
+    Bootstrap {
+        /// RustGrid control-plane instance URL.
+        #[arg(long, value_name = "URL")]
+        instance: String,
+        /// File holding the one-time token; deleted after it is read.
+        #[arg(long, value_name = "PATH")]
+        token_file: PathBuf,
+        /// Unprivileged user the coding agent and quality gates run as.
+        #[arg(long, value_name = "USER")]
+        run_as: String,
+        /// Directory for the run's repository workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace_root: PathBuf,
     },
     /// Show local configuration, credentials, repository, and worker status.
     Status {
@@ -101,10 +120,29 @@ fn run() -> Result<()> {
                 once,
             )?)
         }
-        Commands::Serve { interval } => {
+        Commands::Serve {
+            interval,
+            exit_after_run,
+        } => {
             let context = AppContext::load(&config_path)?;
-            Ok(runner::serve(&context, Duration::from_secs(interval))?)
+            Ok(runner::serve(
+                &context,
+                Duration::from_secs(interval),
+                exit_after_run,
+            )?)
         }
+        Commands::Bootstrap {
+            instance,
+            token_file,
+            run_as,
+            workspace_root,
+        } => rustgrid_agent::auth::bootstrap(
+            &config_path,
+            &instance,
+            &token_file,
+            &run_as,
+            &workspace_root,
+        ),
         Commands::Status { json } => {
             let context = AppContext::load(&config_path)?;
             runner::status(&context, json)
