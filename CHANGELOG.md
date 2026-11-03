@@ -3,7 +3,16 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 1.5.0 - 2026-11-03
+
+### Security
+
+- Update rustls and the other locked dependencies to clear RUSTSEC-2026-0285,
+  -0346, -0348, -0349, -0381 and -0382, and replace the yanked
+  `async-executor`.
+- The container image uses Node 24.22.1 and npm's bundled `brace-expansion`
+  5.0.11 and `undici` 6.29.1, clearing the high and critical findings in the
+  Node 24.18.1 image.
 
 ### Fixed
 
@@ -20,6 +29,8 @@ Semantic Versioning.
   still run.
 - An idle queue stream read timeout is treated as an idle poll instead of being
   logged as an unavailable stream.
+- An execution-protocol event built from an older state is rejected as a
+  revision conflict instead of as a mismatched causation id.
 
 ### Changed
 

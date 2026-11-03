@@ -3335,6 +3335,14 @@ impl ExecutionState {
                 field: "execution_attempt",
             });
         }
+        // A writer that built its event from an older state also derived its
+        // context from that state, so report the stale revision first.
+        if event.aggregate_revision_before != self.aggregate_revision {
+            return Err(ProtocolViolation::RevisionConflict {
+                expected: event.aggregate_revision_before,
+                actual: self.aggregate_revision,
+            });
+        }
         event.validate_context_against(self)?;
         if event.repository_revision != self.repository_revision {
             return Err(ProtocolViolation::EnvelopeMismatch {
@@ -3351,12 +3359,6 @@ impl ExecutionState {
         if event.event_id != event.expected_event_id()? {
             return Err(ProtocolViolation::InvalidEventIdentity {
                 event_id: event.event_id.clone(),
-            });
-        }
-        if event.aggregate_revision_before != self.aggregate_revision {
-            return Err(ProtocolViolation::RevisionConflict {
-                expected: event.aggregate_revision_before,
-                actual: self.aggregate_revision,
             });
         }
         let expected_sequence = self.next_sequence();
@@ -10187,10 +10189,10 @@ impl ExecutionState {
                 .is_some_and(|node| node.kind == NodeKind::Planning)
             && (!terminal
                 || self.current_planning_action.is_some()
-                || !self
+                || self
                     .planning
                     .as_ref()
-                    .is_some_and(|planning| planning.convergence.is_some()))
+                    .is_none_or(|planning| planning.convergence.is_none()))
         {
             return Err(ProtocolViolation::PlanningContract {
                 code: "planning_failure_without_blocking_convergence",
