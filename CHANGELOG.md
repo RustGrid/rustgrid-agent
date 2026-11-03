@@ -3,6 +3,19 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.5.2 - 2026-11-03
+
+### Fixed
+
+- On a RustGrid-hosted VM, the coding agent and quality gates now run with the
+  run user's own home. The worker's `HOME`, `USER`, `LOGNAME`, `SHELL`, `MAIL`,
+  `TMPDIR` and `XDG_*` variables are no longer carried across `sudo`, so npm,
+  git and Claude Code stop failing on the worker's private home
+  (`EACCES` on `~/.npm`).
+
+Version 1.5.1 was never released; its tag points at a commit still versioned
+1.5.0.
+
 ## 1.5.0 - 2026-11-03
 
 ### Security
