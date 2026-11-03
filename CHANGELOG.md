@@ -33,6 +33,14 @@ Semantic Versioning.
 
 ### Added
 
+- RustGrid-hosted VMs: `rustgrid-agent bootstrap` exchanges the one-time token
+  RustGrid places in a VM's user-data for that VM's worker credential and
+  writes a single-run configuration, and `serve --exit-after-run` exits once
+  the assigned run finishes. The new `disposable_vm` executor treats the VM as
+  the isolation boundary and runs the coding agent and quality gates as an
+  unprivileged user through sudo, passing only allowlisted and run-scoped
+  variables. It refuses to start from a configuration `bootstrap` did not
+  write.
 - Run Claude Code as the coding agent when RustGrid signs a version 2
   execution policy with `agent.provider: "claude"`. Claude Code's
   `stream-json` output is translated into the worker's agent event stream, so

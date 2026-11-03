@@ -54,7 +54,13 @@ pub(crate) enum Executor {
         cpus: u16,
         memory: String,
     },
+    DisposableVm {
+        run_as: String,
+    },
 }
+
+/// Absolute so the lookup does not depend on a cleared child `PATH`.
+const SUDO: &str = "/usr/bin/sudo";
 
 pub(crate) struct RunCommand<'a> {
     pub args: &'a [String],
@@ -74,7 +80,13 @@ pub(crate) struct RunCommand<'a> {
 
 impl Executor {
     pub(crate) const fn externally_isolated(&self) -> bool {
-        matches!(self, Self::DockerSandbox { .. })
+        matches!(self, Self::DockerSandbox { .. } | Self::DisposableVm { .. })
+    }
+
+    /// Commands run as host processes, so the worker applies the environment
+    /// allowlist and child limits itself.
+    const fn runs_on_host(&self) -> bool {
+        matches!(self, Self::Local | Self::DisposableVm { .. })
     }
 
     pub(crate) fn sandbox_name_for_run(run_id: &str) -> String {
@@ -84,6 +96,9 @@ impl Executor {
     pub(crate) fn from_config(config: &ExecutorConfig) -> Self {
         match config {
             ExecutorConfig::Local => Self::Local,
+            ExecutorConfig::DisposableVm { run_as } => Self::DisposableVm {
+                run_as: run_as.clone(),
+            },
             ExecutorConfig::DockerSandbox {
                 command,
                 template,
@@ -220,7 +235,7 @@ impl Executor {
         running: &AtomicBool,
     ) -> Result<ExecutionHandle> {
         match self {
-            Self::Local => Ok(ExecutionHandle::Local),
+            Self::Local | Self::DisposableVm { .. } => Ok(ExecutionHandle::Local),
             Self::DockerSandbox {
                 command,
                 template,
@@ -473,17 +488,14 @@ impl Executor {
                 idle_timeout: request.idle_timeout,
                 output_is_activity: request.output_is_activity,
                 max_output_bytes: request.max_output_bytes,
-                environment_allowlist: matches!(self, Self::Local)
-                    .then_some(request.environment_allowlist),
+                environment_allowlist: self.runs_on_host().then_some(request.environment_allowlist),
                 // Docker Sandboxes receive these through the protected env file.
-                extra_environment: if matches!(self, Self::Local) {
+                extra_environment: if self.runs_on_host() {
                     request.extra_environment
                 } else {
                     &[]
                 },
-                limits: matches!(self, Self::Local)
-                    .then_some(request.limits)
-                    .flatten(),
+                limits: self.runs_on_host().then_some(request.limits).flatten(),
             },
             on_line,
         );
@@ -528,10 +540,8 @@ impl Executor {
             request.running,
             request.timeout,
             request.max_output_bytes,
-            matches!(self, Self::Local).then_some(request.environment_allowlist),
-            matches!(self, Self::Local)
-                .then_some(request.limits)
-                .flatten(),
+            self.runs_on_host().then_some(request.environment_allowlist),
+            self.runs_on_host().then_some(request.limits).flatten(),
         );
         let quota_exceeded = monitor.finish();
         if quota_exceeded {
@@ -611,6 +621,10 @@ impl Executor {
                 args: args.to_vec(),
                 _env_file: None,
             }),
+            (Self::DisposableVm { run_as }, ExecutionHandle::Local) => Ok(PreparedCommand {
+                args: run_as_user(run_as, args, allowlist, extra_environment),
+                _env_file: None,
+            }),
             (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) => {
                 let mut wrapped = vec![command.clone(), "exec".into()];
                 if interactive {
@@ -637,6 +651,44 @@ impl Executor {
             _ => bail!("executor handle does not match configured executor"),
         }
     }
+}
+
+/// Runs `args` as `user` through sudo. sudo resets the environment, so only
+/// the allowlisted and run-scoped variables the worker set are carried over.
+/// `umask 002` keeps files the agent writes editable by the worker's group.
+fn run_as_user(
+    user: &str,
+    args: &[String],
+    allowlist: &[String],
+    extra_environment: &[(String, String)],
+) -> Vec<String> {
+    let mut preserved = allowlist
+        .iter()
+        .filter(|name| std::env::var_os(name.as_str()).is_some())
+        .cloned()
+        .chain(extra_environment.iter().map(|(name, _)| name.clone()))
+        .collect::<Vec<_>>();
+    preserved.sort();
+    preserved.dedup();
+    let mut wrapped = vec![
+        SUDO.to_owned(),
+        "-n".into(),
+        "-H".into(),
+        "-u".into(),
+        user.to_owned(),
+    ];
+    if !preserved.is_empty() {
+        wrapped.push(format!("--preserve-env={}", preserved.join(",")));
+    }
+    wrapped.extend([
+        "--".into(),
+        "/bin/sh".into(),
+        "-c".into(),
+        "umask 002; exec \"$@\"".into(),
+        "rustgrid-run".into(),
+    ]);
+    wrapped.extend_from_slice(args);
+    wrapped
 }
 
 fn capture_sandbox_prepare_command(
@@ -1200,6 +1252,50 @@ mod tests {
             ]
         );
         assert_eq!(SANDBOX_NETWORK_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn disposable_vm_runs_commands_as_the_run_user_with_only_named_variables() {
+        let executor = Executor::DisposableVm {
+            run_as: "rustgrid-run".into(),
+        };
+        assert!(executor.externally_isolated());
+        let workspace = std::env::temp_dir();
+        let prepared = executor
+            .wrap(
+                &ExecutionHandle::Local,
+                &workspace,
+                &["claude".into(), "--print".into()],
+                &["RUSTGRID_TEST_UNSET_VARIABLE".into()],
+                &[("ANTHROPIC_AUTH_TOKEN".into(), "rgmg_secret".into())],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            prepared.args,
+            [
+                "/usr/bin/sudo",
+                "-n",
+                "-H",
+                "-u",
+                "rustgrid-run",
+                "--preserve-env=ANTHROPIC_AUTH_TOKEN",
+                "--",
+                "/bin/sh",
+                "-c",
+                "umask 002; exec \"$@\"",
+                "rustgrid-run",
+                "claude",
+                "--print",
+            ]
+        );
+        assert!(!prepared.args.iter().any(|arg| arg.contains("rgmg_secret")));
+    }
+
+    #[test]
+    fn disposable_vm_without_variables_preserves_none() {
+        let args = run_as_user("rustgrid-run", &["true".into()], &[], &[]);
+        assert!(!args.iter().any(|arg| arg.starts_with("--preserve-env")));
     }
 
     #[test]

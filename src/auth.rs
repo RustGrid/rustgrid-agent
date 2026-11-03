@@ -1,5 +1,6 @@
 use std::{
-    env,
+    env, fs,
+    path::Path,
     process::Command,
     time::{Duration, Instant},
 };
@@ -11,6 +12,23 @@ use serde::{Deserialize, Serialize};
 use crate::{config::AppContext, shutdown};
 
 const DEVICE_PATH: &str = "agent-workers/device-authorizations";
+const HOSTED_BOOTSTRAP_PATH: &str = "agent-workers/hosted-bootstrap";
+const BOOTSTRAP_ATTEMPTS: u32 = 10;
+
+#[derive(Debug, Deserialize)]
+struct HostedCredential {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+    installation_id: String,
+    run_id: String,
+    worker: DeviceCredentialWorker,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostedBootstrapError {
+    error: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct DeviceAuthorization {
@@ -268,6 +286,100 @@ pub fn logout(context: &mut AppContext) -> Result<()> {
     context.clear_login()?;
     println!("[ complete] Worker {worker_id} credential revoked and removed locally");
     Ok(())
+}
+
+/// Sets up a RustGrid-hosted VM: exchanges the one-time token RustGrid placed
+/// in the VM's user-data for this VM's worker credential, then writes the
+/// configuration for its single run. The token file is deleted either way.
+pub fn bootstrap(
+    config_path: &Path,
+    instance: &str,
+    token_file: &Path,
+    run_as: &str,
+    workspace_root: &Path,
+) -> Result<()> {
+    let token = fs::read_to_string(token_file)
+        .with_context(|| format!("could not read {}", token_file.display()))?;
+    let removed = fs::remove_file(token_file);
+    let token = token.trim().to_owned();
+    removed.with_context(|| format!("could not delete {}", token_file.display()))?;
+    if token.is_empty() {
+        bail!("the bootstrap token file is empty");
+    }
+
+    let api_url = crate::config::api_url_for_instance_url(instance)?;
+    let endpoint = format!("{}/{HOSTED_BOOTSTRAP_PATH}", api_url.trim_end_matches('/'));
+    let client = device_client()?;
+    let request = serde_json::json!({
+        "token": token,
+        "hostname": hostname(),
+        "operating_system": env::consts::OS,
+        "architecture": env::consts::ARCH,
+        "agent_version": env!("CARGO_PKG_VERSION"),
+    });
+    // The VM can boot before RustGrid's API is reachable from it, so only
+    // transport and server errors are retried. A rejected token never is.
+    let mut attempt = 0_u32;
+    let credential: HostedCredential = loop {
+        attempt += 1;
+        match client.post(&endpoint).json(&request).send() {
+            Ok(response) if response.status() == StatusCode::OK => {
+                break response
+                    .json()
+                    .context("RustGrid returned an invalid hosted credential")?;
+            }
+            Ok(response) if !response.status().is_server_error() => {
+                let status = response.status();
+                let error = response
+                    .json::<HostedBootstrapError>()
+                    .map(|body| body.error)
+                    .unwrap_or_else(|_| "invalid_response".to_owned());
+                bail!("RustGrid rejected the hosted bootstrap token ({status}: {error})");
+            }
+            Ok(response) if attempt >= BOOTSTRAP_ATTEMPTS => {
+                bail!(
+                    "RustGrid kept failing the hosted bootstrap ({})",
+                    response.status()
+                );
+            }
+            Err(error) if attempt >= BOOTSTRAP_ATTEMPTS => {
+                return Err(error).context("could not reach RustGrid for the hosted bootstrap");
+            }
+            _ => std::thread::sleep(transient_delay(attempt)),
+        }
+    };
+    uuid::Uuid::parse_str(&credential.installation_id)
+        .context("RustGrid returned an invalid installation ID")?;
+    uuid::Uuid::parse_str(&credential.run_id).context("RustGrid returned an invalid run ID")?;
+    if credential.token_type != "Bearer" || credential.access_token.len() < 32 {
+        bail!("RustGrid returned an incomplete hosted credential");
+    }
+
+    let config = crate::config::hosted_config(
+        instance,
+        &credential.installation_id,
+        &credential.run_id,
+        run_as,
+        workspace_root,
+    )?;
+    crate::config::save_config(config_path, &config)?;
+    let mut context = AppContext::load_for_login(config_path, None)?;
+    context.save_login(
+        &credential.access_token,
+        &credential.worker.id,
+        &credential.worker.tenant_id,
+        &credential.worker.name,
+        credential.expires_in,
+    )?;
+    println!(
+        "[ complete] Hosted worker {} is ready for run {}",
+        credential.worker.id, credential.run_id
+    );
+    Ok(())
+}
+
+fn transient_delay(attempt: u32) -> Duration {
+    Duration::from_secs(u64::from(attempt.min(6)).saturating_mul(5))
 }
 
 fn device_client() -> Result<Client> {

@@ -75,6 +75,10 @@ pub struct Config {
     pub max_child_file_bytes: u64,
     #[serde(default = "default_max_child_open_files")]
     pub max_child_open_files: u64,
+    /// The one run a disposable hosted VM was created for. Written only by
+    /// `bootstrap`; the `disposable_vm` executor refuses to start without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -105,6 +109,10 @@ pub enum ExecutorConfig {
         #[serde(default = "default_sandbox_capacity_memory")]
         capacity_memory: String,
     },
+    /// A RustGrid-hosted VM created for one run and destroyed after it. The VM
+    /// is the isolation boundary; the coding agent and quality gates run as
+    /// the unprivileged `run_as` user, which cannot read the worker credential.
+    DisposableVm { run_as: String },
 }
 
 impl ExecutorConfig {
@@ -142,17 +150,23 @@ impl ExecutorConfig {
     }
 
     pub fn is_isolated(&self) -> bool {
-        matches!(self, Self::DockerSandbox { .. })
+        matches!(self, Self::DockerSandbox { .. } | Self::DisposableVm { .. })
     }
 
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::DockerSandbox { .. } => "docker_sandbox",
+            Self::DisposableVm { .. } => "disposable_vm",
         }
     }
 
     pub(crate) fn validate_production(&self, max_concurrency: usize) -> Result<()> {
+        // A disposable VM is checked against its bootstrap record in
+        // `Config::validate`; nothing here depends on host capacity.
+        if matches!(self, Self::DisposableVm { .. }) {
+            return Ok(());
+        }
         let Self::DockerSandbox {
             template,
             codex_version,
@@ -584,6 +598,44 @@ impl AppContext {
     }
 }
 
+fn validate_unix_user(name: &str) -> Result<()> {
+    let valid = (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+        });
+    if !valid || name == "root" {
+        bail!("disposable_vm run_as must be an unprivileged Unix user name");
+    }
+    Ok(())
+}
+
+/// Configuration for a hosted VM: one run, executed by `run_as`.
+pub(crate) fn hosted_config(
+    instance_url: &str,
+    installation_id: &str,
+    run_id: &str,
+    run_as: &str,
+    workspace_root: &Path,
+) -> Result<Config> {
+    let mut config = serde_json::from_str::<Config>("{}")?;
+    config.instance_url = Some(normalize_instance_url(instance_url)?);
+    config.installation_id = Some(installation_id.to_owned());
+    config.hosted_run_id = Some(run_id.to_owned());
+    config.max_concurrency = 1;
+    config.executor = ExecutorConfig::DisposableVm {
+        run_as: run_as.to_owned(),
+    };
+    config.workspace_root = Some(workspace_root.to_path_buf());
+    // The VM is deleted after the run, so nothing is worth retaining.
+    config.failed_workspace_retention_hours = 0;
+    config.validate()?;
+    Ok(config)
+}
+
 pub(crate) fn first_login_config() -> Result<Config> {
     let mut config = serde_json::from_str::<Config>("{}")?;
     config.executor = ExecutorConfig::production_default();
@@ -688,6 +740,11 @@ fn validate_control_plane_url(url: &reqwest::Url) -> Result<()> {
     Ok(())
 }
 
+/// The API URL for an instance URL given on the command line.
+pub(crate) fn api_url_for_instance_url(instance_url: &str) -> Result<String> {
+    Ok(api_url_for_instance(&normalize_instance_url(instance_url)?))
+}
+
 fn api_url_for_instance(instance_url: &str) -> String {
     format!("{}/api/v1", instance_url.trim_end_matches('/'))
 }
@@ -786,6 +843,17 @@ impl Config {
                 parse_binary_size(capacity_memory)?;
             }
             ExecutorConfig::Local => {}
+            ExecutorConfig::DisposableVm { run_as } => {
+                if self.hosted_run_id.is_none() {
+                    bail!(
+                        "the disposable_vm executor runs only on a RustGrid-hosted VM set up by `rustgrid-agent bootstrap`"
+                    );
+                }
+                if self.max_concurrency != 1 {
+                    bail!("disposable_vm executor requires max_concurrency=1");
+                }
+                validate_unix_user(run_as)?;
+            }
         }
         if !(30..=86_400).contains(&self.lease_seconds) {
             bail!("lease_seconds must be between 30 and 86400");
@@ -855,6 +923,7 @@ mod tests {
             max_child_memory_bytes: 8 * 1024 * 1024 * 1024,
             max_child_file_bytes: 1024 * 1024 * 1024,
             max_child_open_files: 1024,
+            hosted_run_id: None,
         };
         config.validate().unwrap();
     }
@@ -1054,5 +1123,39 @@ mod tests {
         );
         assert!(normalize_instance_url("http://example.com").is_err());
         assert!(normalize_instance_url("https://example.com/custom").is_err());
+    }
+
+    #[test]
+    fn hosted_config_is_a_single_run_disposable_vm() {
+        let config = hosted_config(
+            "https://app.rustgrid.com",
+            "6f1c1d4e-8a39-4c4d-9a3b-2d9a3b2d9a3b",
+            "9d3d7ee6-0000-4000-8000-000000000001",
+            "rustgrid-run",
+            Path::new("/var/lib/rustgrid-workspaces"),
+        )
+        .unwrap();
+        assert_eq!(config.executor.kind(), "disposable_vm");
+        assert!(config.executor.is_isolated());
+        assert_eq!(config.max_concurrency, 1);
+        assert!(config.executor.validate_production(1).is_ok());
+    }
+
+    #[test]
+    fn disposable_vm_refuses_a_config_not_written_by_bootstrap() {
+        let mut config = serde_json::from_str::<Config>("{}").unwrap();
+        config.executor = ExecutorConfig::DisposableVm {
+            run_as: "rustgrid-run".into(),
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("bootstrap"), "{error}");
+    }
+
+    #[test]
+    fn disposable_vm_refuses_root_and_unsafe_user_names() {
+        for user in ["root", "", "Run", "a b", "x;rm"] {
+            assert!(validate_unix_user(user).is_err(), "{user}");
+        }
+        assert!(validate_unix_user("rustgrid-run").is_ok());
     }
 }
