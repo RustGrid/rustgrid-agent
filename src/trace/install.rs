@@ -525,7 +525,13 @@ fn latest_session() -> Option<String> {
         })
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .max_by_key(|(modified, _)| *modified)?;
-    let session: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let session: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    let problem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|id| fs::read_to_string(super::problem_path(&dir, id)).ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
     let ticket = session
         .pointer("/ticket/key")
         .and_then(Value::as_str)
@@ -545,7 +551,11 @@ fn latest_session() -> Option<String> {
     } else {
         "up to date"
     };
-    Some(format!("{ticket}, {}, {state}", ago(modified)))
+    let mut line = format!("{ticket}, {}, {state}", ago(modified));
+    if let Some(problem) = problem {
+        line.push_str(&format!("\n  Last upload problem: {problem}"));
+    }
+    Some(line)
 }
 
 #[cfg(test)]

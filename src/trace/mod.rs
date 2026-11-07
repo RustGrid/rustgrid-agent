@@ -47,6 +47,15 @@ const AGENT_NAME: &str = "Claude Code (IDE)";
 const LINK_TIMEOUT: Duration = Duration::from_secs(8);
 /// Lines read per flush pass before saving progress.
 const LINES_PER_SAVE: usize = 25;
+/// A waiting session in the same folder as a session that just started is
+/// treated as left behind after this long: the IDE's "new conversation"
+/// button starts a session without ending the previous one.
+const LEFT_IN_SAME_FOLDER: Duration = Duration::from_secs(30);
+/// Any other session counts as left behind after this long without activity,
+/// even if a turn looks unfinished (an interrupted turn never reports Stop).
+const LEFT_ANYWHERE: Duration = Duration::from_secs(30 * 60);
+/// Ended sessions whose run never closed are retried for this long.
+const GIVE_UP_RETRYING: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 static LINK_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*/?rustgrid-link\s+([a-z][a-z0-9]{1,9}-[0-9]+)\s*$")
@@ -130,6 +139,13 @@ struct Session {
     stops: u64,
     #[serde(default)]
     stops_handled: u64,
+    /// Prompts sent to Claude. More prompts than stops means a turn is running.
+    #[serde(default)]
+    prompts: u64,
+    /// How many times the run was reopened after it ended, so the reopened
+    /// execution gets its own telemetry.
+    #[serde(default)]
+    generation: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -343,6 +359,13 @@ fn hook_in(
         });
     }
 
+    // A session that was ended (by the "new conversation" button heuristic,
+    // or a resumed conversation) and is used again picks its run back up.
+    if session.ended && matches!(event, "UserPromptSubmit" | "PostToolUse" | "Stop") {
+        session.reopen();
+    }
+
+    let mut left_behind = Vec::new();
     let outcome = match event {
         "UserPromptSubmit" => {
             let prompt = input.prompt.as_deref().unwrap_or_default();
@@ -362,6 +385,7 @@ fn hook_in(
                     None => "Link this session to the RustGrid ticket you are working on: /rustgrid-link ADD-123 (or work on a branch named after it, like rustgrid/ADD-123-short-title).".to_owned(),
                 })
             } else {
+                session.prompts += 1;
                 HookOutcome::Continue
             }
         }
@@ -369,6 +393,7 @@ fn hook_in(
             if spawn {
                 let _ = install::ensure_link_command();
             }
+            left_behind = end_left_behind(&dir, &session);
             HookOutcome::Continue
         }
         "Stop" => {
@@ -386,8 +411,95 @@ fn hook_in(
     fs::write(dir.join(format!("{}.dirty", session.session_id)), b"")?;
     if spawn {
         spawn_flush(config_path, &session.session_id);
+        for session_id in &left_behind {
+            spawn_flush(config_path, session_id);
+        }
     }
     Ok(outcome)
+}
+
+impl Session {
+    /// Picks an ended session's run back up. If the run was already closed on
+    /// RustGrid, the next flush starts it again, which reopens the same run.
+    fn reopen(&mut self) {
+        self.ended = false;
+        if self.finalized {
+            self.finalized = false;
+            self.run_id = None;
+            self.execution_reported = false;
+            self.generation += 1;
+        }
+    }
+
+    /// Whether this session was left without Claude Code reporting its end.
+    fn left_behind(&self, started: &Session, idle: Duration) -> bool {
+        if self.ended || self.run_id.is_none() {
+            return false;
+        }
+        if idle >= LEFT_ANYWHERE {
+            return true;
+        }
+        let turn_running = self.prompts > self.stops;
+        let same_folder = self.cwd.is_some() && self.cwd == started.cwd;
+        same_folder && !turn_running && idle >= LEFT_IN_SAME_FOLDER
+    }
+
+    /// Time since the session last did anything.
+    fn idle(&self, dir: &Path) -> Duration {
+        let modified = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
+        let last = [
+            modified(&Self::path(dir, &self.session_id)),
+            self.transcript_path.as_deref().and_then(modified),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        last.and_then(|time| time.elapsed().ok())
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// Ends the sessions a newly started one left behind, and returns them along
+/// with ended sessions whose run never closed, so their flushes can run again.
+fn end_left_behind(dir: &Path, started: &Session) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut pending = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if session_id == started.session_id || !valid_session_id(session_id) {
+            continue;
+        }
+        let Ok(Some(_guard)) = SessionLock::acquire(dir, session_id, "state", true) else {
+            continue;
+        };
+        let Ok(mut session) = Session::load(dir, session_id) else {
+            continue;
+        };
+        let idle = session.idle(dir);
+        if session.ended && !session.finalized && session.run_id.is_some() {
+            // RustGrid closes runs idle for two hours itself; stop retrying old ones.
+            if idle < GIVE_UP_RETRYING {
+                pending.push(session.session_id);
+            }
+        } else if session.left_behind(started, idle) {
+            session.ended = true;
+            session.stops += 1;
+            if session.save(dir).is_ok()
+                && fs::write(dir.join(format!("{session_id}.dirty")), b"").is_ok()
+            {
+                pending.push(session.session_id);
+            }
+        }
+    }
+    pending
 }
 
 /// Links the session to a ticket now, while the person waits, and returns
@@ -480,17 +592,47 @@ pub fn flush(config_path: &Path, session_id: &str) -> Result<()> {
     let Some(_flusher) = SessionLock::acquire(&dir, session_id, "flush", false)? else {
         return Ok(());
     };
+    let result = flush_session(config_path, &dir, session_id);
+    record_problem(&dir, session_id, result.as_ref().err());
+    result
+}
+
+fn flush_session(config_path: &Path, dir: &Path, session_id: &str) -> Result<()> {
     let context = AppContext::load(config_path)?;
     let client = RustGridClient::new(&context)?;
     let dirty = dir.join(format!("{session_id}.dirty"));
     for _ in 0..20 {
         let _ = fs::remove_file(&dirty);
-        flush_pass(&client, &dir, session_id)?;
+        flush_pass(&client, dir, session_id)?;
         if !dirty.exists() {
             break;
         }
     }
     Ok(())
+}
+
+/// The flush runs detached with no output, so its last problem is kept in
+/// `<session-id>.error` for `trace status`, and cleared once a flush succeeds.
+fn record_problem(dir: &Path, session_id: &str, problem: Option<&anyhow::Error>) {
+    let path = problem_path(dir, session_id);
+    match problem {
+        Some(error) => {
+            let _ = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut file| writeln!(file, "{} {error:#}", now_rfc3339()));
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) fn problem_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{session_id}.error"))
 }
 
 fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<()> {
@@ -532,7 +674,12 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
     let ticket_id = session.ticket.as_ref().and_then(|ticket| ticket.id.clone());
 
     if !session.execution_reported {
-        report_execution(client, &run_id, ExecutionStatus::Running)?;
+        report_execution(
+            client,
+            &run_id,
+            session.generation,
+            ExecutionStatus::Running,
+        )?;
         session.execution_reported = true;
     }
 
@@ -616,7 +763,12 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
         save_merged(dir, &session)?;
     }
     if session.ended && !session.finalized {
-        report_execution(client, &run_id, ExecutionStatus::Succeeded)?;
+        report_execution(
+            client,
+            &run_id,
+            session.generation,
+            ExecutionStatus::Succeeded,
+        )?;
         end_run(
             client,
             &session,
@@ -634,7 +786,9 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
 fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
     let _guard = SessionLock::acquire(dir, &flushed.session_id, "state", true)?;
     let mut current = Session::load(dir, &flushed.session_id)?;
-    let relinked = current.run_id.is_some() && current.run_id != flushed.run_id;
+    // A relink or a reopen while this flush ran: keep the hook's run.
+    let relinked = (current.run_id.is_some() && current.run_id != flushed.run_id)
+        || current.generation != flushed.generation;
     if !relinked {
         current.run_id = flushed.run_id.clone();
         current.ticket = flushed.ticket.clone();
@@ -768,9 +922,15 @@ fn report_item(
             session.totals.output += output;
             let at = at.clone().unwrap_or_else(now_rfc3339);
             let call_id = stable_uuid(&format!("ide:{run_id}:call:{message_id}"));
+            // A relink's earlier run never reopens, so it keeps the first execution.
+            let generation = if session.run_id.as_deref() == Some(run_id) {
+                session.generation
+            } else {
+                0
+            };
             let snapshot = ModelCallSnapshot {
                 id: call_id,
-                execution_id: execution_id(run_id),
+                execution_id: execution_id(run_id, generation),
                 agent_id: None,
                 agent_name: Some(AGENT_NAME.to_owned()),
                 phase_id: None,
@@ -835,12 +995,21 @@ fn report_item(
     }
 }
 
-fn execution_id(run_id: &str) -> Uuid {
-    stable_uuid(&format!("ide:{run_id}:execution"))
+fn execution_id(run_id: &str, generation: u32) -> Uuid {
+    if generation == 0 {
+        stable_uuid(&format!("ide:{run_id}:execution"))
+    } else {
+        stable_uuid(&format!("ide:{run_id}:execution:{generation}"))
+    }
 }
 
-fn report_execution(client: &RustGridClient, run_id: &str, status: ExecutionStatus) -> Result<()> {
-    let id = execution_id(run_id);
+fn report_execution(
+    client: &RustGridClient,
+    run_id: &str,
+    generation: u32,
+    status: ExecutionStatus,
+) -> Result<()> {
+    let id = execution_id(run_id, generation);
     let finished = !matches!(status, ExecutionStatus::Running);
     let (event_type, revision) = if finished {
         ("execution.completed", 2)
@@ -1013,6 +1182,149 @@ mod tests {
             HookOutcome::Continue
         );
         assert!(dir.join("s-1.dirty").exists());
+    }
+
+    fn waiting_session(dir: &Path, id: &str, cwd: &Path, prompts: u64, idle: Duration) {
+        let session = Session {
+            session_id: id.into(),
+            cwd: Some(cwd.to_path_buf()),
+            ticket: Some(LinkedTicket {
+                key: "ADD-363".into(),
+                id: Some("ticket-1".into()),
+                ..LinkedTicket::default()
+            }),
+            run_id: Some(format!("run-{id}")),
+            prompts,
+            stops: 1,
+            ..Session::default()
+        };
+        session.save(dir).unwrap();
+        File::options()
+            .write(true)
+            .open(Session::path(dir, id))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - idle)
+            .unwrap();
+    }
+
+    fn start(dir: &Path, config: &Path, id: &str, cwd: &Path) {
+        hook_in(
+            dir,
+            config,
+            "SessionStart",
+            HookInput {
+                session_id: id.into(),
+                cwd: Some(cwd.to_path_buf()),
+                ..HookInput::default()
+            },
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_new_conversation_ends_the_one_it_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = root.path().join("repo");
+        let elsewhere = root.path().join("elsewhere");
+        let config = root.path().join("config.json");
+        fs::write(&config, "{}").unwrap();
+        let minute = Duration::from_secs(60);
+
+        waiting_session(&dir, "replaced", &repo, 1, minute);
+        waiting_session(&dir, "mid-turn", &repo, 2, minute);
+        waiting_session(&dir, "just-used", &repo, 1, Duration::ZERO);
+        waiting_session(&dir, "other-folder", &elsewhere, 1, minute);
+        waiting_session(
+            &dir,
+            "forgotten",
+            &elsewhere,
+            2,
+            Duration::from_secs(31 * 60),
+        );
+        start(&dir, &config, "new", &repo);
+
+        let ended = |id: &str| Session::load(&dir, id).unwrap().ended;
+        assert!(ended("replaced"));
+        assert!(dir.join("replaced.dirty").exists());
+        assert!(
+            ended("forgotten"),
+            "a session idle for half an hour is over"
+        );
+        assert!(!ended("mid-turn"), "a running turn is not left behind");
+        assert!(!ended("just-used"), "a session in use is not left behind");
+        assert!(
+            !ended("other-folder"),
+            "another folder's session may be in use"
+        );
+        // The replaced session's final reply is still flushed.
+        let replaced = Session::load(&dir, "replaced").unwrap();
+        assert!(replaced.stops > replaced.stops_handled);
+    }
+
+    #[test]
+    fn an_ended_session_used_again_reopens_its_run() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = root.path().join("repo");
+        let config = root.path().join("config.json");
+        fs::write(
+            &config,
+            r#"{"worker_id":"9b0f4c4e-8f43-4a07-9a3e-3d2b0c3e1f10"}"#,
+        )
+        .unwrap();
+
+        waiting_session(&dir, "s-1", &repo, 1, Duration::ZERO);
+        let mut session = Session::load(&dir, "s-1").unwrap();
+        session.ended = true;
+        session.finalized = true;
+        session.execution_reported = true;
+        session.save(&dir).unwrap();
+
+        assert_eq!(
+            prompt(&dir, &config, &repo, "one more thing"),
+            HookOutcome::Continue
+        );
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert!(!session.ended && !session.finalized);
+        // The next flush starts the run again; RustGrid reopens the same one.
+        assert!(session.run_id.is_none());
+        assert!(session.ticket.is_some());
+        assert_eq!(session.generation, 1);
+        assert_ne!(execution_id("run", 0), execution_id("run", 1));
+    }
+
+    #[test]
+    fn a_reopen_during_a_flush_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let repo = root.path().join("repo");
+        waiting_session(&dir, "s-1", &repo, 1, Duration::ZERO);
+        let mut flushed = Session::load(&dir, "s-1").unwrap();
+        flushed.finalized = true;
+
+        let mut current = Session::load(&dir, "s-1").unwrap();
+        current.finalized = true;
+        current.reopen();
+        current.save(&dir).unwrap();
+
+        save_merged(&dir, &flushed).unwrap();
+        let merged = Session::load(&dir, "s-1").unwrap();
+        assert!(merged.run_id.is_none() && !merged.finalized);
+    }
+
+    #[test]
+    fn flush_problems_are_kept_until_a_flush_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let error = anyhow::anyhow!("RustGrid answered 409");
+        record_problem(root.path(), "s-1", Some(&error));
+        let text = fs::read_to_string(problem_path(root.path(), "s-1")).unwrap();
+        assert!(text.contains("RustGrid answered 409"), "{text}");
+        record_problem(root.path(), "s-1", None);
+        assert!(!problem_path(root.path(), "s-1").exists());
     }
 
     #[test]

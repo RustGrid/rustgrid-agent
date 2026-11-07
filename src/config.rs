@@ -797,10 +797,8 @@ impl Config {
         {
             bail!("worker_name must be between 1 and 255 characters");
         }
-        for (name, value) in [("default_base_branch", self.default_base_branch.as_str())] {
-            if value.trim().is_empty() {
-                bail!("config value {name} cannot be empty");
-            }
+        if self.default_base_branch.trim().is_empty() {
+            bail!("config value default_base_branch cannot be empty");
         }
         if !(5..=300).contains(&self.heartbeat_interval_seconds) {
             bail!("heartbeat_interval_seconds must be between 5 and 300");

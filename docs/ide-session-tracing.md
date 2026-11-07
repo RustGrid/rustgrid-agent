@@ -87,8 +87,15 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     run, with its summary comment, and traces the rest of the session on the new
     ticket.
 - **Ending a session:** when it ends, the run closes and RustGrid posts the
-  summary. If Claude Code never reports the end, RustGrid closes the run after
-  two hours without activity.
+  summary.
+  - **New conversation:** the IDE's **+** (new conversation) button starts a
+    session without ending the previous one. When a session starts, the run of
+    a session in the same folder closes once that session has waited 30
+    seconds with no turn running. A session anywhere closes after 30 minutes
+    without activity.
+  - **Used again:** if a closed session gets another prompt (another tab, or a
+    resumed conversation), its run reopens on the same ticket.
+  - **Never reported:** RustGrid closes a run after two hours without activity.
 
 ## Rolling it out to a team
 
@@ -117,7 +124,10 @@ version. `trace status` warns when a user has set it.
 
 - **Problem log:** tracing problems never block a prompt. They are printed by
   the hook as `[rustgrid trace] …`, which Claude Code shows in its hook output.
-- **Status:** `rustgrid-agent trace status` is the first thing to run.
+- **Status:** `rustgrid-agent trace status` is the first thing to run. It shows
+  the last upload problem of the latest session.
+- **Upload problems:** uploads run in the background, so their last problem is
+  kept in `~/.rustgrid/trace/<session-id>.error` until an upload succeeds.
 - **Session state:** each session's state is in `~/.rustgrid/trace/<session-id>.json`.
   Deleting it makes the next flush re-upload the session; RustGrid ignores
   events it already has.
