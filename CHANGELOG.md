@@ -3,6 +3,19 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.6.3 - 2026-11-07
+
+### Changed
+
+- An IDE session's timeline keeps only Claude's final reply for each prompt,
+  recorded as that prompt's outcome when the turn ends. Interim narration and
+  read-only tool calls (Read, Grep, Glob) are no longer posted; the activity
+  steps already show them.
+- `/rustgrid-link` no longer shows up as a blocked prompt. The hook passes the
+  link to Claude, which confirms it in one line. A failed link still blocks
+  with the reason.
+- The `/rustgrid-link` command file is refreshed when it is out of date.
+
 ## 1.6.2 - 2026-11-07
 
 ### Fixed

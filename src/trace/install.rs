@@ -75,12 +75,12 @@ fn link_command_path() -> Result<PathBuf> {
         .join("rustgrid-link.md"))
 }
 
-/// Puts the `/rustgrid-link` command in the person's Claude Code commands if
-/// it is missing. Hooks call this, so installs done as root by device
-/// management still give everyone the command.
+/// Puts the current `/rustgrid-link` command in the person's Claude Code
+/// commands when it is missing or out of date. Hooks call this, so installs
+/// done as root by device management, and upgrades, give everyone the command.
 pub fn ensure_link_command() -> Result<()> {
     let path = link_command_path()?;
-    if !path.exists() {
+    if fs::read_to_string(&path).ok().as_deref() != Some(LINK_COMMAND) {
         fs::create_dir_all(path.parent().expect("command path has a parent"))?;
         fs::write(&path, LINK_COMMAND)?;
     }
