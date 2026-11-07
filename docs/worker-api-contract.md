@@ -72,8 +72,11 @@ catalog and places `--model <id>` in the snapshotted, hashed command above.
 ### Agent providers and policy versions
 
 Policy version `1` always runs Codex and carries the `codex` block shown above.
-Policy version `2` replaces it with a provider-tagged `agent` block. RustGrid
-emits version `2` for models in its Claude Code catalog:
+Codex then authenticates with the worker's own Codex login. Policy version `2`
+replaces it with a provider-tagged `agent` block, and the agent reaches its
+model through the RustGrid model gateway with the tenant's provider key instead.
+RustGrid emits version `2` for models in its Claude Code catalog and for Codex
+models it serves with the tenant's OpenAI API key:
 
 ```json
 "execution_policy": {
@@ -107,8 +110,14 @@ fallback model. Inside a Docker Sandbox microVM the worker adds
 with Claude Code's OS sandbox enabled, writes confined to the workspace, and no
 unsandboxed fallback, the equivalent of Codex `workspace-write`.
 
-Claude Code never receives the tenant's Anthropic key. Before each Claude
-session the worker calls `POST /agent-runs/{run_id}/model-gateway-token`:
+A version `2` Codex command must invoke the `codex` executable. The worker owns
+its model provider, so it also rejects `--profile`/`-p`, `--oss`,
+`--local-provider`, and any `-c` override that names a model provider or a base
+URL, in addition to the sandbox and approval flags rejected for version `1`.
+
+The agent never receives the tenant's provider key. Before each session of a
+version `2` policy the worker calls
+`POST /agent-runs/{run_id}/model-gateway-token`:
 
 ```json
 {
@@ -121,12 +130,38 @@ session the worker calls `POST /agent-runs/{run_id}/model-gateway-token`:
 ```
 
 The token is issued only to the bound worker while it holds an active lease on
-a run whose signed policy uses Claude Code and whose tenant has a valid
-Anthropic connection; a missing connection is `409` with code
-`ai_provider_not_configured`. Claude Code sends Anthropic Messages requests to
-`<API URL><base_path>/v1/messages` with `Authorization: Bearer <token>`.
-RustGrid rechecks the lease on every request, rejects any model other than the
-run's, attaches the key, and streams the response back.
+a run whose signed policy is version `2` and whose tenant has a valid
+connection for the policy's provider; a missing connection is `409` with code
+`ai_provider_not_configured`. `provider` is `anthropic` for Claude Code and
+`openai` for Codex, and the worker rejects a token for the other provider.
+
+| Agent | `base_path` | Requests | Token delivery |
+| --- | --- | --- | --- |
+| Claude Code | `/agent-gateway/anthropic` | Anthropic Messages at `<API URL><base_path>/v1/messages` | `ANTHROPIC_AUTH_TOKEN` |
+| Codex | `/agent-gateway/openai` | OpenAI Responses at `<API URL><base_path>/v1/responses` | `RUSTGRID_MODEL_GATEWAY_TOKEN` |
+
+Both send `Authorization: Bearer <token>`. RustGrid rechecks the lease on every
+request, rejects any model other than the run's, attaches the key, and streams
+the response back.
+
+For Codex the worker adds a worker-owned model provider to each session:
+
+```text
+-c model_provider="rustgrid_gateway"
+-c model_providers.rustgrid_gateway.base_url="<API URL><base_path>/v1"
+-c model_providers.rustgrid_gateway.env_key="RUSTGRID_MODEL_GATEWAY_TOKEN"
+-c model_providers.rustgrid_gateway.wire_api="responses"
+-c model_providers.rustgrid_gateway.requires_openai_auth=false
+-c model_providers.rustgrid_gateway.supports_websockets=false
+```
+
+It adds `--model <token model>` when the signed command names no model. The
+token variable reaches the Codex process only, and the ChatGPT OAuth provider
+that version `1` uses in Docker Sandboxes is not configured. Because no host
+login is involved, a gateway-backed Codex run needs no Codex credentials on
+the worker, including RustGrid-hosted disposable VMs. If the tenant has no
+valid OpenAI connection, the run stops for human intervention with "Connect a
+valid OpenAI API key in RustGrid".
 
 The worker translates Claude Code's `stream-json` messages into the same agent
 event stream it reads from Codex, so worker-owned command interception,

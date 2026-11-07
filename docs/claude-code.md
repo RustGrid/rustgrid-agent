@@ -13,7 +13,9 @@ escalations, budgets, recovery, and telemetry.
 2. A user selects one of those models for a run.
 3. RustGrid signs a version 2 execution policy whose `agent` block names
    `provider: "claude"` and the `claude` command with `--model <id>`. Codex
-   models keep producing the unchanged version 1 policy.
+   models served with the tenant's OpenAI API key get a version 2 policy with
+   `provider: "codex"` and use the same model gateway; other Codex models keep
+   the unchanged version 1 policy and the worker's own Codex login.
 4. The worker validates the policy and runs Claude Code in the run's sandbox.
 
 The policy schema is in [the worker run contract](worker-api-contract.md#agent-providers-and-policy-versions).

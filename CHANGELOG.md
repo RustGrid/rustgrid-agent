@@ -3,6 +3,19 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- Codex can run on the tenant's OpenAI API key through the RustGrid model
+  gateway, the same way Claude Code runs on the Anthropic key. RustGrid selects
+  this by signing a version 2 policy with `agent.provider: "codex"`; the worker
+  gets a run-scoped gateway token for each session and points Codex at it with
+  a worker-owned model provider. The key never reaches the worker, and no Codex
+  login is needed on it, which lets hosted runs use any Codex model RustGrid
+  serves through the API key. Version 1 policies keep using the worker's own
+  Codex login unchanged.
+
 ## 1.6.4 - 2026-11-07
 
 ### Fixed

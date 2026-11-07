@@ -1341,6 +1341,10 @@ fn apply_codex_config_identity(value: &str, provider: &mut String, model: &mut O
     let value = value.trim().trim_matches('"');
     match key.trim() {
         "model" if safe_identifier(value, 200).is_some() => *model = Some(value.to_owned()),
+        // The gateway provider is a route to OpenAI, not a model vendor.
+        "model_provider" if value == crate::manifest::CODEX_GATEWAY_PROVIDER => {
+            *provider = crate::agent::AgentProvider::Codex.model_vendor().to_owned();
+        }
         "model_provider" if safe_identifier(value, 100).is_some() => *provider = value.to_owned(),
         _ => {}
     }
@@ -1385,6 +1389,23 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_gateway_codex_sessions_as_openai() {
+        let args = [
+            "codex",
+            "exec",
+            "--model",
+            "gpt-5.6-sol",
+            "-c",
+            "model_provider=\"rustgrid_gateway\"",
+        ]
+        .map(String::from);
+        assert_eq!(
+            codex_provider_and_model(&args),
+            ("openai".into(), "gpt-5.6-sol".into())
+        );
+    }
 
     #[test]
     fn resolves_model_identity_from_codex_flags_and_config_overrides() {

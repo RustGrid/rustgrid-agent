@@ -17,7 +17,6 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    agent::AgentProvider,
     api::{AgentRun, RustGridClient, Ticket, Worker},
     attachments,
     config::AppContext,
@@ -371,7 +370,7 @@ fn execute_claimed(
         )?;
         let handle = executor.prepare(
             execution_policy.agent.provider,
-            &model_gateway_hosts(execution_policy.agent.provider, &context.api_url),
+            &model_gateway_hosts(execution_policy.uses_model_gateway(), &context.api_url),
             &run.id,
             &repo.root,
             execution_policy.requires_npm_registry() || repo.root.join("package.json").is_file(),
@@ -1584,10 +1583,11 @@ pub fn status(context: &AppContext, json_output: bool) -> Result<()> {
     crate::health::status(context, json_output)
 }
 
-/// Claude Code runs reach Anthropic through the RustGrid model gateway, so the
-/// run's sandbox must reach the RustGrid API host.
-fn model_gateway_hosts(provider: AgentProvider, api_url: &str) -> Vec<String> {
-    if provider != AgentProvider::Claude {
+/// Gateway-backed runs (Claude Code, and Codex on API-key models) reach their
+/// model through the RustGrid model gateway, so the run's sandbox must reach
+/// the RustGrid API host.
+fn model_gateway_hosts(uses_model_gateway: bool, api_url: &str) -> Vec<String> {
+    if !uses_model_gateway {
         return Vec::new();
     }
     reqwest::Url::parse(api_url)
@@ -1608,21 +1608,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_claude_runs_open_the_rustgrid_gateway_host() {
+    fn only_gateway_runs_open_the_rustgrid_gateway_host() {
         assert_eq!(
-            model_gateway_hosts(AgentProvider::Claude, "https://app.rustgrid.com/api/v1"),
+            model_gateway_hosts(true, "https://app.rustgrid.com/api/v1"),
             ["app.rustgrid.com"]
         );
         assert_eq!(
-            model_gateway_hosts(
-                AgentProvider::Claude,
-                "https://rustgrid.internal:8443/api/v1"
-            ),
+            model_gateway_hosts(true, "https://rustgrid.internal:8443/api/v1"),
             ["rustgrid.internal:8443"]
         );
-        assert!(
-            model_gateway_hosts(AgentProvider::Codex, "https://app.rustgrid.com/api/v1").is_empty()
-        );
+        assert!(model_gateway_hosts(false, "https://app.rustgrid.com/api/v1").is_empty());
     }
 
     fn run(id: &str) -> AgentRun {

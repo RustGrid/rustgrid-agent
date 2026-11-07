@@ -522,7 +522,12 @@ impl ExecutionPolicy {
             bail!("execution policy contains an empty command, gate id, or timeout");
         }
         match agent.provider {
-            AgentProvider::Codex => validate_codex_command(&agent.command)?,
+            AgentProvider::Codex => {
+                validate_codex_command(&agent.command)?;
+                if self.uses_model_gateway() {
+                    validate_gateway_codex_command(&agent.command)?;
+                }
+            }
             AgentProvider::Claude => validate_claude_command(&agent.command)?,
         }
         if agent
@@ -540,6 +545,15 @@ impl ExecutionPolicy {
             bail!("execution sandbox policy is not enforceable by this worker");
         }
         Ok(())
+    }
+
+    /// Whether the agent reaches its model through the RustGrid model gateway
+    /// with the tenant's provider key, instead of a credential held by the
+    /// worker host. Every version 2 policy does: Claude Code always, and Codex
+    /// when RustGrid signs it from its API-key model catalog. Version 1 Codex
+    /// policies keep using the worker's own Codex login.
+    pub fn uses_model_gateway(&self) -> bool {
+        self.policy_version >= 2
     }
 
     /// The hardened agent command line. The worker, not the signed policy, owns
@@ -601,7 +615,7 @@ impl ExecutionPolicy {
         if !command.iter().any(|part| part == "--ephemeral") {
             command.insert(insertion, "--ephemeral".into());
         }
-        if externally_isolated {
+        if externally_isolated && !self.uses_model_gateway() {
             // Docker Sandboxes inject the host-held ChatGPT OAuth credential through
             // an HTTPS proxy. Codex's WebSocket transport is not reliable through
             // that interception layer, while api.openai.com requires API-key scopes
@@ -681,6 +695,73 @@ fn validate_codex_command(command: &[String]) -> Result<()> {
             || lower.contains("sandbox_mode")
     }) {
         bail!("execution policy contains an empty command, gate id, or timeout");
+    }
+    Ok(())
+}
+
+/// Name of the worker-owned Codex model provider that targets the gateway.
+pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "rustgrid_gateway";
+
+/// Variable that carries the run-scoped gateway token to the Codex process
+/// only. `RUSTGRID_*` names are stripped from every other child process.
+pub(crate) const CODEX_GATEWAY_TOKEN_ENV: &str = "RUSTGRID_MODEL_GATEWAY_TOKEN";
+
+/// Points one Codex session at the RustGrid model gateway. Codex sends OpenAI
+/// Responses requests to `<base_url>/v1/responses` with the run-scoped token
+/// as its bearer key, and runs the token's model when the signed command names
+/// none (the gateway rejects every other model).
+pub(crate) fn codex_gateway_args(args: &[String], base_url: &str, model: &str) -> Vec<String> {
+    let mut command = args.to_vec();
+    let base_url = format!("{}/v1", base_url.trim_end_matches('/'));
+    let mut additions = Vec::new();
+    let names_model = command
+        .iter()
+        .any(|part| matches!(part.as_str(), "--model" | "-m") || part.starts_with("--model="));
+    if !names_model {
+        additions.extend(["--model".to_owned(), model.to_owned()]);
+    }
+    let provider = CODEX_GATEWAY_PROVIDER;
+    for override_value in [
+        format!("model_provider=\"{provider}\""),
+        format!("model_providers.{provider}.name=\"RustGrid model gateway\""),
+        format!("model_providers.{provider}.base_url=\"{base_url}\""),
+        format!("model_providers.{provider}.env_key=\"{CODEX_GATEWAY_TOKEN_ENV}\""),
+        format!("model_providers.{provider}.wire_api=\"responses\""),
+        format!("model_providers.{provider}.requires_openai_auth=false"),
+        format!("model_providers.{provider}.supports_websockets=false"),
+    ] {
+        additions.extend(["-c".to_owned(), override_value]);
+    }
+    let insertion = command
+        .iter()
+        .position(|part| part == "-")
+        .unwrap_or(command.len());
+    command.splice(insertion..insertion, additions);
+    command
+}
+
+/// A gateway-backed Codex policy must leave the model provider to the worker:
+/// it rejects provider, profile, local-model, and endpoint overrides that
+/// would route the session around the gateway.
+fn validate_gateway_codex_command(command: &[String]) -> Result<()> {
+    let executable = std::path::Path::new(&command[0])
+        .file_name()
+        .and_then(|name| name.to_str());
+    if executable != Some(AgentProvider::Codex.executable()) {
+        bail!("Codex execution policy must invoke the codex executable");
+    }
+    for argument in &command[1..] {
+        let lower = argument.to_ascii_lowercase();
+        let flag = lower
+            .split_once('=')
+            .map_or(lower.as_str(), |(flag, _)| flag);
+        if matches!(flag, "--profile" | "-p" | "--oss" | "--local-provider")
+            || lower.contains("model_provider")
+            || lower.contains("base_url")
+            || lower.contains("profile")
+        {
+            bail!("Codex gateway policy contains a worker-owned model provider setting: {flag}");
+        }
     }
     Ok(())
 }
@@ -1189,5 +1270,103 @@ mod tests {
         policy.agent.provider = AgentProvider::Claude;
         policy.agent.command = vec!["claude".into(), "-p".into()];
         assert!(policy.validate().is_err());
+    }
+
+    fn gateway_codex_policy(command: &[&str]) -> ExecutionPolicy {
+        let mut value = claude_policy();
+        value["agent"] = serde_json::json!({
+            "provider": "codex",
+            "command": command,
+            "environment_allowlist": ["PATH", "HOME"]
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn only_version_two_policies_use_the_model_gateway() {
+        let legacy: ExecutionPolicy = serde_json::from_value(manifest().execution_policy).unwrap();
+        assert!(!legacy.uses_model_gateway());
+        let claude: ExecutionPolicy = serde_json::from_value(claude_policy()).unwrap();
+        assert!(claude.uses_model_gateway());
+        assert!(gateway_codex_policy(&["codex", "exec", "--json"]).uses_model_gateway());
+    }
+
+    #[test]
+    fn gateway_codex_runs_drop_the_chatgpt_oauth_provider() {
+        let policy =
+            gateway_codex_policy(&["codex", "exec", "--json", "--model", "gpt-5.6-sol", "-"]);
+        assert!(policy.validate().is_ok());
+        let isolated = policy.agent_args(true, &[]);
+        assert!(
+            !isolated
+                .iter()
+                .any(|arg| arg.contains("rustgrid_chatgpt_http"))
+        );
+        assert!(
+            isolated
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "danger-full-access"])
+        );
+        assert_eq!(isolated.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn codex_gateway_args_route_the_session_through_rustgrid() {
+        let base = ["codex", "exec", "--json", "--model", "gpt-5.6-sol", "-"].map(String::from);
+        let args = codex_gateway_args(
+            &base,
+            "https://app.rustgrid.com/api/v1/agent-gateway/openai/",
+            "gpt-5.6-sol",
+        );
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+        for expected in [
+            "model_provider=\"rustgrid_gateway\"",
+            "model_providers.rustgrid_gateway.base_url=\"https://app.rustgrid.com/api/v1/agent-gateway/openai/v1\"",
+            "model_providers.rustgrid_gateway.env_key=\"RUSTGRID_MODEL_GATEWAY_TOKEN\"",
+            "model_providers.rustgrid_gateway.wire_api=\"responses\"",
+            "model_providers.rustgrid_gateway.requires_openai_auth=false",
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "-c" && pair[1] == expected),
+                "missing {expected} in {args:?}"
+            );
+        }
+        assert_eq!(args.iter().filter(|arg| *arg == "--model").count(), 1);
+
+        let unpinned = codex_gateway_args(
+            &base[..3],
+            "https://rg/api/v1/agent-gateway/openai",
+            "gpt-5.6-terra",
+        );
+        assert!(
+            unpinned
+                .windows(2)
+                .any(|pair| pair == ["--model", "gpt-5.6-terra"])
+        );
+    }
+
+    #[test]
+    fn gateway_codex_policies_cannot_reroute_the_model_provider() {
+        for command in [
+            &["codex", "exec", "-c", "model_provider=\"openai\""][..],
+            &[
+                "codex",
+                "exec",
+                "-c",
+                "model_providers.x.base_url=\"https://evil\"",
+            ],
+            &["codex", "exec", "-c", "openai_base_url=\"https://evil\""],
+            &["codex", "exec", "--profile", "work"],
+            &["codex", "exec", "-p", "work"],
+            &["codex", "exec", "--oss"],
+            &["codex", "exec", "--local-provider", "ollama"],
+            &["claude", "-p"],
+        ] {
+            assert!(
+                gateway_codex_policy(command).validate().is_err(),
+                "accepted {command:?}"
+            );
+        }
     }
 }
