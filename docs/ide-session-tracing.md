@@ -5,7 +5,32 @@ RustGrid ticket they are working on: the same trace an agent run leaves, so
 the ticket shows what changed and how.
 
 It needs RustGrid with interactive runs (`POST /api/v1/agent-runs/interactive`)
-and `rustgrid-agent` 1.6.0 or later, signed in with `rustgrid-agent login`.
+and `rustgrid-agent` 1.6.1 or later.
+
+## Set up
+
+```sh
+brew install RustGrid/tap/rustgrid-agent
+rustgrid-agent trace install
+```
+
+`trace install`:
+- writes the Claude Code hooks for the binary's real location into **managed
+  settings**, which users cannot override. That file is shared by everyone on
+  the computer, so `sudo` asks for your password for that one step;
+- merges with any settings already there, adding or replacing only its own
+  hooks;
+- installs the `/rustgrid-link` command;
+- signs the computer in to RustGrid if it isn't yet;
+- runs `trace status` to check that it all works.
+
+Restart Claude Code afterwards.
+
+| Command | What it does |
+|---|---|
+| `rustgrid-agent trace status` | Shows whether sessions are traced, where the hooks are, whether RustGrid answers, which ticket the current branch links to, and the last traced session. |
+| `rustgrid-agent trace install --user` | Writes the hooks into your own `~/.claude/settings.json` instead, without sudo. Good for trying it out, but you can remove them. |
+| `rustgrid-agent trace uninstall` | Removes exactly what `install` added. |
 
 ## What is recorded
 
@@ -65,33 +90,34 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
   summary. If Claude Code never reports the end, RustGrid closes the run after
   two hours without activity.
 
-## Rolling it out so it cannot be turned off
+## Rolling it out to a team
 
-Install hooks through Claude Code **managed settings**, which users cannot
-override, using your device management tool (Jamf, Intune, …):
+Have your device management tool (Jamf, Intune, …) run, as root:
 
-1. Install `rustgrid-agent` 1.6.0+ at `/usr/local/bin/rustgrid-agent`.
-2. Deploy [`packaging/claude-code/managed-settings.json`](../packaging/claude-code/managed-settings.json)
-   to:
-   - **macOS:** `/Library/Application Support/ClaudeCode/managed-settings.json`
-   - **Linux and WSL:** `/etc/claude-code/managed-settings.json`
+```sh
+brew install RustGrid/tap/rustgrid-agent   # or install the release binary
+rustgrid-agent trace install --no-login
+```
 
-   If you already ship managed settings, merge the `hooks` block into them. To
-   stop people adding their own hooks as well, also set
-   `"allowManagedHooksOnly": true`.
-3. Deploy [`packaging/claude-code/commands/rustgrid-link.md`](../packaging/claude-code/commands/rustgrid-link.md)
-   to each user's `~/.claude/commands/` so `/rustgrid-link` autocompletes. The
-   hook handles the command either way.
-4. Each developer runs `rustgrid-agent login` once.
+This writes the managed hooks for everyone on the computer. Each person signs
+in once: Claude Code tells them to run `rustgrid-agent login` before their first
+prompt.
 
-Before rolling out, confirm on a test machine that a user's own `disableAllHooks`
-or project settings do not disable the managed hooks with your Claude Code
-version.
+To also stop people adding their own hooks, set `"allowManagedHooksOnly": true`
+in the same managed settings file. The file is at
+`/Library/Application Support/ClaudeCode/managed-settings.json` on macOS and
+`/etc/claude-code/managed-settings.json` on Linux. The reference copy is
+[`packaging/claude-code/managed-settings.json`](../packaging/claude-code/managed-settings.json).
+
+Before relying on it, confirm on a test machine that a user's own
+`disableAllHooks` does not disable the managed hooks with your Claude Code
+version. `trace status` warns when a user has set it.
 
 ## Troubleshooting
 
 - **Problem log:** tracing problems never block a prompt. They are printed by
   the hook as `[rustgrid trace] …`, which Claude Code shows in its hook output.
+- **Status:** `rustgrid-agent trace status` is the first thing to run.
 - **Session state:** each session's state is in `~/.rustgrid/trace/<session-id>.json`.
   Deleting it makes the next flush re-upload the session; RustGrid ignores
   events it already has.

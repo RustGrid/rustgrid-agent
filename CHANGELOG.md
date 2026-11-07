@@ -3,6 +3,22 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.6.1 - 2026-11-07
+
+### Added
+
+- `rustgrid-agent trace install` sets up IDE session tracing in one step. It
+  writes the Claude Code hooks for the binary's real location into managed
+  settings (asking sudo for that step), merges with any settings already there,
+  installs the `/rustgrid-link` command, signs the computer in if needed, and
+  checks that everything works. `--user` writes your own settings instead.
+  Device management can run it as root with `--no-login`.
+- `rustgrid-agent trace status` shows whether sessions are traced, where the
+  hooks are, whether RustGrid answers, which ticket the current branch links
+  to, and the last traced session.
+- `rustgrid-agent trace uninstall` removes exactly what `install` added.
+- The Homebrew formula tells you how to turn tracing on.
+
 ## 1.6.0 - 2026-11-07
 
 ### Added

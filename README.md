@@ -421,8 +421,9 @@ child process groups and exits safely.
 ### `trace`
 
 ```sh
-rustgrid-agent trace hook UserPromptSubmit   # called by Claude Code hooks
-rustgrid-agent trace flush --session <id>    # started by the hooks
+rustgrid-agent trace install     # set up tracing on this computer
+rustgrid-agent trace status      # check that it works
+rustgrid-agent trace uninstall   # stop tracing
 ```
 
 Traces Claude Code sessions in a person's IDE onto the RustGrid ticket they

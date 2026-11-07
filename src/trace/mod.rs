@@ -11,6 +11,7 @@
 //! `/rustgrid-link ADD-354`. Until then `UserPromptSubmit` blocks the prompt.
 //! RustGrid being unreachable never blocks: data waits on disk and is retried.
 
+pub mod install;
 pub mod redact;
 pub mod transcript;
 
@@ -351,6 +352,12 @@ fn hook_in(
             } else {
                 HookOutcome::Continue
             }
+        }
+        "SessionStart" => {
+            if spawn {
+                let _ = install::ensure_link_command();
+            }
+            HookOutcome::Continue
         }
         "SessionEnd" => {
             session.ended = true;
