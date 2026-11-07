@@ -20,7 +20,7 @@ use crate::{
     executor::{ExecutionHandle, Executor, RunCommand},
     git::Repo,
     lifecycle::{RunPhase, StepStatus},
-    manifest::ExecutionManifest,
+    manifest::{CODEX_GATEWAY_TOKEN_ENV, ExecutionManifest, codex_gateway_args},
     mission::{BudgetStage, BudgetUsage, MissionBudget, MissionClass, MissionProfile},
     optimization::{DependencyState, process_command_output},
     reporting::Reporter,
@@ -474,14 +474,21 @@ pub(crate) fn run_agent_prompt(
         let agent_attempt = agent_sessions;
         let mut stream = AgentStream::new(provider);
         // Each session gets a fresh run-scoped token; the tenant key stays in RustGrid.
-        let gateway_environment = match provider {
-            AgentProvider::Claude => claude_gateway_environment(context, step_id, agent_attempt)?,
-            AgentProvider::Codex => Vec::new(),
+        let GatewaySession {
+            args: session_args,
+            environment: gateway_environment,
+        } = if policy.uses_model_gateway() {
+            model_gateway_session(context, provider, &agent_args, step_id, agent_attempt)?
+        } else {
+            GatewaySession {
+                args: agent_args.clone(),
+                environment: Vec::new(),
+            }
         };
         let session_started = Instant::now();
         let telemetry = RefCell::new(context.reporter.start_agent_telemetry(
             provider,
-            &agent_args,
+            &session_args,
             &session_prompt,
             context.mission_class,
             context.budget,
@@ -492,7 +499,7 @@ pub(crate) fn run_agent_prompt(
         let result = context.executor.streaming(
             context.executor_handle,
             RunCommand {
-                args: &agent_args,
+                args: &session_args,
                 cwd: &context.repo.root,
                 stdin_text: Some(&session_prompt),
                 running: context.running,
@@ -824,14 +831,18 @@ pub(crate) fn run_agent_prompt(
     Ok(())
 }
 
-/// Obtains a run-scoped RustGrid model gateway token for one Claude Code
-/// session. RustGrid holds the tenant's Anthropic key and attaches it
-/// server-side, so the worker and sandbox only ever see the short-lived token.
-fn claude_gateway_environment(
+/// Obtains a run-scoped RustGrid model gateway token for one agent session and
+/// returns the session's command line and gateway environment. RustGrid holds
+/// the tenant's provider key and attaches it server-side, so the worker and
+/// sandbox only ever see the short-lived token.
+fn model_gateway_session(
     context: &AgentContext<'_>,
+    provider: AgentProvider,
+    agent_args: &[String],
     step_id: &str,
     agent_attempt: u32,
-) -> Result<Vec<(String, String)>> {
+) -> Result<GatewaySession> {
+    let agent_name = provider.display_name();
     let token = match context
         .api
         .issue_model_gateway_token(&context.manifest.run.id)
@@ -839,17 +850,29 @@ fn claude_gateway_environment(
         Ok(token) => token,
         Err(error) if api::is_missing_provider_connection(&error) => {
             return Err(RunFailure::HumanIntervention {
-                action: "Connect a valid Anthropic API key in RustGrid (AI provider connections) before running Claude Code, then retry".into(),
+                action: format!(
+                    "Connect a valid {} API key in RustGrid (AI provider connections) before running {agent_name}, then retry",
+                    provider_key_name(provider)
+                ),
             }
             .into());
         }
         Err(error) => return Err(error.context("could not obtain a RustGrid model gateway token")),
     };
+    if token.provider != provider.model_vendor() {
+        bail!(
+            "RustGrid issued a {} model gateway token for a {agent_name} run",
+            token.provider
+        );
+    }
     if agent_attempt == 1 {
         context.reporter.step(
             &format!("{step_id}_model_gateway"),
             StepStatus::Completed,
-            "Claude Code reaches Anthropic through the RustGrid model gateway",
+            &format!(
+                "{agent_name} reaches {} through the RustGrid model gateway",
+                provider_key_name(provider)
+            ),
             Some(json!({
                 "provider": token.provider,
                 "model": token.model,
@@ -857,10 +880,37 @@ fn claude_gateway_environment(
             })),
         )?;
     }
-    Ok(gateway_environment(
-        &context.api.model_gateway_base_url(&token),
-        &token,
-    ))
+    let base_url = context.api.model_gateway_base_url(&token);
+    Ok(match provider {
+        AgentProvider::Claude => GatewaySession {
+            args: agent_args.to_vec(),
+            environment: gateway_environment(&base_url, &token),
+        },
+        AgentProvider::Codex => GatewaySession {
+            args: codex_gateway_args(agent_args, &base_url, &token.model),
+            environment: codex_gateway_environment(&token),
+        },
+    })
+}
+
+/// One agent session's command line and run-scoped gateway environment.
+struct GatewaySession {
+    args: Vec<String>,
+    environment: Vec<(String, String)>,
+}
+
+/// The provider whose key the tenant connects in RustGrid.
+const fn provider_key_name(provider: AgentProvider) -> &'static str {
+    match provider {
+        AgentProvider::Codex => "OpenAI",
+        AgentProvider::Claude => "Anthropic",
+    }
+}
+
+/// Codex environment for the gateway: only the run-scoped token, read by the
+/// worker-owned `rustgrid_gateway` model provider.
+fn codex_gateway_environment(token: &ModelGatewayToken) -> Vec<(String, String)> {
+    vec![(CODEX_GATEWAY_TOKEN_ENV.to_owned(), token.token.clone())]
 }
 
 /// Claude Code environment for the gateway. Every model alias resolves to the
