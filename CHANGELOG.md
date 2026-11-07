@@ -3,6 +3,22 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.6.0 - Unreleased
+
+### Added
+
+- `rustgrid-agent trace` traces Claude Code sessions in a person's IDE onto
+  the RustGrid ticket they work on, as an interactive run: prompts, activity
+  steps, commands with their output, edited paths, Claude's replies, priced
+  token usage and pull requests, then one summary comment when the session
+  ends. Text is redacted before it leaves the machine.
+- Sessions link to a ticket from the branch name or with
+  `/rustgrid-link ADD-123`; prompts are blocked until a session is linked and
+  the computer is signed in.
+- `packaging/claude-code/` holds the managed-settings hooks and the
+  `/rustgrid-link` command for rolling tracing out so it cannot be turned off.
+  Requires RustGrid with interactive runs.
+
 ## 1.5.2 - 2026-11-03
 
 ### Fixed

@@ -35,4 +35,5 @@ pub mod supervisor;
 pub mod telemetry;
 pub mod token;
 pub mod token_consumption;
+pub mod trace;
 pub mod workspace;

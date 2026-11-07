@@ -1346,7 +1346,7 @@ fn apply_codex_config_identity(value: &str, provider: &mut String, model: &mut O
     }
 }
 
-fn stable_uuid(value: &str) -> Uuid {
+pub(crate) fn stable_uuid(value: &str) -> Uuid {
     Uuid::new_v5(&TELEMETRY_NAMESPACE, value.as_bytes())
 }
 

@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/rustgrid-agent trace hook SessionStart", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/rustgrid-agent trace hook UserPromptSubmit", "timeout": 15 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/rustgrid-agent trace hook PostToolUse", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/rustgrid-agent trace hook Stop", "timeout": 5 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/rustgrid-agent trace hook SessionEnd", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

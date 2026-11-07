@@ -306,7 +306,7 @@ fn content_blocks(event: &Value) -> &[Value] {
 
 /// Maps a Claude tool call onto the canonical item type telemetry and the
 /// worker guards already understand.
-fn tool_item(block: &Value) -> Option<Value> {
+pub(crate) fn tool_item(block: &Value) -> Option<Value> {
     let id = block.get("id").and_then(Value::as_str)?;
     let name = block.get("name").and_then(Value::as_str)?;
     let input = block.get("input").cloned().unwrap_or(Value::Null);
@@ -355,7 +355,7 @@ fn tool_item(block: &Value) -> Option<Value> {
     Some(item)
 }
 
-fn tool_result_text(content: Option<&Value>) -> String {
+pub(crate) fn tool_result_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(parts)) => parts
@@ -369,7 +369,7 @@ fn tool_result_text(content: Option<&Value>) -> String {
 
 /// Claude Code reports a failing shell command as `Exit code N` on the first
 /// line of the tool result.
-fn reported_exit_code(output: &str) -> Option<i64> {
+pub(crate) fn reported_exit_code(output: &str) -> Option<i64> {
     output
         .lines()
         .next()?
@@ -387,7 +387,7 @@ fn reported_exit_code(output: &str) -> Option<i64> {
 /// stay visible as `cache_creation_input_tokens`, with the 1-hour TTL share in
 /// `cache_creation_1h_input_tokens`, because Anthropic bills 1-hour writes at
 /// a higher rate than 5-minute writes.
-fn canonical_usage(usage: &Value) -> Option<Value> {
+pub(crate) fn canonical_usage(usage: &Value) -> Option<Value> {
     let count = |field: &str| usage.get(field).and_then(Value::as_u64);
     let output_tokens = count("output_tokens")?;
     let uncached = count("input_tokens")?;

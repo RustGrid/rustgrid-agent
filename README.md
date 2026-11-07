@@ -418,6 +418,18 @@ leases before taking new work, and supervises every run independently. SIGTERM
 drains active runs without accepting new assignments. SIGINT cancels active
 child process groups and exits safely.
 
+### `trace`
+
+```sh
+rustgrid-agent trace hook UserPromptSubmit   # called by Claude Code hooks
+rustgrid-agent trace flush --session <id>    # started by the hooks
+```
+
+Traces Claude Code sessions in a person's IDE onto the RustGrid ticket they
+work on: prompts, steps, commands, replies, usage and the pull request, plus
+one summary comment. Install it through Claude Code managed settings so it
+cannot be turned off; see [IDE session tracing](docs/ide-session-tracing.md).
+
 ## Run lifecycle, recovery, and telemetry
 
 Manifest version `2` owns the repository, input prompt, selected model, agent
@@ -585,6 +597,7 @@ More operational failure modes and recovery procedures are in
 - [Container deployment](deploy/README.md)
 - [Known limitations](docs/known-limitations.md)
 - [Telemetry and data handling](docs/telemetry.md)
+- [IDE session tracing](docs/ide-session-tracing.md)
 - [Staging certification](docs/staging-certification.md)
 - [Release checklist](docs/release-checklist.md)
 - [Roadmap](ROADMAP.md) and [changelog](CHANGELOG.md)
