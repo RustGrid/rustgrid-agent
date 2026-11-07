@@ -3,7 +3,17 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
-## 1.6.1 - 2026-11-07
+## 1.6.2 - 2026-11-07
+
+### Fixed
+
+- The container image builds again: it now includes the Claude Code command
+  and settings templates that `trace install` embeds.
+
+Version 1.6.1 was never released; its release run was cancelled before
+publishing anything. Its changes ship in 1.6.2.
+
+## 1.6.1 - 2026-11-07 (not released)
 
 ### Added
 
