@@ -5,6 +5,8 @@ FROM ${RUST_BUILDER_IMAGE} AS builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
+# install.rs embeds the Claude Code command and settings templates.
+COPY packaging/claude-code ./packaging/claude-code
 COPY README.md LICENSE ./
 RUN cargo build --locked --release
 
