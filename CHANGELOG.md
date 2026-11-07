@@ -3,6 +3,26 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.6.4 - 2026-11-07
+
+### Fixed
+
+- Starting a new conversation in the IDE (its **+** button) closes the run of
+  the session it replaced, with its summary comment. Claude Code does not report
+  the end of that session, so its run used to stay open, its timer still running,
+  until RustGrid closed it two hours later. When a session starts, a session in
+  the same folder with no turn running for 30 seconds is ended. A session anywhere
+  is ended after 30 minutes without activity.
+- A session that was ended and gets another prompt reopens its run on the same
+  ticket, instead of tracing onto a closed run.
+- Ended sessions whose run never closed are retried when a session starts, for
+  up to a week.
+
+### Changed
+
+- Background upload problems are kept in `~/.rustgrid/trace/<session-id>.error`
+  and shown by `trace status`, instead of being discarded.
+
 ## 1.6.3 - 2026-11-07
 
 ### Changed
