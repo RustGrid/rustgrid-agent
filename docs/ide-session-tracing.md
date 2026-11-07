@@ -88,6 +88,10 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     ticket.
 - **Ending a session:** when it ends, the run closes and RustGrid posts the
   summary.
+  - **Pull request:** a pull request is the session's result. When the turn
+    that opened one finishes, the run closes with its summary, the pull request
+    attached. A later prompt reopens the run, which closes again only when it
+    opens another pull request.
   - **New conversation:** the IDE's **+** (new conversation) button starts a
     session without ending the previous one. When a session starts, the run of
     a session in the same folder closes once that session has waited 30

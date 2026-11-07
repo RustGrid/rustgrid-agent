@@ -146,6 +146,10 @@ struct Session {
     /// execution gets its own telemetry.
     #[serde(default)]
     generation: u32,
+    /// Pull requests the run had when a pull request last ended it. A reopened
+    /// run ends again only when it opens another one.
+    #[serde(default)]
+    pull_requests_ended: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -747,6 +751,13 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
         }
         session.stops_handled = session.stops;
         save_merged(dir, &session)?;
+        // A pull request is the session's deliverable: the turn that opened
+        // it closes the run, with its summary. Another prompt reopens it.
+        if session.previous_run.is_none()
+            && session.pull_requests.len() > session.pull_requests_ended
+        {
+            end_on_pull_request(dir, &mut session)?;
+        }
     }
 
     if let Some(previous) = session.previous_run.clone()
@@ -782,6 +793,27 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
     Ok(())
 }
 
+/// Ends the session because a turn opened a pull request, unless a hook
+/// relinked or reopened it, or a new turn started, while this flush ran.
+fn end_on_pull_request(dir: &Path, flushed: &mut Session) -> Result<()> {
+    let _guard = SessionLock::acquire(dir, &flushed.session_id, "state", true)?;
+    let mut current = Session::load(dir, &flushed.session_id)?;
+    let turn_running = current.prompts > current.stops;
+    if current.ended
+        || turn_running
+        || current.run_id != flushed.run_id
+        || current.generation != flushed.generation
+    {
+        return Ok(());
+    }
+    current.ended = true;
+    current.pull_requests_ended = flushed.pull_requests.len();
+    current.save(dir)?;
+    flushed.ended = true;
+    flushed.pull_requests_ended = current.pull_requests_ended;
+    Ok(())
+}
+
 /// Saves flush progress without losing link changes a hook made meanwhile.
 fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
     let _guard = SessionLock::acquire(dir, &flushed.session_id, "state", true)?;
@@ -795,6 +827,7 @@ fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
         current.link_problem = flushed.link_problem.clone();
         current.pull_requests = flushed.pull_requests.clone();
         current.finalized = flushed.finalized;
+        current.pull_requests_ended = flushed.pull_requests_ended;
     }
     current.previous_run = flushed
         .previous_run
@@ -1314,6 +1347,43 @@ mod tests {
         save_merged(&dir, &flushed).unwrap();
         let merged = Session::load(&dir, "s-1").unwrap();
         assert!(merged.run_id.is_none() && !merged.finalized);
+    }
+
+    #[test]
+    fn a_turn_that_opens_a_pull_request_ends_the_run() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let repo = root.path().join("repo");
+        waiting_session(&dir, "s-1", &repo, 1, Duration::ZERO);
+        let mut flushed = Session::load(&dir, "s-1").unwrap();
+        flushed.pull_requests = vec!["https://github.com/RustGrid/x/pull/57".into()];
+
+        end_on_pull_request(&dir, &mut flushed).unwrap();
+        assert!(flushed.ended);
+        let saved = Session::load(&dir, "s-1").unwrap();
+        assert!(saved.ended);
+        assert_eq!(saved.pull_requests_ended, 1);
+
+        // Reopened by another prompt, the run ends again only on a new PR.
+        let mut current = saved;
+        current.finalized = true;
+        current.reopen();
+        current.save(&dir).unwrap();
+        assert!(current.pull_requests.len() <= current.pull_requests_ended);
+    }
+
+    #[test]
+    fn a_pull_request_does_not_end_a_turn_already_running() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let repo = root.path().join("repo");
+        waiting_session(&dir, "s-1", &repo, 2, Duration::ZERO);
+        let mut flushed = Session::load(&dir, "s-1").unwrap();
+        flushed.pull_requests = vec!["https://github.com/RustGrid/x/pull/57".into()];
+
+        end_on_pull_request(&dir, &mut flushed).unwrap();
+        assert!(!flushed.ended);
+        assert!(!Session::load(&dir, "s-1").unwrap().ended);
     }
 
     #[test]

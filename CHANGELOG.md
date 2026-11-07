@@ -5,6 +5,13 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- A traced IDE session's run closes when the turn that opened a pull request
+  finishes, so the ticket shows the agent report and summary right away instead
+  of after the session ends or sits idle. Another prompt reopens the run, which
+  closes again only when it opens another pull request.
+
 ### Added
 
 - Codex can run on the tenant's OpenAI API key through the RustGrid model
