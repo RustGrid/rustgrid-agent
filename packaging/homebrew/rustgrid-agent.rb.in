@@ -11,6 +11,13 @@ class RustgridAgent < Formula
     system "cargo", "install", *std_cargo_args(path: ".")
   end
 
+  def caveats
+    <<~EOS
+      To trace your Claude Code sessions onto RustGrid tickets, run:
+        rustgrid-agent trace install
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/rustgrid-agent --version")
   end

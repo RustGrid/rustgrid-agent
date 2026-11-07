@@ -72,7 +72,7 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         workspace_root: PathBuf,
     },
-    /// Trace Claude Code IDE sessions onto RustGrid tickets (called by hooks).
+    /// Trace Claude Code sessions on this computer onto RustGrid tickets.
     Trace {
         #[command(subcommand)]
         command: TraceCommand,
@@ -96,6 +96,42 @@ enum TraceCommand {
     Flush {
         #[arg(long)]
         session: String,
+    },
+    /// Set up Claude Code on this computer so every session is traced.
+    ///
+    /// By default the hooks go into Claude Code's managed settings, which
+    /// users cannot turn off (sudo asks for your password for that step).
+    /// Also signs this computer in if needed and checks that tracing works.
+    Install {
+        /// Use your own Claude Code settings instead; you can remove them.
+        #[arg(long)]
+        user: bool,
+        /// Do not sign in, for example when device management runs this.
+        #[arg(long)]
+        no_login: bool,
+        /// Print the sign-in URL without launching a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// RustGrid control-plane instance URL to sign in to.
+        #[arg(long, value_name = "URL")]
+        instance: Option<String>,
+        /// Only write the managed hooks (run through sudo by `install`).
+        #[arg(long, hide = true)]
+        system_only: bool,
+        /// The binary the hooks run (passed through sudo by `install`).
+        #[arg(long, hide = true)]
+        binary: Option<std::path::PathBuf>,
+    },
+    /// Show whether Claude Code sessions on this computer are traced.
+    Status,
+    /// Stop tracing Claude Code sessions on this computer.
+    Uninstall {
+        /// Only remove the hooks from your own Claude Code settings.
+        #[arg(long)]
+        user: bool,
+        /// Only remove the managed hooks (run through sudo by `uninstall`).
+        #[arg(long, hide = true)]
+        system_only: bool,
     },
 }
 
@@ -190,6 +226,52 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Trace {
             command: TraceCommand::Hook { .. },
         } => unreachable!("hooks are handled before configuration loads"),
+        Commands::Trace {
+            command:
+                TraceCommand::Install {
+                    user,
+                    no_login,
+                    no_browser,
+                    instance,
+                    system_only,
+                    binary,
+                },
+        } => {
+            use rustgrid_agent::trace::install;
+            if system_only {
+                let binary = match binary {
+                    Some(binary) => binary,
+                    None => install::stable_binary_path(&std::env::current_exe()?),
+                };
+                return install::install_managed(&binary);
+            }
+            install::install(
+                &config_path,
+                install::InstallOptions {
+                    scope: if user {
+                        install::Scope::User
+                    } else {
+                        install::Scope::Managed
+                    },
+                    login: !no_login,
+                    open_browser: !no_browser,
+                    instance,
+                },
+            )
+        }
+        Commands::Trace {
+            command: TraceCommand::Status,
+        } => rustgrid_agent::trace::install::status(&config_path),
+        Commands::Trace {
+            command: TraceCommand::Uninstall { user, system_only },
+        } => {
+            use rustgrid_agent::trace::install;
+            if system_only {
+                install::uninstall_system_only()
+            } else {
+                install::uninstall(user.then_some(install::Scope::User))
+            }
+        }
         Commands::Status { json } => {
             let context = AppContext::load(&config_path)?;
             runner::status(&context, json)
