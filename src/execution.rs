@@ -1660,7 +1660,7 @@ fn command_matches_full_gate(candidate: &str, configured: &str) -> bool {
             .all(|token| broad_flags.contains(token) || token.starts_with("--color"))
 }
 
-fn derived_progress_from_line(line: &str) -> Option<(String, &'static str)> {
+pub(crate) fn derived_progress_from_line(line: &str) -> Option<(String, &'static str)> {
     let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
     if event.get("type").and_then(serde_json::Value::as_str) != Some("item.started") {
         return None;

@@ -72,6 +72,11 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         workspace_root: PathBuf,
     },
+    /// Trace Claude Code IDE sessions onto RustGrid tickets (called by hooks).
+    Trace {
+        #[command(subcommand)]
+        command: TraceCommand,
+    },
     /// Show local configuration, credentials, repository, and worker status.
     Status {
         /// Emit machine-readable JSON for health probes.
@@ -80,9 +85,45 @@ enum Commands {
     },
 }
 
-fn run() -> Result<()> {
+#[derive(Debug, Subcommand)]
+enum TraceCommand {
+    /// Handle one Claude Code hook; reads the hook's JSON from stdin.
+    Hook {
+        /// The hook event, such as SessionStart, UserPromptSubmit or SessionEnd.
+        event: String,
+    },
+    /// Report what is new in a session's transcript (started by hooks).
+    Flush {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+/// Runs a Claude Code hook. Exit code 2 blocks the prompt and shows the
+/// reason; tracing problems are logged and never block.
+fn run_hook(config_path: &std::path::Path, event: &str) -> ExitCode {
+    let mut stdin = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin).is_err() {
+        return ExitCode::SUCCESS;
+    }
+    let Ok(input) = serde_json::from_str(&stdin) else {
+        return ExitCode::SUCCESS;
+    };
+    match rustgrid_agent::trace::hook(config_path, event, input) {
+        Ok(rustgrid_agent::trace::HookOutcome::Block(reason)) => {
+            eprintln!("{reason}");
+            ExitCode::from(2)
+        }
+        Ok(rustgrid_agent::trace::HookOutcome::Continue) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("[rustgrid trace] {error:#}");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     rustgrid_agent::shutdown::install()?;
-    let cli = Cli::parse();
     let config_path = match &cli.command {
         Commands::Setup { .. } => rustgrid_agent::setup::setup_config_path(cli.config.as_deref())?,
         _ => rustgrid_agent::config::resolve_config_path(cli.config.as_deref())?,
@@ -143,6 +184,12 @@ fn run() -> Result<()> {
             &run_as,
             &workspace_root,
         ),
+        Commands::Trace {
+            command: TraceCommand::Flush { session },
+        } => rustgrid_agent::trace::flush(&config_path, &session),
+        Commands::Trace {
+            command: TraceCommand::Hook { .. },
+        } => unreachable!("hooks are handled before configuration loads"),
         Commands::Status { json } => {
             let context = AppContext::load(&config_path)?;
             runner::status(&context, json)
@@ -151,7 +198,19 @@ fn run() -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    // Hooks must answer Claude Code quickly and never fail a prompt over tracing.
+    let cli = Cli::parse();
+    if let Commands::Trace {
+        command: TraceCommand::Hook { event },
+    } = &cli.command
+    {
+        let Ok(config_path) = rustgrid_agent::config::resolve_config_path(cli.config.as_deref())
+        else {
+            return ExitCode::SUCCESS;
+        };
+        return run_hook(&config_path, event);
+    }
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("\n[error] {error:#}");

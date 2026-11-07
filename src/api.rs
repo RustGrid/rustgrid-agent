@@ -80,6 +80,8 @@ const WORKERS: &str = "agent-workers";
 const RUNS: &str = "agent-runs";
 const STANDARD_RETRY_POLICY: RetryPolicy = RetryPolicy::new(6, 250, 30_000);
 const GITHUB_TOKEN_RETRY_POLICY: RetryPolicy = RetryPolicy::new(8, 1_000, 30_000);
+/// For calls a person is waiting on, such as linking an IDE session.
+const QUICK_RETRY_POLICY: RetryPolicy = RetryPolicy::new(2, 250, 1_000);
 
 #[derive(Clone, Copy)]
 struct RetryPolicy {
@@ -277,15 +279,40 @@ struct QualityGateRecord {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct InteractiveRunStarted {
+    pub run: InteractiveRun,
+    pub ticket: InteractiveRunTicket,
+    pub created: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InteractiveRun {
+    pub id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InteractiveRunTicket {
+    pub id: String,
+    pub key: String,
+    pub title: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AttachmentDownloadTarget {
     url: String,
 }
 
 impl RustGridClient {
     pub fn new(context: &AppContext) -> Result<Self> {
+        Self::with_timeout(context, Duration::from_secs(30))
+    }
+
+    /// A client for calls a person is waiting on, which must give up sooner.
+    pub fn with_timeout(context: &AppContext, timeout: Duration) -> Result<Self> {
         Ok(Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(timeout)
                 .user_agent(concat!("rustgrid-agent/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             base_url: context.api_url.trim_end_matches('/').to_owned(),
@@ -865,6 +892,50 @@ impl RustGridClient {
         )
     }
 
+    /// Starts, or continues, the interactive run for a Claude Code IDE session.
+    pub fn start_interactive_run(&self, body: Value, quick: bool) -> Result<InteractiveRunStarted> {
+        let idempotency = format!("interactive-start-{}", Uuid::new_v4());
+        let value = self.send_value_with_policy(
+            Method::POST,
+            &format!("{RUNS}/interactive"),
+            Some(body),
+            Some(&idempotency),
+            None,
+            if quick {
+                QUICK_RETRY_POLICY
+            } else {
+                STANDARD_RETRY_POLICY
+            },
+        )?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Ends an IDE session's run; RustGrid posts the summary comment.
+    pub fn end_interactive_run(&self, run_id: &str, body: Value) -> Result<()> {
+        self.send_empty(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/interactive/end"),
+            Some(body),
+            Some(&format!("interactive-end-{run_id}")),
+        )
+    }
+
+    /// Appends one already-redacted trace event (`progress`, `message` or `log`).
+    pub fn publish_trace_event(
+        &self,
+        run_id: &str,
+        event_kind: &str,
+        data: Value,
+        idempotency: &str,
+    ) -> Result<()> {
+        self.send_empty(
+            Method::POST,
+            &format!("{RUNS}/{run_id}/events"),
+            Some(json!({"event_type": event_kind, "data": data})),
+            Some(idempotency),
+        )
+    }
+
     pub fn attach_pr(&self, ticket_id: &str, run_id: &str, url: &str, number: u64) -> Result<()> {
         let body = json!({
             "kind": "github_pr",
@@ -1074,6 +1145,13 @@ fn is_idempotency_busy_body(body: &str) -> bool {
     let normalized = body.to_ascii_lowercase();
     normalized.contains("idempotency key is busy")
         && normalized.contains("another attempt in-flight")
+}
+
+/// The HTTP status RustGrid answered with, if the error is an HTTP response.
+pub fn http_status(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<HttpFailure>()
+        .map(|failure| failure.status.as_u16())
 }
 
 pub fn is_conflict(error: &anyhow::Error) -> bool {

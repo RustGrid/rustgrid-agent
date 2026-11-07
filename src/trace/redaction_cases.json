@@ -1,0 +1,25 @@
+{
+  "description": "Secret redaction cases shared by RustGrid (security/event_data.rs) and rustgrid-agent (trace redaction). <<x*N>> expands to the character x repeated N times, so no realistic token is committed. Keep both copies identical.",
+  "cases": [
+    { "input": "token ghp_<<a*36>> here", "expected": "token [REDACTED] here" },
+    { "input": "key sk-ant-api03-<<b*40>>", "expected": "key [REDACTED]" },
+    { "input": "openai sk-proj-<<c*40>>", "expected": "openai [REDACTED]" },
+    { "input": "rustgrid rge_<<d*43>> rgk_<<e*32>>", "expected": "rustgrid [REDACTED] [REDACTED]" },
+    { "input": "do dop_v1_<<f*64>>", "expected": "do [REDACTED]" },
+    { "input": "stripe sk_live_<<g*24>> and whsec_<<h*32>>", "expected": "stripe [REDACTED] and [REDACTED]" },
+    { "input": "slack xoxb-<<1*12>>-<<2*12>>-<<i*24>>", "expected": "slack [REDACTED]" },
+    { "input": "id AKIA<<Q*16>> done", "expected": "id [REDACTED] done" },
+    { "input": "aws_secret_access_key = <<j*40>>", "expected": "aws_secret_access_key = [REDACTED]" },
+    { "input": "<<-*5>>BEGIN OPENSSH PRIVATE KEY<<-*5>>\nb3BlbnNzaA\n<<-*5>>END OPENSSH PRIVATE KEY<<-*5>>\nafter", "expected": "[REDACTED]\nafter" },
+    { "input": "DATABASE_URL=postgres://u:p@h/db", "expected": "DATABASE_URL=[REDACTED]" },
+    { "input": "connect to postgres://app:hunter2@db.internal:5432/x", "expected": "connect to postgres://app:[REDACTED]@db.internal:5432/x" },
+    { "input": "export STRIPE_SECRET_KEY=\"abc def\"", "expected": "export STRIPE_SECRET_KEY=[REDACTED]" },
+    { "input": "RUSTGRID_SANDBOX_TOKEN: abc123", "expected": "RUSTGRID_SANDBOX_TOKEN: [REDACTED]" },
+    { "input": "{\"password\": \"hunter2\", \"user\": \"ada\"}", "expected": "{\"password\": \"[REDACTED]\", \"user\": \"ada\"}" },
+    { "input": "Authorization: Bearer <<k*20>>", "expected": "Authorization: [REDACTED]" },
+    { "input": "jwt eyJ<<l*12>>.<<m*12>>.<<n*12>>", "expected": "jwt [REDACTED]" },
+    { "input": "MAX_TOKENS=4000 and let token = parse(input)", "expected": "MAX_TOKENS=4000 and let token = parse(input)" },
+    { "input": "cargo test -p ticket-cmd --test multi_agent_cost_it", "expected": "cargo test -p ticket-cmd --test multi_agent_cost_it" },
+    { "input": "see https://github.com/RustGrid/rustgrid/pull/50 and git@github.com:RustGrid/x.git", "expected": "see https://github.com/RustGrid/rustgrid/pull/50 and git@github.com:RustGrid/x.git" }
+  ]
+}
