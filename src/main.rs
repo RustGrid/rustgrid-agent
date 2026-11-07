@@ -150,6 +150,10 @@ fn run_hook(config_path: &std::path::Path, event: &str) -> ExitCode {
             eprintln!("{reason}");
             ExitCode::from(2)
         }
+        Ok(rustgrid_agent::trace::HookOutcome::Context(context)) => {
+            println!("{context}");
+            ExitCode::SUCCESS
+        }
         Ok(rustgrid_agent::trace::HookOutcome::Continue) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("[rustgrid trace] {error:#}");

@@ -88,6 +88,29 @@ pub struct TranslatorState {
     /// Claude Code repeats a session's `pr-link` record every turn.
     #[serde(default)]
     pull_requests: Vec<String>,
+    /// Claude's latest reply in the current turn. Only the last one is the
+    /// turn's outcome; earlier ones narrate work the steps already show.
+    #[serde(default)]
+    reply: Option<PendingReply>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingReply {
+    id: String,
+    text: String,
+    at: Option<String>,
+}
+
+/// Read-only tools: the activity steps already say what Claude was doing.
+const QUIET_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "LS", "TodoWrite", "NotebookRead"];
+
+/// Ends the current turn: Claude's last reply, if any, is its outcome.
+pub fn finish_turn(state: &mut TranslatorState) -> Option<TraceItem> {
+    state.reply.take().map(|reply| TraceItem::AgentMessage {
+        id: reply.id,
+        text: reply.text,
+        at: reply.at,
+    })
 }
 
 pub fn translate(state: &mut TranslatorState, line: &str) -> Vec<TraceItem> {
@@ -189,14 +212,16 @@ fn user(
         if text.trim().is_empty() && images == 0 {
             return Vec::new();
         }
-        // A new prompt starts a new turn of activity.
+        // A new prompt ends the previous turn and starts a new one.
         state.last_phase = None;
-        return vec![TraceItem::Prompt {
+        let mut items: Vec<TraceItem> = finish_turn(state).into_iter().collect();
+        items.push(TraceItem::Prompt {
             id: uuid.to_owned(),
             text: redact_truncated(&text, MAX_PROMPT_CHARS),
             images,
             at,
-        }];
+        });
+        return items;
     }
     let mut items = Vec::new();
     for block in blocks(record) {
@@ -246,6 +271,7 @@ fn user(
                     });
                 }
             }
+            _ if QUIET_TOOLS.contains(&tool_name(&item).as_str()) => {}
             _ => items.push(TraceItem::Tool {
                 id: id.to_owned(),
                 tool: tool_name(&item),
@@ -305,7 +331,7 @@ fn assistant(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if !text.trim().is_empty() {
-                    items.push(TraceItem::AgentMessage {
+                    state.reply = Some(PendingReply {
                         id: format!("{uuid}:{index}"),
                         text: redact_truncated(text, MAX_MESSAGE_CHARS),
                         at: at.clone(),
@@ -372,12 +398,15 @@ fn tool_target(item: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Translates the lines, then ends the turn as the Stop hook does.
     fn run(lines: &[&str]) -> Vec<TraceItem> {
         let mut state = TranslatorState::default();
-        lines
+        let mut items: Vec<TraceItem> = lines
             .iter()
             .flat_map(|line| translate(&mut state, &with_token(line)))
-            .collect()
+            .collect();
+        items.extend(finish_turn(&mut state));
+        items
     }
 
     /// Fixtures hold a placeholder so no token-shaped text is committed.
@@ -447,12 +476,6 @@ mod tests {
                     id: "a2:0".into(),
                     message: "Running focused validation".into(),
                 },
-                TraceItem::Tool {
-                    id: "t1".into(),
-                    tool: "Grep".into(),
-                    target: Some("fn login".into()),
-                    failed: false,
-                },
                 TraceItem::Command {
                     id: "t2".into(),
                     command: "cargo test -p app".into(),
@@ -476,11 +499,6 @@ mod tests {
                     id: "a3:0".into(),
                     message: "Updating implementation".into(),
                 },
-                TraceItem::AgentMessage {
-                    id: "a3:1".into(),
-                    text: "Fixed the redirect.".into(),
-                    at: None,
-                },
                 TraceItem::FileChange {
                     id: "t3".into(),
                     paths: vec!["/repo/src/login.rs".into()],
@@ -489,8 +507,46 @@ mod tests {
                     url: "https://github.com/RustGrid/x/pull/57".into(),
                     number: Some(57),
                 },
+                // Claude's last reply is the turn's outcome, recorded when it ends.
+                TraceItem::AgentMessage {
+                    id: "a3:1".into(),
+                    text: "Fixed the redirect.".into(),
+                    at: None,
+                },
             ]
         );
+    }
+
+    #[test]
+    fn only_the_last_reply_of_a_turn_is_kept() {
+        let narration = r#"{"type":"assistant","uuid":"n1","message":{"id":"msg_9","model":"m","content":[{"type":"text","text":"Now let me check the router."}]}}"#;
+        let answer = r#"{"type":"assistant","uuid":"n2","message":{"id":"msg_10","model":"m","content":[{"type":"text","text":"The redirect is fixed."}]}}"#;
+        let next_prompt = r#"{"type":"user","uuid":"u5","origin":{"kind":"human"},"message":{"role":"user","content":"Thanks, now the docs"}}"#;
+        let replies = |items: &[TraceItem]| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    TraceItem::AgentMessage { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut state = TranslatorState::default();
+        let mut items = Vec::new();
+        for line in [PROMPT, narration, answer, next_prompt] {
+            items.extend(translate(&mut state, line));
+        }
+        // The next prompt ends the first turn with its last reply only.
+        assert_eq!(replies(&items), vec!["The redirect is fixed."]);
+        let position = |wanted: &str| {
+            items.iter().position(|item| match item {
+                TraceItem::AgentMessage { text, .. } => text == wanted,
+                TraceItem::Prompt { text, .. } => text == wanted,
+                _ => false,
+            })
+        };
+        assert!(position("The redirect is fixed.") < position("Thanks, now the docs"));
+        assert!(finish_turn(&mut state).is_none());
     }
 
     #[test]
@@ -501,7 +557,11 @@ mod tests {
         let mut reloaded: TranslatorState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         let items = translate(&mut reloaded, &with_token(RESULTS));
-        assert_eq!(items.len(), 2);
+        // The Grep result is quiet; the command completes from the saved state.
+        assert!(
+            matches!(items.as_slice(), [TraceItem::Command { .. }]),
+            "{items:?}"
+        );
         // The repeated usage on a later record of the same message is not counted twice.
         assert!(
             translate(&mut reloaded, SAME_MESSAGE_BASH)

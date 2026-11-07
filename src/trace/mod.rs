@@ -73,6 +73,9 @@ pub struct HookInput {
 #[derive(Debug, PartialEq, Eq)]
 pub enum HookOutcome {
     Continue,
+    /// Exit code 0 with this text on stdout, which Claude Code adds to the
+    /// prompt's context, so Claude can tell the person what happened.
+    Context(String),
     /// Exit code 2: the prompt is not sent and the reason is shown.
     Block(String),
 }
@@ -121,6 +124,12 @@ struct Session {
     ended: bool,
     #[serde(default)]
     finalized: bool,
+    /// Turns Claude Code reported ending (Stop and SessionEnd hooks), and how
+    /// many of them a flush has closed with their final reply.
+    #[serde(default)]
+    stops: u64,
+    #[serde(default)]
+    stops_handled: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -339,7 +348,10 @@ fn hook_in(
             let prompt = input.prompt.as_deref().unwrap_or_default();
             if let Some(found) = LINK_COMMAND.captures(prompt) {
                 let key = found[1].to_ascii_uppercase();
-                HookOutcome::Block(link(config_path, &mut session, &key))
+                match link(config_path, &mut session, &key) {
+                    Ok(linked) => HookOutcome::Context(linked),
+                    Err(problem) => HookOutcome::Block(problem),
+                }
             } else if !is_logged_in(config_path) {
                 HookOutcome::Block(
                     "RustGrid traces this session, but this computer is not signed in. Run `rustgrid-agent login`, then send your prompt again.".to_owned(),
@@ -359,8 +371,13 @@ fn hook_in(
             }
             HookOutcome::Continue
         }
+        "Stop" => {
+            session.stops += 1;
+            HookOutcome::Continue
+        }
         "SessionEnd" => {
             session.ended = true;
+            session.stops += 1;
             HookOutcome::Continue
         }
         _ => HookOutcome::Continue,
@@ -375,15 +392,15 @@ fn hook_in(
 
 /// Links the session to a ticket now, while the person waits, and returns
 /// what to tell them.
-fn link(config_path: &Path, session: &mut Session, key: &str) -> String {
-    let context = match AppContext::load(config_path) {
-        Ok(context) => context,
-        Err(_) => return "This computer is not signed in to RustGrid. Run `rustgrid-agent login`, then link again.".to_owned(),
-    };
-    let client = match RustGridClient::with_timeout(&context, LINK_TIMEOUT) {
-        Ok(client) => client,
-        Err(error) => return format!("Could not reach RustGrid to link {key}: {error}"),
-    };
+/// Links the session to a ticket now, while the person waits. On success,
+/// returns context for Claude to confirm the link; otherwise, why it failed.
+fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, String> {
+    let context = AppContext::load(config_path).map_err(|_| {
+        "This computer is not signed in to RustGrid. Run `rustgrid-agent login`, then link again."
+            .to_owned()
+    })?;
+    let client = RustGridClient::with_timeout(&context, LINK_TIMEOUT)
+        .map_err(|error| format!("Could not reach RustGrid to link {key}: {error}"))?;
     match client.start_interactive_run(start_body(session, key), true) {
         Ok(started) => {
             if let Some(run_id) = session.run_id.take()
@@ -418,15 +435,15 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> String {
             session.execution_reported = false;
             session.ended = false;
             session.finalized = false;
-            format!(
-                "Linked to {} · {}. RustGrid will trace this session on that ticket; send your prompt.",
+            Ok(format!(
+                "RustGrid linked this Claude Code session to ticket {} ({}). From now on the session is traced on that ticket. Confirm this to the user in one short sentence, naming the ticket key and title, and do nothing else.",
                 started.ticket.key, started.ticket.title
-            )
+            ))
         }
-        Err(error) if api::http_status(&error) == Some(404) => {
-            format!("{key} is not a RustGrid ticket you can open. Check the key and link again.")
-        }
-        Err(error) => format!("Could not link {key}: {error}"),
+        Err(error) if api::http_status(&error) == Some(404) => Err(format!(
+            "{key} is not a RustGrid ticket you can open. Check the key and link again."
+        )),
+        Err(error) => Err(format!("Could not link {key}: {error}")),
     }
 }
 
@@ -539,6 +556,9 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
             if let Some(previous) = session.previous_run.clone()
                 && session.offset >= previous.until_offset
             {
+                if let Some(reply) = transcript::finish_turn(&mut session.translator) {
+                    report_item(client, &mut session, &previous.run_id, None, &reply)?;
+                }
                 end_run(
                     client,
                     &session,
@@ -566,6 +586,19 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
                 since_save = 0;
             }
         }
+        save_merged(dir, &session)?;
+    }
+
+    // A turn Claude Code reported ending is closed with its final reply.
+    if session.stops > session.stops_handled {
+        if let Some(reply) = transcript::finish_turn(&mut session.translator) {
+            let (run, ticket) = match &session.previous_run {
+                Some(previous) => (previous.run_id.clone(), None),
+                None => (run_id.clone(), ticket_id.clone()),
+            };
+            report_item(client, &mut session, &run, ticket.as_deref(), &reply)?;
+        }
+        session.stops_handled = session.stops;
         save_merged(dir, &session)?;
     }
 
@@ -614,6 +647,7 @@ fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
         .clone()
         .filter(|_| current.previous_run.is_some());
     current.offset = flushed.offset;
+    current.stops_handled = flushed.stops_handled;
     current.translator = flushed.translator.clone();
     current.turn = flushed.turn;
     current.calls = flushed.calls;
