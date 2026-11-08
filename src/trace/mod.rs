@@ -1158,6 +1158,7 @@ fn report_telemetry(
             session.telemetry_refused_run = Some(run_id.to_owned());
             Ok(())
         }
+        Err(error) if api::is_replayed_telemetry(&error) => Ok(()),
         result => result,
     }
 }

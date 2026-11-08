@@ -3,6 +3,15 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- A traced session no longer stops uploading when RustGrid answers a telemetry
+  batch with "idempotency key was reused with different data". That answer
+  means an earlier attempt already recorded the batch's events, so the worker
+  moves on to the session's prompts, replies and summary.
+
 ## 1.8.0 - 2026-11-08
 
 ### Added
