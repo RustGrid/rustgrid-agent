@@ -613,6 +613,16 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
             session.execution_reported = false;
             session.ended = false;
             session.finalized = false;
+            let branch_note = session
+                .cwd
+                .clone()
+                .map(|cwd| switch_to_ticket_branch(&cwd, &ticket_key, &started.ticket.title))
+                .and_then(|switch| {
+                    if let BranchSwitch::Switched { to, .. } = &switch {
+                        session.branch = Some(to.clone());
+                    }
+                    switch.note()
+                });
             let linked = format!(
                 "RustGrid linked this Claude Code session to ticket {} ({}). From now on the session is traced on that ticket.",
                 started.ticket.key, started.ticket.title
@@ -630,7 +640,7 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                             .map(|(context, plan)| (dir, context, plan))
                     })
             };
-            Ok(match loaded {
+            let mut linked = match loaded {
                 Ok((ticket_dir, context, plan)) => Linked {
                     context,
                     ticket_dir,
@@ -643,13 +653,118 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                     ticket_dir: PathBuf::new(),
                     attachments: false,
                 },
-            })
+            };
+            if let Some(note) = branch_note {
+                linked.context.push_str("\n\n");
+                linked.context.push_str(&note);
+            }
+            Ok(linked)
         }
         Err(error) if api::http_status(&error) == Some(404) => Err(format!(
             "{key} is not a RustGrid ticket you can open. Check the key and link again."
         )),
         Err(error) => Err(format!("Could not link {key}: {error}")),
     }
+}
+
+/// What linking a ticket did to the repository's working branch.
+#[derive(Debug, PartialEq, Eq)]
+enum BranchSwitch {
+    /// Not a git repository, or the branch already names the ticket.
+    Unchanged,
+    Switched {
+        from: String,
+        to: String,
+        created: bool,
+    },
+    Failed {
+        from: String,
+        to: String,
+        reason: String,
+    },
+}
+
+impl BranchSwitch {
+    /// What Claude should tell the person about the branch, if anything.
+    fn note(&self) -> Option<String> {
+        match self {
+            Self::Unchanged => None,
+            Self::Switched { from, to, created } => Some(format!(
+                "RustGrid also moved the working branch from {from} to {} {to}, so the session's work lands on this ticket's branch; uncommitted changes came along. Mention the branch in the same sentence.",
+                if *created {
+                    "the new branch"
+                } else {
+                    "the existing branch"
+                }
+            )),
+            Self::Failed { from, to, reason } => Some(format!(
+                "RustGrid could not move the working branch from {from} to {to} ({reason}), so the session is still on {from}. Tell the user in the same sentence, and suggest committing or stashing their changes and running `git switch {to}`."
+            )),
+        }
+    }
+}
+
+/// Puts the repository at `cwd` on a branch named after the linked ticket,
+/// unless its branch already names that ticket. An existing branch of that
+/// name is reused; otherwise it is created from the current commit, so
+/// nothing in progress is lost.
+fn switch_to_ticket_branch(cwd: &Path, key: &str, title: &str) -> BranchSwitch {
+    let Some(from) = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) else {
+        return BranchSwitch::Unchanged;
+    };
+    if ticket_keys_in_branch(&from)
+        .iter()
+        .any(|found| found == key)
+    {
+        return BranchSwitch::Unchanged;
+    }
+    let to = crate::git::branch_name(key, title);
+    let exists = git_status(
+        cwd,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{to}"),
+        ],
+    )
+    .is_ok();
+    let switch: &[&str] = if exists {
+        &["switch", &to]
+    } else {
+        &["switch", "--create", &to]
+    };
+    let mut args = vec!["-c", "core.hooksPath=/dev/null"];
+    args.extend_from_slice(switch);
+    match git_status(cwd, &args) {
+        Ok(()) => BranchSwitch::Switched {
+            from,
+            to,
+            created: !exists,
+        },
+        Err(reason) => BranchSwitch::Failed { from, to, reason },
+    }
+}
+
+/// Runs git for its effect; on failure, returns the first line it printed.
+fn git_status(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("git failed")
+        .to_owned())
 }
 
 fn spawn_flush(config_path: &Path, session_id: &str) {
@@ -1280,6 +1395,103 @@ fn end_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo_on(branch: &str) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path();
+        for args in [
+            vec!["init", "--quiet", "--initial-branch", branch],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["commit", "--quiet", "--allow-empty", "-m", "start"],
+        ] {
+            git_status(path, &args).unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn linking_moves_the_session_to_the_tickets_branch() {
+        let repo = repo_on("main");
+        fs::write(repo.path().join("work.txt"), "in progress").unwrap();
+        assert_eq!(
+            switch_to_ticket_branch(repo.path(), "AGENT-8", "Match the branch"),
+            BranchSwitch::Switched {
+                from: "main".into(),
+                to: "agent/agent-8-match-the-branch".into(),
+                created: true,
+            }
+        );
+        let head = git(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(head.as_deref(), Some("agent/agent-8-match-the-branch"));
+        assert!(repo.path().join("work.txt").exists());
+
+        // Already on a branch naming the ticket: nothing moves.
+        assert_eq!(
+            switch_to_ticket_branch(repo.path(), "AGENT-8", "Another title"),
+            BranchSwitch::Unchanged
+        );
+
+        // Linking another ticket leaves this one's branch.
+        assert!(matches!(
+            switch_to_ticket_branch(repo.path(), "AGENT-9", "Next"),
+            BranchSwitch::Switched { created: true, .. }
+        ));
+
+        // Coming back reuses the branch made before.
+        assert_eq!(
+            switch_to_ticket_branch(repo.path(), "AGENT-8", "Match the branch"),
+            BranchSwitch::Switched {
+                from: "agent/agent-9-next".into(),
+                to: "agent/agent-8-match-the-branch".into(),
+                created: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_branch_for_another_ticket_is_not_reused() {
+        let repo = repo_on("rustgrid/ADD-12-old-work");
+        let switch = switch_to_ticket_branch(repo.path(), "ADD-13", "New work");
+        assert!(
+            matches!(&switch, BranchSwitch::Switched { from, to, .. }
+                if from == "rustgrid/ADD-12-old-work" && to == "agent/add-13-new-work"),
+            "{switch:?}"
+        );
+        assert!(switch.note().unwrap().contains("agent/add-13-new-work"));
+    }
+
+    #[test]
+    fn a_failed_switch_is_reported_and_outside_git_nothing_happens() {
+        // The ticket's branch changes f.txt, and main has its own edit to it.
+        let repo = repo_on("main");
+        let path = repo.path();
+        let commit_f = |text: &str| {
+            fs::write(path.join("f.txt"), text).unwrap();
+            git_status(path, &["add", "f.txt"]).unwrap();
+            git_status(path, &["commit", "--quiet", "-m", text]).unwrap();
+        };
+        commit_f("main");
+        git_status(path, &["switch", "--quiet", "--create", "agent/add-5-x"]).unwrap();
+        commit_f("ticket");
+        git_status(path, &["switch", "--quiet", "main"]).unwrap();
+        fs::write(path.join("f.txt"), "edited").unwrap();
+
+        let switch = switch_to_ticket_branch(repo.path(), "ADD-5", "x");
+        let BranchSwitch::Failed { from, to, .. } = &switch else {
+            panic!("a conflicting switch must fail: {switch:?}");
+        };
+        assert_eq!((from.as_str(), to.as_str()), ("main", "agent/add-5-x"));
+        assert!(switch.note().unwrap().contains("git switch agent/add-5-x"));
+        let head = git(repo.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(head.as_deref(), Some("main"));
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            switch_to_ticket_branch(plain.path(), "ADD-5", "x"),
+            BranchSwitch::Unchanged
+        );
+    }
 
     #[test]
     fn branch_names_carry_ticket_keys() {
