@@ -66,6 +66,11 @@ static LINK_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\s*/?rustgrid-link\s+([a-z][a-z0-9]{1,9}-[0-9]+)\s*$")
         .expect("link command regex must compile")
 });
+/// Context an IDE adds around what the person typed, such as
+/// `<ide_opened_file>…</ide_opened_file>` or `<ide_selection>…</ide_selection>`.
+static IDE_CONTEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<ide_[a-z_]+>.*?</ide_[a-z_]+>").expect("IDE context regex must compile")
+});
 static BRANCH_TICKET: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:^|[/_-])([a-z][a-z0-9]{1,9}-[0-9]+)(?:$|[/_-])")
         .expect("branch ticket regex must compile")
@@ -292,6 +297,27 @@ fn repository_from_remote(remote: &str) -> Option<String> {
     (!path.starts_with('/')).then_some(path)
 }
 
+/// What a prompt asks of `/rustgrid-link`, once IDE context is set aside.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkRequest {
+    Key(String),
+    /// `/rustgrid-link` without a ticket key it can read.
+    Unreadable,
+}
+
+fn link_request(prompt: &str) -> Option<LinkRequest> {
+    let typed = IDE_CONTEXT.replace_all(prompt, "");
+    if let Some(found) = LINK_COMMAND.captures(&typed) {
+        return Some(LinkRequest::Key(found[1].to_ascii_uppercase()));
+    }
+    let typed = typed.trim_start();
+    let command = typed.strip_prefix('/').unwrap_or(typed);
+    command
+        .strip_prefix("rustgrid-link")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        .then_some(LinkRequest::Unreadable)
+}
+
 /// Ticket keys a branch name may carry, most specific first.
 pub fn ticket_keys_in_branch(branch: &str) -> Vec<String> {
     let mut keys = Vec::new();
@@ -389,8 +415,13 @@ fn hook_in(
     let outcome = match event {
         "UserPromptSubmit" => {
             let prompt = input.prompt.as_deref().unwrap_or_default();
-            if let Some(found) = LINK_COMMAND.captures(prompt) {
-                let key = found[1].to_ascii_uppercase();
+            let request = link_request(prompt);
+            if request == Some(LinkRequest::Unreadable) {
+                HookOutcome::Block(
+                    "RustGrid did not find a ticket key to link. Use /rustgrid-link ADD-123."
+                        .to_owned(),
+                )
+            } else if let Some(LinkRequest::Key(key)) = request {
                 match link(config_path, &mut session, &key) {
                     Ok(linked) => {
                         if spawn && linked.attachments {
@@ -1277,6 +1308,34 @@ mod tests {
                 .captures("please /rustgrid-link ADD-1 and fix")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn link_commands_are_recognised_next_to_ide_context() {
+        let key = |key: &str| Some(LinkRequest::Key(key.to_owned()));
+        assert_eq!(
+            link_request(
+                "<ide_opened_file>The user opened the file /repo/tests/page.test.tsx in the IDE. This may or may not be related to the current task.</ide_opened_file>/rustgrid-link ADD-374"
+            ),
+            key("ADD-374")
+        );
+        assert_eq!(
+            link_request(
+                "/rustgrid-link add-374\n<ide_selection>The user selected lines 1 to 3:\nfn main() {}\n</ide_selection>"
+            ),
+            key("ADD-374")
+        );
+        assert_eq!(
+            link_request("/rustgrid-link"),
+            Some(LinkRequest::Unreadable)
+        );
+        assert_eq!(
+            link_request("/rustgrid-link nope"),
+            Some(LinkRequest::Unreadable)
+        );
+        assert_eq!(link_request("please /rustgrid-link ADD-1 and fix"), None);
+        assert_eq!(link_request("/rustgrid-linker ADD-1"), None);
+        assert_eq!(link_request("fix the login page"), None);
     }
 
     #[test]

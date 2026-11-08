@@ -3,6 +3,17 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.8.2 - 2026-11-08
+
+### Fixed
+
+- `/rustgrid-link KEY` links the session when a file is open in VS Code. The
+  extension adds a note about the open file or selection to the prompt, so the
+  hook did not recognise the command: the session stayed unlinked, or on the
+  ticket it already had, and Claude wrongly said tracing was not installed.
+  `/rustgrid-link` without a readable key is now refused with a usage hint, and
+  if a link still does not happen Claude points to `rustgrid-agent trace status`.
+
 ## 1.8.1 - 2026-11-08
 
 ### Fixed
