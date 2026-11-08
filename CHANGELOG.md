@@ -3,6 +3,20 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- A reopened IDE run gets a new summary each time it closes. Every close
+  reused the first close's request key, so RustGrid could replay the first
+  summary instead of writing one for the latest prompt.
+- Signing in again no longer stops a session's uploads. RustGrid refuses writes
+  to runs the earlier sign-in started; the failing upload was retried forever
+  and blocked the session's later replies and its run's close. Refused
+  telemetry is now skipped and the rest of the run still uploads. A run whose
+  prompts and replies are refused too stops uploading, and `trace status`
+  explains why.
+
 ## 1.7.0 - 2026-11-07
 
 ### Changed

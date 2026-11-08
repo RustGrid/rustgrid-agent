@@ -132,6 +132,12 @@ version. `trace status` warns when a user has set it.
   the last upload problem of the latest session.
 - **Upload problems:** uploads run in the background, so their last problem is
   kept in `~/.rustgrid/trace/<session-id>.error` until an upload succeeds.
+- **Signed in again:** a run belongs to the worker that started it. After
+  `rustgrid-agent login` signs the computer in as a new worker, RustGrid
+  refuses uploads to runs the earlier sign-in started. Telemetry it refuses is
+  skipped, and the rest of the run still uploads. If RustGrid refuses the run's
+  prompts and replies too, the session stops uploading to that run instead of
+  retrying, and `trace status` says so. New sessions are traced normally.
 - **Session state:** each session's state is in `~/.rustgrid/trace/<session-id>.json`.
   Deleting it makes the next flush re-upload the session; RustGrid ignores
   events it already has.
