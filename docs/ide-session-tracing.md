@@ -81,6 +81,15 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     (`agent/add-354-fix-login`, `rustgrid/ADD-12`).
   - **By hand:** type `/rustgrid-link ADD-354`. The hook validates the key with
     RustGrid and links the session.
+  - **Ticket branch:** linking by hand also puts the repository on a branch
+    named after the ticket (`agent/add-354-<title>`), so the session's work
+    never lands on a branch belonging to something else. A branch that already
+    names the ticket is kept, an existing `agent/add-354-<title>` branch is
+    reused, and otherwise a new one is created from the current commit, with
+    uncommitted changes carried over. If git refuses the switch (for example,
+    local changes the other branch would overwrite), the session stays linked
+    on its current branch and Claude tells you how to switch. RustGrid
+    records the branch the session was on when it was linked.
   - **Ticket content:** `/rustgrid-link` also gives Claude the ticket's title,
     type, status, priority and description, so the session starts from the
     whole ticket. The ticket is written to
