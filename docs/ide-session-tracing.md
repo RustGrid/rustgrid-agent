@@ -80,7 +80,21 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
   - **From the branch name:** a branch named after a ticket links the session
     (`agent/add-354-fix-login`, `rustgrid/ADD-12`).
   - **By hand:** type `/rustgrid-link ADD-354`. The hook validates the key with
-    RustGrid, confirms the ticket title, and does not send that prompt to Claude.
+    RustGrid and links the session.
+  - **Ticket content:** `/rustgrid-link` also gives Claude the ticket's title,
+    type, status, priority and description, so the session starts from the
+    whole ticket. The ticket is written to
+    `.git/rustgrid-agent/tickets/<KEY>/ticket.md` in the repository, which git
+    never commits (`~/.rustgrid/tickets/<KEY>/` outside a repository). Its
+    attachments download in the background to the `attachments` folder next
+    to it: at most 50 files, 25 MB each and 100 MB in total. Files flagged by
+    the virus scan are skipped, and each file is checked against its SHA-256
+    before it appears. Claude gets each file's path and reads the ones it
+    needs. If the ticket's content can't be loaded within the hook's time
+    limit, the session is still linked and Claude says so. A download problem
+    is kept in `attachments.error` in the same folder. A ticket linked from
+    the branch name is traced the same way, but its content is not loaded:
+    run `/rustgrid-link` to load it.
   - **Unlinked:** until a session is linked, the hook blocks prompts with
     instructions. It also blocks prompts until the computer is signed in.
   - **Relinking:** linking another ticket mid-session ends the first ticket's

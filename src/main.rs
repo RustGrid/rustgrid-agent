@@ -97,6 +97,12 @@ enum TraceCommand {
         #[arg(long)]
         session: String,
     },
+    /// Download a linked ticket's attachments (started by /rustgrid-link).
+    #[command(hide = true)]
+    Attachments {
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
     /// Set up Claude Code on this computer so every session is traced.
     ///
     /// By default the hooks go into Claude Code's managed settings, which
@@ -227,6 +233,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Trace {
             command: TraceCommand::Flush { session },
         } => rustgrid_agent::trace::flush(&config_path, &session),
+        Commands::Trace {
+            command: TraceCommand::Attachments { dir },
+        } => rustgrid_agent::trace::ticket::download(&config_path, &dir),
         Commands::Trace {
             command: TraceCommand::Hook { .. },
         } => unreachable!("hooks are handled before configuration loads"),
