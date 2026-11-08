@@ -1300,6 +1300,19 @@ pub(crate) fn refused_run(error: &anyhow::Error) -> Option<RefusedRun> {
     })
 }
 
+/// RustGrid already holds a telemetry batch under this idempotency key, sent
+/// by an earlier attempt whose body differed (for example, a retried
+/// `execution.started` with a later timestamp). Every event in a batch has a
+/// stable id, so the events are already recorded and the batch is done.
+pub(crate) fn is_replayed_telemetry(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
+        failure.status == StatusCode::CONFLICT
+            && failure.path.ends_with("/telemetry/batch")
+            && (failure.body.contains("idempotency_conflict")
+                || failure.body.contains("reused with different data"))
+    })
+}
+
 pub(crate) fn is_missing_provider_connection(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
         failure.path.ends_with("/model-gateway-token")
@@ -1559,6 +1572,37 @@ mod tests {
     fn each_end_of_a_reopened_run_is_a_new_request() {
         assert_eq!(interactive_end_key("run-1", 0), "interactive-end-run-1");
         assert_eq!(interactive_end_key("run-1", 2), "interactive-end-run-1-2");
+    }
+
+    #[test]
+    fn recognizes_replayed_telemetry_batches() {
+        let body = r#"{"code":"conflict","error":"telemetry idempotency key was reused with different data","where_":"repo.agent_usage.ingest.idempotency_conflict"}"#;
+        let replayed = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/telemetry/batch".into(),
+            request_id: None,
+            error_code: Some("conflict".into()),
+            body: body.into(),
+        });
+        assert!(is_replayed_telemetry(&replayed));
+
+        let other_path = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/events".into(),
+            request_id: None,
+            error_code: Some("conflict".into()),
+            body: body.into(),
+        });
+        assert!(!is_replayed_telemetry(&other_path));
+
+        let busy = anyhow::Error::new(HttpFailure {
+            status: StatusCode::CONFLICT,
+            path: "agent-runs/run/telemetry/batch".into(),
+            request_id: None,
+            error_code: Some("conflict".into()),
+            body: r#"{"error":"idempotency key is busy; another attempt in-flight","code":"conflict"}"#.into(),
+        });
+        assert!(!is_replayed_telemetry(&busy));
     }
 
     #[test]
