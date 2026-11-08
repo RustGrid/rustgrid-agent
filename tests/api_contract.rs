@@ -683,3 +683,55 @@ fn lifecycle_side_effects_use_stable_idempotency_keys() {
     let request = request.recv().unwrap().to_ascii_lowercase();
     assert!(request.contains("idempotency-key: run-status-run-1-succeeded-3"));
 }
+
+#[test]
+fn reads_a_linked_tickets_description() {
+    let Some((url, request)) = server(json!({
+        "id": "5145bdf2-ae11-4696-9195-5037d023f67e",
+        "project_key": "AGENT",
+        "title": "Show the full ticket",
+        "description": "Pull the **description**.",
+        "status": "in_progress",
+        "priority": "high",
+        "type": "task",
+        "row_version": 3
+    })) else {
+        return;
+    };
+    let ticket = RustGridClient::new(&context(url))
+        .unwrap()
+        .fetch_ticket_details("5145bdf2-ae11-4696-9195-5037d023f67e")
+        .unwrap();
+    let request = request.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(request.starts_with("GET /tickets/5145bdf2-ae11-4696-9195-5037d023f67e HTTP/1.1"));
+    assert_eq!(ticket.title, "Show the full ticket");
+    assert_eq!(
+        ticket.description.as_deref(),
+        Some("Pull the **description**.")
+    );
+    assert_eq!(ticket.kind.as_deref(), Some("task"));
+}
+
+#[test]
+fn lists_a_linked_tickets_attachments() {
+    let Some((url, request)) = server(json!({
+        "items": [{
+            "id": "a1", "ticket_id": "t-1", "filename": "shot.png",
+            "media_family": "image", "mime": "image/png", "size_bytes": 2048,
+            "sha256": "ab", "status": "ready", "virus_status": "clean",
+            "variants": [], "can_preview": true
+        }]
+    })) else {
+        return;
+    };
+    let attachments = RustGridClient::new(&context(url))
+        .unwrap()
+        .list_ticket_attachments("t-1")
+        .unwrap();
+    let request = request.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(request.starts_with("GET /tickets/t-1/attachments HTTP/1.1"));
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].filename, "shot.png");
+    assert_eq!(attachments[0].size_bytes, Some(2048));
+    assert_eq!(attachments[0].virus_status.as_deref(), Some("clean"));
+}

@@ -82,6 +82,8 @@ const STANDARD_RETRY_POLICY: RetryPolicy = RetryPolicy::new(6, 250, 30_000);
 const GITHUB_TOKEN_RETRY_POLICY: RetryPolicy = RetryPolicy::new(8, 1_000, 30_000);
 /// For calls a person is waiting on, such as linking an IDE session.
 const QUICK_RETRY_POLICY: RetryPolicy = RetryPolicy::new(2, 250, 1_000);
+/// For reads made while a person waits on a hook with a hard time limit.
+const SINGLE_ATTEMPT_POLICY: RetryPolicy = RetryPolicy::new(1, 0, 0);
 
 #[derive(Clone, Copy)]
 struct RetryPolicy {
@@ -283,6 +285,43 @@ pub struct InteractiveRunStarted {
     pub run: InteractiveRun,
     pub ticket: InteractiveRunTicket,
     pub created: bool,
+}
+
+/// A ticket as an IDE session sees it when it links to it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TicketDetails {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
+/// One file attached to a ticket.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TicketAttachment {
+    pub id: String,
+    pub filename: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub virus_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TicketAttachmentList {
+    items: Vec<TicketAttachment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,6 +654,32 @@ impl RustGridClient {
             after_sequence = page.next_sequence;
         }
         anyhow::bail!("agent event replay exceeded 10,000 events while reconciling cursor")
+    }
+
+    /// The ticket's title, description and status, without its comments.
+    pub fn fetch_ticket_details(&self, ticket_id: &str) -> Result<TicketDetails> {
+        let value = self.send_value_with_policy(
+            Method::GET,
+            &format!("tickets/{ticket_id}"),
+            None,
+            None,
+            None,
+            SINGLE_ATTEMPT_POLICY,
+        )?;
+        deserialize_envelope(value, &[])
+    }
+
+    pub fn list_ticket_attachments(&self, ticket_id: &str) -> Result<Vec<TicketAttachment>> {
+        let value = self.send_value_with_policy(
+            Method::GET,
+            &format!("tickets/{ticket_id}/attachments"),
+            None,
+            None,
+            None,
+            SINGLE_ATTEMPT_POLICY,
+        )?;
+        let list: TicketAttachmentList = deserialize_envelope(value, &[])?;
+        Ok(list.items)
     }
 
     pub fn fetch_ticket(&self, ticket_id: &str) -> Result<Ticket> {

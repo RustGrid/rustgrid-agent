@@ -13,6 +13,7 @@
 
 pub mod install;
 pub mod redact;
+pub mod ticket;
 pub mod transcript;
 
 use std::{
@@ -45,6 +46,10 @@ use transcript::{TraceItem, TranslatorState};
 const AGENT_NAME: &str = "Claude Code (IDE)";
 /// How long a person waits for `/rustgrid-link` to answer.
 const LINK_TIMEOUT: Duration = Duration::from_secs(8);
+/// The prompt hook has 15 seconds. Linking and loading the ticket's content
+/// share 12 of them; each content request gets at most this long.
+const LINK_CONTENT_BUDGET: Duration = Duration::from_secs(12);
+const LINK_CONTENT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Lines read per flush pass before saving progress.
 const LINES_PER_SAVE: usize = 25;
 /// A waiting session in the same folder as a session that just started is
@@ -387,7 +392,12 @@ fn hook_in(
             if let Some(found) = LINK_COMMAND.captures(prompt) {
                 let key = found[1].to_ascii_uppercase();
                 match link(config_path, &mut session, &key) {
-                    Ok(linked) => HookOutcome::Context(linked),
+                    Ok(linked) => {
+                        if spawn && linked.attachments {
+                            spawn_attachment_download(config_path, &linked.ticket_dir);
+                        }
+                        HookOutcome::Context(linked.context)
+                    }
                     Err(problem) => HookOutcome::Block(problem),
                 }
             } else if !is_logged_in(config_path) {
@@ -517,17 +527,25 @@ fn end_left_behind(dir: &Path, started: &Session) -> Vec<String> {
     pending
 }
 
-/// Links the session to a ticket now, while the person waits, and returns
-/// what to tell them.
+/// A linked ticket: the context Claude gets, and where its content is.
+struct Linked {
+    context: String,
+    ticket_dir: PathBuf,
+    /// Whether attachments are waiting to be downloaded.
+    attachments: bool,
+}
+
 /// Links the session to a ticket now, while the person waits. On success,
-/// returns context for Claude to confirm the link; otherwise, why it failed.
-fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, String> {
+/// returns the ticket's content as context for Claude; otherwise, why it
+/// failed.
+fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, String> {
     let context = AppContext::load(config_path).map_err(|_| {
         "This computer is not signed in to RustGrid. Run `rustgrid-agent login`, then link again."
             .to_owned()
     })?;
     let client = RustGridClient::with_timeout(&context, LINK_TIMEOUT)
         .map_err(|error| format!("Could not reach RustGrid to link {key}: {error}"))?;
+    let started_at = std::time::Instant::now();
     match client.start_interactive_run(start_body(session, key), true) {
         Ok(started) => {
             if let Some(run_id) = session.run_id.take()
@@ -552,6 +570,7 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, 
                     .and_then(|cwd| git(cwd, &["rev-parse", "HEAD"]))
                     .or(session.start_sha.take());
             }
+            let (ticket_id, ticket_key) = (started.ticket.id.clone(), started.ticket.key.clone());
             session.run_id = Some(started.run.id);
             session.ticket = Some(LinkedTicket {
                 key: started.ticket.key.clone(),
@@ -563,10 +582,37 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, 
             session.execution_reported = false;
             session.ended = false;
             session.finalized = false;
-            Ok(format!(
-                "RustGrid linked this Claude Code session to ticket {} ({}). From now on the session is traced on that ticket. Confirm this to the user in one short sentence, naming the ticket key and title, and do nothing else.",
+            let linked = format!(
+                "RustGrid linked this Claude Code session to ticket {} ({}). From now on the session is traced on that ticket.",
                 started.ticket.key, started.ticket.title
-            ))
+            );
+            // The link stands even when the ticket's content can't be loaded,
+            // and loading it never pushes the hook past Claude Code's limit.
+            let remaining = LINK_CONTENT_BUDGET.saturating_sub(started_at.elapsed());
+            let loaded = if remaining < Duration::from_secs(1) {
+                Err(anyhow::anyhow!("linking took too long to also load it"))
+            } else {
+                RustGridClient::with_timeout(&context, (remaining / 2).min(LINK_CONTENT_TIMEOUT))
+                    .and_then(|client| {
+                        let dir = ticket::context_dir(session.cwd.as_deref(), &ticket_key)?;
+                        ticket::prepare(&client, &ticket_id, &ticket_key, &dir)
+                            .map(|(context, plan)| (dir, context, plan))
+                    })
+            };
+            Ok(match loaded {
+                Ok((ticket_dir, context, plan)) => Linked {
+                    context,
+                    ticket_dir,
+                    attachments: !plan.is_empty(),
+                },
+                Err(error) => Linked {
+                    context: format!(
+                        "{linked} RustGrid did not return the ticket's description and attachments ({error:#}). Confirm the link to the user in one short sentence, naming the ticket key and title, say that its description could not be loaded, and do nothing else."
+                    ),
+                    ticket_dir: PathBuf::new(),
+                    attachments: false,
+                },
+            })
         }
         Err(error) if api::http_status(&error) == Some(404) => Err(format!(
             "{key} is not a RustGrid ticket you can open. Check the key and link again."
@@ -576,6 +622,18 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, 
 }
 
 fn spawn_flush(config_path: &Path, session_id: &str) {
+    spawn_detached(config_path, &["trace", "flush", "--session", session_id]);
+}
+
+/// Downloads a linked ticket's attachments after the hook returns.
+fn spawn_attachment_download(config_path: &Path, ticket_dir: &Path) {
+    let Some(dir) = ticket_dir.to_str() else {
+        return;
+    };
+    spawn_detached(config_path, &["trace", "attachments", "--dir", dir]);
+}
+
+fn spawn_detached(config_path: &Path, args: &[&str]) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
@@ -583,12 +641,12 @@ fn spawn_flush(config_path: &Path, session_id: &str) {
     command
         .arg("--config")
         .arg(config_path)
-        .args(["trace", "flush", "--session", session_id])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // SAFETY: setsid only detaches the child from Claude Code's process group,
-    // so the upload outlives the hook.
+    // so the work outlives the hook.
     unsafe {
         command.pre_exec(|| {
             libc::setsid();

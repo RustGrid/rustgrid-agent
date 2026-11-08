@@ -5,6 +5,14 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- `/rustgrid-link KEY` gives Claude the ticket's whole content: title, type,
+  status, priority and description, plus the local paths of its attachments,
+  which download in the background into the repository's git directory. The
+  ticket is also saved as `ticket.md` next to them. Loading stays within the
+  prompt hook's time limit; if it can't, the session is still linked.
+
 ### Fixed
 
 - A reopened IDE run gets a new summary each time it closes. Every close

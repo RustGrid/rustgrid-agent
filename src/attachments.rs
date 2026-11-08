@@ -155,7 +155,7 @@ fn extension_for_mime(mime: &str) -> &'static str {
     if mime == "image/png" { "png" } else { "jpg" }
 }
 
-fn safe_filename(filename: &str) -> String {
+pub(crate) fn safe_filename(filename: &str) -> String {
     let basename = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let sanitized = basename
         .chars()
