@@ -911,12 +911,15 @@ impl RustGridClient {
     }
 
     /// Ends an IDE session's run; RustGrid posts the summary comment.
-    pub fn end_interactive_run(&self, run_id: &str, body: Value) -> Result<()> {
+    /// `generation` counts the run's reopens, so each end of a reopened run is
+    /// a new request and RustGrid writes a new summary instead of replaying
+    /// the first one.
+    pub fn end_interactive_run(&self, run_id: &str, generation: u32, body: Value) -> Result<()> {
         self.send_empty(
             Method::POST,
             &format!("{RUNS}/{run_id}/interactive/end"),
             Some(body),
-            Some(&format!("interactive-end-{run_id}")),
+            Some(&interactive_end_key(run_id, generation)),
         )
     }
 
@@ -1148,6 +1151,15 @@ fn is_idempotency_busy_body(body: &str) -> bool {
 }
 
 /// The HTTP status RustGrid answered with, if the error is an HTTP response.
+/// The first end of a run keeps the key earlier releases used, so an end
+/// retried across an upgrade stays idempotent.
+fn interactive_end_key(run_id: &str, generation: u32) -> String {
+    match generation {
+        0 => format!("interactive-end-{run_id}"),
+        generation => format!("interactive-end-{run_id}-{generation}"),
+    }
+}
+
 pub fn http_status(error: &anyhow::Error) -> Option<u16> {
     error
         .downcast_ref::<HttpFailure>()
@@ -1194,6 +1206,35 @@ pub fn is_lease_lost(error: &anyhow::Error) -> bool {
 }
 
 /// RustGrid has no valid tenant Anthropic connection for a Claude run.
+/// A write RustGrid refused because this worker does not own the run, for
+/// example after the computer signed in again as a new worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RefusedRun {
+    pub run_id: String,
+    /// The refused write was telemetry, which RustGrid checks separately.
+    pub telemetry: bool,
+}
+
+/// The run a `403` refused, when the refused request wrote to one run.
+pub(crate) fn refused_run(error: &anyhow::Error) -> Option<RefusedRun> {
+    let failure = error.downcast_ref::<HttpFailure>()?;
+    if failure.status != StatusCode::FORBIDDEN {
+        return None;
+    }
+    let mut parts = failure.path.trim_start_matches('/').split('/');
+    let run_id = loop {
+        if parts.next()? == RUNS {
+            break parts.next()?;
+        }
+    };
+    Uuid::parse_str(run_id).ok()?;
+    let telemetry = parts.next() == Some("telemetry");
+    Some(RefusedRun {
+        run_id: run_id.to_owned(),
+        telemetry,
+    })
+}
+
 pub(crate) fn is_missing_provider_connection(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HttpFailure>().is_some_and(|failure| {
         failure.path.ends_with("/model-gateway-token")
@@ -1398,6 +1439,61 @@ mod tests {
             7
         );
         assert!(parse_etag_row_version("\"agent-runs:abc:7\"", "tickets", "abc").is_err());
+    }
+
+    #[test]
+    fn names_the_run_a_forbidden_write_targeted() {
+        let failure = |status, path: &str| {
+            anyhow::Error::new(HttpFailure {
+                status,
+                path: path.into(),
+                request_id: None,
+                error_code: Some("forbidden".into()),
+                body: "agent worker credential cannot report telemetry for this run".into(),
+            })
+        };
+        let run = "dc3d82a4-199d-44bc-b6ba-f70040ae70b2";
+        assert_eq!(
+            refused_run(&failure(
+                StatusCode::FORBIDDEN,
+                &format!("agent-runs/{run}/telemetry/batch")
+            )),
+            Some(RefusedRun {
+                run_id: run.into(),
+                telemetry: true
+            })
+        );
+        assert_eq!(
+            refused_run(&failure(
+                StatusCode::FORBIDDEN,
+                &format!("/agent-runs/{run}/events")
+            )),
+            Some(RefusedRun {
+                run_id: run.into(),
+                telemetry: false
+            })
+        );
+        assert_eq!(
+            refused_run(&failure(StatusCode::FORBIDDEN, "agent-runs/interactive")),
+            None
+        );
+        assert_eq!(
+            refused_run(&failure(StatusCode::FORBIDDEN, "tickets/t-1/links")),
+            None
+        );
+        assert_eq!(
+            refused_run(&failure(
+                StatusCode::NOT_FOUND,
+                &format!("agent-runs/{run}/events")
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn each_end_of_a_reopened_run_is_a_new_request() {
+        assert_eq!(interactive_end_key("run-1", 0), "interactive-end-run-1");
+        assert_eq!(interactive_end_key("run-1", 2), "interactive-end-run-1-2");
     }
 
     #[test]

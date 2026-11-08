@@ -150,6 +150,14 @@ struct Session {
     /// run ends again only when it opens another one.
     #[serde(default)]
     pull_requests_ended: usize,
+    /// A run RustGrid refused this worker's writes to, because a different
+    /// sign-in started it. Its uploads stop; `trace status` explains why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refused_run: Option<String>,
+    /// A run whose telemetry RustGrid refused. Its prompts, replies and
+    /// summary are still uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_refused_run: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -159,6 +167,9 @@ struct PreviousRun {
     pull_requests: Vec<String>,
     /// Transcript bytes before the relink belong to this run.
     until_offset: u64,
+    /// The run's reopen count when the session relinked away from it.
+    #[serde(default)]
+    generation: u32,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -532,6 +543,7 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<String, 
                     start_sha: session.start_sha.clone(),
                     pull_requests: std::mem::take(&mut session.pull_requests),
                     until_offset,
+                    generation: session.generation,
                 });
                 // The new ticket's changes are counted from here.
                 session.start_sha = session
@@ -607,13 +619,47 @@ fn flush_session(config_path: &Path, dir: &Path, session_id: &str) -> Result<()>
     let dirty = dir.join(format!("{session_id}.dirty"));
     for _ in 0..20 {
         let _ = fs::remove_file(&dirty);
-        flush_pass(&client, dir, session_id)?;
+        match flush_pass(&client, dir, session_id) {
+            Ok(()) => {}
+            // A run another sign-in owns is dropped, so the rest still uploads.
+            Err(error) => match api::refused_run(&error) {
+                Some(refused) if refuse_run(dir, session_id, &refused.run_id)? => continue,
+                _ => return Err(error),
+            },
+        }
         if !dirty.exists() {
             break;
         }
     }
     Ok(())
 }
+
+/// Stops uploading to a run RustGrid refused this worker's writes to. Returns
+/// whether the session had that run.
+fn refuse_run(dir: &Path, session_id: &str, run_id: &str) -> Result<bool> {
+    let _guard = SessionLock::acquire(dir, session_id, "state", true)?;
+    let mut session = Session::load(dir, session_id)?;
+    let refused = if session
+        .previous_run
+        .as_ref()
+        .is_some_and(|previous| previous.run_id == run_id)
+    {
+        session.previous_run = None;
+        true
+    } else if session.run_id.as_deref() == Some(run_id) {
+        session.refused_run = Some(run_id.to_owned());
+        true
+    } else {
+        false
+    };
+    if refused {
+        session.save(dir)?;
+    }
+    Ok(refused)
+}
+
+/// What `trace status` says about a run RustGrid refused.
+pub(crate) const REFUSED_RUN_PROBLEM: &str = "RustGrid refuses uploads to this session's run because a different sign-in on this computer started it (for example before `rustgrid-agent login` ran again). Its remaining prompts and replies are not traced.";
 
 /// The flush runs detached with no output, so its last problem is kept in
 /// `<session-id>.error` for `trace status`, and cleared once a flush succeeds.
@@ -675,15 +721,13 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
     let Some(run_id) = session.run_id.clone() else {
         return Ok(());
     };
+    if session.refused_run.as_deref() == Some(run_id.as_str()) {
+        return Ok(());
+    }
     let ticket_id = session.ticket.as_ref().and_then(|ticket| ticket.id.clone());
 
     if !session.execution_reported {
-        report_execution(
-            client,
-            &run_id,
-            session.generation,
-            ExecutionStatus::Running,
-        )?;
+        report_execution(client, &mut session, &run_id, ExecutionStatus::Running)?;
         session.execution_reported = true;
     }
 
@@ -714,6 +758,7 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
                     client,
                     &session,
                     &previous.run_id,
+                    previous.generation,
                     previous.start_sha.as_deref(),
                     &previous.pull_requests,
                 )?;
@@ -767,6 +812,7 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
             client,
             &session,
             &previous.run_id,
+            previous.generation,
             previous.start_sha.as_deref(),
             &previous.pull_requests,
         )?;
@@ -774,16 +820,12 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
         save_merged(dir, &session)?;
     }
     if session.ended && !session.finalized {
-        report_execution(
-            client,
-            &run_id,
-            session.generation,
-            ExecutionStatus::Succeeded,
-        )?;
+        report_execution(client, &mut session, &run_id, ExecutionStatus::Succeeded)?;
         end_run(
             client,
             &session,
             &run_id,
+            session.generation,
             session.start_sha.as_deref(),
             &session.pull_requests,
         )?;
@@ -828,6 +870,7 @@ fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
         current.pull_requests = flushed.pull_requests.clone();
         current.finalized = flushed.finalized;
         current.pull_requests_ended = flushed.pull_requests_ended;
+        current.telemetry_refused_run = flushed.telemetry_refused_run.clone();
     }
     current.previous_run = flushed
         .previous_run
@@ -996,7 +1039,9 @@ fn report_item(
                 usage_source: UsageSource::ProviderReported,
                 capture_granularity: CaptureGranularity::ModelCall,
             };
-            client.report_telemetry_batch(
+            report_telemetry(
+                client,
+                session,
                 run_id,
                 &TelemetryBatch::new(vec![TelemetryEvent {
                     event_id: stable_uuid(&format!(
@@ -1036,13 +1081,36 @@ fn execution_id(run_id: &str, generation: u32) -> Uuid {
     }
 }
 
+/// Sends telemetry unless RustGrid already refused it for this run. A refusal
+/// only stops telemetry: the run's prompts, replies and summary still upload.
+fn report_telemetry(
+    client: &RustGridClient,
+    session: &mut Session,
+    run_id: &str,
+    batch: &TelemetryBatch,
+) -> Result<()> {
+    if session.telemetry_refused_run.as_deref() == Some(run_id) {
+        return Ok(());
+    }
+    match client.report_telemetry_batch(run_id, batch) {
+        Err(error)
+            if api::refused_run(&error)
+                .is_some_and(|refused| refused.telemetry && refused.run_id == run_id) =>
+        {
+            session.telemetry_refused_run = Some(run_id.to_owned());
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn report_execution(
     client: &RustGridClient,
+    session: &mut Session,
     run_id: &str,
-    generation: u32,
     status: ExecutionStatus,
 ) -> Result<()> {
-    let id = execution_id(run_id, generation);
+    let id = execution_id(run_id, session.generation);
     let finished = !matches!(status, ExecutionStatus::Running);
     let (event_type, revision) = if finished {
         ("execution.completed", 2)
@@ -1050,7 +1118,9 @@ fn report_execution(
         ("execution.started", 1)
     };
     let now = now_rfc3339();
-    client.report_telemetry_batch(
+    report_telemetry(
+        client,
+        session,
         run_id,
         &TelemetryBatch::new(vec![TelemetryEvent {
             event_id: stable_uuid(&format!(
@@ -1079,6 +1149,7 @@ fn end_run(
     client: &RustGridClient,
     session: &Session,
     run_id: &str,
+    generation: u32,
     start_sha: Option<&str>,
     pull_requests: &[String],
 ) -> Result<()> {
@@ -1113,7 +1184,7 @@ fn end_run(
     if let Some(url) = pull_requests.last() {
         body["pull_request_url"] = json!(url);
     }
-    client.end_interactive_run(run_id, body)
+    client.end_interactive_run(run_id, generation, body)
 }
 
 #[cfg(test)]
@@ -1384,6 +1455,43 @@ mod tests {
         end_on_pull_request(&dir, &mut flushed).unwrap();
         assert!(!flushed.ended);
         assert!(!Session::load(&dir, "s-1").unwrap().ended);
+    }
+
+    #[test]
+    fn a_run_another_sign_in_owns_stops_uploading() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let repo = root.path().join("repo");
+        waiting_session(&dir, "s-1", &repo, 1, Duration::ZERO);
+
+        assert!(!refuse_run(&dir, "s-1", "run-other").unwrap());
+        assert!(Session::load(&dir, "s-1").unwrap().refused_run.is_none());
+
+        assert!(refuse_run(&dir, "s-1", "run-s-1").unwrap());
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert_eq!(session.refused_run.as_deref(), Some("run-s-1"));
+        // Unrelated flush progress keeps the refusal.
+        save_merged(&dir, &session).unwrap();
+        assert!(Session::load(&dir, "s-1").unwrap().refused_run.is_some());
+    }
+
+    #[test]
+    fn a_refused_earlier_ticket_run_is_dropped_so_the_new_one_uploads() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().to_path_buf();
+        let repo = root.path().join("repo");
+        waiting_session(&dir, "s-1", &repo, 1, Duration::ZERO);
+        let mut session = Session::load(&dir, "s-1").unwrap();
+        session.previous_run = Some(PreviousRun {
+            run_id: "run-old".into(),
+            ..PreviousRun::default()
+        });
+        session.save(&dir).unwrap();
+
+        assert!(refuse_run(&dir, "s-1", "run-old").unwrap());
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert!(session.previous_run.is_none());
+        assert!(session.refused_run.is_none());
     }
 
     #[test]

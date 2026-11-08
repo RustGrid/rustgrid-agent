@@ -544,7 +544,16 @@ fn latest_session() -> Option<String> {
         .zip(session.get("offset").and_then(Value::as_u64))
         .map(|(length, offset)| length.saturating_sub(offset))
         .unwrap_or(0);
-    let state = if session.get("finalized").and_then(Value::as_bool) == Some(true) {
+    let refused = session.get("refused_run").and_then(Value::as_str).is_some()
+        && session.get("refused_run") == session.get("run_id");
+    let problem = if refused {
+        Some(super::REFUSED_RUN_PROBLEM.to_owned())
+    } else {
+        problem
+    };
+    let state = if refused {
+        "not traced"
+    } else if session.get("finalized").and_then(Value::as_bool) == Some(true) {
         "ended"
     } else if pending > 0 {
         "upload pending"
