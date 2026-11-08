@@ -3,6 +3,18 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.9.0 - 2026-11-08
+
+### Changed
+
+- `/rustgrid-link KEY` puts the repository on a branch named after the ticket
+  (`agent/<key>-<title>`), so a session's work no longer lands on whatever
+  branch happened to be checked out. A branch that already names the ticket is
+  kept, an existing branch of that name is reused, and otherwise one is created
+  from the current commit with uncommitted changes carried over. If git refuses
+  the switch, the session stays linked on its branch and Claude says how to
+  switch.
+
 ## 1.8.2 - 2026-11-08
 
 ### Fixed
