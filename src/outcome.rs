@@ -6,6 +6,8 @@ use crate::error::{
 pub struct RunSummary {
     pub ticket_key: String,
     pub branch: String,
+    /// The ticket's earlier branch this run did not build on, if any.
+    pub stale_branch: Option<String>,
     pub commit: String,
     pub pull_request_url: String,
     pub direct_operation_summary: Option<String>,
@@ -148,6 +150,7 @@ mod tests {
             !RunOutcome::Succeeded(RunSummary {
                 ticket_key: "RG-1".into(),
                 branch: "agent/rg-1".into(),
+                stale_branch: None,
                 commit: "abc".into(),
                 pull_request_url: "https://github.com/o/r/pull/1".into(),
                 direct_operation_summary: None,

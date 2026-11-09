@@ -27,10 +27,7 @@ use crate::{
     },
     executor::{ExecutionHandle, Executor, SANDBOX_PREPARE_TIMEOUT_SECONDS},
     finalization::finalize,
-    git::{
-        ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, branch_name,
-        fresh_branch_name,
-    },
+    git::{ReconciledCommit, ReconciliationKind, RemoteBranchMoved, Repo, choose_run_branch},
     github::GitHubClient,
     journal::{RecoveryPlan, RunJournal},
     lifecycle::{RunPhase, StepStatus, TicketStatus, WorkerStatus},
@@ -633,6 +630,7 @@ fn execute_direct_operation(
     Ok(RunSummary {
         ticket_key: ticket.key.clone(),
         branch: String::new(),
+        stale_branch: None,
         commit: String::new(),
         pull_request_url: String::new(),
         direct_operation_summary: Some(summary),
@@ -943,16 +941,40 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         )?;
     }
 
-    let branch = if manifest.fresh_start()? {
-        fresh_branch_name(&ticket.key, &ticket.title, &run.id)
-    } else {
-        branch_name(&ticket.key, &ticket.title)
-    };
+    let tokens = GitHubTokenManager::new(
+        api,
+        &run.id,
+        &manifest.repository,
+        &manifest.required_permissions,
+    );
+    let run_branch = choose_run_branch(
+        &ticket.key,
+        &ticket.title,
+        &run.id,
+        reporter.recorded_branch().as_deref(),
+        manifest.fresh_start()?,
+        |usual| {
+            if repo.local_branch_exists(usual)? {
+                return Ok(true);
+            }
+            let token = tokens.token()?;
+            Ok(repo
+                .remote_branch_head(usual, &token, &manifest.web_base_url)?
+                .is_some())
+        },
+    )?;
+    let branch = run_branch.name;
+    let stale_branch = run_branch.stale;
     reporter.step(
         "branch_create",
         StepStatus::Running,
-        &format!("Creating branch {branch}"),
-        Some(json!({"base": base_branch})),
+        &match &stale_branch {
+            Some(stale) => format!(
+                "Branch {stale} already exists from an earlier run; creating fresh branch {branch} so its changes stay out of this run"
+            ),
+            None => format!("Creating branch {branch}"),
+        },
+        Some(json!({"base": base_branch, "stale_branch": stale_branch})),
     )?;
     let resumed_branch = repo.checkout_or_create_branch(&branch, base_branch)?;
     reporter.record_branch(&branch)?;
@@ -960,10 +982,14 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         "branch_create",
         StepStatus::Completed,
         &format!(
-            "{} branch {branch}",
-            if resumed_branch { "Resumed" } else { "Created" }
+            "{} branch {branch}{}",
+            if resumed_branch { "Resumed" } else { "Created" },
+            stale_branch
+                .as_deref()
+                .map(|stale| format!(" (stale branch {stale} left untouched)"))
+                .unwrap_or_default()
         ),
-        Some(json!({"resumed": resumed_branch})),
+        Some(json!({"resumed": resumed_branch, "stale_branch": stale_branch})),
     )?;
 
     bootstrap_dependencies(
@@ -1015,12 +1041,6 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         reporter.set_phase(RunPhase::Publishing);
     }
 
-    let tokens = GitHubTokenManager::new(
-        api,
-        &run.id,
-        &manifest.repository,
-        &manifest.required_permissions,
-    );
     publish_commit(
         PublicationContext {
             app: context,
@@ -1070,7 +1090,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
             github.create_pull_request(
                 &repo_config,
                 &format!("{}: {}", ticket.key, ticket.title),
-                &pull_request_body(ticket, &run.id, &gate_summary),
+                &pull_request_body(ticket, &run.id, &gate_summary, stale_branch.as_deref()),
                 &branch,
                 base_branch,
             )?
@@ -1260,6 +1280,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
     let summary = RunSummary {
         ticket_key: ticket.key.clone(),
         branch,
+        stale_branch,
         commit,
         pull_request_url: pr.html_url,
         direct_operation_summary: None,

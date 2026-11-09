@@ -111,8 +111,8 @@ impl Repo {
         Ok(())
     }
 
-    pub fn create_branch(&self, branch: &str, base: &str) -> Result<()> {
-        if command::capture(
+    pub fn local_branch_exists(&self, branch: &str) -> Result<bool> {
+        Ok(command::capture(
             "git",
             [
                 "show-ref",
@@ -123,8 +123,11 @@ impl Repo {
             &self.root,
         )?
         .status
-        .success()
-        {
+        .success())
+    }
+
+    pub fn create_branch(&self, branch: &str, base: &str) -> Result<()> {
+        if self.local_branch_exists(branch)? {
             bail!("local branch {branch} already exists");
         }
         command::checked(
@@ -136,19 +139,7 @@ impl Repo {
     }
 
     pub fn checkout_or_create_branch(&self, branch: &str, base: &str) -> Result<bool> {
-        let exists = command::capture(
-            "git",
-            [
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-            &self.root,
-        )?
-        .status
-        .success();
-        if exists {
+        if self.local_branch_exists(branch)? {
             command::checked(
                 "git",
                 ["-c", hooks_disabled(), "switch", branch],
@@ -609,6 +600,56 @@ pub fn fresh_branch_name(key: &str, title: &str, run_id: &str) -> String {
         .to_owned()
 }
 
+/// The branch a run works on, and the earlier branch it stepped around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunBranch {
+    pub name: String,
+    /// The ticket's usual branch, left by an earlier run. The run does not
+    /// build on it, so its changes cannot mix with the new implementation.
+    pub stale: Option<String>,
+}
+
+/// Picks the branch for a run.
+///
+/// A run that recorded a branch before stopping keeps it, so recovery resumes
+/// its own work. Any other run starts from a branch nothing else has touched:
+/// it uses the ticket's usual branch only when that branch exists nowhere yet,
+/// and otherwise a branch named for the run, with the existing one reported
+/// as stale.
+pub fn choose_run_branch(
+    key: &str,
+    title: &str,
+    run_id: &str,
+    recorded: Option<&str>,
+    fresh_start: bool,
+    branch_exists: impl FnOnce(&str) -> Result<bool>,
+) -> Result<RunBranch> {
+    if let Some(recorded) = recorded {
+        return Ok(RunBranch {
+            name: recorded.to_owned(),
+            stale: None,
+        });
+    }
+    let fresh = || fresh_branch_name(key, title, run_id);
+    if fresh_start {
+        return Ok(RunBranch {
+            name: fresh(),
+            stale: None,
+        });
+    }
+    let usual = branch_name(key, title);
+    if branch_exists(&usual)? {
+        return Ok(RunBranch {
+            name: fresh(),
+            stale: Some(usual),
+        });
+    }
+    Ok(RunBranch {
+        name: usual,
+        stale: None,
+    })
+}
+
 pub fn read_repo_instructions(root: &Path) -> Result<Vec<(String, String)>> {
     let mut result = Vec::new();
     for name in ["AGENTS.md", "README.md"] {
@@ -639,6 +680,64 @@ mod tests {
             branch_name("RG-42", "Fix the Café / API!"),
             "agent/rg-42-fix-the-caf-api"
         );
+    }
+
+    #[test]
+    fn run_branch_uses_the_usual_branch_when_none_exists() {
+        let branch =
+            choose_run_branch("RG-1", "Fix it", "run-2", None, false, |_| Ok(false)).unwrap();
+        assert_eq!(
+            branch,
+            RunBranch {
+                name: "agent/rg-1-fix-it".into(),
+                stale: None,
+            }
+        );
+    }
+
+    #[test]
+    fn run_branch_steps_around_an_existing_branch() {
+        let branch = choose_run_branch("RG-1", "Fix it", "run-2", None, false, |name| {
+            Ok(name == "agent/rg-1-fix-it")
+        })
+        .unwrap();
+        assert_eq!(
+            branch,
+            RunBranch {
+                name: "agent/rg-1-fix-it-run-2".into(),
+                stale: Some("agent/rg-1-fix-it".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn run_branch_keeps_the_recorded_branch_when_resuming() {
+        let branch = choose_run_branch(
+            "RG-1",
+            "Fix it",
+            "run-2",
+            Some("agent/rg-1-fix-it"),
+            false,
+            |_| panic!("a resumed run must not look for a stale branch"),
+        )
+        .unwrap();
+        assert_eq!(
+            branch,
+            RunBranch {
+                name: "agent/rg-1-fix-it".into(),
+                stale: None,
+            }
+        );
+    }
+
+    #[test]
+    fn run_branch_is_per_run_on_a_fresh_start() {
+        let branch = choose_run_branch("RG-1", "Fix it", "run-2", None, true, |_| {
+            panic!("a fresh start always uses a per-run branch")
+        })
+        .unwrap();
+        assert_eq!(branch.name, "agent/rg-1-fix-it-run-2");
+        assert_eq!(branch.stale, None);
     }
 
     #[test]
