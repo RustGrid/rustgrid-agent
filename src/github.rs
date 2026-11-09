@@ -107,6 +107,7 @@ pub enum CheckConclusion {
     Failure,
     Cancelled,
     Skipped,
+    Neutral,
     TimedOut,
     Unknown(String),
 }
@@ -114,6 +115,12 @@ pub enum CheckConclusion {
 impl CheckConclusion {
     pub const fn is_success(&self) -> bool {
         matches!(self, Self::Success)
+    }
+
+    /// The workflow or job finished without running its work, e.g. a job `if:` that
+    /// excluded it (CI gated on a PR label). That is neither a pass nor a failure.
+    pub const fn did_not_run(&self) -> bool {
+        matches!(self, Self::Skipped | Self::Neutral)
     }
 
     pub const fn is_repairable_failure(&self) -> bool {
@@ -126,6 +133,7 @@ impl CheckConclusion {
             Self::Failure => "failure",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
+            Self::Neutral => "neutral",
             Self::TimedOut => "timed_out",
             Self::Unknown(value) => value,
         }
@@ -142,6 +150,7 @@ impl<'de> Deserialize<'de> for CheckConclusion {
             "failure" => Self::Failure,
             "cancelled" => Self::Cancelled,
             "skipped" => Self::Skipped,
+            "neutral" => Self::Neutral,
             "timed_out" => Self::TimedOut,
             value => Self::Unknown(value.to_owned()),
         })
@@ -350,13 +359,7 @@ impl GitHubClient {
                 .as_ref()
                 .map_or("unknown", CheckConclusion::as_str)
         );
-        for job in jobs.into_iter().filter(|job| {
-            job.status.is_completed()
-                && job
-                    .conclusion
-                    .as_ref()
-                    .is_none_or(|conclusion| !conclusion.is_success())
-        }) {
+        for job in jobs.into_iter().filter(job_needs_diagnostics) {
             diagnostics.push_str(&format!(
                 "\n\nJob {} concluded as {}.",
                 job.name,
@@ -369,10 +372,9 @@ impl GitHubClient {
                 .iter()
                 .filter(|step| {
                     step.status.is_completed()
-                        && step
-                            .conclusion
-                            .as_ref()
-                            .is_none_or(|conclusion| !conclusion.is_success())
+                        && step.conclusion.as_ref().is_none_or(|conclusion| {
+                            !conclusion.is_success() && !conclusion.did_not_run()
+                        })
                 })
                 .map(|step| step.name.as_str())
                 .collect::<Vec<_>>();
@@ -560,6 +562,16 @@ fn log_tail(value: &str, max: usize) -> &str {
     &value[start..]
 }
 
+/// Completed jobs that did not pass. Skipped jobs never ran, so they have no log to
+/// fetch (GitHub answers 404 BlobNotFound) and say nothing about the failure.
+fn job_needs_diagnostics(job: &WorkflowJob) -> bool {
+    job.status.is_completed()
+        && job
+            .conclusion
+            .as_ref()
+            .is_none_or(|conclusion| !conclusion.is_success() && !conclusion.did_not_run())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +606,37 @@ mod tests {
         assert!(CheckConclusion::TimedOut.is_repairable_failure());
         assert!(!CheckConclusion::Cancelled.is_repairable_failure());
         assert!(!CheckConclusion::Skipped.is_repairable_failure());
+    }
+
+    #[test]
+    fn skipped_and_neutral_conclusions_did_not_run() {
+        for (raw, expected) in [
+            ("skipped", true),
+            ("neutral", true),
+            ("success", false),
+            ("failure", false),
+            ("cancelled", false),
+        ] {
+            let conclusion: CheckConclusion =
+                serde_json::from_value(serde_json::json!(raw)).unwrap();
+            assert_eq!(conclusion.as_str(), raw);
+            assert_eq!(conclusion.did_not_run(), expected, "{raw}");
+        }
+        assert!(!CheckConclusion::Neutral.is_repairable_failure());
+    }
+
+    #[test]
+    fn skipped_jobs_are_left_out_of_failure_diagnostics() {
+        let job = |conclusion| WorkflowJob {
+            id: 1,
+            name: "Worker protocol and state machine".into(),
+            status: CheckStatus::Completed,
+            conclusion: Some(conclusion),
+            steps: Vec::new(),
+        };
+        assert!(job_needs_diagnostics(&job(CheckConclusion::Failure)));
+        assert!(job_needs_diagnostics(&job(CheckConclusion::Cancelled)));
+        assert!(!job_needs_diagnostics(&job(CheckConclusion::Skipped)));
+        assert!(!job_needs_diagnostics(&job(CheckConclusion::Success)));
     }
 }
