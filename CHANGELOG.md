@@ -3,6 +3,19 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.10.0 - 2026-11-09
+
+### Changed
+
+- A cloud run starts from a branch no earlier run has touched. If the ticket's
+  branch `agent/<key>-<title>` already exists, locally or on GitHub, the run
+  creates `agent/<key>-<title>-<run-id>` from the base branch instead of
+  building on the old commits and reusing the old pull request. The existing
+  branch is left untouched and reported as stale in the `branch_create` step
+  (`stale_branch`), in a "Stale branch" section of the pull request body, and
+  in the run summary. A run recovering its own earlier work keeps the branch it
+  recorded.
+
 ## 1.9.1 - 2026-11-09
 
 ### Fixed
