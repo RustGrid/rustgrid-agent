@@ -223,8 +223,13 @@ fn workflow_matches(run: &WorkflowRun, requirement: &str) -> bool {
             .is_some_and(|value| value.eq_ignore_ascii_case(requirement))
 }
 
-pub(crate) fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &str) -> String {
-    format!(
+pub(crate) fn pull_request_body(
+    ticket: &Ticket,
+    run_id: &str,
+    quality_gate: &str,
+    stale_branch: Option<&str>,
+) -> String {
+    let mut body = format!(
         "Implements RustGrid ticket **{}**.\n\n{}\n\n### Verification\n\n- `{}`\n\nRustGrid agent run: `{}`\n",
         ticket.key,
         ticket
@@ -233,6 +238,16 @@ pub(crate) fn pull_request_body(ticket: &Ticket, run_id: &str, quality_gate: &st
             .unwrap_or("No description provided."),
         quality_gate,
         run_id
+    );
+    if let Some(stale) = stale_branch {
+        body.push_str(&stale_branch_note(stale));
+    }
+    body
+}
+
+fn stale_branch_note(stale: &str) -> String {
+    format!(
+        "\n### Stale branch\n\nBranch `{stale}` already existed from an earlier run. This run started from a fresh branch off the base, so nothing on `{stale}` is part of this change. Review that branch and close it, or its pull request, if it is no longer needed.\n"
     )
 }
 
@@ -244,6 +259,9 @@ pub(crate) fn print_summary(summary: &RunSummary, gate: &str) {
         return;
     }
     println!("  Branch:       {}", summary.branch);
+    if let Some(stale) = &summary.stale_branch {
+        println!("  Stale branch: {stale} (left as is; not part of this run)");
+    }
     println!("  Commit:       {}", summary.commit);
     println!("  Quality gate: passed ({gate})");
     println!("  Pull request: {}", summary.pull_request_url);
@@ -252,6 +270,23 @@ pub(crate) fn print_summary(summary: &RunSummary, gate: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_request_body_marks_the_stale_branch() {
+        let ticket: Ticket = serde_json::from_value(serde_json::json!({
+            "id": "ticket-1",
+            "key": "RG-1",
+            "title": "Fix it",
+            "description": "Do the thing.",
+        }))
+        .unwrap();
+        let plain = pull_request_body(&ticket, "run-2", "cargo test", None);
+        assert!(!plain.contains("Stale branch"));
+        let marked = pull_request_body(&ticket, "run-2", "cargo test", Some("agent/rg-1-fix-it"));
+        assert!(marked.starts_with(&plain));
+        assert!(marked.contains("### Stale branch"));
+        assert!(marked.contains("`agent/rg-1-fix-it`"));
+    }
 
     #[test]
     fn skipped_or_neutral_required_workflow_is_not_a_failure() {

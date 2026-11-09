@@ -333,6 +333,10 @@ impl<'a> Reporter<'a> {
         Ok(self.journal.borrow_mut().record_executor(kind, id, state)?)
     }
 
+    pub(crate) fn recorded_branch(&self) -> Option<String> {
+        self.journal.borrow().branch.clone()
+    }
+
     pub(crate) fn record_branch(&self, branch: &str) -> Result<()> {
         Ok(self.journal.borrow_mut().record_branch(branch)?)
     }
