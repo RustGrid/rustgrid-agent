@@ -10,7 +10,7 @@ use serde_json::json;
 use crate::{
     api::Ticket,
     config::RepoConfig,
-    github::{CheckRun, GitHubClient, WorkflowRun},
+    github::{CheckConclusion, CheckRun, CheckStatus, GitHubClient, WorkflowRun},
     lifecycle::StepStatus,
     outcome::RunSummary,
     reporting::Reporter,
@@ -72,17 +72,20 @@ pub(crate) fn wait_for_required_workflows(
         let discovery_closed = started.elapsed() >= WORKFLOW_DISCOVERY_GRACE;
         let mut all_passed = true;
         let mut absent = Vec::new();
+        let mut not_run = Vec::new();
         for name in requirements.required {
             let workflow = latest_workflow_run(&workflows, name);
             let check = latest_check_run(&checks, name);
             let state = workflow
                 .map(|run| (&run.status, run.conclusion.as_ref()))
                 .or_else(|| check.map(|check| (&check.status, check.conclusion.as_ref())));
-            match state {
-                Some((status, conclusion))
-                    if status.is_completed()
-                        && conclusion.is_some_and(|value| value.is_success()) => {}
-                Some((status, conclusion)) if status.is_completed() => {
+            match requirement_outcome(state, discovery_closed) {
+                RequirementOutcome::Passed => {}
+                RequirementOutcome::NotRun => not_run.push(name.as_str()),
+                RequirementOutcome::Absent => absent.push(name.as_str()),
+                RequirementOutcome::Pending => all_passed = false,
+                RequirementOutcome::Failed => {
+                    let conclusion = state.and_then(|(_, conclusion)| conclusion);
                     let fallback = format!(
                         "Required GitHub workflow {name} concluded as {}.",
                         conclusion.map_or("unknown", |value| value.as_str())
@@ -102,19 +105,22 @@ pub(crate) fn wait_for_required_workflows(
                     }
                     .into());
                 }
-                None if discovery_closed => absent.push(name.as_str()),
-                _ => all_passed = false,
             }
         }
         if all_passed {
-            let message = if absent.is_empty() {
-                "Required GitHub workflows passed".to_owned()
-            } else {
-                format!(
-                    "Required GitHub workflows passed; skipped {} that never ran on this commit",
+            let mut message = "Required GitHub workflows passed".to_owned();
+            if !not_run.is_empty() {
+                message.push_str(&format!(
+                    "; {} skipped by its trigger conditions",
+                    not_run.join(", ")
+                ));
+            }
+            if !absent.is_empty() {
+                message.push_str(&format!(
+                    "; skipped {} that never ran on this commit",
                     absent.join(", ")
-                )
-            };
+                ));
+            }
             reporter.step(
                 "required_workflows",
                 StepStatus::Completed,
@@ -122,6 +128,7 @@ pub(crate) fn wait_for_required_workflows(
                 Some(json!({
                     "required": requirements.required,
                     "absent": absent,
+                    "not_run": not_run,
                     "duration_ms": started.elapsed().as_millis()
                 })),
             )?;
@@ -133,6 +140,34 @@ pub(crate) fn wait_for_required_workflows(
             }
             thread::sleep(Duration::from_millis(250));
         }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RequirementOutcome {
+    Passed,
+    /// Completed without running its work (`skipped`/`neutral`), e.g. CI whose jobs are
+    /// gated on a `run-ci` PR label. Not a failure: nothing was checked.
+    NotRun,
+    /// Nothing registered on the commit within the discovery grace window.
+    Absent,
+    Pending,
+    Failed,
+}
+
+fn requirement_outcome(
+    state: Option<(&CheckStatus, Option<&CheckConclusion>)>,
+    discovery_closed: bool,
+) -> RequirementOutcome {
+    match state {
+        Some((status, conclusion)) if status.is_completed() => match conclusion {
+            Some(value) if value.is_success() => RequirementOutcome::Passed,
+            Some(value) if value.did_not_run() => RequirementOutcome::NotRun,
+            _ => RequirementOutcome::Failed,
+        },
+        Some(_) => RequirementOutcome::Pending,
+        None if discovery_closed => RequirementOutcome::Absent,
+        None => RequirementOutcome::Pending,
     }
 }
 
@@ -217,7 +252,48 @@ pub(crate) fn print_summary(summary: &RunSummary, gate: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::{CheckConclusion, CheckStatus};
+
+    #[test]
+    fn skipped_or_neutral_required_workflow_is_not_a_failure() {
+        let completed = CheckStatus::Completed;
+        for conclusion in [CheckConclusion::Skipped, CheckConclusion::Neutral] {
+            for discovery_closed in [false, true] {
+                assert_eq!(
+                    requirement_outcome(Some((&completed, Some(&conclusion))), discovery_closed),
+                    RequirementOutcome::NotRun
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_workflow_outcomes() {
+        let completed = CheckStatus::Completed;
+        assert_eq!(
+            requirement_outcome(Some((&completed, Some(&CheckConclusion::Success))), false),
+            RequirementOutcome::Passed
+        );
+        for conclusion in [
+            CheckConclusion::Failure,
+            CheckConclusion::Cancelled,
+            CheckConclusion::TimedOut,
+            CheckConclusion::Unknown("action_required".into()),
+        ] {
+            assert_eq!(
+                requirement_outcome(Some((&completed, Some(&conclusion))), false),
+                RequirementOutcome::Failed
+            );
+        }
+        assert_eq!(
+            requirement_outcome(Some((&completed, None)), false),
+            RequirementOutcome::Failed
+        );
+        assert_eq!(
+            requirement_outcome(None, false),
+            RequirementOutcome::Pending
+        );
+        assert_eq!(requirement_outcome(None, true), RequirementOutcome::Absent);
+    }
 
     #[test]
     fn workflow_reconciliation_uses_the_latest_run() {
