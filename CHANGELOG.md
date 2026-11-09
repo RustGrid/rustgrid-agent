@@ -3,6 +3,18 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.9.1 - 2026-11-09
+
+### Fixed
+
+- A required GitHub workflow that completes as `skipped` or `neutral`, such as
+  CI whose jobs only run when a PR has a `run-ci` label, is treated as not run
+  instead of as a failure. Agent runs no longer end blocked on it; the run's
+  step reports the workflow as skipped by its trigger conditions.
+- Required-workflow failure diagnostics leave out skipped jobs, whose logs
+  GitHub cannot serve (404 `BlobNotFound`), and no longer list skipped steps as
+  failed steps.
+
 ## 1.9.0 - 2026-11-08
 
 ### Changed
