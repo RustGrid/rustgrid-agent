@@ -38,6 +38,44 @@ timeout, and connection failures retry the whole install up to three times;
 exhaustion is classified as transient worker infrastructure instead of letting
 Codex proceed with missing dependencies.
 
+Every new or recovered Docker Sandbox receives sandbox-scoped network rules
+for Playwright's current and legacy browser CDNs, download redirect targets,
+the public npm registry, and Ubuntu/Debian package repositories (HTTP and
+HTTPS). This applies to both Codex and Claude Code, even without a JavaScript
+manifest or npm quality gate. The host's global policy is unchanged.
+Repository setup or the coding agent can install the project's own Playwright
+version and matching browsers inside the VM:
+
+```sh
+npm ci
+npx playwright install --with-deps
+npx playwright test
+```
+
+Docker's agent templates provide a writable home and passwordless sudo inside
+the VM, so Playwright can populate its browser cache and install system libraries.
+Custom templates must provide these capabilities too. The project's Playwright
+version must support the template's OS: for example, Playwright 1.56.1 rejects
+Ubuntu 26.04 before downloading anything; Playwright 1.65.0 supports it. Pin a
+compatible template or update the project's Playwright version in that case.
+Browser installation is on demand; admission does not download browsers for
+projects that do not use them.
+An organization-level deny still takes precedence over sandbox-scoped rules.
+
+Verified matrix (2026-11-11, `sbx` 0.37.0, pinned example template, Ubuntu
+26.04 aarch64, non-root `agent` user): Playwright 1.65.0 with Chromium
+158.0.8127.18, Firefox 159.0 and WebKit 27.2 installs via
+`npx playwright install --with-deps` and launches each browser headless.
+Browsers land in the per-sandbox cache `~/.cache/ms-playwright`
+(`/home/agent/.cache/ms-playwright`), which lives as long as the sandbox: a
+retained sandbox reuses it and a repeated install is a no-op, while a new
+sandbox downloads afresh (about 450 MiB for all three browsers plus system
+packages; allow several minutes on slow links). Playwright retries a failed
+download through its other allowlisted mirrors and exits non-zero with the URL
+and error once all fail. If an install fails, run `sbx policy log <sandbox>` on
+the worker host: a host listed under blocked requests needs reviewing before it
+is allowlisted.
+
 The example systemd unit is in
 `packaging/systemd/rustgrid-agent.service`. Prefer logging in once as the
 dedicated service account so the credential lands in that account's secret

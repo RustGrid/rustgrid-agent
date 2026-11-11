@@ -26,6 +26,30 @@ use crate::{
 const SANDBOX_NETWORK_ATTEMPTS: u32 = 3;
 pub(crate) const SANDBOX_PREPARE_TIMEOUT_SECONDS: u64 = 180;
 const NPM_REGISTRY: &str = "https://registry.npmjs.org";
+// Playwright fetches browser revisions separately from its npm package. Include
+// its current/legacy CDNs, redirect targets and the apt repositories used by
+// `playwright install --with-deps`. Keep these rules sandbox-scoped, including
+// on recovery, rather than relying on the host's evolving default allowlist.
+const BROWSER_INSTALL_HOSTS: &[&str] = &[
+    "registry.npmjs.org:443",
+    "cdn.playwright.dev:443",
+    "playwright.download.prss.microsoft.com:443",
+    "playwright.azureedge.net:443",
+    "playwright-akamai.azureedge.net:443",
+    "playwright-verizon.azureedge.net:443",
+    "playwright2.blob.core.windows.net:443",
+    "storage.googleapis.com:443",
+    "archive.ubuntu.com:80",
+    "archive.ubuntu.com:443",
+    "security.ubuntu.com:80",
+    "security.ubuntu.com:443",
+    "ports.ubuntu.com:80",
+    "ports.ubuntu.com:443",
+    "deb.debian.org:80",
+    "deb.debian.org:443",
+    "security.debian.org:80",
+    "security.debian.org:443",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) enum ExecutionHandle {
@@ -220,9 +244,9 @@ impl Executor {
         Ok(removed)
     }
 
-    /// `allowed_hosts` are added to the sandbox's own network policy, for
-    /// example the RustGrid model gateway for Claude Code runs. The rules are
-    /// scoped to this sandbox and disappear with it.
+    /// Browser installation hosts and `allowed_hosts` (for example the RustGrid
+    /// model gateway) are added to the sandbox's own network policy. The rules
+    /// are scoped to this sandbox and disappear with it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         &self,
@@ -811,8 +835,11 @@ fn allow_sandbox_hosts(
     workspace: &Path,
     running: &AtomicBool,
 ) -> Result<()> {
-    if hosts.is_empty() {
-        return Ok(());
+    let mut hosts = hosts.to_vec();
+    for host in BROWSER_INSTALL_HOSTS {
+        if !hosts.iter().any(|existing| existing == host) {
+            hosts.push((*host).to_owned());
+        }
     }
     let args = [
         "policy".to_owned(),
@@ -1284,6 +1311,152 @@ mod tests {
             interactive.args[0..5],
             ["sbx", "exec", "-i", "-w", workspace.to_str().unwrap()]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_and_retained_sandboxes_allow_browser_installation_for_both_providers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for provider in [AgentProvider::Codex, AgentProvider::Claude] {
+            for retained in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let workspace = directory.path();
+                let name = sandbox_name("browser-install-test");
+                let agent_version = required_agent_version(provider, "1.2.3");
+                let script = workspace.join("fake-sbx");
+                let listed = if retained {
+                    serde_json::json!({"sandboxes": [{"name": name}]}).to_string()
+                } else {
+                    "{\"sandboxes\":[]}".into()
+                };
+                fs::write(
+                    &script,
+                    format!(
+                        r#"#!/bin/sh
+printf '%s\n' "$*" >> calls
+case "$1" in
+    ls) printf '%s\n' '{listed}' ;;
+    exec) printf '%s\n' '{agent_version}' ;;
+esac
+"#
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+                let executor = Executor::DockerSandbox {
+                    command: script.to_str().unwrap().into(),
+                    template: "pinned-template".into(),
+                    codex_version: "1.2.3".into(),
+                    claude_template: Some("pinned-claude-template".into()),
+                    claude_version: Some("1.2.3".into()),
+                    cpus: 1,
+                    memory: "1g".into(),
+                };
+                let extra_hosts = match provider {
+                    AgentProvider::Codex => vec![],
+                    AgentProvider::Claude => vec!["gateway.example.com:443".into()],
+                };
+                let handle = executor
+                    .prepare(
+                        provider,
+                        &extra_hosts,
+                        "browser-install-test",
+                        workspace,
+                        false, // Also works without a JS manifest or npm quality gate.
+                        retained.then_some(name.as_str()),
+                        &AtomicBool::new(true),
+                    )
+                    .unwrap();
+                assert_eq!(handle.id(), Some(name.as_str()));
+                let calls = fs::read_to_string(workspace.join("calls")).unwrap();
+                let lines = calls.lines().collect::<Vec<_>>();
+                let policy_index = lines
+                    .iter()
+                    .position(|line| line.starts_with("policy allow network "))
+                    .unwrap();
+                let policy = lines[policy_index];
+                assert!(policy.starts_with(&format!("policy allow network --sandbox {name} ")));
+                if provider == AgentProvider::Claude {
+                    assert!(policy.contains("gateway.example.com:443,"));
+                }
+                let hosts = policy
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .split(',')
+                    .collect::<Vec<_>>();
+                for host in BROWSER_INSTALL_HOSTS {
+                    assert!(hosts.contains(host), "missing browser install host {host}");
+                }
+                assert!(!hosts.contains(&"*"));
+                assert!(
+                    policy_index
+                        < lines
+                            .iter()
+                            .position(|line| line.starts_with("exec "))
+                            .unwrap()
+                );
+                assert_eq!(calls.contains("create --quiet"), !retained);
+                if retained {
+                    assert!(!calls.contains("rm --force"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_policy_failure_preserves_retained_sandbox_and_prevents_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let name = sandbox_name("browser-install-test");
+        let script = workspace.join("fake-sbx");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> calls
+case "$1" in
+    ls) printf '%s\n' '{{"sandboxes":[{{"name":"{name}"}}]}}' ;;
+    policy) echo 'policy unavailable' >&2; exit 1 ;;
+    *) exit 99 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = Executor::DockerSandbox {
+            command: script.to_str().unwrap().into(),
+            template: "pinned-template".into(),
+            codex_version: "1.2.3".into(),
+            claude_template: None,
+            claude_version: None,
+            cpus: 1,
+            memory: "1g".into(),
+        };
+        let error = executor
+            .prepare(
+                AgentProvider::Codex,
+                &[],
+                "browser-install-test",
+                workspace,
+                false,
+                Some(&name),
+                &AtomicBool::new(true),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RunFailure>(),
+            Some(RunFailure::InfrastructureTransient { detail })
+                if detail.contains("sandbox preserved") && detail.contains("policy unavailable")
+        ));
+        let calls = fs::read_to_string(workspace.join("calls")).unwrap();
+        assert!(!calls.contains("exec "));
+        assert!(!calls.contains("rm --force"));
     }
 
     #[test]
