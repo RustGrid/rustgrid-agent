@@ -69,7 +69,7 @@ intervention and still runs Codex.
 | Docker Sandbox | `--sandbox danger-full-access` | `--permission-mode bypassPermissions` |
 | Local executor | `--sandbox workspace-write` | `--permission-mode acceptEdits` plus the Claude Code OS sandbox with writes confined to the workspace and no unsandboxed fallback |
 | Image attachments | `--image <path>` | The prompt lists the preview path; Claude reads it with its file tool |
-| Usage | `turn.completed` usage | The final `result` usage, with cache writes and reads folded into input tokens |
+| Usage | One model call per response, from Codex's OpenTelemetry `codex.sse_event` logs; the `turn.completed` usage reconciles the total | One model call per API message, from each `assistant` message's usage; the final `result` usage reconciles the total. Cache writes and reads are folded into input tokens |
 | Token report provider | `codex` | `claude` |
 
 The worker translates each Claude Code `stream-json` message into its canonical
@@ -79,6 +79,27 @@ becomes agent messages. Running a worker-owned full gate is intercepted the
 same way for both agents. Only a focused validation command that succeeds
 counts as validation evidence. Thinking-only messages, token estimates, and
 rate-limit notices do not reset the idle watchdog.
+
+Token usage is reported per model call while the session runs, so RustGrid's
+consumption and cost over time show every call rather than one point at the
+end:
+
+- Claude Code repeats each API message's final usage on every record it
+  streams for that message. The worker reports it once per message id, with
+  the message's model and stop reason, before the tool calls it requested.
+- Codex prints usage only when a turn ends, and runs with `--ephemeral`, so
+  the worker points Codex's OTLP/HTTP log exporter (`-c otel.exporter=...`) at
+  a receiver it runs on `127.0.0.1` for the agent step. Each
+  `response.completed` log becomes one model call with the time Codex
+  recorded. The receiver requires a per-step token and keeps only token
+  counts, the model, and the service tier; the account and session details in
+  those logs are dropped. In a Docker Sandbox, Codex reaches the receiver as
+  `host.docker.internal:<port>`, and the worker allows `localhost:<port>` for
+  that sandbox only.
+- When the turn ends, the provider's aggregate usage is compared with the
+  calls already reported. Anything the calls did not cover is reported as one
+  more call, so totals still match what the provider billed. If the per-call
+  source is unavailable, the turn's aggregate is reported as before.
 
 The worker removes `ANTHROPIC_*` and `CLAUDE_CODE_*` variables from every child
 process, as it removes `OPENAI_*` and `CODEX_*`.

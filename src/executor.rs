@@ -556,6 +556,27 @@ impl Executor {
         result
     }
 
+    /// The address an agent running in this executor uses for a service the
+    /// worker listens on at `127.0.0.1:port`. Host processes share the
+    /// worker's loopback. A Docker Sandbox reaches the host as
+    /// `host.docker.internal` through its proxy, which checks the request as
+    /// `localhost:port`, so only that port is allowed, for this sandbox only.
+    pub(crate) fn worker_service_address(
+        &self,
+        handle: &ExecutionHandle,
+        cwd: &Path,
+        running: &AtomicBool,
+        port: u16,
+    ) -> Result<String> {
+        match (self, handle) {
+            (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) => {
+                allow_sandbox_hosts(command, name, &[format!("localhost:{port}")], cwd, running)?;
+                Ok(format!("host.docker.internal:{port}"))
+            }
+            _ => Ok(format!("127.0.0.1:{port}")),
+        }
+    }
+
     pub(crate) fn destroy(&self, handle: &ExecutionHandle, cwd: &Path) -> Result<()> {
         let (Self::DockerSandbox { command, .. }, ExecutionHandle::DockerSandbox { name }) =
             (self, handle)
@@ -1101,6 +1122,25 @@ fn parse_sbx_version(output: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_executors_reach_worker_services_on_loopback() {
+        let running = AtomicBool::new(true);
+        let cwd = Path::new(".");
+        for executor in [
+            Executor::Local,
+            Executor::DisposableVm {
+                run_as: "rustgrid-run".into(),
+            },
+        ] {
+            assert_eq!(
+                executor
+                    .worker_service_address(&ExecutionHandle::Local, cwd, &running, 4318)
+                    .unwrap(),
+                "127.0.0.1:4318"
+            );
+        }
+    }
 
     #[test]
     fn sandbox_names_are_stable_and_safe() {
