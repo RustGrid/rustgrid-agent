@@ -172,20 +172,7 @@ fn read_export(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, &'static 
     let mut reader = BufReader::new(stream);
     let mut header_bytes = 0;
     let mut line = String::new();
-    let mut read_line = |line: &mut String| -> Result<(), &'static str> {
-        line.clear();
-        let read = reader
-            .by_ref()
-            .take((MAX_HEADER_BYTES - header_bytes) as u64)
-            .read_line(line)
-            .map_err(|_| "400 Bad Request")?;
-        header_bytes += read;
-        if read == 0 || !line.ends_with('\n') {
-            return Err("431 Request Header Fields Too Large");
-        }
-        Ok(())
-    };
-    read_line(&mut line)?;
+    read_header_line(&mut reader, &mut header_bytes, &mut line)?;
     let mut request = line.split_whitespace();
     if request.next() != Some("POST") {
         return Err("405 Method Not Allowed");
@@ -197,7 +184,7 @@ fn read_export(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, &'static 
     let mut authorized = false;
     let mut json = false;
     loop {
-        read_line(&mut line)?;
+        read_header_line(&mut reader, &mut header_bytes, &mut line)?;
         let header = line.trim_end();
         if header.is_empty() {
             break;
@@ -228,11 +215,30 @@ fn read_export(stream: &mut TcpStream, token: &str) -> Result<Vec<u8>, &'static 
         return Err("413 Content Too Large");
     }
     let mut body = vec![0; length];
-    drop(read_line);
     reader
         .read_exact(&mut body)
         .map_err(|_| "400 Bad Request")?;
     Ok(body)
+}
+
+/// Reads one header line into `line`, keeping all headers within
+/// `MAX_HEADER_BYTES`.
+fn read_header_line(
+    reader: &mut BufReader<&mut TcpStream>,
+    header_bytes: &mut usize,
+    line: &mut String,
+) -> Result<(), &'static str> {
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take((MAX_HEADER_BYTES - *header_bytes) as u64)
+        .read_line(line)
+        .map_err(|_| "400 Bad Request")?;
+    *header_bytes += read;
+    if read == 0 || !line.ends_with('\n') {
+        return Err("431 Request Header Fields Too Large");
+    }
+    Ok(())
 }
 
 /// The model calls in one export: each completed Codex response that reported
