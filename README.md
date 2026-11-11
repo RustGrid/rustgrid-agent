@@ -290,7 +290,7 @@ development-only local executor unless `executor` is set.
 | `executor.command` | `sbx` | Docker Sandboxes executable. |
 | `executor.template` | Digest-pinned default | Production rejects mutable tags and requires a 64-character `@sha256:` digest. |
 | `executor.codex_version` | `0.142.4` | Exact numeric Codex CLI version, for example `0.142.4`. Must match the pinned template. |
-| `executor.claude_template`, `executor.claude_version` | Unset | Optional pair that enables Claude Code runs: a digest-pinned template that embeds Claude Code and its exact CLI version, for example `2.1.246`. Set both or neither. Without them, Claude runs stop for human intervention. |
+| `executor.claude_template`, `executor.claude_version` | Unset | Optional pair that enables Claude Code runs: a digest-pinned template that embeds Claude Code and its exact CLI version, for example `2.1.251`. Set both or neither. Without them, Claude runs stop for human intervention. |
 | `executor.cpus`, `executor.memory` | `4`, `8g` | CPU and memory allocated to each run sandbox. |
 | `executor.capacity_cpus`, `executor.capacity_memory` | `4`, `8g` | Host capacity reserved for all concurrent worker sandboxes. Startup rejects overcommit. |
 | `lease_seconds` | `900`; range `30..=86400` | Requested run lease. Must exceed three heartbeat intervals. |

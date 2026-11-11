@@ -38,7 +38,7 @@ separate image for each agent.
 
    ```sh
    sbx create --name claude-pin-check --template '<template>@sha256:<digest>' claude "$PWD"
-   sbx exec claude-pin-check claude --version   # for example: 2.1.246 (Claude Code)
+   sbx exec claude-pin-check claude --version   # for example: 2.1.251 (Claude Code)
    sbx rm --force claude-pin-check
    ```
 
@@ -48,7 +48,7 @@ separate image for each agent.
    "executor": {
      "kind": "docker_sandbox",
      "claude_template": "docker.io/docker/sandbox-templates@sha256:<digest>",
-     "claude_version": "2.1.246"
+     "claude_version": "2.1.251"
    }
    ```
 
