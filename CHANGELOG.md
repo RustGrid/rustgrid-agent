@@ -3,6 +3,15 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- New and recovered Docker Sandboxes allow Playwright's browser download CDNs
+  and redirect targets, npm, and Ubuntu/Debian system package repositories.
+  Codex and Claude Code can install Playwright and matching browsers inside
+  their sandbox without changing the host's global network policy.
+
 ## 1.11.0 - 2026-11-11
 
 ### Changed
