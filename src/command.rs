@@ -888,6 +888,7 @@ fn display_command(parts: &[String]) -> String {
                     .split_once('=')
                     .map_or_else(|| part.clone(), |(key, _)| format!("{key}=<redacted>"));
             }
+            let part = &redact_usage_token(part);
             if part
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-._/:=".contains(c))
@@ -901,9 +902,34 @@ fn display_command(parts: &[String]) -> String {
         .join(" ")
 }
 
+/// Hides the Codex usage receiver's token in a `-c otel.exporter=...` value.
+fn redact_usage_token(part: &str) -> String {
+    let marker = format!("\"{}\"=\"", crate::codex_usage::TOKEN_HEADER);
+    let Some(start) = part.find(&marker).map(|index| index + marker.len()) else {
+        return part.to_owned();
+    };
+    let end = part[start..]
+        .find('"')
+        .map_or(part.len(), |offset| start + offset);
+    format!("{}<redacted>{}", &part[..start], &part[end..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printed_commands_hide_the_codex_usage_token() {
+        let parts = [
+            "codex".to_owned(),
+            "-c".into(),
+            "otel.exporter={otlp-http={endpoint=\"http://127.0.0.1:4318/v1/logs\",protocol=\"json\",headers={\"x-rustgrid-usage-token\"=\"abc123\"}}}".into(),
+        ];
+        let shown = display_command(&parts);
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+        assert!(shown.contains("127.0.0.1:4318"));
+    }
 
     #[test]
     fn parses_without_a_shell() {

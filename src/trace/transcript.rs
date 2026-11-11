@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::redact::{redact, redact_truncated};
-use crate::agent::{canonical_usage, reported_exit_code, tool_item, tool_result_text};
+use crate::agent::{call_usage, reported_exit_code, tool_item, tool_result_text};
 use crate::execution::derived_progress_from_line;
 
 const MAX_PROMPT_CHARS: usize = 20_000;
@@ -296,17 +296,11 @@ fn assistant(
         message.get("id").and_then(Value::as_str),
         message.get("usage"),
     ) && !state.seen_messages.iter().any(|seen| seen == message_id)
-        && let Some(mut canonical) = canonical_usage(usage)
+        && let Some(canonical) = call_usage(usage)
     {
         state.seen_messages.push_back(message_id.to_owned());
         while state.seen_messages.len() > SEEN_MESSAGES {
             state.seen_messages.pop_front();
-        }
-        // RustGrid prices standard processing only and fails closed otherwise.
-        for field in ["service_tier", "inference_geo", "speed"] {
-            if let Some(value) = usage.get(field).filter(|value| value.is_string()) {
-                canonical[field] = value.clone();
-            }
         }
         items.push(TraceItem::ModelCall {
             message_id: message_id.to_owned(),

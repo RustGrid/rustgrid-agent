@@ -15,6 +15,7 @@ use crate::{
     agent::{AgentProvider, AgentStream},
     api::{self, AgentRun, ModelGatewayToken, RustGridClient, Ticket},
     architecture::{PlanVerdict, escalation_from_feedback},
+    codex_usage::CodexUsageReceiver,
     command,
     config::AppContext,
     executor::{ExecutionHandle, Executor, RunCommand},
@@ -469,6 +470,9 @@ pub(crate) fn run_agent_prompt(
             )?;
         }
     }
+    let codex_usage = (provider == AgentProvider::Codex)
+        .then(|| codex_usage_receiver(context))
+        .flatten();
     let agent_succeeded = loop {
         agent_sessions = agent_sessions.saturating_add(1);
         let agent_attempt = agent_sessions;
@@ -485,6 +489,16 @@ pub(crate) fn run_agent_prompt(
                 environment: Vec::new(),
             }
         };
+        // Exporting usage is not part of the agent's context, so telemetry
+        // sizes the session from the arguments without it.
+        let command_args = match &codex_usage {
+            Some((receiver, address)) => {
+                // Usage a previous session exported late belongs to that session.
+                receiver.take_calls();
+                with_codex_args(session_args.clone(), receiver.codex_args(address))
+            }
+            None => session_args.clone(),
+        };
         let session_started = Instant::now();
         let telemetry = RefCell::new(context.reporter.start_agent_telemetry(
             provider,
@@ -499,7 +513,7 @@ pub(crate) fn run_agent_prompt(
         let result = context.executor.streaming(
             context.executor_handle,
             RunCommand {
-                args: &session_args,
+                args: &command_args,
                 cwd: &context.repo.root,
                 stdin_text: Some(&session_prompt),
                 running: context.running,
@@ -518,6 +532,17 @@ pub(crate) fn run_agent_prompt(
             |raw_line| {
                 for line in stream.translate(raw_line) {
                 let line = line.as_str();
+                if let Some((receiver, _)) = &codex_usage {
+                    // A turn's last response is exported shortly after it ends.
+                    let calls = if is_turn_completion(line) {
+                        receiver.settle(Instant::now())
+                    } else {
+                        receiver.take_calls()
+                    };
+                    for call in calls {
+                        telemetry.borrow_mut().observe_line(&call);
+                    }
+                }
                 telemetry.borrow_mut().observe_line(line);
                 if let Some(command) = attempted_worker_owned_command(line, &policy.quality_gates) {
                     if let Some(reason) = ownership_override_reason.borrow_mut().take()
@@ -891,6 +916,42 @@ fn model_gateway_session(
             environment: codex_gateway_environment(&token),
         },
     })
+}
+
+/// Starts the receiver for Codex's per-response usage and resolves how Codex
+/// reaches it. Without it Codex still reports each turn's aggregate, so a
+/// failure here only costs the per-call detail.
+fn codex_usage_receiver(context: &AgentContext<'_>) -> Option<(CodexUsageReceiver, String)> {
+    let receiver = CodexUsageReceiver::start()
+        .map_err(|error| eprintln!("[warning] Codex per-call usage is unavailable: {error:#}"))
+        .ok()?;
+    let address = context
+        .executor
+        .worker_service_address(
+            context.executor_handle,
+            &context.repo.root,
+            context.running,
+            receiver.port(),
+        )
+        .map_err(|error| eprintln!("[warning] Codex per-call usage is unavailable: {error:#}"))
+        .ok()?;
+    Some((receiver, address))
+}
+
+/// Inserts Codex configuration overrides before the stdin prompt marker.
+fn with_codex_args(mut args: Vec<String>, overrides: Vec<String>) -> Vec<String> {
+    let insertion = args
+        .iter()
+        .position(|part| part == "-")
+        .unwrap_or(args.len());
+    args.splice(insertion..insertion, overrides);
+    args
+}
+
+fn is_turn_completion(line: &str) -> bool {
+    line.contains("\"turn.completed\"")
+        && serde_json::from_str::<serde_json::Value>(line)
+            .is_ok_and(|event| event["type"] == "turn.completed")
 }
 
 /// One agent session's command line and run-scoped gateway environment.
@@ -1875,6 +1936,38 @@ pub(crate) fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_overrides_go_before_the_stdin_prompt() {
+        let args = ["codex", "exec", "--json", "-"].map(String::from).to_vec();
+        assert_eq!(
+            with_codex_args(args, vec!["-c".into(), "otel.log_user_prompt=false".into()]),
+            [
+                "codex",
+                "exec",
+                "--json",
+                "-c",
+                "otel.log_user_prompt=false",
+                "-"
+            ]
+        );
+        let without_marker = ["codex", "exec"].map(String::from).to_vec();
+        assert_eq!(
+            with_codex_args(without_marker, vec!["-c".into(), "x=1".into()]),
+            ["codex", "exec", "-c", "x=1"]
+        );
+    }
+
+    #[test]
+    fn turn_completion_is_matched_by_event_type_only() {
+        assert!(is_turn_completion(
+            r#"{"type":"turn.completed","usage":{}}"#
+        ));
+        assert!(!is_turn_completion(
+            r#"{"type":"item.completed","item":{"text":"\"turn.completed\""}}"#
+        ));
+        assert!(!is_turn_completion("turn.completed"));
+    }
 
     #[test]
     fn extracts_only_agent_feedback_from_codex_jsonl() {

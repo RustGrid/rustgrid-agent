@@ -275,6 +275,38 @@ pub(crate) struct NormalizedUsage {
     raw: Option<Map<String, Value>>,
 }
 
+impl NormalizedUsage {
+    /// What this aggregate holds beyond the calls already reported, or `None`
+    /// when they cover all of it. Providers aggregate a turn's calls, so a
+    /// remainder is usage no single call reported.
+    fn remainder_after(&self, reported: TokenConsumption) -> Option<Self> {
+        let input = self.input_tokens?.saturating_sub(reported.input_tokens);
+        let output = self
+            .output_tokens
+            .unwrap_or(0)
+            .saturating_sub(reported.output_tokens);
+        let cached = self
+            .cached_input_tokens
+            .unwrap_or(0)
+            .saturating_sub(reported.cached_input_tokens)
+            .min(input);
+        if input == 0 && output == 0 {
+            return None;
+        }
+        let mut raw = Map::new();
+        raw.insert("turn_aggregate_remainder".into(), Value::Bool(true));
+        Some(Self {
+            input_tokens: Some(input),
+            cached_input_tokens: Some(cached),
+            output_tokens: Some(output),
+            reasoning_tokens: None,
+            total_tokens: input.checked_add(output),
+            source: Some(UsageSource::WorkerCalculated),
+            raw: Some(raw),
+        })
+    }
+}
+
 pub(crate) trait UsageAdapter {
     fn normalize_usage(&self, event: &Value) -> NormalizedUsage;
 }
@@ -335,17 +367,26 @@ fn optional_count(value: &Map<String, Value>, field: &str) -> Option<u64> {
     value.get(field).and_then(Value::as_u64)
 }
 
+/// Usage fields that are short identifiers rather than counts. RustGrid prices
+/// by them (standard processing only), so they travel with the counts.
+const PRICING_IDENTIFIERS: [&str; 3] = ["service_tier", "inference_geo", "speed"];
+
 fn safe_usage_payload(usage: &Map<String, Value>) -> Option<Map<String, Value>> {
     let safe = usage
         .iter()
-        .filter(|(key, value)| {
+        .filter(|(key, _)| {
             key.len() <= 80
                 && key
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_')
-                && matches!(value, Value::Null | Value::Bool(_) | Value::Number(_))
         })
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .filter_map(|(key, value)| match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => Some((key.clone(), value.clone())),
+            Value::String(text) if PRICING_IDENTIFIERS.contains(&key.as_str()) => {
+                safe_identifier(text, 40).map(|text| (key.clone(), Value::String(text)))
+            }
+            _ => None,
+        })
         .collect::<Map<_, _>>();
     (!safe.is_empty()
         && serde_json::to_vec(&safe).is_ok_and(|bytes| bytes.len() <= MAX_RAW_USAGE_BYTES))
@@ -601,12 +642,41 @@ fn sync_directory(_path: &Path) -> Result<()> {
 
 struct ActiveTurn {
     id: Uuid,
-    model_call_id: Uuid,
     index: u32,
     started_at: String,
     context_tokens_before_call: Option<u64>,
     context_window_limit: Option<u64>,
     narration_characters: u64,
+    /// The model call started but not yet completed, if any.
+    open_call: Option<OpenCall>,
+    next_call_index: u32,
+    /// Usage of the calls the agent reported one by one during this turn.
+    /// The turn's aggregate only adds what these did not already cover.
+    reported_calls: u32,
+    reported_usage: TokenConsumption,
+}
+
+struct OpenCall {
+    id: Uuid,
+    index: u32,
+    started_at: String,
+}
+
+/// Everything about one model call that varies between its snapshots.
+struct CallRecord {
+    id: Uuid,
+    turn_index: u32,
+    call_index: u32,
+    started_at: String,
+    completed_at: Option<String>,
+    status: ModelCallStatus,
+    model: Option<String>,
+    usage: Option<NormalizedUsage>,
+    context_tokens_before_call: Option<u64>,
+    context_window_limit: Option<u64>,
+    finish_reason: Option<String>,
+    provider_request_id: Option<String>,
+    granularity: CaptureGranularity,
 }
 
 struct ActiveTool {
@@ -700,6 +770,11 @@ impl AgentTelemetrySession {
                 }
                 self.start_turn(&event);
             }
+            // A call reported after its turn ended is already in that turn's
+            // aggregate, so only calls inside a turn are counted.
+            Some("model_call.completed") if self.active_turn.is_some() => {
+                self.complete_call(&event);
+            }
             Some("turn.completed") => {
                 if self.active_turn.is_none() {
                     self.start_turn(&event);
@@ -741,7 +816,7 @@ impl AgentTelemetrySession {
         }
         if self.active_turn.is_some() {
             self.finish_turn(outcome, None, None);
-        } else if self.last_model_call_id.is_none() {
+        } else if self.next_turn_index == 0 {
             self.start_turn(&Value::Null);
             self.finish_turn(outcome, None, None);
         }
@@ -766,6 +841,11 @@ impl AgentTelemetrySession {
             },
         );
         self.finished = true;
+    }
+
+    /// The agent's own session id, such as the Codex thread id.
+    pub fn agent_session_id(&self) -> Option<Uuid> {
+        self.agent_id
     }
 
     pub fn last_model_call_id(&self) -> Option<Uuid> {
@@ -804,7 +884,6 @@ impl AgentTelemetrySession {
         let index = self.next_turn_index;
         self.next_turn_index = self.next_turn_index.saturating_add(1);
         let id = stable_uuid(&format!("execution:{}:turn:{index}", self.execution_id));
-        let model_call_id = stable_uuid(&format!("turn:{id}:model_call:0"));
         let started_at = now_rfc3339();
         let context_window_limit = event.get("model_context_window").and_then(Value::as_u64);
         let context_tokens_before_call = event
@@ -816,14 +895,16 @@ impl AgentTelemetrySession {
             .max(context_tokens_before_call.unwrap_or(0));
         self.active_turn = Some(ActiveTurn {
             id,
-            model_call_id,
             index,
             started_at: started_at.clone(),
             context_tokens_before_call,
             context_window_limit,
             narration_characters: 0,
+            open_call: None,
+            next_call_index: 0,
+            reported_calls: 0,
+            reported_usage: TokenConsumption::default(),
         });
-        self.last_model_call_id = Some(model_call_id);
         self.emit(
             "turn.started",
             1,
@@ -841,24 +922,117 @@ impl AgentTelemetrySession {
                 },
             },
         );
+        self.open_call();
+    }
+
+    /// Starts the turn's next model call. Its id for call 0 is the id a turn's
+    /// single aggregate call always had, so earlier reports stay idempotent.
+    fn open_call(&mut self) {
+        self.open_call_at(None);
+    }
+
+    fn open_call_at(&mut self, started_at: Option<String>) {
+        let Some(turn) = self.active_turn.as_mut() else {
+            return;
+        };
+        if turn.open_call.is_some() {
+            return;
+        }
+        let index = turn.next_call_index;
+        turn.next_call_index = turn.next_call_index.saturating_add(1);
+        let id = stable_uuid(&format!("turn:{}:model_call:{index}", turn.id));
+        let started_at = started_at.unwrap_or_else(now_rfc3339);
+        turn.open_call = Some(OpenCall {
+            id,
+            index,
+            started_at: started_at.clone(),
+        });
+        let record = CallRecord {
+            id,
+            turn_index: turn.index,
+            call_index: index,
+            started_at: started_at.clone(),
+            completed_at: None,
+            status: ModelCallStatus::InProgress,
+            model: None,
+            usage: None,
+            context_tokens_before_call: turn.context_tokens_before_call,
+            context_window_limit: turn.context_window_limit,
+            finish_reason: None,
+            provider_request_id: None,
+            granularity: CaptureGranularity::TurnAggregate,
+        };
+        self.last_model_call_id = Some(id);
         self.emit(
             "model_call.started",
             1,
-            model_call_id,
+            id,
             &started_at,
             TelemetryPayload::ModelCall {
-                model_call: Box::new(self.model_snapshot(
-                    model_call_id,
-                    index,
-                    &started_at,
-                    None,
-                    ModelCallStatus::InProgress,
-                    None,
-                    context_tokens_before_call,
-                    context_window_limit,
-                    None,
-                    None,
-                )),
+                model_call: Box::new(self.model_snapshot(record)),
+            },
+        );
+    }
+
+    /// Reports one provider API call as it completes, with the session's
+    /// running totals, so consumption is visible over the session. A call read
+    /// back from a record carries the times the provider recorded.
+    fn complete_call(&mut self, event: &Value) {
+        let recorded_at = |field: &str| {
+            event
+                .get(field)
+                .and_then(Value::as_str)
+                .and_then(safe_timestamp)
+        };
+        let started_at = recorded_at("started_at");
+        let completed_at = recorded_at("completed_at").unwrap_or_else(now_rfc3339);
+        let usage = CodexUsageAdapter.normalize_usage(event);
+        let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens) else {
+            return;
+        };
+        let cached = usage.cached_input_tokens.unwrap_or(0);
+        if let Err(error) = self.legacy_delta.add_counts(input, cached, output) {
+            eprintln!("[warning] legacy token aggregate overflowed: {error:#}");
+            return;
+        }
+        self.open_call_at(started_at);
+        let Some(turn) = self.active_turn.as_mut() else {
+            return;
+        };
+        let _ = turn.reported_usage.add_counts(input, cached, output);
+        turn.reported_calls = turn.reported_calls.saturating_add(1);
+        let call = turn.open_call.take().expect("call opened above");
+        let record = CallRecord {
+            id: call.id,
+            turn_index: turn.index,
+            call_index: call.index,
+            started_at: call.started_at,
+            completed_at: Some(completed_at.clone()),
+            status: ModelCallStatus::Success,
+            model: event
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|value| safe_identifier(value, 120)),
+            usage: Some(usage),
+            context_tokens_before_call: Some(input),
+            context_window_limit: turn.context_window_limit,
+            finish_reason: event
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .and_then(|value| safe_identifier(value, 80)),
+            provider_request_id: event
+                .get("provider_request_id")
+                .and_then(Value::as_str)
+                .and_then(|value| safe_identifier(value, 160)),
+            granularity: CaptureGranularity::ModelCall,
+        };
+        self.emit(
+            "model_call.completed",
+            2,
+            record.id,
+            &completed_at,
+            TelemetryPayload::ModelCall {
+                model_call: Box::new(self.model_snapshot(record)),
             },
         );
     }
@@ -882,6 +1056,23 @@ impl AgentTelemetrySession {
             source: Some(UsageSource::Unavailable),
             ..NormalizedUsage::default()
         });
+        if turn.reported_calls > 0 {
+            // The calls were already reported one by one. Only usage the
+            // aggregate holds beyond them is left to report.
+            match usage.remainder_after(turn.reported_usage) {
+                Some(remainder) => usage = remainder,
+                None if matches!(outcome, SessionOutcome::Succeeded) => {
+                    self.close_turn(turn, outcome, &completed_at);
+                    return;
+                }
+                None => {
+                    usage = NormalizedUsage {
+                        source: Some(UsageSource::Unavailable),
+                        ..NormalizedUsage::default()
+                    };
+                }
+            }
+        }
         let raw = usage.raw.get_or_insert_with(Map::new);
         raw.extend(self.invocation.context_estimates.clone());
         raw.insert(
@@ -908,37 +1099,48 @@ impl AgentTelemetrySession {
             })
             .and_then(Value::as_str)
             .and_then(|value| safe_identifier(value, 160));
-        let model_status = model_status(outcome);
         let model_event_type = if matches!(outcome, SessionOutcome::Succeeded) {
             "model_call.completed"
         } else {
             "model_call.failed"
         };
+        self.active_turn = Some(turn);
+        self.open_call();
+        let mut turn = self.active_turn.take().expect("turn restored above");
+        let call = turn.open_call.take().expect("call opened above");
+        let record = CallRecord {
+            id: call.id,
+            turn_index: turn.index,
+            call_index: call.index,
+            started_at: call.started_at,
+            completed_at: Some(completed_at.clone()),
+            status: model_status(outcome),
+            model: None,
+            usage: Some(usage),
+            context_tokens_before_call: turn.context_tokens_before_call,
+            context_window_limit: turn.context_window_limit,
+            finish_reason,
+            provider_request_id,
+            granularity: CaptureGranularity::TurnAggregate,
+        };
         self.emit(
             model_event_type,
             2,
-            turn.model_call_id,
+            record.id,
             &completed_at,
             TelemetryPayload::ModelCall {
-                model_call: Box::new(self.model_snapshot(
-                    turn.model_call_id,
-                    turn.index,
-                    &turn.started_at,
-                    Some(completed_at.clone()),
-                    model_status,
-                    Some(usage),
-                    turn.context_tokens_before_call,
-                    turn.context_window_limit,
-                    finish_reason,
-                    provider_request_id,
-                )),
+                model_call: Box::new(self.model_snapshot(record)),
             },
         );
+        self.close_turn(turn, outcome, &completed_at);
+    }
+
+    fn close_turn(&mut self, turn: ActiveTurn, outcome: SessionOutcome, completed_at: &str) {
         self.emit(
             "turn.completed",
             2,
             turn.id,
-            &completed_at,
+            completed_at,
             TelemetryPayload::Turn {
                 turn: TurnSnapshot {
                     id: turn.id,
@@ -946,7 +1148,7 @@ impl AgentTelemetrySession {
                     phase_id: Some(self.phase_id),
                     turn_index: turn.index,
                     started_at: Some(turn.started_at),
-                    completed_at: Some(completed_at.clone()),
+                    completed_at: Some(completed_at.to_owned()),
                     status: execution_status(outcome),
                 },
             },
@@ -977,7 +1179,7 @@ impl AgentTelemetrySession {
             turn_index: turn.index,
             started_at: started_at.clone(),
             request_bytes: tool_request_bytes(item),
-            related_model_call_id: Some(turn.model_call_id),
+            related_model_call_id: self.last_model_call_id,
         };
         self.emit(
             "tool_call.started",
@@ -1054,20 +1256,22 @@ impl AgentTelemetrySession {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn model_snapshot(
-        &self,
-        id: Uuid,
-        turn_index: u32,
-        started_at: &str,
-        completed_at: Option<String>,
-        status: ModelCallStatus,
-        usage: Option<NormalizedUsage>,
-        context_tokens_before_call: Option<u64>,
-        context_window_limit: Option<u64>,
-        finish_reason: Option<String>,
-        provider_request_id: Option<String>,
-    ) -> ModelCallSnapshot {
+    fn model_snapshot(&self, record: CallRecord) -> ModelCallSnapshot {
+        let CallRecord {
+            id,
+            turn_index,
+            call_index,
+            started_at,
+            completed_at,
+            status,
+            model,
+            usage,
+            context_tokens_before_call,
+            context_window_limit,
+            finish_reason,
+            provider_request_id,
+            granularity,
+        } = record;
         let usage = usage.unwrap_or_default();
         ModelCallSnapshot {
             id,
@@ -1077,10 +1281,10 @@ impl AgentTelemetrySession {
             phase_id: Some(self.phase_id),
             phase_name: Some(self.invocation.phase_name.clone()),
             turn_index,
-            call_index: 0,
+            call_index,
             provider: self.invocation.provider.clone(),
-            model: self.invocation.model.clone(),
-            started_at: started_at.to_owned(),
+            model: model.unwrap_or_else(|| self.invocation.model.clone()),
+            started_at,
             completed_at,
             status,
             input_tokens: usage.input_tokens,
@@ -1109,7 +1313,7 @@ impl AgentTelemetrySession {
             provider_request_id,
             provider_usage_payload: usage.raw,
             usage_source: usage.source.unwrap_or(UsageSource::Unavailable),
-            capture_granularity: CaptureGranularity::TurnAggregate,
+            capture_granularity: granularity,
         }
     }
 
@@ -1294,6 +1498,20 @@ fn tool_error_code(item: &Value) -> Option<String> {
             Value::Number(value) => Some(value.to_string()),
             _ => None,
         })
+}
+
+/// An RFC 3339 UTC timestamp as providers record them, such as
+/// `2026-11-08T21:18:55.758Z`.
+fn safe_timestamp(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let shaped = (20..=35).contains(&bytes.len())
+        && bytes[4] == b'-'
+        && bytes[10] == b'T'
+        && value.ends_with('Z')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || b"-:.TZ".contains(byte));
+    shaped.then(|| value.to_owned())
 }
 
 fn safe_identifier(value: &str, max: usize) -> Option<String> {
@@ -1516,6 +1734,179 @@ mod tests {
                 output_tokens: 25,
             }
         );
+    }
+
+    fn recording_session(run_id: &str) -> (AgentTelemetrySession, mpsc::Receiver<EmitterMessage>) {
+        let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let emitter = TelemetryEmitter {
+            sender,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+        };
+        let session = AgentTelemetrySession::start(
+            AgentInvocation {
+                agent_name: "Claude Code".into(),
+                run_id: run_id.into(),
+                execution_sequence: 1,
+                phase_name: "implementation".into(),
+                provider: "anthropic".into(),
+                model: "claude-opus-5-5".into(),
+                attempt_number: 1,
+                retry_of_call_id: None,
+                context_estimates: Map::new(),
+            },
+            Some(emitter),
+        );
+        (session, receiver)
+    }
+
+    fn completed_calls(receiver: &mpsc::Receiver<EmitterMessage>) -> Vec<ModelCallSnapshot> {
+        receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                EmitterMessage::Event { event, .. } => Some(*event),
+                EmitterMessage::Flush(_) => None,
+            })
+            .filter(|event| event.event_type == "model_call.completed")
+            .map(|event| match event.payload {
+                TelemetryPayload::ModelCall { model_call } => *model_call,
+                _ => panic!("model_call.completed must contain a model call payload"),
+            })
+            .collect()
+    }
+
+    const CALL_A: &str = r#"{"type":"model_call.completed","id":"msg_a","model":"claude-opus-5-5","finish_reason":"tool_use","usage":{"input_tokens":30000,"cached_input_tokens":29000,"output_tokens":200,"total_tokens":30200,"service_tier":"standard"}}"#;
+    const CALL_B: &str = r#"{"type":"model_call.completed","id":"msg_b","model":"claude-haiku-5-5","usage":{"input_tokens":31000,"cached_input_tokens":30000,"output_tokens":50,"total_tokens":31050}}"#;
+
+    #[test]
+    fn each_model_call_is_reported_as_it_completes_with_running_totals() {
+        let (mut session, receiver) = recording_session("run-calls");
+        session.observe_line(r#"{"type":"turn.started"}"#);
+        session.observe_line(CALL_A);
+        let first = completed_calls(&receiver);
+        assert_eq!(
+            first.len(),
+            1,
+            "the call is reported before the session ends"
+        );
+        assert_eq!(session.budget_usage(0, 0).output_tokens, 200);
+
+        session.observe_line(CALL_B);
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":61000,"cached_input_tokens":59000,"output_tokens":250,"total_tokens":61250}}"#,
+        );
+        session.finish(SessionOutcome::Succeeded);
+        let calls = first
+            .into_iter()
+            .chain(completed_calls(&receiver))
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 2, "a fully covered aggregate adds no call");
+        assert_eq!(
+            calls.iter().map(|call| call.call_index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(calls[0].model, "claude-opus-5-5");
+        assert_eq!(calls[1].model, "claude-haiku-5-5");
+        assert_eq!(calls[0].finish_reason.as_deref(), Some("tool_use"));
+        assert!(matches!(
+            calls[0].capture_granularity,
+            CaptureGranularity::ModelCall
+        ));
+        assert_eq!(
+            calls[0]
+                .provider_usage_payload
+                .as_ref()
+                .and_then(|payload| payload.get("service_tier"))
+                .and_then(Value::as_str),
+            Some("standard")
+        );
+        assert_eq!(calls[0].output_tokens, Some(200));
+        assert_eq!(calls[0].cumulative_output_tokens, 200);
+        assert_eq!(calls[1].cumulative_output_tokens, 250);
+        assert_eq!(calls[1].cumulative_input_tokens, 61_000);
+        assert_eq!(calls[1].cumulative_cached_input_tokens, 59_000);
+        assert_eq!(
+            session.take_legacy_delta(),
+            TokenConsumption {
+                input_tokens: 61_000,
+                cached_input_tokens: 59_000,
+                output_tokens: 250,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_the_calls_did_not_cover_is_reported_once_at_the_end() {
+        let (mut session, receiver) = recording_session("run-remainder");
+        session.observe_line(r#"{"type":"turn.started"}"#);
+        session.observe_line(CALL_A);
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":32000,"cached_input_tokens":29500,"output_tokens":260}}"#,
+        );
+        session.finish(SessionOutcome::Succeeded);
+        let calls = completed_calls(&receiver);
+
+        assert_eq!(calls.len(), 2);
+        let remainder = &calls[1];
+        assert_eq!(remainder.call_index, 1);
+        assert_eq!(remainder.input_tokens, Some(2_000));
+        assert_eq!(remainder.cached_input_tokens, Some(500));
+        assert_eq!(remainder.output_tokens, Some(60));
+        assert!(matches!(
+            remainder.usage_source,
+            UsageSource::WorkerCalculated
+        ));
+        assert_eq!(remainder.cumulative_input_tokens, 32_000);
+        assert_eq!(remainder.cumulative_output_tokens, 260);
+        assert_eq!(
+            session.take_legacy_delta(),
+            TokenConsumption {
+                input_tokens: 32_000,
+                cached_input_tokens: 29_500,
+                output_tokens: 260,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_calls_read_back_keep_the_times_codex_recorded() {
+        let (mut session, receiver) = recording_session("run-codex");
+        session.observe_line(r#"{"type":"turn.started"}"#);
+        session.observe_line(
+            r#"{"type":"model_call.completed","completed_at":"2026-11-08T21:18:55.758Z","usage":{"input_tokens":25838,"cached_input_tokens":13056,"output_tokens":194}}"#,
+        );
+        session.observe_line(
+            r#"{"type":"model_call.completed","started_at":"2026-11-08T21:18:55.758Z","completed_at":"2026-11-08T21:18:59.994Z","usage":{"input_tokens":27585,"cached_input_tokens":13056,"output_tokens":79}}"#,
+        );
+        session.observe_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":53423,"cached_input_tokens":26112,"output_tokens":273}}"#,
+        );
+        session.finish(SessionOutcome::Succeeded);
+        let calls = completed_calls(&receiver);
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].completed_at.as_deref(),
+            Some("2026-11-08T21:18:55.758Z")
+        );
+        assert_eq!(calls[1].started_at, "2026-11-08T21:18:55.758Z");
+        assert_eq!(
+            calls[1].completed_at.as_deref(),
+            Some("2026-11-08T21:18:59.994Z")
+        );
+        assert_eq!(calls[1].model, "claude-opus-5-5", "the invocation's model");
+        assert_eq!(calls[1].cumulative_input_tokens, 53_423);
+        assert_eq!(calls[1].cumulative_output_tokens, 273);
+    }
+
+    #[test]
+    fn only_timestamps_shaped_like_rfc3339_are_kept() {
+        assert!(safe_timestamp("2026-11-08T21:18:55.758Z").is_some());
+        assert!(safe_timestamp("2026-11-08T21:18:55Z").is_some());
+        assert!(safe_timestamp("2026-11-08 21:18:55").is_none());
+        assert!(safe_timestamp("2026-11-08T21:18:55.758Z<script>").is_none());
+        assert!(safe_timestamp("").is_none());
     }
 
     #[test]

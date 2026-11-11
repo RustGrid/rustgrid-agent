@@ -8,8 +8,15 @@
 //! downstream guard (worker-owned command detection, focused-validation
 //! evidence, completion readiness, token accounting) applies to both agents
 //! without a second implementation.
+//!
+//! One event is the worker's own addition: `model_call.completed` carries the
+//! usage of a single provider API call (`id`, `model`, `finish_reason`,
+//! `usage` in the canonical `turn.completed` shape). It is emitted as each call
+//! finishes, so telemetry can report consumption over the session instead of
+//! once at the end. The turn's aggregate usage still follows on
+//! `turn.completed`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -135,6 +142,9 @@ pub(crate) fn claude_output_is_meaningful_activity(line: &str) -> bool {
 #[derive(Default)]
 pub(crate) struct ClaudeStreamTranslator {
     pending: HashMap<String, Value>,
+    /// API messages whose usage was already reported. Claude Code repeats a
+    /// message's usage on every content-block record it streams for it.
+    reported_calls: HashSet<String>,
 }
 
 impl ClaudeStreamTranslator {
@@ -190,6 +200,9 @@ impl ClaudeStreamTranslator {
             .and_then(Value::as_str)
             .unwrap_or("message");
         let mut events = Vec::new();
+        if let Some(call) = self.model_call(event) {
+            events.push(call);
+        }
         for (index, block) in content_blocks(event).iter().enumerate() {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
@@ -224,6 +237,27 @@ impl ClaudeStreamTranslator {
             }
         }
         events
+    }
+
+    /// The usage of one Anthropic API call, the first time its message is seen.
+    /// Every record of a message carries the message's final usage, and the
+    /// records only stream once the message is complete.
+    fn model_call(&mut self, event: &Value) -> Option<Value> {
+        let message = event.get("message")?;
+        let message_id = message.get("id").and_then(Value::as_str)?;
+        if self.reported_calls.contains(message_id) {
+            return None;
+        }
+        let usage = message.get("usage").and_then(call_usage)?;
+        self.reported_calls.insert(message_id.to_owned());
+        let mut call = json!({"type": "model_call.completed", "id": message_id, "usage": usage});
+        if let Some(model) = message.get("model").and_then(Value::as_str) {
+            call["model"] = json!(model);
+        }
+        if let Some(reason) = message.get("stop_reason").and_then(Value::as_str) {
+            call["finish_reason"] = json!(reason);
+        }
+        Some(call)
     }
 
     fn tool_results(&mut self, event: &Value) -> Vec<Value> {
@@ -418,6 +452,19 @@ pub(crate) fn canonical_usage(usage: &Value) -> Option<Value> {
     Some(canonical)
 }
 
+/// The canonical usage of one Anthropic API call, keeping the processing
+/// fields RustGrid prices by. RustGrid prices standard processing only and
+/// fails closed otherwise, so these must travel with every call.
+pub(crate) fn call_usage(usage: &Value) -> Option<Value> {
+    let mut canonical = canonical_usage(usage)?;
+    for field in ["service_tier", "inference_geo", "speed"] {
+        if let Some(value) = usage.get(field).filter(|value| value.is_string()) {
+            canonical[field] = value.clone();
+        }
+    }
+    Some(canonical)
+}
+
 /// Resolves the telemetry vendor and model from a Claude Code command line.
 pub(crate) fn claude_vendor_and_model(args: &[String]) -> (String, String) {
     let mut model = None;
@@ -531,6 +578,40 @@ mod tests {
         assert_eq!(usage["output_tokens"], 419);
         assert_eq!(usage["reasoning_output_tokens"], 164);
         assert_eq!(usage["total_tokens"], 18 + 64_807 + 1_200 + 419);
+    }
+
+    #[test]
+    fn each_api_call_reports_its_usage_once_as_it_completes() {
+        let usage = r#""usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":30000,"output_tokens":207,"service_tier":"standard"}"#;
+        let thinking = format!(
+            r#"{{"type":"assistant","message":{{"id":"msg_a","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{{"type":"thinking","thinking":"plan"}}],{usage}}}}}"#
+        );
+        let tool = format!(
+            r#"{{"type":"assistant","message":{{"id":"msg_a","model":"claude-opus-5-5","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_9","name":"Bash","input":{{"command":"ls"}}}}],{usage}}}}}"#
+        );
+        let reply = r#"{"type":"assistant","message":{"id":"msg_b","model":"claude-haiku-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":5,"cache_read_input_tokens":30300,"output_tokens":12}}}"#;
+        let events = translate_all(&[INIT, &thinking, &tool, reply]);
+        let calls = events
+            .iter()
+            .filter(|event| event["type"] == "model_call.completed")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "one call per API message, not per record");
+        assert_eq!(calls[0]["id"], "msg_a");
+        assert_eq!(calls[0]["model"], "claude-opus-5-5");
+        assert_eq!(calls[0]["finish_reason"], "tool_use");
+        assert_eq!(calls[0]["usage"]["input_tokens"], 2 + 100 + 30_000);
+        assert_eq!(calls[0]["usage"]["cached_input_tokens"], 30_000);
+        assert_eq!(calls[0]["usage"]["cache_creation_input_tokens"], 100);
+        assert_eq!(calls[0]["usage"]["output_tokens"], 207);
+        assert_eq!(calls[0]["usage"]["service_tier"], "standard");
+        assert_eq!(calls[1]["model"], "claude-haiku-5-5");
+        assert_eq!(calls[1]["usage"]["output_tokens"], 12);
+        // The call is reported before the tool call it requested.
+        let call_position = events.iter().position(|event| event["id"] == "msg_a");
+        let tool_position = events
+            .iter()
+            .position(|event| event["type"] == "item.started");
+        assert!(call_position < tool_position);
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod api;
 pub mod architecture;
 pub mod attachments;
 pub mod auth;
+mod codex_usage;
 pub mod command;
 pub mod config;
 pub mod coordinator;
