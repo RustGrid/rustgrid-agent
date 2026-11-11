@@ -3,6 +3,29 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## 1.11.0 - 2026-11-11
+
+### Changed
+
+- Cloud runs report token usage once per model call while the session runs,
+  instead of once at the end, so RustGrid's consumption and cost over time
+  show every call. Claude Code calls come from each `assistant` message's
+  usage. Codex calls come from Codex's OpenTelemetry `response.completed`
+  logs, which the worker receives on `127.0.0.1` with a per-step token; only
+  token counts, model and service tier are kept. In a Docker Sandbox the
+  worker allows `localhost:<port>` for that sandbox only.
+- When a turn ends, the provider's aggregate usage is reconciled with the
+  calls already reported, so totals still match billing. Without a per-call
+  source the aggregate is reported as before.
+- Budget advisories can fire during a session, since token counts now grow
+  as calls complete. Codex turns wait up to 3 seconds at the end for the last
+  usage export.
+
+### Security
+
+- The container image pins Claude Code 2.1.251, which fixes
+  GHSA-5xjx-9qx6-jcrv (High) in 2.1.246.
+
 ## 1.10.0 - 2026-11-09
 
 ### Changed
