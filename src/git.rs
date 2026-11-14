@@ -111,6 +111,11 @@ impl Repo {
         Ok(())
     }
 
+    /// The branch prefix configured for this repository.
+    pub fn branch_prefix(&self) -> String {
+        branch_prefix(&self.root)
+    }
+
     pub fn local_branch_exists(&self, branch: &str) -> Result<bool> {
         Ok(command::capture(
             "git",
@@ -567,6 +572,18 @@ fn parse_porcelain_z(bytes: &[u8]) -> BTreeSet<String> {
     paths
 }
 
+/// Longest slug a branch name segment gets, in bytes.
+const SLUG_LIMIT: usize = 48;
+
+/// The branch prefix used when the repository sets none.
+pub const DEFAULT_BRANCH_PREFIX: &str = "agent";
+
+/// The Git config key that sets the branch prefix, per repository or with
+/// `--global` for every repository.
+pub const BRANCH_PREFIX_KEY: &str = "rustgrid.branchPrefix";
+
+/// Lowercase ASCII words joined by dashes. Long values are cut at the last
+/// whole word within the limit, so a name never ends mid-word.
 pub fn slug(value: &str) -> String {
     let mut output = String::new();
     let mut dash = false;
@@ -578,24 +595,57 @@ pub fn slug(value: &str) -> String {
             output.push('-');
             dash = true;
         }
-        if output.len() >= 48 {
-            break;
-        }
     }
-    output.trim_matches('-').to_owned()
+    let output = output.trim_matches('-');
+    if output.len() <= SLUG_LIMIT {
+        return output.to_owned();
+    }
+    // A dash right after the limit means the word at the limit is whole.
+    let cut = output[..=SLUG_LIMIT]
+        .rfind('-')
+        .filter(|&index| index > 0)
+        .unwrap_or(SLUG_LIMIT);
+    output[..cut].trim_end_matches('-').to_owned()
 }
 
-pub fn branch_name(key: &str, title: &str) -> String {
+/// A branch prefix made safe for a ref name: each `/`-separated part is
+/// slugged and empty parts are dropped. Falls back to the default.
+pub fn normalize_branch_prefix(value: &str) -> String {
+    let prefix = value
+        .split('/')
+        .map(slug)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if prefix.is_empty() {
+        DEFAULT_BRANCH_PREFIX.to_owned()
+    } else {
+        prefix
+    }
+}
+
+/// The branch prefix Git config sets for the repository at `dir`, or the
+/// default. Repository config wins over `--global`, as usual for Git.
+pub fn branch_prefix(dir: &Path) -> String {
+    let configured = command::capture("git", ["config", "--get", BRANCH_PREFIX_KEY], dir)
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    normalize_branch_prefix(configured.trim())
+}
+
+pub fn branch_name(prefix: &str, key: &str, title: &str) -> String {
     let key = slug(key);
     let title = slug(title);
-    format!("agent/{key}-{title}")
+    format!("{prefix}/{key}-{title}")
         .trim_end_matches('-')
         .to_owned()
 }
 
-pub fn fresh_branch_name(key: &str, title: &str, run_id: &str) -> String {
+pub fn fresh_branch_name(prefix: &str, key: &str, title: &str, run_id: &str) -> String {
     let run_id = slug(run_id);
-    format!("{}-{run_id}", branch_name(key, title))
+    format!("{}-{run_id}", branch_name(prefix, key, title))
         .trim_end_matches('-')
         .to_owned()
 }
@@ -617,6 +667,7 @@ pub struct RunBranch {
 /// and otherwise a branch named for the run, with the existing one reported
 /// as stale.
 pub fn choose_run_branch(
+    prefix: &str,
     key: &str,
     title: &str,
     run_id: &str,
@@ -630,14 +681,14 @@ pub fn choose_run_branch(
             stale: None,
         });
     }
-    let fresh = || fresh_branch_name(key, title, run_id);
+    let fresh = || fresh_branch_name(prefix, key, title, run_id);
     if fresh_start {
         return Ok(RunBranch {
             name: fresh(),
             stale: None,
         });
     }
-    let usual = branch_name(key, title);
+    let usual = branch_name(prefix, key, title);
     if branch_exists(&usual)? {
         return Ok(RunBranch {
             name: fresh(),
@@ -677,15 +728,77 @@ mod tests {
     #[test]
     fn creates_safe_branch_names() {
         assert_eq!(
-            branch_name("RG-42", "Fix the Café / API!"),
+            branch_name("agent", "RG-42", "Fix the Café / API!"),
             "agent/rg-42-fix-the-caf-api"
         );
     }
 
     #[test]
+    fn long_titles_are_cut_at_a_whole_word() {
+        assert_eq!(
+            branch_name(
+                "agent",
+                "ADD-437",
+                "redesign the UI/UX of sign in and registration dialog with the new flat design",
+            ),
+            "agent/add-437-redesign-the-ui-ux-of-sign-in-and-registration"
+        );
+        // A word ending exactly at the limit is kept whole.
+        let exact = format!("{} tail", "a".repeat(SLUG_LIMIT));
+        assert_eq!(slug(&exact), "a".repeat(SLUG_LIMIT));
+        // A single word longer than the limit is cut at the limit.
+        assert_eq!(slug(&"b".repeat(60)), "b".repeat(SLUG_LIMIT));
+    }
+
+    #[test]
+    fn branch_names_use_the_given_prefix() {
+        assert_eq!(
+            branch_name("rustgrid", "ADD-12", "Fix login"),
+            "rustgrid/add-12-fix-login"
+        );
+        assert_eq!(
+            fresh_branch_name("team/bots", "ADD-12", "Fix login", "run-1"),
+            "team/bots/add-12-fix-login-run-1"
+        );
+    }
+
+    #[test]
+    fn branch_prefixes_are_made_ref_safe() {
+        assert_eq!(normalize_branch_prefix("rustgrid"), "rustgrid");
+        assert_eq!(normalize_branch_prefix("Team/Bots/"), "team/bots");
+        assert_eq!(normalize_branch_prefix("../x y"), "x-y");
+        assert_eq!(normalize_branch_prefix(""), DEFAULT_BRANCH_PREFIX);
+        assert_eq!(normalize_branch_prefix("//"), DEFAULT_BRANCH_PREFIX);
+    }
+
+    #[test]
+    fn branch_prefix_comes_from_repository_git_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", BRANCH_PREFIX_KEY, "rustgrid"]);
+        assert_eq!(branch_prefix(directory.path()), "rustgrid");
+        git(&["config", "--unset", BRANCH_PREFIX_KEY]);
+        // With nothing set here, a --global value may apply; it is never empty.
+        assert!(!branch_prefix(directory.path()).is_empty());
+    }
+
+    #[test]
     fn run_branch_uses_the_usual_branch_when_none_exists() {
-        let branch =
-            choose_run_branch("RG-1", "Fix it", "run-2", None, false, |_| Ok(false)).unwrap();
+        let branch = choose_run_branch("agent", "RG-1", "Fix it", "run-2", None, false, |_| {
+            Ok(false)
+        })
+        .unwrap();
         assert_eq!(
             branch,
             RunBranch {
@@ -697,7 +810,7 @@ mod tests {
 
     #[test]
     fn run_branch_steps_around_an_existing_branch() {
-        let branch = choose_run_branch("RG-1", "Fix it", "run-2", None, false, |name| {
+        let branch = choose_run_branch("agent", "RG-1", "Fix it", "run-2", None, false, |name| {
             Ok(name == "agent/rg-1-fix-it")
         })
         .unwrap();
@@ -713,6 +826,7 @@ mod tests {
     #[test]
     fn run_branch_keeps_the_recorded_branch_when_resuming() {
         let branch = choose_run_branch(
+            "agent",
             "RG-1",
             "Fix it",
             "run-2",
@@ -732,7 +846,7 @@ mod tests {
 
     #[test]
     fn run_branch_is_per_run_on_a_fresh_start() {
-        let branch = choose_run_branch("RG-1", "Fix it", "run-2", None, true, |_| {
+        let branch = choose_run_branch("agent", "RG-1", "Fix it", "run-2", None, true, |_| {
             panic!("a fresh start always uses a per-run branch")
         })
         .unwrap();
@@ -743,11 +857,13 @@ mod tests {
     #[test]
     fn fresh_branch_names_are_isolated_by_run() {
         let first = fresh_branch_name(
+            "agent",
             "AOPS-102",
             "Production verification and security hardening",
             "11111111-1111-4111-8111-111111111111",
         );
         let second = fresh_branch_name(
+            "agent",
             "AOPS-102",
             "Production verification and security hardening",
             "22222222-2222-4222-8222-222222222222",

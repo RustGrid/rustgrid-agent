@@ -948,6 +948,7 @@ fn execute(execution: ExecutionContext<'_>) -> Result<RunSummary> {
         &manifest.required_permissions,
     );
     let run_branch = choose_run_branch(
+        &repo.branch_prefix(),
         &ticket.key,
         &ticket.title,
         &run.id,
