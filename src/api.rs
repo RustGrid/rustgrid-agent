@@ -361,6 +361,21 @@ impl RustGridClient {
         })
     }
 
+    /// A client for a test server at `base_url`.
+    #[cfg(test)]
+    pub(crate) fn for_tests(base_url: &str) -> Self {
+        Self {
+            http: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("test client must build"),
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            api_key: "test-key".into(),
+            session_id: Uuid::new_v4(),
+            max_concurrency: 1,
+        }
+    }
+
     pub fn heartbeat(&self, worker_id: &str) -> Result<()> {
         self.heartbeat_with_status(worker_id, WorkerStatus::Online)
     }

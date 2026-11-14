@@ -6,9 +6,11 @@
 //! `rustgrid-agent trace flush` then reads the session transcript from where it
 //! last stopped, redacts it, and reports it to the session's interactive run.
 //!
-//! A session must be linked to a ticket before Claude sees a prompt: by the
-//! branch name (`agent/add-354-…`, `rustgrid/ADD-12`) or with
-//! `/rustgrid-link ADD-354`. Until then `UserPromptSubmit` blocks the prompt.
+//! A session must be linked to a ticket with `/rustgrid-link ADD-354` before
+//! Claude sees a prompt; until then `UserPromptSubmit` blocks the prompt. Every
+//! new conversation (`SessionStart` from startup or `/clear`) starts unlinked,
+//! even on a branch that names a ticket; a resumed or compacted one keeps its
+//! link.
 //! RustGrid being unreachable never blocks: data waits on disk and is retried.
 
 pub mod install;
@@ -86,6 +88,9 @@ pub struct HookInput {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Why `SessionStart` fired: `startup`, `resume`, `clear` or `compact`.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// What a hook tells Claude Code.
@@ -104,7 +109,8 @@ struct LinkedTicket {
     key: String,
     id: Option<String>,
     title: Option<String>,
-    /// Taken from the branch name and not yet confirmed by RustGrid.
+    /// Taken from the branch name and not yet confirmed by RustGrid. Only
+    /// session state written by older versions has such a ticket.
     #[serde(default)]
     unconfirmed: bool,
 }
@@ -391,20 +397,6 @@ fn hook_in(
             .as_deref()
             .and_then(repository_from_remote);
     }
-    if session.ticket.is_none()
-        && session.link_problem.is_none()
-        && let Some(key) = session
-            .branch
-            .as_deref()
-            .and_then(|branch| ticket_keys_in_branch(branch).into_iter().next())
-    {
-        session.ticket = Some(LinkedTicket {
-            key,
-            unconfirmed: true,
-            ..LinkedTicket::default()
-        });
-    }
-
     // A session that was ended (by the "new conversation" button heuristic,
     // or a resumed conversation) and is used again picks its run back up.
     if session.ended && matches!(event, "UserPromptSubmit" | "PostToolUse" | "Stop") {
@@ -438,7 +430,7 @@ fn hook_in(
             } else if session.ticket.is_none() {
                 HookOutcome::Block(match session.link_problem.as_deref() {
                     Some(problem) => format!("{problem} Link the ticket you are working on: /rustgrid-link ADD-123"),
-                    None => "Link this session to the RustGrid ticket you are working on: /rustgrid-link ADD-123 (or work on a branch named after it, like rustgrid/ADD-123-short-title).".to_owned(),
+                    None => "Link this session to the RustGrid ticket you are working on: /rustgrid-link ADD-123".to_owned(),
                 })
             } else {
                 session.prompts += 1;
@@ -446,6 +438,9 @@ fn hook_in(
             }
         }
         "SessionStart" => {
+            if starts_new_conversation(input.source.as_deref()) {
+                session.unlink();
+            }
             if spawn {
                 let _ = install::ensure_link_command();
             }
@@ -474,7 +469,54 @@ fn hook_in(
     Ok(outcome)
 }
 
+/// Whether `SessionStart` began a new conversation rather than continuing one.
+/// Claude Code versions that send no source are treated as continuing, so a
+/// resumed session is never unlinked by mistake.
+fn starts_new_conversation(source: Option<&str>) -> bool {
+    matches!(source, Some("startup" | "clear"))
+}
+
 impl Session {
+    /// Ends the link to the session's ticket. Its open run is closed with the
+    /// transcript written so far, as on a relink; the next prompt is blocked
+    /// until `/rustgrid-link` links a ticket again.
+    fn unlink(&mut self) {
+        match self.run_id.take() {
+            Some(run_id) if !self.finalized => self.retire_run(run_id),
+            _ => {}
+        }
+        if self.ticket.take().is_some() || self.link_problem.is_some() {
+            // A flush still running for the old link must not restore it.
+            self.generation += 1;
+        }
+        self.link_problem = None;
+        self.execution_reported = false;
+        self.ended = false;
+        self.finalized = false;
+    }
+
+    /// Hands the session's run over to the flush to end once the transcript
+    /// written so far is reported. Later changes are counted from HEAD.
+    fn retire_run(&mut self, run_id: String) {
+        let until_offset = self
+            .transcript_path
+            .as_deref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
+        self.previous_run = Some(PreviousRun {
+            run_id,
+            start_sha: self.start_sha.clone(),
+            pull_requests: std::mem::take(&mut self.pull_requests),
+            until_offset,
+            generation: self.generation,
+        });
+        self.start_sha = self
+            .cwd
+            .as_deref()
+            .and_then(|cwd| git(cwd, &["rev-parse", "HEAD"]))
+            .or(self.start_sha.take());
+    }
+
     /// Picks an ended session's run back up. If the run was already closed on
     /// RustGrid, the next flush starts it again, which reopens the same run.
     fn reopen(&mut self) {
@@ -582,24 +624,7 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
             if let Some(run_id) = session.run_id.take()
                 && run_id != started.run.id
             {
-                let until_offset = session
-                    .transcript_path
-                    .as_deref()
-                    .and_then(|path| fs::metadata(path).ok())
-                    .map_or(0, |metadata| metadata.len());
-                session.previous_run = Some(PreviousRun {
-                    run_id,
-                    start_sha: session.start_sha.clone(),
-                    pull_requests: std::mem::take(&mut session.pull_requests),
-                    until_offset,
-                    generation: session.generation,
-                });
-                // The new ticket's changes are counted from here.
-                session.start_sha = session
-                    .cwd
-                    .as_deref()
-                    .and_then(|cwd| git(cwd, &["rev-parse", "HEAD"]))
-                    .or(session.start_sha.take());
+                session.retire_run(run_id);
             }
             let (ticket_id, ticket_key) = (started.ticket.id.clone(), started.ticket.key.clone());
             session.run_id = Some(started.run.id);
@@ -896,7 +921,7 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
     };
     let mut session = snapshot;
 
-    // Confirm a ticket taken from the branch name.
+    // Confirm a ticket an older version took from the branch name.
     if session.run_id.is_none()
         && let Some(ticket) = session.ticket.clone()
     {
@@ -923,7 +948,7 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
         save_merged(dir, &session)?;
     }
     let Some(run_id) = session.run_id.clone() else {
-        return Ok(());
+        return flush_retired_run(client, dir, session);
     };
     if session.refused_run.as_deref() == Some(run_id.as_str()) {
         return Ok(());
@@ -1060,6 +1085,53 @@ fn end_on_pull_request(dir: &Path, flushed: &mut Session) -> Result<()> {
     Ok(())
 }
 
+/// Closes the run an unlinked session left: reports the transcript written
+/// before the unlink to it and ends it. Lines after the unlink wait for the
+/// next link, as they do in a session that was never linked.
+fn flush_retired_run(client: &RustGridClient, dir: &Path, mut session: Session) -> Result<()> {
+    let Some(previous) = session.previous_run.clone() else {
+        return Ok(());
+    };
+    if let Some(path) = session.transcript_path.clone()
+        && let Ok(mut file) = File::open(&path)
+    {
+        let length = file.metadata()?.len().min(previous.until_offset);
+        if session.offset < length {
+            file.seek(SeekFrom::Start(session.offset))?;
+            let mut buffer = Vec::new();
+            file.take(length - session.offset)
+                .read_to_end(&mut buffer)?;
+            let mut consumed = 0usize;
+            while let Some(newline) = buffer[consumed..].iter().position(|byte| *byte == b'\n') {
+                let line_end = consumed + newline + 1;
+                let line = String::from_utf8_lossy(&buffer[consumed..line_end - 1]).into_owned();
+                let mut translator = session.translator.clone();
+                for item in &transcript::translate(&mut translator, &line) {
+                    report_item(client, &mut session, &previous.run_id, None, item)?;
+                }
+                session.translator = translator;
+                consumed = line_end;
+                session.offset += (newline + 1) as u64;
+            }
+            save_merged(dir, &session)?;
+        }
+    }
+    if let Some(reply) = transcript::finish_turn(&mut session.translator) {
+        report_item(client, &mut session, &previous.run_id, None, &reply)?;
+    }
+    session.stops_handled = session.stops;
+    end_run(
+        client,
+        &session,
+        &previous.run_id,
+        previous.generation,
+        previous.start_sha.as_deref(),
+        &previous.pull_requests,
+    )?;
+    session.previous_run = None;
+    save_merged(dir, &session)
+}
+
 /// Saves flush progress without losing link changes a hook made meanwhile.
 fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
     let _guard = SessionLock::acquire(dir, &flushed.session_id, "state", true)?;
@@ -1076,10 +1148,15 @@ fn save_merged(dir: &Path, flushed: &Session) -> Result<()> {
         current.pull_requests_ended = flushed.pull_requests_ended;
         current.telemetry_refused_run = flushed.telemetry_refused_run.clone();
     }
-    current.previous_run = flushed
-        .previous_run
-        .clone()
-        .filter(|_| current.previous_run.is_some());
+    current.previous_run = match current.previous_run.take() {
+        // A hook retired the run this flush was reporting to: the flush has
+        // not ended it, so it stays for the next flush.
+        Some(retired) if flushed.run_id.as_deref() == Some(retired.run_id.as_str()) => {
+            Some(retired)
+        }
+        Some(_) => flushed.previous_run.clone(),
+        None => None,
+    };
     current.offset = flushed.offset;
     current.stops_handled = flushed.stops_handled;
     current.translator = flushed.translator.clone();
@@ -1572,6 +1649,7 @@ mod tests {
                 transcript_path: None,
                 cwd: Some(cwd.to_path_buf()),
                 prompt: Some(text.into()),
+                source: None,
             },
             false,
         )
@@ -1603,19 +1681,212 @@ mod tests {
         };
         assert!(reason.contains("/rustgrid-link ADD-123"), "{reason}");
 
-        // A branch named after a ticket links the session.
+        // A linked session prompts.
         let mut session = Session::load(&dir, "s-1").unwrap();
         session.ticket = Some(LinkedTicket {
             key: "ADD-354".into(),
-            unconfirmed: true,
+            id: Some("ticket-1".into()),
             ..LinkedTicket::default()
         });
+        session.run_id = Some("run-1".into());
         session.save(&dir).unwrap();
         assert_eq!(
             prompt(&dir, &config, &repo, "fix it"),
             HookOutcome::Continue
         );
         assert!(dir.join("s-1.dirty").exists());
+    }
+
+    fn session_start(dir: &Path, config: &Path, cwd: &Path, source: &str) {
+        hook_in(
+            dir,
+            config,
+            "SessionStart",
+            HookInput {
+                session_id: "s-1".into(),
+                cwd: Some(cwd.to_path_buf()),
+                source: Some(source.into()),
+                ..HookInput::default()
+            },
+            false,
+        )
+        .unwrap();
+    }
+
+    fn linked_session(dir: &Path, transcript: &Path) {
+        Session {
+            session_id: "s-1".into(),
+            transcript_path: Some(transcript.to_path_buf()),
+            ticket: Some(LinkedTicket {
+                key: "ADD-437".into(),
+                id: Some("ticket-1".into()),
+                title: Some("Redesign sign in".into()),
+                unconfirmed: false,
+            }),
+            run_id: Some("run-old".into()),
+            execution_reported: true,
+            ..Session::default()
+        }
+        .save(dir)
+        .unwrap();
+    }
+
+    /// Answers every request with `200 {}` and records `METHOD path`.
+    fn fake_rustgrid() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let mut parts = request_line.split_whitespace();
+                let _ = sender.send(format!(
+                    "{} {}",
+                    parts.next().unwrap_or_default(),
+                    parts.next().unwrap_or_default()
+                ));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+            }
+        });
+        (url, receiver)
+    }
+
+    const USER_LINE: &str = r#"{"type":"user","uuid":"u1","timestamp":"2026-11-14T10:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"Redesign the dialog"}]}}"#;
+
+    #[test]
+    fn a_new_conversation_starts_unlinked_even_on_a_ticket_branch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = repo_on("rustgrid/add-437-redesign-sign-in");
+        let config = root.path().join("config.json");
+        fs::write(
+            &config,
+            r#"{"worker_id":"9b0f4c4e-8f43-4a07-9a3e-3d2b0c3e1f10"}"#,
+        )
+        .unwrap();
+
+        session_start(&dir, &config, repo.path(), "startup");
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert!(session.ticket.is_none(), "the branch must not link it");
+        let HookOutcome::Block(reason) = prompt(&dir, &config, repo.path(), "go") else {
+            panic!("a new conversation must be linked before it prompts");
+        };
+        assert!(reason.contains("/rustgrid-link ADD-123"), "{reason}");
+        assert!(!reason.contains("branch"), "{reason}");
+    }
+
+    #[test]
+    fn resumed_and_compacted_conversations_keep_their_link() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let config = root.path().join("config.json");
+        fs::write(&config, "{}").unwrap();
+        let transcript = root.path().join("t.jsonl");
+        linked_session(&dir, &transcript);
+
+        for source in ["resume", "compact"] {
+            session_start(&dir, &config, root.path(), source);
+            let session = Session::load(&dir, "s-1").unwrap();
+            assert_eq!(session.run_id.as_deref(), Some("run-old"), "{source}");
+            assert!(session.ticket.is_some(), "{source}");
+        }
+        assert!(!starts_new_conversation(None));
+    }
+
+    #[test]
+    fn clearing_unlinks_and_closes_the_run_at_the_clear() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let config = root.path().join("config.json");
+        fs::write(&config, "{}").unwrap();
+        let transcript = root.path().join("t.jsonl");
+        fs::write(&transcript, format!("{USER_LINE}\n")).unwrap();
+        linked_session(&dir, &transcript);
+
+        session_start(&dir, &config, root.path(), "clear");
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert!(session.ticket.is_none());
+        assert!(session.run_id.is_none());
+        let retired = session.previous_run.clone().expect("the run is closed");
+        assert_eq!(retired.run_id, "run-old");
+        assert_eq!(
+            retired.until_offset,
+            fs::metadata(&transcript).unwrap().len()
+        );
+        assert!(session.generation > 0, "a running flush must not relink it");
+
+        // Lines after the clear wait for the next link.
+        let mut file = File::options().append(true).open(&transcript).unwrap();
+        writeln!(file, "{}", USER_LINE.replace("u1", "u2")).unwrap();
+
+        let (url, requests) = fake_rustgrid();
+        let client = RustGridClient::for_tests(&url);
+        flush_pass(&client, &dir, "s-1").unwrap();
+        let requests: Vec<String> = requests.try_iter().collect();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r == "POST /agent-runs/run-old/events"),
+            "{requests:?}"
+        );
+        assert_eq!(
+            requests.last().map(String::as_str),
+            Some("POST /agent-runs/run-old/interactive/end"),
+            "{requests:?}"
+        );
+        let session = Session::load(&dir, "s-1").unwrap();
+        assert!(session.previous_run.is_none());
+        assert_eq!(session.offset, retired.until_offset);
+    }
+
+    #[test]
+    fn a_flush_racing_a_relink_keeps_the_retired_run() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = root.path().join("t.jsonl");
+        linked_session(&dir, &transcript);
+        // The flush read the session before the hook unlinked it.
+        let flushed = Session::load(&dir, "s-1").unwrap();
+        let mut session = flushed.clone();
+        session.unlink();
+        session.save(&dir).unwrap();
+
+        save_merged(&dir, &flushed).unwrap();
+        let merged = Session::load(&dir, "s-1").unwrap();
+        assert_eq!(
+            merged
+                .previous_run
+                .map(|previous| previous.run_id)
+                .as_deref(),
+            Some("run-old")
+        );
+        assert!(merged.run_id.is_none());
+        assert!(merged.ticket.is_none());
     }
 
     fn waiting_session(dir: &Path, id: &str, cwd: &Path, prompts: u64, idle: Duration) {

@@ -5,8 +5,18 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Changed
+
+- Every new Claude Code conversation (startup or `/clear`) starts unlinked
+  from RustGrid, even on a branch named after a ticket. The first prompt asks
+  for `/rustgrid-link`. A branch name no longer links a session by itself.
+  `/clear` in a linked session closes that ticket's run at the clear. Resumed
+  and compacted conversations keep their link.
+
 ### Fixed
 
+- A trace flush running while a session was relinked no longer drops the
+  earlier ticket's run before it is ended.
 - New and recovered Docker Sandboxes allow Playwright's browser download CDNs
   and redirect targets, npm, and Ubuntu/Debian system package repositories.
   Codex and Claude Code can install Playwright and matching browsers inside

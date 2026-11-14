@@ -28,7 +28,7 @@ Restart Claude Code afterwards.
 
 | Command | What it does |
 |---|---|
-| `rustgrid-agent trace status` | Shows whether sessions are traced, where the hooks are, whether RustGrid answers, which ticket the current branch links to, and the last traced session. |
+| `rustgrid-agent trace status` | Shows whether sessions are traced, where the hooks are, whether RustGrid answers, which ticket the current branch names, and the last traced session. |
 | `rustgrid-agent trace install --user` | Writes the hooks into your own `~/.claude/settings.json` instead, without sudo. Good for trying it out, but you can remove them. |
 | `rustgrid-agent trace uninstall` | Removes exactly what `install` added. |
 
@@ -77,11 +77,13 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
   transcript offset is only saved once its lines are uploaded, and the next hook
   retries.
 - **Linking a ticket:**
-  - **From the branch name:** a branch named after a ticket links the session
-    (`agent/add-354-fix-login`, `rustgrid/ADD-12`).
-  - **By hand:** type `/rustgrid-link ADD-354`. The hook validates the key with
-    RustGrid and links the session.
-  - **Ticket branch:** linking by hand also puts the repository on a branch
+  - **Every new conversation starts unlinked.** A new Claude Code chat, or
+    `/clear`, has no ticket, even on a branch named after one. Type
+    `/rustgrid-link ADD-354`: the hook validates the key with RustGrid and
+    links the session. `/clear` in a linked session ends that ticket's run,
+    with its summary comment, at the point of the clear. A resumed (`--resume`,
+    `--continue`) or compacted conversation keeps its link.
+  - **Ticket branch:** linking also puts the repository on a branch
     named after the ticket (`agent/add-354-<title>`), so the session's work
     never lands on a branch belonging to something else. A branch that already
     names the ticket is kept, an existing `agent/add-354-<title>` branch is
@@ -101,9 +103,9 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     before it appears. Claude gets each file's path and reads the ones it
     needs. If the ticket's content can't be loaded within the hook's time
     limit, the session is still linked and Claude says so. A download problem
-    is kept in `attachments.error` in the same folder. A ticket linked from
-    the branch name is traced the same way, but its content is not loaded:
-    run `/rustgrid-link` to load it.
+    is kept in `attachments.error` in the same folder. Sessions linked from
+    the branch name by older versions are still traced, but their
+    content is not loaded.
   - **Unlinked:** until a session is linked, the hook blocks prompts with
     instructions. It also blocks prompts until the computer is signed in.
   - **Relinking:** linking another ticket mid-session ends the first ticket's
