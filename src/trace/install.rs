@@ -493,9 +493,11 @@ pub fn status(config_path: &Path) -> Result<()> {
             .map(|branch| branch.trim().to_owned())
     {
         match super::ticket_keys_in_branch(&branch).first() {
-            Some(key) => println!("  This repository's branch {branch} links sessions to {key}."),
+            Some(key) => println!(
+                "  Branch {branch} names {key}. New sessions start unlinked: link them with /rustgrid-link {key}."
+            ),
             None => println!(
-                "  Branch {branch} names no ticket: link sessions with /rustgrid-link ADD-123."
+                "  Branch {branch} names no ticket. New sessions start unlinked: link them with /rustgrid-link ADD-123."
             ),
         }
     }
