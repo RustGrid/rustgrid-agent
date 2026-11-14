@@ -92,6 +92,12 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     local changes the other branch would overwrite), the session stays linked
     on its current branch and Claude tells you how to switch. RustGrid
     records the branch the session was on when it was linked.
+  - **Branch prefix:** ticket branches start with `agent/` unless Git config
+    sets `rustgrid.branchPrefix`. Set it per repository
+    (`git config rustgrid.branchPrefix rustgrid` gives
+    `rustgrid/add-354-<title>`) or for every repository with `--global`.
+    Cloud runs use the same setting. Titles are cut at the last whole word
+    within 48 characters.
   - **Ticket content:** `/rustgrid-link` also gives Claude the ticket's title,
     type, status, priority and description, so the session starts from the
     whole ticket. The ticket is written to

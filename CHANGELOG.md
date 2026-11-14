@@ -3,10 +3,21 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 1.12.0 - 2026-11-14
+
+### Added
+
+- The Git config key `rustgrid.branchPrefix` sets the prefix of ticket branches,
+  per repository or with `--global`. `/rustgrid-link` and cloud runs both use
+  it, so `git config rustgrid.branchPrefix rustgrid` gives
+  `rustgrid/add-437-<title>`. Without it, branches start with `agent/` as
+  before.
 
 ### Changed
 
+- Ticket titles in branch names are cut at the last whole word within 48
+  characters instead of mid-word (`…-and-registration`, not
+  `…-and-registration-d`).
 - Every new Claude Code conversation (startup or `/clear`) starts unlinked
   from RustGrid, even on a branch named after a ticket. The first prompt asks
   for `/rustgrid-link`. A branch name no longer links a session by itself.

@@ -743,7 +743,7 @@ fn switch_to_ticket_branch(cwd: &Path, key: &str, title: &str) -> BranchSwitch {
     {
         return BranchSwitch::Unchanged;
     }
-    let to = crate::git::branch_name(key, title);
+    let to = crate::git::branch_name(&crate::git::branch_prefix(cwd), key, title);
     let exists = git_status(
         cwd,
         &[
@@ -1480,6 +1480,8 @@ mod tests {
             vec!["init", "--quiet", "--initial-branch", branch],
             vec!["config", "user.email", "test@example.com"],
             vec!["config", "user.name", "Test"],
+            // Pinned, so a --global prefix on the machine cannot change names.
+            vec!["config", crate::git::BRANCH_PREFIX_KEY, "agent"],
             vec!["commit", "--quiet", "--allow-empty", "-m", "start"],
         ] {
             git_status(path, &args).unwrap();
@@ -1523,6 +1525,29 @@ mod tests {
                 to: "agent/agent-8-match-the-branch".into(),
                 created: false,
             }
+        );
+    }
+
+    #[test]
+    fn linking_uses_the_repositorys_branch_prefix() {
+        let repo = repo_on("main");
+        git_status(
+            repo.path(),
+            &["config", crate::git::BRANCH_PREFIX_KEY, "rustgrid"],
+        )
+        .unwrap();
+        assert_eq!(
+            switch_to_ticket_branch(repo.path(), "ADD-437", "Redesign sign in"),
+            BranchSwitch::Switched {
+                from: "main".into(),
+                to: "rustgrid/add-437-redesign-sign-in".into(),
+                created: true,
+            }
+        );
+        // The prefixed branch is recognised as the ticket's own.
+        assert_eq!(
+            switch_to_ticket_branch(repo.path(), "ADD-437", "Redesign sign in"),
+            BranchSwitch::Unchanged
         );
     }
 
