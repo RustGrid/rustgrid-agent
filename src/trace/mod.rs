@@ -13,6 +13,7 @@
 //! link.
 //! RustGrid being unreachable never blocks: data waits on disk and is retried.
 
+pub mod architecture;
 pub mod install;
 pub mod redact;
 pub mod ticket;
@@ -627,6 +628,13 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                 session.retire_run(run_id);
             }
             let (ticket_id, ticket_key) = (started.ticket.id.clone(), started.ticket.key.clone());
+            // The contract is written before the ticket's content, so it
+            // reaches Claude even when the content cannot be loaded.
+            let architecture = ticket::context_dir(session.cwd.as_deref(), &ticket_key)
+                .ok()
+                .and_then(|dir| {
+                    architecture::prepare(&dir, &started.run.id, started.architecture.as_ref())
+                });
             session.run_id = Some(started.run.id);
             session.ticket = Some(LinkedTicket {
                 key: started.ticket.key.clone(),
@@ -661,8 +669,14 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                 RustGridClient::with_timeout(&context, (remaining / 2).min(LINK_CONTENT_TIMEOUT))
                     .and_then(|client| {
                         let dir = ticket::context_dir(session.cwd.as_deref(), &ticket_key)?;
-                        ticket::prepare(&client, &ticket_id, &ticket_key, &dir)
-                            .map(|(context, plan)| (dir, context, plan))
+                        ticket::prepare(
+                            &client,
+                            &ticket_id,
+                            &ticket_key,
+                            &dir,
+                            architecture.as_deref(),
+                        )
+                        .map(|(context, plan)| (dir, context, plan))
                     })
             };
             let mut linked = match loaded {
@@ -673,7 +687,8 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                 },
                 Err(error) => Linked {
                     context: format!(
-                        "{linked} RustGrid did not return the ticket's description and attachments ({error:#}). Confirm the link to the user in one short sentence, naming the ticket key and title, say that its description could not be loaded, and do nothing else."
+                        "{linked} RustGrid did not return the ticket's description and attachments ({error:#}).\n\n{}Confirm the link to the user in one short sentence, naming the ticket key and title, say that its description could not be loaded, and do nothing else.",
+                        architecture.as_deref().unwrap_or_default()
                     ),
                     ticket_dir: PathBuf::new(),
                     attachments: false,
@@ -1022,6 +1037,14 @@ fn flush_pass(client: &RustGridClient, dir: &Path, session_id: &str) -> Result<(
                 None => (run_id.clone(), ticket_id.clone()),
             };
             report_item(client, &mut session, &run, ticket.as_deref(), &reply)?;
+            // A reply that asks for an architecture escalation raises it.
+            if session.previous_run.is_none()
+                && let TraceItem::AgentMessage { text, .. } = &reply
+                && let Some(key) = session.ticket.as_ref().map(|ticket| ticket.key.clone())
+                && let Ok(dir) = ticket::context_dir(session.cwd.as_deref(), &key)
+            {
+                architecture::escalate_from_reply(client, &dir, &run, text);
+            }
         }
         session.stops_handled = session.stops;
         save_merged(dir, &session)?;
