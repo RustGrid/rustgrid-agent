@@ -67,6 +67,7 @@ pub(crate) fn prepare(
     ticket_id: &str,
     key: &str,
     dir: &Path,
+    architecture: Option<&str>,
 ) -> Result<(String, Vec<PlannedAttachment>)> {
     let ticket = client.fetch_ticket_details(ticket_id)?;
     // A ticket without readable attachments still gives its description.
@@ -91,6 +92,7 @@ pub(crate) fn prepare(
         &plan,
         skipped,
         attachment_problem.as_deref(),
+        architecture,
     );
     Ok((context, plan))
 }
@@ -164,6 +166,7 @@ fn context_text(
     plan: &[PlannedAttachment],
     skipped: usize,
     attachment_problem: Option<&str>,
+    architecture: Option<&str>,
 ) -> String {
     let mut text = format!(
         "RustGrid linked this Claude Code session to ticket {key} ({}). From now on the session is traced on that ticket.\n\n",
@@ -197,8 +200,16 @@ fn context_text(
             attachment_lines(plan, skipped)
         ));
     }
+    if let Some(architecture) = architecture {
+        text.push_str(architecture);
+    }
     text.push_str(&format!(
-        "Confirm the link to the user in one short sentence, naming {key} and its title, and say that its description and attachments are loaded. Do nothing else until the user asks."
+        "Confirm the link to the user in one short sentence, naming {key} and its title, and say that its description{} are loaded. Do nothing else until the user asks.",
+        if architecture.is_some() {
+            ", attachments and architecture contract"
+        } else {
+            " and attachments"
+        }
     ));
     text
 }
@@ -284,7 +295,7 @@ fn matches_checksum(attachment: &PlannedAttachment, bytes: &[u8]) -> bool {
     }
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -362,6 +373,7 @@ mod tests {
             &plan,
             1,
             None,
+            None,
         );
         assert!(text.starts_with(
             "RustGrid linked this Claude Code session to ticket AGENT-7 (Show the full ticket)."
@@ -382,13 +394,40 @@ mod tests {
             &[],
             0,
             None,
+            None,
         );
         assert!(text.contains("the rest is in ticket.md"));
         assert!(text.len() < INLINE_DESCRIPTION_CHARS + 2_000);
 
-        let none = context_text("AGENT-7", &ticket(None), Path::new("/d"), &[], 0, None);
+        let none = context_text(
+            "AGENT-7",
+            &ticket(None),
+            Path::new("/d"),
+            &[],
+            0,
+            None,
+            None,
+        );
         assert!(none.contains("(no description)"));
         assert!(none.contains("Attachments: none."));
+        assert!(none.contains("description and attachments are loaded"));
+    }
+
+    #[test]
+    fn the_architecture_contract_comes_before_the_confirmation() {
+        let text = context_text(
+            "AGENT-7",
+            &ticket(None),
+            Path::new("/d"),
+            &[],
+            0,
+            None,
+            Some("Architecture: read /d/architecture.md.\n\n"),
+        );
+        let architecture = text.find("Architecture: read /d/architecture.md.").unwrap();
+        let confirm = text.find("Confirm the link").unwrap();
+        assert!(architecture < confirm);
+        assert!(text.contains("description, attachments and architecture contract are loaded"));
     }
 
     #[test]

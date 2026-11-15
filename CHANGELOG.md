@@ -3,6 +3,22 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- Claude Code IDE sessions work under the project's architecture contract.
+  `/rustgrid-link` writes it to `architecture.md` next to `ticket.md` and gives
+  Claude its guardrails and protected paths. When a reply ends with the plan
+  check's escalation lines, the trace hook raises the escalation for an
+  architect. A failure is kept in `architecture.error`.
+
+### Fixed
+
+- Agents now see the contract's guardrails and protected paths. The worker
+  dropped them, and the boundaries' `access` and the contract's `standard`,
+  when it read the manifest.
+
 ## 1.12.0 - 2026-11-14
 
 ### Added

@@ -112,6 +112,15 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     is kept in `attachments.error` in the same folder. Sessions linked from
     the branch name by older versions are still traced, but their
     content is not loaded.
+  - **Architecture contract:** when the project defines one, the session
+    works under it like any other run. RustGrid pins the run to the version
+    current when the session starts, and the link writes it to
+    `architecture.md` next to `ticket.md`, with the plan check Claude follows
+    before changing code. Claude gets the Block and Ask guardrails and the
+    protected paths inline. When Claude cannot stay inside the ticket's
+    boundaries, it ends its reply with the escalation lines from the plan
+    check, and the hook raises the escalation for an architect on the run. An
+    escalation that could not be raised is kept in `architecture.error`.
   - **Unlinked:** until a session is linked, the hook blocks prompts with
     instructions. It also blocks prompts until the computer is signed in.
   - **Relinking:** linking another ticket mid-session ends the first ticket's

@@ -16,9 +16,49 @@ pub struct ArchitectureContext {
     pub ticket_boundary_ids: Vec<String>,
     #[serde(default)]
     pub open_escalations: Vec<ArchitectureEscalation>,
+    /// Guardrails at `block` or `ask`; guardrails that are off are left out.
+    #[serde(default)]
+    pub guardrails: Vec<ArchitectureGuardrail>,
+    /// Boundaries whose paths are read-only or need an architect.
+    #[serde(default)]
+    pub protected_paths: Vec<ArchitectureProtectedPaths>,
     pub escalation_path: String,
     #[serde(default)]
     pub instructions: String,
+}
+
+/// `AgentArchitectureGuardrail`: a guardrail the agent must follow.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ArchitectureGuardrail {
+    pub id: String,
+    #[serde(default)]
+    pub group: String,
+    pub statement: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `block` or `ask`.
+    pub level: String,
+    #[serde(default)]
+    pub locked: bool,
+}
+
+/// `AgentArchitectureProtectedPaths`: paths of a protected boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ArchitectureProtectedPaths {
+    pub boundary_id: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// `read_only` or `ask`.
+    pub access: String,
+}
+
+/// Where the agent works, which decides how an escalation reaches RustGrid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptAudience {
+    /// A worker runs the agent and raises the escalation itself.
+    Worker,
+    /// A person's Claude Code session, traced by the `rustgrid-agent` hook.
+    IdeSession,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -32,6 +72,10 @@ pub struct ArchitectureDocument {
     pub decisions: Vec<ArchitectureDecision>,
     #[serde(default)]
     pub profile: Value,
+    /// Fields this worker does not model, such as the standard and guardrail
+    /// settings, kept so the agent sees the whole contract.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -44,6 +88,9 @@ pub struct ArchitectureBoundary {
     pub may_depend_on: Vec<String>,
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Fields this worker does not model, such as `access`.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -246,7 +293,12 @@ impl ArchitectureContext {
         }
     }
 
+    /// The contract and plan check for a worker-run agent.
     pub fn prompt_section(&self) -> Result<String> {
+        self.prompt_for(PromptAudience::Worker)
+    }
+
+    pub fn prompt_for(&self, audience: PromptAudience) -> Result<String> {
         let declared = if self.ticket_boundary_ids.is_empty() {
             "(none declared; stay consistent with every boundary's dependency rules)".to_owned()
         } else {
@@ -284,6 +336,12 @@ Boundaries this ticket declared: {declared}
 Open architecture escalations (do not make these crossings while they are pending):
 {open}
 
+Guardrails (block: never do it; ask: stop and get the person's approval first):
+{guardrails}
+
+Protected paths (read_only: never modify; ask: an architect must approve changes):
+{protected}
+
 Architecture plan check. Before editing any file, plan the change: list each file you intend to create or modify, the boundary that owns it (from the boundary `paths` globs), and every new dependency between boundaries. Check that plan against the contract:
 1. Every changed file belongs to a declared boundary or to no boundary.
 2. Every new cross-boundary dependency is listed in the depending boundary's `may_depend_on`.
@@ -293,8 +351,16 @@ RUSTGRID_AGENT_STATUS: ESCALATE
 RUSTGRID_ESCALATION_BOUNDARIES: <comma-separated boundary IDs the work needs to cross>
 RUSTGRID_ESCALATION_REASON: <one line: why the plan cannot stay inside the declared boundaries>
 RUSTGRID_PROPOSED_CHANGE: <one line: what the change would look like if approved>
-The worker raises the escalation for an architect and independently checks the final diff against the declared boundaries.
+{escalation_handling}
 "#,
+            guardrails = self.guardrail_lines(),
+            protected = self.protected_path_lines(),
+            escalation_handling = match audience {
+                PromptAudience::Worker =>
+                    "The worker raises the escalation for an architect and independently checks the final diff against the declared boundaries.",
+                PromptAudience::IdeSession =>
+                    "When a reply ends with these lines, RustGrid's session hook raises the escalation for an architect on this ticket. Tell the person the work waits on an architect, and continue only with changes that stay inside the boundaries.",
+            },
             version = self.version,
             document = serde_json::to_string_pretty(&self.document)?,
             instructions = if self.instructions.trim().is_empty() {
@@ -399,6 +465,51 @@ fn match_segment(pattern: &[u8], text: &[u8]) -> bool {
         Some((b'*', rest)) => (0..=text.len()).any(|skip| match_segment(rest, &text[skip..])),
         Some((b'?', rest)) => !text.is_empty() && match_segment(rest, &text[1..]),
         Some((byte, rest)) => text.first() == Some(byte) && match_segment(rest, &text[1..]),
+    }
+}
+
+impl ArchitectureContext {
+    /// One line per guardrail, block before ask, for the prompt.
+    pub fn guardrail_lines(&self) -> String {
+        let mut lines = self
+            .guardrails
+            .iter()
+            .filter(|guardrail| guardrail.level == "block")
+            .chain(
+                self.guardrails
+                    .iter()
+                    .filter(|guardrail| guardrail.level != "block"),
+            )
+            .map(|guardrail| {
+                format!(
+                    "- [{}] {} ({})",
+                    guardrail.level, guardrail.statement, guardrail.id
+                )
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push("(none)".to_owned());
+        }
+        lines.join("\n")
+    }
+
+    /// One line per protected boundary, for the prompt.
+    pub fn protected_path_lines(&self) -> String {
+        if self.protected_paths.is_empty() {
+            return "(none)".to_owned();
+        }
+        self.protected_paths
+            .iter()
+            .map(|protected| {
+                format!(
+                    "- [{}] {}: {}",
+                    protected.access,
+                    protected.boundary_id,
+                    protected.paths.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 

@@ -285,6 +285,11 @@ pub struct InteractiveRunStarted {
     pub run: InteractiveRun,
     pub ticket: InteractiveRunTicket,
     pub created: bool,
+    /// The architecture contract the session works under
+    /// (`AgentArchitectureContext`), or null when the project defines none.
+    /// Kept raw so a contract this version cannot read never fails the link.
+    #[serde(default)]
+    pub architecture: Option<Value>,
 }
 
 /// A ticket as an IDE session sees it when it links to it.
