@@ -69,11 +69,12 @@ fn context_text(context: &ArchitectureContext, path: &Path) -> String {
         context.ticket_boundary_ids.join(", ")
     };
     format!(
-        "Architecture: this project has an architecture contract (version {version}), which the session works under. Before planning any code change, read {path} and follow its plan check. The ticket declared these boundaries: {declared}.\nGuardrails (block: never do it; ask: get the user's approval first):\n{guardrails}\nProtected paths (read_only: never modify; ask: an architect must approve changes):\n{protected}\n\n",
+        "Architecture: this project has an architecture contract (version {version}), which the session works under. Before planning any code change, read {path} and follow its plan check. The ticket declared these boundaries: {declared}.\nGuardrails (block: never do it; ask: get the user's approval first):\n{guardrails}\nProtected paths (read_only: never modify; ask: an architect must approve changes):\n{protected}\nArchitect decisions on this ticket's earlier escalations (approved: that crossing is allowed as the resolution says; rejected: follow the resolution instead):\n{decisions}\n\n",
         version = context.version,
         path = path.display(),
         guardrails = context.guardrail_lines(),
         protected = context.protected_path_lines(),
+        decisions = context.decision_lines(),
     )
 }
 
