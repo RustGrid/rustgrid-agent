@@ -194,6 +194,7 @@ architecture. When present it is an `AgentArchitectureContext`:
   },
   "ticket_boundary_ids": ["api"],
   "open_escalations": [],
+  "decided_escalations": [],
   "escalation_path": "/api/v1/agent-runs/{run_id}/architecture-escalations",
   "instructions": "Escalate instead of crossing a boundary."
 }
@@ -220,8 +221,9 @@ The plan is checked twice:
    `RUSTGRID_ESCALATION_REASON`, and `RUSTGRID_PROPOSED_CHANGE` lines.
 2. After every successful Codex session (initial, gate repair, and CI repair)
    the worker matches each agent-changed path against the boundaries. A path is
-   in scope when it belongs to no boundary or to at least one declared
-   boundary. When `ticket_boundary_ids` is empty no path scope is enforced.
+   in scope when it belongs to no boundary, to at least one declared
+   boundary, or to a boundary of an approved entry in `decided_escalations`.
+   When `ticket_boundary_ids` is empty no path scope is enforced.
    `may_depend_on`, rules, and decisions are enforced through the prompt, CI,
    and review, not by the worker's diff check.
 
@@ -247,8 +249,23 @@ worker reuses it instead of raising another.
 
 After escalating, the run ends as a human-intervention block: the ticket moves
 to `blocked`, the workspace and sandbox are retained, and the blocking reason
-names the escalation ID. Approval is expected to be reflected in a later run's
-`ticket_boundary_ids`; the manifest only lists open escalations.
+names the escalation ID.
+
+An architect then approves or rejects the escalation with a resolution. A later
+run of the ticket receives the decision in `decided_escalations` (newest first,
+at most 20, each with `status` and `resolution`; older servers omit the field):
+
+- **Approved:** the prompt tells the agent the crossing is allowed within what
+  the resolution says, and the diff check treats the escalation's boundaries as
+  declared, so the run does not escalate the same crossing again.
+- **Rejected:** the prompt carries the resolution as the guidance for staying
+  inside the boundaries. The diff check is unchanged, so crossing that boundary
+  anyway raises a new escalation.
+
+Deciding an escalation does not change the ticket's `ticket_boundary_ids`.
+Decided entries are not validated against the pinned contract, because one
+decided under an earlier version may name a boundary that version removed;
+approvals of boundaries the contract no longer defines are ignored.
 
 ## Queue and capacity
 

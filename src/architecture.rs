@@ -16,6 +16,12 @@ pub struct ArchitectureContext {
     pub ticket_boundary_ids: Vec<String>,
     #[serde(default)]
     pub open_escalations: Vec<ArchitectureEscalation>,
+    /// The ticket's approved and rejected escalations with the architect's
+    /// resolution, newest first. An approved one lets this run make the
+    /// crossing it names; a rejected one's resolution is the guidance for
+    /// staying inside the boundaries. Older servers do not send it.
+    #[serde(default)]
+    pub decided_escalations: Vec<ArchitectureEscalation>,
     /// Guardrails at `block` or `ask`; guardrails that are off are left out.
     #[serde(default)]
     pub guardrails: Vec<ArchitectureGuardrail>,
@@ -124,6 +130,9 @@ pub struct ArchitectureEscalation {
     pub reason: String,
     pub source: String,
     pub status: String,
+    /// The architect's decision text, once the escalation is decided.
+    #[serde(default)]
+    pub resolution: Option<String>,
 }
 
 /// `RaiseArchitectureEscalationRequest` body produced by the plan check.
@@ -191,7 +200,22 @@ impl ArchitectureContext {
                 bail!("architecture references unknown boundary {reference}");
             }
         }
+        // Decided escalations are not checked: one decided under an earlier
+        // version may name a boundary this version removed, which is no
+        // reason to refuse the run. `approved_boundaries` ignores those.
         Ok(())
+    }
+
+    /// Boundaries an architect approved crossing on this ticket that this
+    /// version of the contract still defines.
+    fn approved_boundaries(&self) -> BTreeSet<&str> {
+        self.decided_escalations
+            .iter()
+            .filter(|escalation| escalation.status == "approved")
+            .flat_map(|escalation| &escalation.boundary_ids)
+            .map(String::as_str)
+            .filter(|id| self.boundary(id).is_some())
+            .collect()
     }
 
     fn boundary(&self, id: &str) -> Option<&ArchitectureBoundary> {
@@ -212,7 +236,8 @@ impl ArchitectureContext {
     }
 
     /// Checks changed paths against the boundaries the ticket declared. A path is
-    /// in scope when it belongs to no boundary or to at least one declared one.
+    /// in scope when it belongs to no boundary, to at least one declared one, or
+    /// to one an architect approved crossing on an earlier escalation.
     /// Without declared boundaries the ticket has no path scope to enforce.
     pub fn check_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> PlanVerdict {
         if self.ticket_boundary_ids.is_empty() {
@@ -222,6 +247,7 @@ impl ArchitectureContext {
             .ticket_boundary_ids
             .iter()
             .map(String::as_str)
+            .chain(self.approved_boundaries())
             .collect::<BTreeSet<_>>();
         let mut crossings = BTreeMap::<&str, Vec<&str>>::new();
         for path in paths {
@@ -293,6 +319,34 @@ impl ArchitectureContext {
         }
     }
 
+    /// One entry per decided escalation with the architect's resolution, or
+    /// `(none)`.
+    pub fn decision_lines(&self) -> String {
+        if self.decided_escalations.is_empty() {
+            "(none)".to_owned()
+        } else {
+            self.decided_escalations
+                .iter()
+                .map(|escalation| {
+                    format!(
+                        "- {} [{}] boundaries {}: {}\n  Architect's resolution: {}",
+                        escalation.id,
+                        escalation.status,
+                        escalation.boundary_ids.join(", "),
+                        escalation.reason,
+                        escalation
+                            .resolution
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|resolution| !resolution.is_empty())
+                            .unwrap_or("(none given)")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
     /// The contract and plan check for a worker-run agent.
     pub fn prompt_section(&self) -> Result<String> {
         self.prompt_for(PromptAudience::Worker)
@@ -321,6 +375,7 @@ impl ArchitectureContext {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let decided = self.decision_lines();
         Ok(format!(
             r#"
 Project architecture contract (version {version}):
@@ -336,6 +391,9 @@ Boundaries this ticket declared: {declared}
 Open architecture escalations (do not make these crossings while they are pending):
 {open}
 
+Architect decisions on this ticket's earlier escalations (newest first; they override the declared boundaries above). Approved: you may make that crossing, within what the resolution allows; it counts as declared in the plan check. Rejected: do not make that crossing; follow the resolution's guidance to stay inside the boundaries, and escalate again only for a different approach:
+{decided}
+
 Guardrails (block: never do it; ask: stop and get the person's approval first):
 {guardrails}
 
@@ -343,7 +401,7 @@ Protected paths (read_only: never modify; ask: an architect must approve changes
 {protected}
 
 Architecture plan check. Before editing any file, plan the change: list each file you intend to create or modify, the boundary that owns it (from the boundary `paths` globs), and every new dependency between boundaries. Check that plan against the contract:
-1. Every changed file belongs to a declared boundary or to no boundary.
+1. Every changed file belongs to a declared boundary, to a boundary an approved decision allows, or to no boundary.
 2. Every new cross-boundary dependency is listed in the depending boundary's `may_depend_on`.
 3. No rule or accepted decision is contradicted.
 If the plan passes, implement it and keep the implementation inside it. If any check fails and no compliant implementation exists, do not make the crossing and do not edit files for it. Instead end your final update with exactly:
@@ -634,11 +692,114 @@ mod tests {
             reason: "needs a roles table".into(),
             source: "agent".into(),
             status: "open".into(),
+            resolution: None,
         });
         assert_eq!(
             context.check_paths(["migrations/002_roles.sql"]),
             PlanVerdict::AwaitingEscalation("esc-1".into())
         );
+    }
+
+    fn decided(
+        id: &str,
+        status: &str,
+        boundaries: &[&str],
+        resolution: &str,
+    ) -> ArchitectureEscalation {
+        ArchitectureEscalation {
+            id: id.into(),
+            agent_run_id: Some("run-0".into()),
+            architecture_version: 3,
+            boundary_ids: boundaries.iter().map(|id| (*id).to_owned()).collect(),
+            reason: "needs a roles table".into(),
+            source: "agent".into(),
+            status: status.into(),
+            resolution: Some(resolution.into()),
+        }
+    }
+
+    #[test]
+    fn an_approved_escalation_lets_a_later_run_cross_its_boundaries() {
+        let mut context = context();
+        context.decided_escalations.push(decided(
+            "esc-1",
+            "approved",
+            &["storage"],
+            "Allowed by ADR-7; add the roles table.",
+        ));
+        assert_eq!(
+            context.check_paths(["crates/api/src/routes.rs", "migrations/002_roles.sql"]),
+            PlanVerdict::WithinBoundaries
+        );
+        // The approval covers only the boundaries it names.
+        let PlanVerdict::Escalate(request) =
+            context.check_paths(["crates/ticket-service/src/security/authz.rs"])
+        else {
+            panic!("expected an escalation");
+        };
+        assert_eq!(request.boundary_ids, ["security-authz"]);
+    }
+
+    #[test]
+    fn a_rejected_escalation_does_not_allow_the_crossing() {
+        let mut context = context();
+        context.decided_escalations.push(decided(
+            "esc-1",
+            "rejected",
+            &["storage"],
+            "Keep roles in the existing table.",
+        ));
+        assert!(matches!(
+            context.check_paths(["migrations/002_roles.sql"]),
+            PlanVerdict::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn a_decision_on_a_removed_boundary_is_ignored_not_refused() {
+        let mut context = context();
+        context.decided_escalations.push(decided(
+            "esc-1",
+            "approved",
+            &["billing"],
+            "Approved under v2.",
+        ));
+        assert!(context.validate("run-1").is_ok());
+        assert!(matches!(
+            context.check_paths(["migrations/002_roles.sql"]),
+            PlanVerdict::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn decided_escalations_default_to_none_from_older_servers() {
+        let context = context();
+        assert!(context.decided_escalations.is_empty());
+        assert!(
+            context
+                .prompt_section()
+                .unwrap()
+                .contains("Architect decisions on this ticket's earlier escalations")
+        );
+    }
+
+    #[test]
+    fn prompt_carries_the_architects_resolution() {
+        let mut context = context();
+        context.decided_escalations.push(decided(
+            "esc-1",
+            "rejected",
+            &["storage"],
+            "Keep roles in the existing table.",
+        ));
+        for audience in [PromptAudience::Worker, PromptAudience::IdeSession] {
+            let prompt = context.prompt_for(audience).unwrap();
+            assert!(
+                prompt.contains("- esc-1 [rejected] boundaries storage"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("Architect's resolution: Keep roles in the existing table."));
+        }
     }
 
     #[test]

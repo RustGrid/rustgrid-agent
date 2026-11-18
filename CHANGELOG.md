@@ -15,6 +15,13 @@ Semantic Versioning.
 
 ### Fixed
 
+- A run after an architecture escalation was decided now gets the decision.
+  The manifest's new `decided_escalations` (RustGrid API 2.2.0) reaches the
+  prompt and, for IDE sessions, the linked context, with the architect's
+  resolution. An approved escalation's boundaries count as declared in the diff
+  check. Before, the second run never saw the decision: after an approval its
+  diff check raised the same escalation again and blocked, and a rejection's
+  guidance never reached the agent.
 - Agents now see the contract's guardrails and protected paths. The worker
   dropped them, and the boundaries' `access` and the contract's `standard`,
   when it read the manifest.
