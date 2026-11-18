@@ -2569,7 +2569,11 @@ mod tests {
     fn real_large_output_preserves_bounded_head_and_tail_on_timeout() {
         let root = tempfile::tempdir().unwrap();
         let program = executable(&["/usr/bin/yes", "/bin/yes"]);
-        let request = process_request(&program, &["validation-tail-marker"], 50, 256);
+        // `yes` never exits, so this always ends in a timeout. The timeout must
+        // still leave room for `yes` to be scheduled and write more than the
+        // 256-byte limit: 50 ms was too short on a loaded CI runner. Only the
+        // bounded head and tail are kept, so a longer run costs no memory.
+        let request = process_request(&program, &["validation-tail-marker"], 2_000, 256);
         let mut artifacts = RecordingArtifactSink::default();
         let mut observations = RecordingObservationSink::default();
 
