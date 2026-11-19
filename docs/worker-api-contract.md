@@ -220,14 +220,23 @@ The plan is checked twice:
    `RUSTGRID_AGENT_STATUS: ESCALATE`, `RUSTGRID_ESCALATION_BOUNDARIES`,
    `RUSTGRID_ESCALATION_REASON`, and `RUSTGRID_PROPOSED_CHANGE` lines.
 2. After every successful Codex session (initial, gate repair, and CI repair)
-   the worker matches each agent-changed path against the boundaries. A path is
-   in scope when it belongs to no boundary, to at least one declared
-   boundary, or to a boundary of an approved entry in `decided_escalations`.
-   When `ticket_boundary_ids` is empty no path scope is enforced.
+   the worker matches each agent-changed path against the contract:
+   - **Protected paths** apply to every run, whatever the ticket declared. A
+     change to a `read_only` path fails the run as a human-intervention block
+     without an escalation: no approval can allow it, only an architect
+     changing the contract. A change to an `ask` path needs an approved entry
+     in `decided_escalations` for that boundary, or it escalates. An unknown
+     `access` value is treated as `read_only`.
+   - **Declared scope:** a path is in scope when it belongs to no boundary, to
+     at least one declared boundary, or to a boundary of an approved entry in
+     `decided_escalations`. When `ticket_boundary_ids` is empty no path scope
+     is enforced.
+
+   `ask` paths and scope crossings found together raise one escalation.
    `may_depend_on`, rules, and decisions are enforced through the prompt, CI,
    and review, not by the worker's diff check.
 
-Either check that fails raises an escalation:
+Either check that fails (other than a `read_only` change) raises an escalation:
 
 `POST /agent-runs/{run_id}/architecture-escalations`
 
