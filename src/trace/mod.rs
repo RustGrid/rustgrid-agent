@@ -92,6 +92,9 @@ pub struct HookInput {
     /// Why `SessionStart` fired: `startup`, `resume`, `clear` or `compact`.
     #[serde(default)]
     pub source: Option<String>,
+    /// `PreToolUse`: the arguments of the tool Claude is about to run.
+    #[serde(default)]
+    pub tool_input: Option<Value>,
 }
 
 /// What a hook tells Claude Code.
@@ -291,6 +294,73 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// `PreToolUse` for file edits: blocks an edit to a protected path of the
+/// linked session's architecture contract. It reads only local files, takes
+/// no session lock and records nothing, and any problem lets the edit through,
+/// because tracing never holds up work.
+fn guard_tool_use(dir: &Path, input: &HookInput) -> HookOutcome {
+    let guard = || -> Option<String> {
+        let session = Session::load(dir, &input.session_id).ok()?;
+        let key = &session.ticket.as_ref()?.key;
+        let cwd = input.cwd.as_deref().or(session.cwd.as_deref())?;
+        let tool_input = input.tool_input.as_ref()?;
+        let file = tool_input
+            .get("file_path")
+            .or_else(|| tool_input.get("notebook_path"))
+            .and_then(Value::as_str)?;
+        let path = repository_path(cwd, Path::new(file))?;
+        let ticket_dir = ticket::context_dir(Some(cwd), key).ok()?;
+        architecture::guard_edit(&ticket_dir, &path)
+    };
+    guard().map_or(HookOutcome::Continue, HookOutcome::Block)
+}
+
+/// `file` relative to the root of the repository `cwd` is in, with `/`
+/// separators and `.` and `..` resolved; `None` outside the repository.
+fn repository_path(cwd: &Path, file: &Path) -> Option<String> {
+    use std::path::Component;
+    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
+    let absolute = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        cwd.join(file)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    let relative = normalized
+        .strip_prefix(&root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            // Git reports the resolved root (macOS `/tmp` is `/private/tmp`).
+            // The file and its folders may not exist yet, so resolve the
+            // nearest folder that does and keep the rest as written.
+            let existing = normalized
+                .ancestors()
+                .find_map(|ancestor| Some((ancestor, ancestor.canonicalize().ok()?)))?;
+            let rest = normalized.strip_prefix(existing.0).ok()?;
+            existing
+                .1
+                .join(rest)
+                .strip_prefix(root.canonicalize().ok()?)
+                .map(Path::to_path_buf)
+                .ok()
+        })?;
+    let parts = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// `owner/repo` from a GitHub-style remote URL.
 fn repository_from_remote(remote: &str) -> Option<String> {
     let path = remote
@@ -379,6 +449,9 @@ fn hook_in(
 ) -> Result<HookOutcome> {
     if !valid_session_id(&input.session_id) {
         bail!("Claude Code sent an invalid session id");
+    }
+    if event == "PreToolUse" {
+        return Ok(guard_tool_use(dir, &input));
     }
     let dir = dir.to_path_buf();
     let _guard = SessionLock::acquire(&dir, &input.session_id, "state", true)?;
@@ -1698,6 +1771,7 @@ mod tests {
                 cwd: Some(cwd.to_path_buf()),
                 prompt: Some(text.into()),
                 source: None,
+                tool_input: None,
             },
             false,
         )
@@ -1743,6 +1817,87 @@ mod tests {
             HookOutcome::Continue
         );
         assert!(dir.join("s-1.dirty").exists());
+    }
+
+    fn pre_edit(dir: &Path, cwd: &Path, file: &str) -> HookOutcome {
+        hook_in(
+            dir,
+            Path::new("/nonexistent/config.json"),
+            "PreToolUse",
+            HookInput {
+                session_id: "s-1".into(),
+                cwd: Some(cwd.to_path_buf()),
+                tool_input: Some(json!({"file_path": file, "old_string": "a", "new_string": "b"})),
+                ..HookInput::default()
+            },
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn edits_to_protected_paths_are_blocked_in_a_linked_session() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("trace");
+        fs::create_dir_all(&dir).unwrap();
+        let repo = repo_on("main");
+        let protected = repo.path().join("crates/core/src/lib.rs");
+        let protected = protected.to_str().unwrap();
+
+        // Unlinked: nothing to check against.
+        assert_eq!(
+            pre_edit(&dir, repo.path(), protected),
+            HookOutcome::Continue
+        );
+
+        let mut session = Session::load(&dir, "s-1").unwrap();
+        session.ticket = Some(LinkedTicket {
+            key: "ADD-354".into(),
+            ..LinkedTicket::default()
+        });
+        session.run_id = Some("run-1".into());
+        session.save(&dir).unwrap();
+        // Linked, but the project has no contract.
+        assert_eq!(
+            pre_edit(&dir, repo.path(), protected),
+            HookOutcome::Continue
+        );
+
+        let ticket_dir = ticket::context_dir(Some(repo.path()), "ADD-354").unwrap();
+        architecture::prepare(
+            &ticket_dir,
+            "run-1",
+            Some(&json!({
+                "version": 1,
+                "document": {
+                    "schema_version": crate::architecture::SCHEMA_VERSION,
+                    "boundaries": [{"id": "core", "name": "Core", "paths": ["crates/core/**"], "access": "read_only"}]
+                },
+                "protected_paths": [{"boundary_id": "core", "paths": ["crates/core/**"], "access": "read_only"}],
+                "escalation_path": "/api/v1/agent-runs/run-1/architecture-escalations"
+            })),
+        )
+        .unwrap();
+
+        let HookOutcome::Block(reason) = pre_edit(&dir, repo.path(), protected) else {
+            panic!("an edit to a read-only path must be blocked");
+        };
+        assert!(reason.contains("crates/core/src/lib.rs"), "{reason}");
+        // Relative and `..` paths resolve to the same file.
+        assert!(matches!(
+            pre_edit(&dir, repo.path(), "crates/http/../core/src/lib.rs"),
+            HookOutcome::Block(_)
+        ));
+        assert_eq!(
+            pre_edit(&dir, repo.path(), "crates/http/src/lib.rs"),
+            HookOutcome::Continue
+        );
+        assert_eq!(
+            pre_edit(&dir, repo.path(), "/elsewhere/crates/core/src/lib.rs"),
+            HookOutcome::Continue
+        );
+        // The guard records nothing for the flush.
+        assert!(!dir.join("s-1.dirty").exists());
     }
 
     fn session_start(dir: &Path, config: &Path, cwd: &Path, source: &str) {

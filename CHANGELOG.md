@@ -5,6 +5,15 @@ Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- IDE sessions keep Claude out of the architecture contract's protected
+  paths. A new `PreToolUse` hook blocks file edits to `read_only` paths, and to
+  `ask` paths until an architect approves an escalation for the boundary. It
+  reads only the contract the link wrote and lets the edit through on any
+  problem. Run `rustgrid-agent trace install` again to add the hook;
+  `trace status` says when it is missing.
+
 ### Fixed
 
 - The worker's diff check now enforces the contract's protected paths, which

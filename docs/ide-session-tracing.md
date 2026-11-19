@@ -67,7 +67,8 @@ RustGrid's.
 ## How it works
 
 Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
-`UserPromptSubmit`, `PostToolUse`, `Stop` and `SessionEnd`.
+`UserPromptSubmit`, `PreToolUse` (file edits only), `PostToolUse`, `Stop` and
+`SessionEnd`.
 
 - **The hook stays fast.** It records the session in `~/.rustgrid/trace`
   (private to the user) and returns at once. It starts a detached
@@ -121,6 +122,17 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     boundaries, it ends its reply with the escalation lines from the plan
     check, and the hook raises the escalation for an architect on the run. An
     escalation that could not be raised is kept in `architecture.error`.
+  - **Protected paths:** before Claude edits a file (`Edit`, `Write`,
+    `MultiEdit`, `NotebookEdit`), the `PreToolUse` hook checks it against the
+    contract the link wrote. An edit to a `read_only` path is blocked. An edit
+    to an `ask` path is blocked until an architect approves an escalation for
+    its boundary; Claude is told to raise one. Run `/rustgrid-link` again after
+    the decision to pick it up. The ticket's declared boundaries are not
+    enforced here, because the person steers the session. The check reads only
+    local files and lets the edit through on any problem. It does not see
+    shell commands, so a `Bash` write is not blocked; the runner and review
+    remain the authority. Installs from before this hook keep tracing, and
+    `trace status` asks for `trace install` to add it.
   - **Unlinked:** until a session is linked, the hook blocks prompts with
     instructions. It also blocks prompts until the computer is signed in.
   - **Relinking:** linking another ticket mid-session ends the first ticket's

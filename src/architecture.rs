@@ -238,6 +238,21 @@ impl ArchitectureContext {
             .collect()
     }
 
+    /// Checks paths against the protected paths alone, leaving the ticket's
+    /// declared scope out. A person's IDE session uses it before each edit:
+    /// the person steers the scope, but protected paths are the contract's
+    /// hard rules.
+    pub fn check_protected_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> PlanVerdict {
+        ArchitectureContext {
+            ticket_boundary_ids: Vec::new(),
+            ..self.clone()
+        }
+        .check_paths(paths)
+    }
+
     /// Checks changed paths against the contract.
     ///
     /// Protected paths apply to every run, whatever scope the ticket declared:
