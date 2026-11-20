@@ -14,6 +14,11 @@ Semantic Versioning.
   problem. Run `rustgrid-agent trace install` again to add the hook;
   `trace status` says when it is missing.
 
+### Security
+
+- The container image moves to Node 24.22.3, which fixes the High-severity
+  Node CVEs the image scan reported in 24.22.1.
+
 ### Fixed
 
 - The worker's diff check now enforces the contract's protected paths, which
