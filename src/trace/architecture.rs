@@ -98,7 +98,10 @@ pub(crate) fn escalate_from_reply(client: &RustGridClient, dir: &Path, run_id: &
             PlanVerdict::Escalate(request) => client
                 .raise_architecture_escalation(run_id, &request)
                 .map(|_| ()),
-            PlanVerdict::WithinBoundaries | PlanVerdict::AwaitingEscalation(_) => Ok(()),
+            // `agent_escalation` never forbids; only the worker's diff check does.
+            PlanVerdict::WithinBoundaries
+            | PlanVerdict::AwaitingEscalation(_)
+            | PlanVerdict::Forbidden(_) => Ok(()),
         });
     let problem = dir.join(PROBLEM_FILE);
     match outcome {

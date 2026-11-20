@@ -151,6 +151,9 @@ pub enum PlanVerdict {
     /// An open escalation already covers these boundaries; block without raising another.
     AwaitingEscalation(String),
     Escalate(EscalationRequest),
+    /// The change touches read-only protected paths. No escalation can allow
+    /// it; only an architect changing the contract can.
+    Forbidden(String),
 }
 
 impl ArchitectureContext {
@@ -235,47 +238,89 @@ impl ArchitectureContext {
             .collect()
     }
 
-    /// Checks changed paths against the boundaries the ticket declared. A path is
-    /// in scope when it belongs to no boundary, to at least one declared one, or
-    /// to one an architect approved crossing on an earlier escalation.
-    /// Without declared boundaries the ticket has no path scope to enforce.
+    /// Checks changed paths against the contract.
+    ///
+    /// Protected paths apply to every run, whatever scope the ticket declared:
+    /// a change to a `read_only` path is forbidden, and a change to an `ask`
+    /// path needs an architect's approved escalation for that boundary. Any
+    /// other access value fails closed as `read_only`.
+    ///
+    /// Then, when the ticket declared boundaries, a path is in scope when it
+    /// belongs to no boundary, to at least one declared one, or to one an
+    /// architect approved crossing on an earlier escalation. Without declared
+    /// boundaries the ticket has no path scope to enforce.
     pub fn check_paths<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> PlanVerdict {
-        if self.ticket_boundary_ids.is_empty() {
-            return PlanVerdict::WithinBoundaries;
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let approved = self.approved_boundaries();
+        let mut read_only = BTreeMap::<&str, Vec<&str>>::new();
+        let mut needs_architect = BTreeMap::<&str, Vec<&str>>::new();
+        for &path in &paths {
+            for protected in &self.protected_paths {
+                if !protected.paths.iter().any(|glob| glob_matches(glob, path)) {
+                    continue;
+                }
+                let boundary = protected.boundary_id.as_str();
+                if protected.access == "ask" {
+                    if !approved.contains(boundary) {
+                        needs_architect.entry(boundary).or_default().push(path);
+                    }
+                } else {
+                    read_only.entry(boundary).or_default().push(path);
+                }
+            }
         }
-        let declared = self
-            .ticket_boundary_ids
-            .iter()
-            .map(String::as_str)
-            .chain(self.approved_boundaries())
-            .collect::<BTreeSet<_>>();
+        if !read_only.is_empty() {
+            return PlanVerdict::Forbidden(format!(
+                "The agent changed read-only protected paths ({}). Revert those changes; only an architect changing the contract can allow them",
+                crossing_detail(&read_only)
+            ));
+        }
+
         let mut crossings = BTreeMap::<&str, Vec<&str>>::new();
-        for path in paths {
-            let owners = self.owners(path);
-            if owners.is_empty() || owners.iter().any(|owner| declared.contains(owner)) {
-                continue;
-            }
-            for owner in owners {
-                crossings.entry(owner).or_default().push(path);
+        if !self.ticket_boundary_ids.is_empty() {
+            let declared = self
+                .ticket_boundary_ids
+                .iter()
+                .map(String::as_str)
+                .chain(approved.iter().copied())
+                .collect::<BTreeSet<_>>();
+            for &path in &paths {
+                let owners = self.owners(path);
+                if owners.is_empty() || owners.iter().any(|owner| declared.contains(owner)) {
+                    continue;
+                }
+                for owner in owners {
+                    crossings.entry(owner).or_default().push(path);
+                }
             }
         }
-        if crossings.is_empty() {
+        if crossings.is_empty() && needs_architect.is_empty() {
             return PlanVerdict::WithinBoundaries;
         }
-        let detail = crossings
-            .iter()
-            .map(|(boundary, paths)| format!("{boundary}: {}", paths.join(", ")))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let mut reasons = Vec::new();
+        if !crossings.is_empty() {
+            reasons.push(format!(
+                "The agent's changes leave the ticket's declared boundaries ({}). Changed paths outside them: {}.",
+                self.ticket_boundary_ids.join(", "),
+                crossing_detail(&crossings)
+            ));
+        }
+        if !needs_architect.is_empty() {
+            reasons.push(format!(
+                "The agent changed protected paths that need an architect's approval: {}.",
+                crossing_detail(&needs_architect)
+            ));
+        }
+        let boundary_ids = crossings
+            .keys()
+            .chain(needs_architect.keys())
+            .map(|id| (*id).to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         self.verdict(EscalationRequest {
-            boundary_ids: crossings.keys().map(|id| (*id).to_owned()).collect(),
-            reason: truncate(
-                &format!(
-                    "The agent's changes leave the ticket's declared boundaries ({}). Changed paths outside them: {detail}",
-                    self.ticket_boundary_ids.join(", ")
-                ),
-                MAX_ESCALATION_TEXT,
-            ),
+            boundary_ids,
+            reason: truncate(&reasons.join(" "), MAX_ESCALATION_TEXT),
             proposed_change: None,
         })
     }
@@ -571,6 +616,15 @@ impl ArchitectureContext {
     }
 }
 
+/// `boundary: path, path; boundary: path` for an escalation reason.
+fn crossing_detail(crossings: &BTreeMap<&str, Vec<&str>>) -> String {
+    crossings
+        .iter()
+        .map(|(boundary, paths)| format!("{boundary}: {}", paths.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn truncate(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
@@ -831,5 +885,91 @@ mod tests {
         assert!(section.contains("Boundaries this ticket declared: api"));
         assert!(section.contains("security::authz"));
         assert!(section.contains("RUSTGRID_AGENT_STATUS: ESCALATE"));
+    }
+
+    fn protected(context: &mut ArchitectureContext, boundary: &str, glob: &str, access: &str) {
+        context.protected_paths.push(ArchitectureProtectedPaths {
+            boundary_id: boundary.into(),
+            paths: vec![glob.into()],
+            access: access.into(),
+        });
+    }
+
+    #[test]
+    fn read_only_protected_paths_are_forbidden_without_declared_scope() {
+        let mut context = context();
+        context.ticket_boundary_ids.clear();
+        protected(&mut context, "storage", "migrations/*.sql", "read_only");
+        let PlanVerdict::Forbidden(action) =
+            context.check_paths(["README.md", "migrations/002_roles.sql"])
+        else {
+            panic!("expected the change to be forbidden");
+        };
+        assert!(action.contains("storage: migrations/002_roles.sql"));
+    }
+
+    #[test]
+    fn read_only_protected_paths_stay_forbidden_inside_declared_boundaries_and_after_approval() {
+        let mut context = context();
+        protected(&mut context, "api", "crates/api/src/auth.rs", "read_only");
+        context
+            .decided_escalations
+            .push(decided("esc-1", "approved", &["api"], "Fine."));
+        assert!(matches!(
+            context.check_paths(["crates/api/src/auth.rs"]),
+            PlanVerdict::Forbidden(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_protected_access_fails_closed() {
+        let mut context = context();
+        protected(&mut context, "storage", "migrations/*.sql", "append_only");
+        assert!(matches!(
+            context.check_paths(["migrations/002_roles.sql"]),
+            PlanVerdict::Forbidden(_)
+        ));
+    }
+
+    #[test]
+    fn ask_protected_paths_escalate_until_an_architect_approves() {
+        let mut context = context();
+        context.ticket_boundary_ids.clear();
+        protected(
+            &mut context,
+            "security-authz",
+            "crates/ticket-service/src/security/**",
+            "ask",
+        );
+        let PlanVerdict::Escalate(request) =
+            context.check_paths(["crates/ticket-service/src/security/authz.rs"])
+        else {
+            panic!("expected an escalation");
+        };
+        assert_eq!(request.boundary_ids, ["security-authz"]);
+        assert!(request.reason.contains("need an architect's approval"));
+
+        context.decided_escalations.push(decided(
+            "esc-1",
+            "approved",
+            &["security-authz"],
+            "Allowed by ADR-7.",
+        ));
+        assert_eq!(
+            context.check_paths(["crates/ticket-service/src/security/authz.rs"]),
+            PlanVerdict::WithinBoundaries
+        );
+    }
+
+    #[test]
+    fn ask_paths_and_declared_scope_crossings_share_one_escalation() {
+        let mut context = context();
+        protected(&mut context, "api", "crates/api/src/routes.rs", "ask");
+        let PlanVerdict::Escalate(request) =
+            context.check_paths(["crates/api/src/routes.rs", "migrations/002_roles.sql"])
+        else {
+            panic!("expected an escalation");
+        };
+        assert_eq!(request.boundary_ids, ["api", "storage"]);
     }
 }

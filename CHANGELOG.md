@@ -3,6 +3,21 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Security
+
+- The container image moves to Node 24.22.3, which fixes the High-severity
+  Node CVEs the image scan reported in 24.22.1.
+
+### Fixed
+
+- The worker's diff check now enforces the contract's protected paths, which
+  were only in the prompt. A change to a `read_only` path fails the run as a
+  human-intervention block, even after an approval; a change to an `ask` path
+  raises an escalation unless an architect already approved that boundary.
+  Both apply when the ticket declares no boundaries.
+
 ## 1.13.0 - 2026-11-18
 
 ### Added

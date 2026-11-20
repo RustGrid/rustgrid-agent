@@ -1007,6 +1007,15 @@ fn enforce_architecture(
 ) -> Result<()> {
     let escalation_id = match verdict {
         PlanVerdict::WithinBoundaries => return Ok(()),
+        PlanVerdict::Forbidden(action) => {
+            context.reporter.step(
+                &format!("{step_id}_architecture_check"),
+                StepStatus::Failed,
+                "Changes touch read-only protected paths",
+                Some(json!({"source": source, "action": action})),
+            )?;
+            return Err(RunFailure::HumanIntervention { action }.into());
+        }
         PlanVerdict::AwaitingEscalation(id) => id,
         PlanVerdict::Escalate(request) => {
             context.reporter.step(
