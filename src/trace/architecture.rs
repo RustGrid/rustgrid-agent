@@ -84,6 +84,26 @@ fn load(dir: &Path) -> Option<ArchitectureContext> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Why Claude may not edit `path` (repository-relative) under the linked
+/// session's contract, or `None` when it may. Only protected paths are
+/// checked; without a contract every edit is allowed.
+pub(crate) fn guard_edit(dir: &Path, path: &str) -> Option<String> {
+    let context = load(dir)?;
+    match context.check_protected_paths([path]) {
+        PlanVerdict::WithinBoundaries => None,
+        PlanVerdict::Forbidden(_) => Some(format!(
+            "RustGrid architecture contract: {path} is a read-only protected path, so this edit was blocked. Do not change it, by this or any other tool. Tell the user; only an architect changing the contract can allow it."
+        )),
+        PlanVerdict::Escalate(request) => Some(format!(
+            "RustGrid architecture contract: {path} is a protected path in boundary {boundaries}, and changing it needs an architect's approval, so this edit was blocked. If the change is needed, stop and end your reply with the plan check's escalation lines for {boundaries}, then wait. Once an architect approves, the user runs /rustgrid-link again to pick up the decision.",
+            boundaries = request.boundary_ids.join(", ")
+        )),
+        PlanVerdict::AwaitingEscalation(id) => Some(format!(
+            "RustGrid architecture contract: {path} is a protected path, and architecture escalation {id} for it is still open, so this edit was blocked. Wait for an architect to decide; then the user runs /rustgrid-link again to pick up the decision."
+        )),
+    }
+}
+
 /// Raises the escalation a reply asks for, if it asks for one. A failure is
 /// recorded in the ticket's directory instead of holding up the trace, and
 /// RustGrid deduplicates retries of the same escalation.
@@ -182,5 +202,41 @@ mod tests {
         let text = prepare(dir.path(), "run-1", Some(&contract("run-9"))).unwrap();
         assert!(text.contains("could not be used"), "{text}");
         assert!(load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn edits_to_protected_paths_are_blocked_and_others_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = contract("run-1");
+        value["document"]["boundaries"]
+            .as_array_mut()
+            .unwrap()
+            .push(
+                json!({"id": "auth", "name": "Auth", "paths": ["crates/auth/**"], "access": "ask"}),
+            );
+        value["protected_paths"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"boundary_id": "auth", "paths": ["crates/auth/**"], "access": "ask"}));
+        prepare(dir.path(), "run-1", Some(&value)).unwrap();
+
+        let read_only = guard_edit(dir.path(), "crates/core/src/lib.rs").unwrap();
+        assert!(
+            read_only.contains("read-only protected path"),
+            "{read_only}"
+        );
+        let ask = guard_edit(dir.path(), "crates/auth/src/token.rs").unwrap();
+        assert!(ask.contains("needs an architect's approval"), "{ask}");
+        assert!(ask.contains("escalation lines for auth"), "{ask}");
+        // The ticket declared only http, but declared scope stays advisory
+        // in an IDE session: only protected paths are blocked.
+        assert_eq!(guard_edit(dir.path(), "crates/other/src/lib.rs"), None);
+        assert_eq!(guard_edit(dir.path(), "crates/http/src/routes.rs"), None);
+    }
+
+    #[test]
+    fn edits_are_allowed_without_a_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(guard_edit(dir.path(), "crates/core/src/lib.rs"), None);
     }
 }

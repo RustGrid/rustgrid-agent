@@ -23,13 +23,18 @@ use serde_json::{Map, Value, json};
 use crate::{api::RustGridClient, config::AppContext};
 
 /// Each hook Claude Code runs, its tool matcher, and its timeout in seconds.
-const HOOKS: [(&str, Option<&str>, u64); 5] = [
+const HOOKS: [(&str, Option<&str>, u64); 6] = [
     ("SessionStart", None, 10),
     ("UserPromptSubmit", None, 15),
+    (GUARD_EVENT, Some("Edit|Write|MultiEdit|NotebookEdit"), 5),
     ("PostToolUse", Some("*"), 5),
     ("Stop", None, 5),
     ("SessionEnd", None, 10),
 ];
+/// Blocks file edits to the architecture contract's protected paths. Tracing
+/// works without it, so installs from before it count as installed and
+/// `trace status` asks for a reinstall to add it.
+const GUARD_EVENT: &str = "PreToolUse";
 /// Marks a hook command as ours, whatever path the binary lives at.
 const HOOK_MARKER: &str = " trace hook ";
 const LINK_COMMAND: &str = include_str!("../../packaging/claude-code/commands/rustgrid-link.md");
@@ -198,11 +203,27 @@ pub fn merge_hooks(settings: &mut Value, binary: &Path) {
     }
 }
 
-/// The command our installed hooks run, if they are all present.
+/// Whether the protected-path guard hook is installed.
+pub fn has_guard_hook(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(GUARD_EVENT))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(is_our_hook)
+}
+
+/// The command our installed tracing hooks run, if they are all present.
 pub fn installed_hook_command(settings: &Value) -> Option<String> {
     let hooks = settings.get("hooks")?.as_object()?;
     let mut command = None;
-    for (event, _, _) in HOOKS {
+    for (event, _, _) in HOOKS
+        .into_iter()
+        .filter(|(event, _, _)| *event != GUARD_EVENT)
+    {
         let found = hooks
             .get(event)?
             .as_array()?
@@ -406,9 +427,8 @@ pub fn status(config_path: &Path) -> Result<()> {
     );
 
     let managed_path = managed_settings_path();
-    let managed = read_settings(&managed_path)
-        .ok()
-        .and_then(|settings| installed_hook_command(&settings));
+    let managed_settings = read_settings(&managed_path).ok();
+    let managed = managed_settings.as_ref().and_then(installed_hook_command);
     let user = user_settings_path()
         .ok()
         .and_then(|path| read_settings(&path).ok());
@@ -441,6 +461,19 @@ pub fn status(config_path: &Path) -> Result<()> {
             println!("{} Hooks: not installed", mark(false));
             problems.push("run `rustgrid-agent trace install`");
         }
+    }
+    let active = if managed.is_some() {
+        managed_settings.as_ref()
+    } else if user_hooks.is_some() {
+        user.as_ref()
+    } else {
+        None
+    };
+    if active.is_some_and(|settings| !has_guard_hook(settings)) {
+        println!(
+            "  ! The hook that keeps Claude out of the architecture contract's protected paths is missing; run `rustgrid-agent trace install{}` to add it.",
+            if managed.is_some() { "" } else { " --user" }
+        );
     }
     if user
         .as_ref()
