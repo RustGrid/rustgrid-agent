@@ -18,6 +18,7 @@ pub mod install;
 pub mod redact;
 pub mod ticket;
 pub mod transcript;
+pub mod updates;
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -178,6 +179,27 @@ struct Session {
     /// summary are still uploaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry_refused_run: Option<String>,
+    /// Where the last check of the run's updates stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updates_cursor: Option<String>,
+    /// The project's architecture version the person was last told about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    announced_architecture_version: Option<i32>,
+    /// The last check could not reach RustGrid, and the person was told.
+    #[serde(default)]
+    updates_unreachable: bool,
+    /// Changes `trace check` found, which Claude hears about with the next
+    /// prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_updates: Vec<String>,
+    /// Escalation id to the status this session was given or told about;
+    /// `None` until the link (or, for older links, the first check) sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    known_escalations: Option<std::collections::BTreeMap<String, String>>,
+    /// When the link was given only the newest decided escalations: the
+    /// oldest decision time among them. Earlier decisions are not news.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decided_before: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -508,7 +530,13 @@ fn hook_in(
                 })
             } else {
                 session.prompts += 1;
-                HookOutcome::Continue
+                match spawn
+                    .then(|| prompt_updates(config_path, &mut session))
+                    .flatten()
+                {
+                    Some(text) => HookOutcome::Context(text),
+                    None => HookOutcome::Continue,
+                }
             }
         }
         "SessionStart" => {
@@ -543,6 +571,16 @@ fn hook_in(
     Ok(outcome)
 }
 
+/// Checks the linked ticket for architect decisions and ticket changes before
+/// the prompt reaches Claude; see [`updates`].
+fn prompt_updates(config_path: &Path, session: &mut Session) -> Option<String> {
+    let key = session.ticket.as_ref()?.key.clone();
+    let dir = ticket::context_dir(session.cwd.as_deref(), &key).ok()?;
+    let client = AppContext::load(config_path)
+        .and_then(|context| RustGridClient::with_timeout(&context, updates::POLL_TIMEOUT));
+    updates::on_prompt(client, session, &dir)
+}
+
 /// Whether `SessionStart` began a new conversation rather than continuing one.
 /// Claude Code versions that send no source are treated as continuing, so a
 /// resumed session is never unlinked by mistake.
@@ -567,6 +605,17 @@ impl Session {
         self.execution_reported = false;
         self.ended = false;
         self.finalized = false;
+        self.forget_updates();
+    }
+
+    /// Starts checking for updates afresh, as for a newly linked run.
+    fn forget_updates(&mut self) {
+        self.updates_cursor = None;
+        self.announced_architecture_version = None;
+        self.updates_unreachable = false;
+        self.pending_updates.clear();
+        self.known_escalations = None;
+        self.decided_before = None;
     }
 
     /// Hands the session's run over to the flush to end once the transcript
@@ -716,6 +765,8 @@ fn link(config_path: &Path, session: &mut Session, key: &str) -> Result<Linked, 
                 unconfirmed: false,
             });
             session.link_problem = None;
+            session.forget_updates();
+            updates::seed(session, started.architecture.as_ref());
             session.execution_reported = false;
             session.ended = false;
             session.finalized = false;

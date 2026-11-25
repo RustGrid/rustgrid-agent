@@ -293,7 +293,7 @@ pub struct InteractiveRunStarted {
 }
 
 /// A ticket as an IDE session sees it when it links to it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TicketDetails {
     pub id: String,
     pub title: String,
@@ -322,6 +322,46 @@ pub struct TicketAttachment {
     pub status: Option<String>,
     #[serde(default)]
     pub virus_status: Option<String>,
+}
+
+/// `AgentRunUpdatesResponse`: what changed on a run's ticket since a cursor.
+/// Items can repeat across responses; they are deduplicated by `id`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RunUpdates {
+    pub cursor: String,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub architecture: RunArchitectureUpdate,
+    /// Raised or decided since the cursor, oldest change first.
+    #[serde(default)]
+    pub escalations: Vec<ArchitectureEscalation>,
+    /// The ticket as it is now, when it changed (always on the first poll).
+    #[serde(default)]
+    pub ticket: Option<RunTicketUpdate>,
+}
+
+/// `AgentRunArchitectureUpdate`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RunArchitectureUpdate {
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub current_version: Option<i32>,
+    #[serde(default)]
+    pub pinned_version: Option<i32>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// `AgentRunTicketUpdate`: the run's ticket as it is now.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RunTicketUpdate {
+    pub key: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub status: String,
 }
 
 #[derive(Deserialize)]
@@ -700,6 +740,29 @@ impl RustGridClient {
         )?;
         let list: TicketAttachmentList = deserialize_envelope(value, &[])?;
         Ok(list.items)
+    }
+
+    /// What changed on the run's ticket since `since` (a cursor from an
+    /// earlier call; `None` returns everything). `None` when RustGrid
+    /// answered 304: nothing changed, and the cursor stays the same.
+    pub fn run_updates(&self, run_id: &str, since: Option<&str>) -> Result<Option<RunUpdates>> {
+        let mut path = format!("agent-runs/{run_id}/updates");
+        if let Some(cursor) = since {
+            path.push_str("?since=");
+            path.push_str(&query_escape(cursor));
+        }
+        match self.send_value_with_policy(
+            Method::GET,
+            &path,
+            None,
+            None,
+            None,
+            SINGLE_ATTEMPT_POLICY,
+        ) {
+            Ok(value) => deserialize_envelope(value, &[]).map(Some),
+            Err(failure) if failure.status == StatusCode::NOT_MODIFIED => Ok(None),
+            Err(failure) => Err(failure.into()),
+        }
     }
 
     pub fn fetch_ticket(&self, ticket_id: &str) -> Result<Ticket> {
@@ -1481,6 +1544,19 @@ fn deserialize_envelope<T: DeserializeOwned>(mut value: Value, keys: &[&str]) ->
         }
     }
     serde_json::from_value(value).context("RustGrid response did not match the expected schema")
+}
+
+/// Percent-encodes a query parameter value, keeping only unreserved characters.
+fn query_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            escaped.push(byte as char);
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
 }
 
 fn payload_fingerprint(value: &Value) -> String {

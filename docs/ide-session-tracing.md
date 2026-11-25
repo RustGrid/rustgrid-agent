@@ -29,6 +29,7 @@ Restart Claude Code afterwards.
 | Command | What it does |
 |---|---|
 | `rustgrid-agent trace status` | Shows whether sessions are traced, where the hooks are, whether RustGrid answers, which ticket the current branch names, and the last traced session. |
+| `rustgrid-agent trace check` | Checks the ticket linked in this folder for architect decisions and ticket changes now, updates `architecture.md` and `ticket.md`, and prints what changed. `--session <id>` picks another session. |
 | `rustgrid-agent trace install --user` | Writes the hooks into your own `~/.claude/settings.json` instead, without sudo. Good for trying it out, but you can remove them. |
 | `rustgrid-agent trace uninstall` | Removes exactly what `install` added. |
 
@@ -126,13 +127,26 @@ Claude Code runs `rustgrid-agent trace hook <event>` for `SessionStart`,
     `MultiEdit`, `NotebookEdit`), the `PreToolUse` hook checks it against the
     contract the link wrote. An edit to a `read_only` path is blocked. An edit
     to an `ask` path is blocked until an architect approves an escalation for
-    its boundary; Claude is told to raise one. Run `/rustgrid-link` again after
-    the decision to pick it up. The ticket's declared boundaries are not
+    its boundary; Claude is told to raise one. The next prompt picks up the
+    decision through the live updates below. The ticket's declared boundaries are not
     enforced here, because the person steers the session. The check reads only
     local files and lets the edit through on any problem. It does not see
     shell commands, so a `Bash` write is not blocked; the runner and review
     remain the authority. Installs from before this hook keep tracing, and
     `trace status` asks for `trace install` to add it.
+  - **Live updates:** on every prompt, the hook asks RustGrid what changed on
+    the run's ticket since the last prompt
+    (`GET /api/v1/agent-runs/{run_id}/updates`, RustGrid API 2.3.0), giving it
+    3 seconds per request. When an architect decided one of the ticket's
+    escalations, a new escalation was raised, or the ticket's title, status or
+    description changed, it rewrites `architecture.md` and `ticket.md` and
+    Claude tells you in plain terms, for example "Architect approved
+    protected-1,3,4,5,6 for RUSTGRID-33: Add it to core." A new contract
+    version is announced but not loaded: the session stays on the version it
+    was linked under until a new conversation links again. If RustGrid can't
+    be reached, the session carries on with the copy it already has and
+    Claude says so once, not on every prompt. `trace check` runs the same
+    check by hand; what it finds reaches Claude with the next prompt.
   - **Unlinked:** until a session is linked, the hook blocks prompts with
     instructions. It also blocks prompts until the computer is signed in.
   - **Relinking:** linking another ticket mid-session ends the first ticket's

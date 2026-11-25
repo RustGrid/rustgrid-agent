@@ -56,6 +56,41 @@ fn openapi_snapshot_contains_the_architecture_escalation_contract() {
 }
 
 #[test]
+fn openapi_snapshot_contains_the_run_updates_contract() {
+    let spec: serde_json::Value =
+        serde_json::from_str(include_str!("../openapi.current.json")).expect("valid OpenAPI JSON");
+    let get = &spec["paths"]["/api/v1/agent-runs/{run_id}/updates"]["get"];
+    assert!(get.is_object(), "missing the run updates path");
+    assert!(
+        get["responses"]["304"].is_object(),
+        "nothing changed must answer 304"
+    );
+    assert!(
+        get["parameters"]
+            .as_array()
+            .expect("parameters")
+            .iter()
+            .any(|parameter| parameter["name"] == "since" && parameter["in"] == "query")
+    );
+    let schemas = &spec["components"]["schemas"];
+    let response = schemas["AgentRunUpdatesResponse"]["required"]
+        .as_array()
+        .expect("updates response required fields");
+    for field in ["cursor", "has_more", "architecture", "escalations"] {
+        assert!(response.iter().any(|value| value == field), "{field}");
+    }
+    let ticket = schemas["AgentRunTicketUpdate"]["required"]
+        .as_array()
+        .expect("ticket update required fields");
+    for field in ["key", "title", "status"] {
+        assert!(ticket.iter().any(|value| value == field), "{field}");
+    }
+    let escalation = &schemas["ArchitectureEscalationResponse"]["properties"];
+    assert!(escalation["resolution"].is_object());
+    assert!(escalation["status"].is_object());
+}
+
+#[test]
 fn openapi_snapshot_documents_provider_tagged_agent_policies() {
     let spec: serde_json::Value =
         serde_json::from_str(include_str!("../openapi.current.json")).expect("valid OpenAPI JSON");

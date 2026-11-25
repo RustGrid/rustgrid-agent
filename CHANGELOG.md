@@ -13,6 +13,15 @@ Semantic Versioning.
   reads only the contract the link wrote and lets the edit through on any
   problem. Run `rustgrid-agent trace install` again to add the hook;
   `trace status` says when it is missing.
+- Claude Code IDE sessions hear about architect decisions while they work.
+  On every prompt the trace hook polls RustGrid's
+  `GET /agent-runs/{run_id}/updates` (RustGrid API 2.3.0) with a 3-second
+  timeout. When an escalation on the ticket was decided or raised, or the
+  ticket's title, status or description changed, it rewrites `architecture.md`
+  and `ticket.md` and tells Claude in plain terms, for example "Architect
+  approved protected-1,3,4,5,6 for RUSTGRID-33: …". If RustGrid can't be
+  reached, the session keeps its copy and says so once per outage.
+- `rustgrid-agent trace check` runs the same check by hand.
 
 ### Security
 

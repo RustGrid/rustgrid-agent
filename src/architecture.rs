@@ -133,6 +133,9 @@ pub struct ArchitectureEscalation {
     /// The architect's decision text, once the escalation is decided.
     #[serde(default)]
     pub resolution: Option<String>,
+    /// When it was decided (RFC 3339, from RustGrid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
 }
 
 /// `RaiseArchitectureEscalationRequest` body produced by the plan check.
@@ -762,6 +765,7 @@ mod tests {
             source: "agent".into(),
             status: "open".into(),
             resolution: None,
+            resolved_at: None,
         });
         assert_eq!(
             context.check_paths(["migrations/002_roles.sql"]),
@@ -784,6 +788,7 @@ mod tests {
             source: "agent".into(),
             status: status.into(),
             resolution: Some(resolution.into()),
+            resolved_at: None,
         }
     }
 
