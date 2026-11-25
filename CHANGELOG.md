@@ -3,7 +3,7 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
-## Unreleased
+## 1.14.0 - 2026-11-25
 
 ### Added
 
@@ -27,6 +27,9 @@ Semantic Versioning.
 
 - The container image moves to Node 24.22.3, which fixes the High-severity
   Node CVEs the image scan reported in 24.22.1.
+- `url` moves to 2.5.9 for RUSTSEC-2026-0592, a stack overflow in
+  `Url::origin()` on nested `blob:` URLs. The agent never calls
+  `Url::origin()`, but the advisory failed the dependency policy check.
 
 ### Fixed
 
