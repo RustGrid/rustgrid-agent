@@ -47,9 +47,18 @@ fn write(dir: &Path, run_id: &str, value: &Value) -> Result<(ArchitectureContext
         serde_json::from_value(value.clone()).context("the contract is malformed")?;
     context.validate(run_id)?;
     fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let path = rewrite(dir, &context)?;
+    let _ = fs::remove_file(dir.join(PROBLEM_FILE));
+    Ok((context, path))
+}
+
+/// Saves the session's contract and the `architecture.md` made from it, as
+/// after an architect decided one of the ticket's escalations. Returns the
+/// document's path.
+pub(super) fn rewrite(dir: &Path, context: &ArchitectureContext) -> Result<PathBuf> {
     super::ticket::write_private(
         &dir.join(CONTEXT_FILE),
-        serde_json::to_string_pretty(&context)?.as_bytes(),
+        serde_json::to_string_pretty(context)?.as_bytes(),
     )?;
     let path = dir.join(DOCUMENT_FILE);
     let document = format!(
@@ -58,8 +67,7 @@ fn write(dir: &Path, run_id: &str, value: &Value) -> Result<(ArchitectureContext
         context.prompt_for(PromptAudience::IdeSession)?
     );
     super::ticket::write_private(&path, document.as_bytes())?;
-    let _ = fs::remove_file(dir.join(PROBLEM_FILE));
-    Ok((context, path))
+    Ok(path)
 }
 
 fn context_text(context: &ArchitectureContext, path: &Path) -> String {
@@ -79,7 +87,7 @@ fn context_text(context: &ArchitectureContext, path: &Path) -> String {
 }
 
 /// The contract the linked session works under, if the link wrote one.
-fn load(dir: &Path) -> Option<ArchitectureContext> {
+pub(super) fn load(dir: &Path) -> Option<ArchitectureContext> {
     let bytes = fs::read(dir.join(CONTEXT_FILE)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -95,11 +103,11 @@ pub(crate) fn guard_edit(dir: &Path, path: &str) -> Option<String> {
             "RustGrid architecture contract: {path} is a read-only protected path, so this edit was blocked. Do not change it, by this or any other tool. Tell the user; only an architect changing the contract can allow it."
         )),
         PlanVerdict::Escalate(request) => Some(format!(
-            "RustGrid architecture contract: {path} is a protected path in boundary {boundaries}, and changing it needs an architect's approval, so this edit was blocked. If the change is needed, stop and end your reply with the plan check's escalation lines for {boundaries}, then wait. Once an architect approves, the user runs /rustgrid-link again to pick up the decision.",
+            "RustGrid architecture contract: {path} is a protected path in boundary {boundaries}, and changing it needs an architect's approval, so this edit was blocked. If the change is needed, stop and end your reply with the plan check's escalation lines for {boundaries}, then wait. Once an architect approves, RustGrid passes the decision on with the user's next prompt.",
             boundaries = request.boundary_ids.join(", ")
         )),
         PlanVerdict::AwaitingEscalation(id) => Some(format!(
-            "RustGrid architecture contract: {path} is a protected path, and architecture escalation {id} for it is still open, so this edit was blocked. Wait for an architect to decide; then the user runs /rustgrid-link again to pick up the decision."
+            "RustGrid architecture contract: {path} is a protected path, and architecture escalation {id} for it is still open, so this edit was blocked. Wait for an architect to decide; RustGrid passes the decision on with the user's next prompt."
         )),
     }
 }

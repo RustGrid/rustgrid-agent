@@ -130,6 +130,17 @@ enum TraceCommand {
     },
     /// Show whether Claude Code sessions on this computer are traced.
     Status,
+    /// Check the linked ticket for architect decisions and ticket changes now.
+    ///
+    /// Runs the check every prompt runs: updates the ticket's
+    /// `architecture.md` and `ticket.md` and prints what changed. Claude
+    /// hears about it with the next prompt.
+    Check {
+        /// The Claude Code session to check; by default the one linked in
+        /// this directory.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Stop tracing Claude Code sessions on this computer.
     Uninstall {
         /// Only remove the hooks from your own Claude Code settings.
@@ -275,6 +286,9 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Trace {
             command: TraceCommand::Status,
         } => rustgrid_agent::trace::install::status(&config_path),
+        Commands::Trace {
+            command: TraceCommand::Check { session },
+        } => rustgrid_agent::trace::updates::check_by_hand(&config_path, session.as_deref()),
         Commands::Trace {
             command: TraceCommand::Uninstall { user, system_only },
         } => {
