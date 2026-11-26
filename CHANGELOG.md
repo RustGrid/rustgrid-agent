@@ -3,7 +3,7 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
-## 1.14.0 - 2026-11-25
+## 1.14.1 - 2026-11-26
 
 ### Fixed
 
