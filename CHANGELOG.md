@@ -3,6 +3,20 @@
 All notable changes to rustgrid-agent are documented here. The project follows
 Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- An IDE session linked under 1.13 or earlier no longer announces old
+  architect decisions as news after the upgrade. When the link's list of
+  decisions was full, decisions older than it were told again on the first
+  check; the cutoff now comes from RustGrid's times for the decisions the link
+  had.
+- The architect decisions in `architecture.md` stay newest first. Decisions
+  kept from an earlier version now take the time RustGrid sends, so later
+  decisions no longer list below them, and decision times are compared as
+  times, so offsets and fractions of a second order correctly.
+
 ## 1.14.0 - 2026-11-25
 
 ### Added

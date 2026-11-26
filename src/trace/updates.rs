@@ -19,7 +19,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -63,6 +63,7 @@ pub(super) fn seed(session: &mut Session, architecture: Option<&Value>) {
 fn seed_from(session: &mut Session, contract: Option<&ArchitectureContext>) {
     let mut known = BTreeMap::new();
     session.decided_before = None;
+    session.decided_before_pending = false;
     if let Some(contract) = contract {
         for escalation in contract
             .open_escalations
@@ -74,11 +75,16 @@ fn seed_from(session: &mut Session, contract: Option<&ArchitectureContext>) {
         // A full list may have left older decisions out; those predate the
         // link and are not news.
         if contract.decided_escalations.len() >= MAX_DECIDED {
-            session.decided_before = contract
+            if contract
                 .decided_escalations
                 .iter()
-                .filter_map(|escalation| escalation.resolved_at.clone())
-                .min();
+                .all(|escalation| decided_time(escalation).is_some())
+            {
+                session.decided_before = oldest(&contract.decided_escalations);
+            } else {
+                // Written by a version that kept no decision times.
+                session.decided_before_pending = true;
+            }
         }
     }
     session.known_escalations = Some(known);
@@ -147,6 +153,8 @@ fn poll(
             break;
         }
     }
+    // Only the first check returns the decisions the link had.
+    session.decided_before_pending = false;
     Ok(())
 }
 
@@ -159,6 +167,9 @@ fn apply(
 ) -> Result<()> {
     let mut contract = architecture::load(dir);
     let mut contract_changed = false;
+    if session.decided_before_pending {
+        settle_cutoff(session, &updates.escalations);
+    }
     for escalation in &updates.escalations {
         if announce(session, escalation) {
             found.lines.push(escalation_line(key, escalation));
@@ -216,6 +227,54 @@ fn apply(
     Ok(())
 }
 
+/// When a decision was made, to sub-second precision, if RustGrid said.
+fn decided_time(escalation: &ArchitectureEscalation) -> Option<SystemTime> {
+    escalation.resolved_at.as_deref().and_then(parse_time)
+}
+
+/// An RFC 3339 time, compared as a time rather than as text, so offsets and
+/// fractions of a second order correctly.
+fn parse_time(value: &str) -> Option<SystemTime> {
+    let time = crate::token::parse_rfc3339_utc(value).ok()?;
+    // The parser drops fractions of a second; keep them for ordering.
+    let fraction = value
+        .split_once('.')
+        .map(|(_, rest)| {
+            rest.bytes()
+                .take_while(u8::is_ascii_digit)
+                .chain(std::iter::repeat(b'0'))
+                .take(9)
+                .fold(0u32, |nanos, digit| nanos * 10 + u32::from(digit - b'0'))
+        })
+        .unwrap_or(0);
+    Some(time + Duration::from_nanos(u64::from(fraction)))
+}
+
+/// The `resolved_at` of the oldest of these decisions.
+fn oldest<'a>(escalations: impl IntoIterator<Item = &'a ArchitectureEscalation>) -> Option<String> {
+    escalations
+        .into_iter()
+        .filter_map(|escalation| Some((decided_time(escalation)?, escalation)))
+        .min_by_key(|(time, _)| *time)
+        .and_then(|(_, escalation)| escalation.resolved_at.clone())
+}
+
+/// For a session linked by a version that kept no decision times: takes the
+/// cutoff from RustGrid's times for the decisions the link had. Until one of
+/// them is seen, a decision the session does not know predates them all,
+/// since RustGrid sends changes oldest first.
+fn settle_cutoff(session: &mut Session, escalations: &[ArchitectureEscalation]) {
+    let known = session.known_escalations.as_ref();
+    let linked = escalations.iter().filter(|escalation| {
+        escalation.status != "open"
+            && known.and_then(|known| known.get(&escalation.id)) == Some(&escalation.status)
+    });
+    if let Some(cutoff) = oldest(linked) {
+        session.decided_before = Some(cutoff);
+        session.decided_before_pending = false;
+    }
+}
+
 /// Whether the session has yet to be told about this escalation's status.
 /// A decision older than those the link was given is recorded, not told.
 fn announce(session: &mut Session, escalation: &ArchitectureEscalation) -> bool {
@@ -224,12 +283,18 @@ fn announce(session: &mut Session, escalation: &ArchitectureEscalation) -> bool 
         return false;
     }
     known.insert(escalation.id.clone(), escalation.status.clone());
-    let predates_link = escalation.status != "open"
-        && session
-            .decided_before
-            .as_deref()
-            .zip(escalation.resolved_at.as_deref())
-            .is_some_and(|(oldest, resolved)| resolved <= oldest);
+    if escalation.status == "open" {
+        return true;
+    }
+    if session.decided_before_pending {
+        return false;
+    }
+    let predates_link = session
+        .decided_before
+        .as_deref()
+        .and_then(parse_time)
+        .zip(decided_time(escalation))
+        .is_some_and(|(oldest, resolved)| resolved <= oldest);
     !predates_link
 }
 
@@ -242,7 +307,9 @@ fn record(contract: &mut ArchitectureContext, escalation: &ArchitectureEscalatio
         .chain(&contract.decided_escalations)
         .find(|known| known.id == escalation.id);
     if known.is_some_and(|known| {
-        known.status == escalation.status && known.resolution == escalation.resolution
+        known.status == escalation.status
+            && known.resolution == escalation.resolution
+            && (known.resolved_at.is_some() || escalation.resolved_at.is_none())
     }) {
         return false;
     }
@@ -269,20 +336,21 @@ fn record(contract: &mut ArchitectureContext, escalation: &ArchitectureEscalatio
             contract.open_escalations.push(escalation.clone());
         }
     } else {
-        // Newest first, as RustGrid sends them when a session links.
-        // A decision without a time is taken as the newest; on a tie the
-        // one just told goes first.
-        let time = |escalation: &ArchitectureEscalation| {
-            escalation
-                .resolved_at
-                .clone()
-                .unwrap_or_else(|| "~".to_owned())
-        };
-        let newer = |known: &ArchitectureEscalation| time(known) > time(escalation);
+        // Newest first, as RustGrid sends them when a session links. One
+        // just told without a time is taken as the newest, and on a tie it
+        // goes first. Decisions an earlier version kept without times stay
+        // on top until the first check, which replays every decision oldest
+        // first, gives each its time; so older decisions it replays cannot
+        // push them out, and every later one finds them timed.
+        let incoming = decided_time(escalation);
         let at = contract
             .decided_escalations
             .iter()
-            .position(|known| !newer(known))
+            .position(|known| match (decided_time(known), incoming) {
+                (Some(known), Some(incoming)) => known <= incoming,
+                (None, Some(_)) => false,
+                (_, None) => true,
+            })
             .unwrap_or(contract.decided_escalations.len());
         contract.decided_escalations.insert(at, escalation.clone());
         contract.decided_escalations.truncate(MAX_DECIDED);
@@ -965,6 +1033,143 @@ mod tests {
                 .iter()
                 .all(|known| known.id != "d-5")
         );
+    }
+
+    #[test]
+    fn an_upgraded_session_does_not_retell_decisions_older_than_its_link() {
+        // Linked by 1.13: a full list of decisions without times, and no
+        // record in the session of what it was told.
+        let dir = linked_dir();
+        let mut legacy = contract();
+        legacy["decided_escalations"] = json!(
+            (10..30)
+                .rev()
+                .map(|day| escalation(&format!("d-{day}"), "approved", Some("Decided.")))
+                .collect::<Vec<_>>()
+        );
+        assert!(architecture::prepare(dir.path(), "run-1", Some(&legacy)).is_some());
+        let mut session = session();
+        assert!(session.known_escalations.is_none());
+
+        let mut all: Vec<Value> = (5..30)
+            .map(|day| {
+                decided_at(
+                    &format!("d-{day}"),
+                    "approved",
+                    &format!("2026-10-{day:02}T00:00:00Z"),
+                )
+            })
+            .collect();
+        all.push(decided_at("d-new", "rejected", "2026-11-25T09:00:00Z"));
+        let (client, _) = server(vec![
+            updates("c1", all, None),
+            updates(
+                "c2",
+                vec![decided_at("d-later", "approved", "2026-11-26T09:00:00Z")],
+                None,
+            ),
+        ]);
+        let found = check(&client, &mut session, dir.path()).unwrap();
+        assert_eq!(
+            found.lines,
+            vec!["Architect rejected protected-1,3 for AGENT-12: Decided.".to_owned()]
+        );
+        assert_eq!(
+            session.decided_before.as_deref(),
+            Some("2026-10-10T00:00:00Z")
+        );
+        assert!(!session.decided_before_pending);
+
+        let found = check(&client, &mut session, dir.path()).unwrap();
+        assert_eq!(found.lines.len(), 1, "{:?}", found.lines);
+        let contract = architecture::load(dir.path()).unwrap();
+        let ids: Vec<&str> = contract
+            .decided_escalations
+            .iter()
+            .map(|known| known.id.as_str())
+            .collect();
+        let mut expected = vec!["d-later".to_owned(), "d-new".to_owned()];
+        expected.extend((12..30).rev().map(|day| format!("d-{day}")));
+        assert_eq!(ids, expected, "newest first");
+        assert!(
+            contract
+                .decided_escalations
+                .iter()
+                .all(|known| known.resolved_at.is_some())
+        );
+    }
+
+    #[test]
+    fn a_decision_kept_without_a_time_gets_one_and_orders_below_later_ones() {
+        // linked_dir's e-0 was written without a time, as 1.13 wrote it.
+        let dir = linked_dir();
+        let mut session = session();
+        let (client, _) = server(vec![
+            updates(
+                "c1",
+                vec![
+                    {
+                        // Resent exactly as the link had it, now with a time.
+                        let mut resent = escalation("e-0", "rejected", Some("Stay in app."));
+                        resent["resolved_at"] = json!("2026-11-20T08:00:00Z");
+                        resent
+                    },
+                    escalation("e-1", "open", None),
+                ],
+                None,
+            ),
+            updates(
+                "c2",
+                vec![decided_at("e-2", "approved", "2026-11-25T08:00:00Z")],
+                None,
+            ),
+        ]);
+        let found = check(&client, &mut session, dir.path()).unwrap();
+        assert!(found.lines.is_empty(), "{:?}", found.lines);
+        let contract = architecture::load(dir.path()).unwrap();
+        assert_eq!(
+            contract.decided_escalations[0].resolved_at.as_deref(),
+            Some("2026-11-20T08:00:00Z"),
+            "the time RustGrid sent is kept"
+        );
+        check(&client, &mut session, dir.path()).unwrap();
+        let contract = architecture::load(dir.path()).unwrap();
+        let ids: Vec<&str> = contract
+            .decided_escalations
+            .iter()
+            .map(|known| known.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e-2", "e-0"]);
+        let document = fs::read_to_string(dir.path().join("architecture.md")).unwrap();
+        assert!(
+            document.find("- e-2 [approved]").unwrap() < document.find("- e-0 [rejected]").unwrap()
+        );
+    }
+
+    #[test]
+    fn decisions_order_by_time_not_by_text() {
+        let dir = linked_dir();
+        let mut session = session();
+        seed(&mut session, Some(&contract()));
+        let (client, _) = server(vec![updates(
+            "c1",
+            vec![
+                // 09:30 UTC, which sorts after 09:45Z as text.
+                decided_at("e-a", "approved", "2026-11-25T10:30:00+01:00"),
+                decided_at("e-b", "approved", "2026-11-25T09:45:00Z"),
+                decided_at("e-c", "approved", "2026-11-25T09:45:00.25Z"),
+            ],
+            None,
+        )]);
+        check(&client, &mut session, dir.path()).unwrap();
+        let contract = architecture::load(dir.path()).unwrap();
+        let ids: Vec<&str> = contract
+            .decided_escalations
+            .iter()
+            .map(|known| known.id.as_str())
+            .filter(|id| *id != "e-0")
+            .collect();
+        assert_eq!(ids, vec!["e-c", "e-b", "e-a"]);
     }
 
     #[test]
