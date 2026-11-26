@@ -200,6 +200,11 @@ struct Session {
     /// oldest decision time among them. Earlier decisions are not news.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decided_before: Option<String>,
+    /// Linked by an earlier version with a full list of decisions that carry
+    /// no times: the cutoff is taken from RustGrid's times for the decisions
+    /// the link had, on the first check.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    decided_before_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -616,6 +621,7 @@ impl Session {
         self.pending_updates.clear();
         self.known_escalations = None;
         self.decided_before = None;
+        self.decided_before_pending = false;
     }
 
     /// Hands the session's run over to the flush to end once the transcript
